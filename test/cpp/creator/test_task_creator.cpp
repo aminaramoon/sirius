@@ -39,6 +39,7 @@ using namespace sirius::creator;
 using namespace sirius::parallel;
 using namespace sirius::pipeline;
 using namespace sirius::op::scan;
+using namespace sirius::exec;
 using namespace std::chrono_literals;
 using namespace sirius::op;
 using sirius::sirius_pipeline_hashmap;
@@ -250,9 +251,9 @@ class test_fixture {
         return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
           std::move(space_configs));
       }()),
-      gpu_executor_config{1, false},
+      gpu_executor_config{.num_threads = 1},
       pipeline_exec(gpu_executor_config, *memory_manager),
-      scan_exec(task_executor_config{2, false}),
+      scan_exec(thread_pool_config{.num_threads = 2}),
       empty_pipelines(),
       pipeline_map(empty_pipelines)
   {
@@ -271,7 +272,7 @@ class test_fixture {
   duckdb::GPUContext gpu_context;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
   duckdb::GPUExecutor gpu_executor;
-  task_executor_config gpu_executor_config;
+  thread_pool_config gpu_executor_config;
   pipeline_executor pipeline_exec;
   duckdb_scan_executor scan_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;

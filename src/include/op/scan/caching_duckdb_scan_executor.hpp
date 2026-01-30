@@ -16,9 +16,12 @@
 
 #pragma once
 
+#include <string>
+
 // sirius
-#include <op/scan/duckdb_scan_task_queue.hpp>
-#include <parallel/task_executor.hpp>
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <op/scan/duckdb_scan_executor.hpp>
+// #include <op/scan/duckdb_scan_task_queue.hpp>
 
 namespace sirius::op::scan {
 
@@ -33,14 +36,15 @@ namespace sirius::op::scan {
  * duckdb_scan_task_queue.
  *
  */
-class duckdb_scan_executor : public sirius::parallel::itask_executor {
+class caching_duckdb_scan_executor : public duckdb_scan_executor {
  public:
   //===----------Constructor----------===//
-  explicit duckdb_scan_executor(sirius::exec::thread_pool_config config)
-    : sirius::parallel::itask_executor(std::make_unique<duckdb_scan_task_queue>(config.num_threads),
-                                       config)
+  explicit caching_duckdb_scan_executor(sirius::exec::thread_pool_config config)
+    : duckdb_scan_executor(config)
   {
   }
+
+  void cache_scan_results_for_query(const std::string& query);
 
   //===----------Methods----------===//
   /**
@@ -50,31 +54,16 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
    */
   void schedule(std::unique_ptr<sirius::parallel::itask> task) override;
 
-  /**
-   * @brief Wait for all scheduled tasks to complete.
-   */
-  void wait();
-
-  /**
-   * @brief Worker thread loop.
-   *
-   * @param worker_id The ID of the worker thread.
-   */
-  void worker_loop(int32_t worker_id) override;
-
-  /**
-   * @brief Get the number of threads in the thread pool for this executor.
-   *
-   * @return The number of threads in the thread pool for this executor.
-   */
-  [[nodiscard]] int32_t get_num_threads() const { return _config.num_threads; }
-
   //===----------Fields----------===//
  private:
-  std::atomic<uint64_t> _total_tasks    = 0;  ///< The total number of scheduled tasks
-  std::atomic<uint64_t> _finished_tasks = 0;  ///< The total number of finished tasks
-  std::mutex _finish_mutex;                   ///< Mutex to protect condition variable
-  std::condition_variable _finish_cv;         ///< Condition variable to signal task completion
+  struct scan_state {
+    std::size_t pipeline_id{0};
+    std::atomic<std::size_t> cursor{0};
+    std::vector<std::shared_ptr<int>> results;
+  };
+  std::mutex _cache_mutex;
+  std::size_t _query_hash = 0;
+  std::unordered_map<std::size_t, scan_state> _cache;
 };
 
 }  // namespace sirius::op::scan

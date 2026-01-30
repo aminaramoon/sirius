@@ -61,7 +61,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    *
    * @param config Configuration for the task executor (thread count, retry policy, etc.)
    */
-  explicit gpu_pipeline_executor(sirius::parallel::task_executor_config config,
+  explicit gpu_pipeline_executor(sirius::exec::thread_pool_config config,
                                  const cucascade::memory::memory_space* mem_space,
                                  pipeline_executor* pipeline_exec);
 

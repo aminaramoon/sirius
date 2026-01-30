@@ -59,7 +59,7 @@ void local_task_buffer::close()
   _cv.notify_all();
 }
 
-gpu_pipeline_executor::gpu_pipeline_executor(sirius::parallel::task_executor_config config,
+gpu_pipeline_executor::gpu_pipeline_executor(sirius::exec::thread_pool_config config,
                                              const cucascade::memory::memory_space* mem_space,
                                              pipeline_executor* pipeline_exec)
   : itask_executor(std::make_unique<gpu_pipeline_queue>(config.num_threads), std::move(config)),

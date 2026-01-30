@@ -19,12 +19,14 @@
 #include <blockingconcurrentqueue.h>
 
 #include <atomic>
+#include <concepts>
 #include <optional>
 
 namespace sirius::exec {
 
 template <typename T>
 class interruptible_mpmc {
+ public:
   using value_type = T;
 
  private:
@@ -40,11 +42,15 @@ class interruptible_mpmc {
   interruptible_mpmc(const interruptible_mpmc&)            = delete;
   interruptible_mpmc& operator=(const interruptible_mpmc&) = delete;
 
+  [[nodiscard]] bool is_open() const noexcept { return _is_active.load(std::memory_order_relaxed); }
+
   /**
-   * \brief Pushes an item into the queue.
+   * \brief Pushes an item into the queue (move version).
+   * \note Only available if value_type is move constructible.
    * \return Returns false if the queue has been stopped/interrupted.
    */
   [[nodiscard]] bool push(value_type item)
+    requires std::move_constructible<value_type>
   {
     if (!_is_active.load(std::memory_order_relaxed)) { return false; }
     queue.enqueue(std::move(item));
@@ -52,10 +58,39 @@ class interruptible_mpmc {
   }
 
   /**
+   * \brief Pushes an item into the queue (copy version).
+   * \note Only available if value_type is copy constructible.
+   * \return Returns false if the queue has been stopped/interrupted.
+   */
+  [[nodiscard]] bool push(const value_type& item)
+    requires std::copy_constructible<value_type>
+  {
+    if (!_is_active.load(std::memory_order_relaxed)) { return false; }
+    queue.enqueue(item);
+    return true;
+  }
+
+  /**
+   * \brief Constructs an item in-place and pushes it into the queue.
+   * \note Only available if value_type is constructible from Args.
+   * \return Returns false if the queue has been stopped/interrupted.
+   */
+  template <typename... Args>
+    requires std::constructible_from<value_type, Args...>
+  [[nodiscard]] bool emplace(Args&&... args)
+  {
+    if (!_is_active.load(std::memory_order_relaxed)) { return false; }
+    queue.enqueue(value_type(std::forward<Args>(args)...));
+    return true;
+  }
+
+  /**
    * \brief Blocks waiting for an item.
+   * \note Only available if value_type is default initializable and move constructible.
    * \return Returns std::nullopt if the queue is interrupted (shutdown).
    */
-  std::optional<value_type> wait_pop()
+  std::optional<value_type> pop()
+    requires std::default_initializable<value_type> && std::move_constructible<value_type>
   {
     value_type item;
     while (_is_active.load(std::memory_order_relaxed)) {
@@ -66,9 +101,11 @@ class interruptible_mpmc {
 
   /**
    * \brief Attempts to pop without blocking.
-   * \return Returns nullptr if the queue is empty.
+   * \note Only available if value_type is default initializable and move constructible.
+   * \return Returns std::nullopt if the queue is empty.
    */
   std::optional<value_type> try_pop()
+    requires std::default_initializable<value_type> && std::move_constructible<value_type>
   {
     value_type item;
     if (queue.try_dequeue(item)) { return std::move(item); }
@@ -80,15 +117,13 @@ class interruptible_mpmc {
    * \brief Sets the active flag to false.
    * Consumer threads will see this flag on their next loop cycle (max 10ms delay).
    */
-  void interrupt()
+  void interrupt() noexcept
   {
-    _is_active.store(false, std::memory_order_relaxed);
-    value_type item;
-    while (queue.try_dequeue(item)) {}
+    _is_active.store(false);
   }
 
   /**
-   * Resets the queue state to active (useful for restarting workers).
+   * \brief Resets the queue state to active (useful for restarting workers).
    */
   void reset() { _is_active.store(true, std::memory_order_relaxed); }
 };

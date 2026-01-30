@@ -26,11 +26,11 @@
 namespace sirius {
 namespace pipeline {
 
-pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
+pipeline_executor::pipeline_executor(const exec::thread_pool_config& gpu_task_executor_config,
                                      sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                                      const cucascade::memory::system_topology_info* sys_topology)
   : sirius::parallel::itask_executor(std::make_unique<pipeline_queue>(1),
-                                     {.num_threads = 1, .retry_on_error = false})
+                                     {.num_threads = 1})
 {
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   auto num_gpus   = gpu_spaces.size();

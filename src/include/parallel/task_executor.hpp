@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "config.hpp"
+#include "exec/config.hpp"
 #include "task_queue.hpp"
 
 #include <atomic>
@@ -34,7 +34,7 @@ namespace parallel {
  */
 class itask_executor {
  public:
-  itask_executor(std::unique_ptr<itask_queue> task_queue, task_executor_config config)
+  itask_executor(std::unique_ptr<itask_queue> task_queue, exec::thread_pool_config config)
     : _task_queue(std::move(task_queue)), _config(std::move(config)), _running(false)
   {
   }
@@ -67,7 +67,7 @@ class itask_executor {
 
  protected:
   std::unique_ptr<itask_queue> _task_queue;
-  task_executor_config _config;
+  exec::thread_pool_config _config;
   std::atomic<bool> _running;
   std::vector<std::thread> _threads;
 };

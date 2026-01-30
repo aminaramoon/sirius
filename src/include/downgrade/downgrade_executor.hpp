@@ -45,7 +45,7 @@ class downgrade_executor : public itask_executor {
    * @param config Configuration for the task executor (thread count, retry policy, etc.)
    * @param data_repo_mgr Reference to the data repository for accessing and storing data batches
    */
-  explicit downgrade_executor(task_executor_config config,
+  explicit downgrade_executor(exec::thread_pool_config config,
                               cucascade::shared_data_repository_manager& data_repo_mgr)
     : itask_executor(std::make_unique<downgrade_task_queue>(), config),
       _data_repo_mgr(data_repo_mgr)

@@ -51,11 +51,12 @@ void itask_executor::on_task_error(int worker_id,
                                    std::unique_ptr<itask> task,
                                    const std::exception& e)
 {
-  if (_config.retry_on_error) {
-    schedule(std::move(task));
-  } else {
-    stop();
-  }
+  stop();
+  // if (_config.retry_on_error) {
+  //   schedule(std::move(task));
+  // } else {
+  //   stop();
+  // }
 }
 
 void itask_executor::worker_loop(int worker_id)
