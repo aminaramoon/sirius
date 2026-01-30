@@ -16,6 +16,7 @@
 
 #include "pipeline/gpu_pipeline_executor.hpp"
 
+#include "creator/task_creator.hpp"
 #include "pipeline/gpu_pipeline_queue.hpp"
 #include "pipeline/pipeline_executor.hpp"
 
@@ -65,7 +66,8 @@ gpu_pipeline_executor::gpu_pipeline_executor(sirius::parallel::task_executor_con
   : itask_executor(std::make_unique<gpu_pipeline_queue>(config.num_threads), std::move(config)),
     _local_task_buffer(std::make_unique<local_task_buffer>()),
     _memory_space_view(mem_space),
-    _pipeline_exec(pipeline_exec)
+    _pipeline_exec(pipeline_exec),
+    _task_creator(nullptr)
 {
 }
 
@@ -140,6 +142,14 @@ void gpu_pipeline_executor::worker_loop(int worker_id)
       // set stream reservation
       task->execute();
       // reset memory resource
+
+      // Now that the task has been completed, schedule some task creation attempts for the output consumers of the task's output
+      // cast task to gpu_pipeline_task and get the output consumers
+      auto gpu_pipeline_task = cast_to_gpu_pipeline_task(task.get());
+      auto output_consumers = gpu_pipeline_task->get_output_consumers();
+      for (auto& consumer : output_consumers) {
+        _task_creator->schedule(consumer);
+      }
     } catch (const std::exception& e) {
       on_task_error(worker_id, std::move(task), e);
     }
@@ -175,6 +185,11 @@ gpu_pipeline_task* gpu_pipeline_executor::cast_to_gpu_pipeline_task(sirius::para
 {
   // Safely cast to gpu_pipeline_task
   return dynamic_cast<gpu_pipeline_task*>(task);
+}
+
+void gpu_pipeline_executor::set_task_creator(creator::task_creator* creator)
+{
+  _task_creator = creator;
 }
 
 }  // namespace pipeline

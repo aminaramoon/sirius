@@ -47,11 +47,6 @@ class sirius_pipeline;
 class sirius_pipeline_build_state;
 class sirius_meta_pipeline;
 }  // namespace pipeline
-
-namespace creator {
-class task_creator;
-}  // namespace creator
-
 namespace op {
 
 enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
@@ -238,16 +233,12 @@ class sirius_physical_operator {
   bool all_ports_empty();
   //! Check if the pipeline is finished
   bool check_pipeline_finished();
-  //! Set the creator of the task
-  void set_creator(creator::task_creator* creator);
-
+ 
  private:
   //! The ports of the operator
   std::unordered_map<std::string, std::unique_ptr<port>> ports;
   //! The next operators to be executed after this operator when it is used as a sink
   std::vector<std::pair<sirius_physical_operator*, std::string_view>> next_port_after_sink;
-  //! The creator of the task
-  creator::task_creator* creator;
 };
 
 }  // namespace op

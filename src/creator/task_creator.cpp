@@ -102,7 +102,23 @@ void task_creator::reset()
   _priority_scans = std::queue<duckdb::shared_ptr<pipeline::sirius_pipeline>>{};
 }
 
-void task_creator::process_next_task(op::sirius_physical_operator* node) {}
+void task_creator::process_next_task(op::sirius_physical_operator* node) {
+  auto hint = node->get_next_task_hint();
+  
+  if (hint.has_value() && hint.value().hint == op::TaskCreationHint::READY) {
+    // WSM TODO: how do we handle other ports that are not default?
+    schedule(hint.value().producer);
+  } else if (hint.has_value() && hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
+    process_next_task(hint.value().producer);
+  } else {
+    if (!_priority_scans.empty()) {
+      duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
+      auto* scan_node                                        = pipeline->get_source().get();
+      schedule(scan_node);
+      _priority_scans.pop();
+    }
+  }
+}
 
 void task_creator::start()
 {
@@ -155,7 +171,6 @@ void task_creator::worker_function(int worker_id)
   //   try {
   //     // scheduling scan task
   //     if (info->_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
-  //       info->_pipeline->get_source()->set_creator(this);
   //       auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
   //         info->_pipeline,
   //         _duckdb_scan_executor,
@@ -179,7 +194,6 @@ void task_creator::worker_function(int worker_id)
   //     } else {
   //       duckdb::reference<sirius::op::sirius_physical_operator> node =
   //         info->_pipeline->get_inner_operators()[0];
-  //       info->_pipeline->get_sink()->set_creator(this);
   //       // need to exhaust input batches until all ports are empty
   //       while (!node.get().all_ports_empty()) {
   //         auto input_batch = node.get().get_input_batch();

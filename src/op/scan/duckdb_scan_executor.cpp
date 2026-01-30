@@ -47,6 +47,10 @@ void duckdb_scan_executor::worker_loop(int32_t worker_id)
     }
     try {
       task->execute();
+
+      // TODO WSM or amin add logic to schedule new tasks based on the output of the current task
+      // need to point to task creator here and call process_next_task on it
+
     } catch (const std::exception& e) {
       on_task_error(worker_id, std::move(task), e);
     }
