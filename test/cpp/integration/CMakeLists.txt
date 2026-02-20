@@ -15,5 +15,7 @@
 # =============================================================================
 
 set(TEST_SOURCES
-    ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_execution_tpch.cpp
+    ${TEST_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_execution_tpch.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_execution_tpch_parquet.cpp
     PARENT_SCOPE)
