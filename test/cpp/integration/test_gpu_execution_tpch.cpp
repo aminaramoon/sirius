@@ -21,6 +21,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -41,10 +42,16 @@ static fs::path get_project_root()
 #endif
 }
 
+static fs::path get_tpch_parquet_dir()
+{
+  return get_project_root() / "test" / "cpp" / "integration" / "tpch" / "parquet";
+}
+
 static fs::path get_tpch_db_path()
 {
   const char* env = std::getenv("SIRIUS_INTEGRATION_TEST_DB_PATH");
-  auto db_path    = env ? fs::path(env) : fs::path(__FILE__).parent_path() / "integration.duckdb";
+  auto db_path =
+    env ? fs::path(env) : fs::path(__FILE__).parent_path() / "tpch/duckdb/integration.duckdb";
   REQUIRE(fs::exists(db_path));
   return db_path;
 }
@@ -56,20 +63,30 @@ static fs::path get_tpch_db_path()
  * a compare_gpu_vs_cpu method for validating GPU execution against CPU results.
  */
 class GPUExecutionFixture {
- public:
-  GPUExecutionFixture()
+ protected:
+  struct SkipLoadDatabase {};
+
+  // Used by derived classes — skips load_database so they can call their own override
+  GPUExecutionFixture(SkipLoadDatabase)
   {
-    // Set up environment variable for config file
     auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
     REQUIRE(fs::exists(cfg_path));
     setenv("SIRIUS_CONFIG_FILE", cfg_path.string().c_str(), 1);
-
-    // Initialize DuckDB with integration database
-    db  = std::make_unique<duckdb::DuckDB>(get_tpch_db_path().string());
+    db  = std::make_unique<duckdb::DuckDB>(nullptr);
     con = std::make_unique<duckdb::Connection>(*db);
   }
 
-  ~GPUExecutionFixture() = default;
+ public:
+  GPUExecutionFixture() : GPUExecutionFixture(SkipLoadDatabase{}) { load_database(); }
+
+  ~GPUExecutionFixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
+
+  virtual void load_database()
+  {
+    auto db_path = get_tpch_db_path();
+    con->Query("ATTACH DATABASE '" + db_path.string() + "' AS tpch;");
+    con->Query("USE tpch;");
+  }
 
   /**
    * @brief Run a query through gpu_execution and through DuckDB CPU, then compare results.
@@ -161,6 +178,30 @@ class GPUExecutionFixture {
 
   std::unique_ptr<duckdb::DuckDB> db;
   std::unique_ptr<duckdb::Connection> con;
+};
+
+class GPUExecutionParquetFixture : public GPUExecutionFixture {
+ public:
+  GPUExecutionParquetFixture() : GPUExecutionFixture(SkipLoadDatabase{}) { load_database(); }
+
+  void load_database() override
+  {
+    auto parquet_dir = fs::path(__FILE__).parent_path() / "tpch/parquet";
+    REQUIRE(fs::exists(parquet_dir));
+
+    static const std::array<std::string, 8> tables = {
+      "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"};
+
+    for (const auto& table : tables) {
+      auto parquet_path = (parquet_dir / (table + ".parquet")).string();
+      auto result       = con->Query("CREATE VIEW " + table + " AS SELECT * FROM read_parquet('" +
+                               parquet_path + "');");
+      if (result->HasError()) {
+        UNSCOPED_INFO("Failed to create view for " << table << ": " << result->GetError());
+      }
+      REQUIRE_FALSE(result->HasError());
+    }
+  }
 };
 
 //===----------------------------------------------------------------------===//
