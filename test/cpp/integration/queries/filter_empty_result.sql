@@ -1,0 +1,1 @@
+select n_nationkey from nation where n_regionkey = 99;
