@@ -152,7 +152,7 @@ class sirius_scan_manager {
   void run_driver_loop();
 
   exec::thread_pool_config _config;
-  std::unique_ptr<exec::thread_pool> _thread_pool;
+  std::unique_ptr<exec::static_thread_pool> _thread_pool;
   std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _scan_op_order;

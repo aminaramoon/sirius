@@ -46,7 +46,7 @@ cached_split_provider::cached_split_provider(
 {
 }
 
-std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
+std::future<void> cached_split_provider::start(exec::static_thread_pool& /*pool*/,
                                                split_connector& connector)
 {
   std::promise<void> promise;

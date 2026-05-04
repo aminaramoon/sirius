@@ -58,7 +58,7 @@ class cached_split_provider : public split_provider {
                         std::shared_ptr<duckdb::Expression> filter_expression,
                         std::shared_ptr<op::scan::scan_plan const> plan);
 
-  std::future<void> start(exec::thread_pool& pool, split_connector& connector) override;
+  std::future<void> start(exec::static_thread_pool& pool, split_connector& connector) override;
 
  private:
   std::vector<std::vector<std::shared_ptr<cudf::column>>> _columns_per_request;

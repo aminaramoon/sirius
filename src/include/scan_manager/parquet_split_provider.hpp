@@ -90,7 +90,7 @@ class parquet_split_provider : public split_provider {
   parquet_split_provider(parquet_split_provider&&)                 = delete;
   parquet_split_provider& operator=(parquet_split_provider&&)      = delete;
 
-  std::future<void> start(exec::thread_pool& pool, split_connector& connector) override;
+  std::future<void> start(exec::static_thread_pool& pool, split_connector& connector) override;
 
  private:
   struct file_batch {
