@@ -189,6 +189,7 @@ set(EXTENSION_SOURCES
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
+    src/op/scan/sirius_gpu_scan_operator.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_concat.cpp
