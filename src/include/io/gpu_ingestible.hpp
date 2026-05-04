@@ -23,11 +23,22 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <utility>
 
 namespace sirius::io {
+
+/**
+ * @brief Tag identifying which concrete @c gpu_ingestible implementation a
+ *        given @c ingestible_table_info should produce.
+ */
+enum class ingestible_type : uint8_t {
+  PARQUET,
+  DUCKDB,
+};
 
 /**
  * @brief Polymorphic description of a post-scan filter and/or projection that
@@ -42,11 +53,14 @@ class post_filter_and_projection_info {
 /**
  * @brief Opaque polymorphic payload handed to a @c gpu_ingestible on
  *        construction. Concrete implementations subclass this and interpret
- *        their own derived state.
+ *        their own derived state. The carried @c type() drives
+ *        @c make_gpu_ingestible's dispatch to the matching concrete ingestible.
  */
 class ingestible_table_info {
  public:
   virtual ~ingestible_table_info() = default;
+
+  [[nodiscard]] virtual ingestible_type type() const = 0;
 
   virtual bool is_injestible_with(std::string_view filename) = 0;
 
@@ -156,5 +170,15 @@ class gpu_ingestible {
  protected:
   std::unique_ptr<ingestible_table_info> _table_info;
 };
+
+/**
+ * @brief Construct the concrete @c gpu_ingestible that matches
+ *        @c table_info->type().
+ *
+ * @throws std::runtime_error if no implementation is registered for the
+ *         carried type.
+ */
+std::unique_ptr<gpu_ingestible> make_gpu_ingestible(
+  std::unique_ptr<ingestible_table_info> table_info);
 
 }  // namespace sirius::io

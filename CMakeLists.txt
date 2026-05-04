@@ -159,6 +159,7 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
     src/io/admission_control.cpp
+    src/io/gpu_ingestible.cpp
     src/io/prefetching_cache.cpp
     src/io/sirius_datasource.cpp
     src/io/uring/uring_ioctx.cpp

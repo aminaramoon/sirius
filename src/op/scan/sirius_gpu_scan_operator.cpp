@@ -45,31 +45,11 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_SCAN, std::move(types), estimated_cardinality),
     _split_connector(std::make_unique<scan_manager::split_connector>()),
-    _table_info(std::move(table_info))
+    _ingestible(io::make_gpu_ingestible(std::move(table_info)))
 {
-  _split_connector->close();
 }
 
 sirius_gpu_scan_operator::~sirius_gpu_scan_operator() = default;
-
-//===----------------------------------------------------------------------===//
-// Setup hooks
-//===----------------------------------------------------------------------===//
-std::unique_ptr<io::ingestible_table_info> sirius_gpu_scan_operator::take_table_info()
-{
-  return std::move(_table_info);
-}
-
-void sirius_gpu_scan_operator::set_ingestible(std::unique_ptr<io::gpu_ingestible> ingestible)
-{
-  _ingestible = std::move(ingestible);
-}
-
-void sirius_gpu_scan_operator::set_split_connector(
-  std::unique_ptr<scan_manager::split_connector> connector)
-{
-  _split_connector = std::move(connector);
-}
 
 //===----------------------------------------------------------------------===//
 // Scheduling interface
@@ -98,20 +78,16 @@ std::unique_ptr<operator_data> sirius_gpu_scan_operator::get_next_task_input_dat
 std::unique_ptr<operator_data> sirius_gpu_scan_operator::execute(const operator_data& input_data,
                                                                  rmm::cuda_stream_view stream)
 {
-  if (!_ingestible) {
-    throw std::runtime_error(
-      "[sirius_gpu_scan_operator] execute() called before set_ingestible() was wired.");
-  }
-
   auto mr = cudf::get_current_device_resource_ref();
 
   std::unique_ptr<cudf::table> table;
   cucascade::memory::memory_space* mem_space = nullptr;
 
   if (auto const* fresh = dynamic_cast<const scan_operator_input*>(&input_data)) {
-    if (!_gpu_memory_space) {
+    if (!fresh->gpu_memory_space) {
       throw std::runtime_error(
-        "[sirius_gpu_scan_operator] execute() called before set_gpu_memory_space() was wired.");
+        "[sirius_gpu_scan_operator] scan_operator_input has null gpu_memory_space; "
+        "prepare_for_processing must run before execute().");
     }
     auto const& metadata = *fresh->metadata;
     table                = _ingestible->materialize_table(metadata.scan(), mr, stream);
@@ -120,7 +96,7 @@ std::unique_ptr<operator_data> sirius_gpu_scan_operator::execute(const operator_
       table            = _ingestible->post_filter_and_project(
         input_table->view(), metadata.filter_and_project(), mr, stream);
     }
-    mem_space = _gpu_memory_space;
+    mem_space = fresh->gpu_memory_space;
   } else if (auto const* pinned =
                dynamic_cast<const scan_operator_with_pinned_table_input*>(&input_data)) {
     if (!pinned->filter_info) {
@@ -129,9 +105,14 @@ std::unique_ptr<operator_data> sirius_gpu_scan_operator::execute(const operator_
       batches.push_back(pinned->batch);
       return std::make_unique<pipelineable_operator_data>(std::move(batches));
     }
+    if (!pinned->gpu_memory_space) {
+      throw std::runtime_error(
+        "[sirius_gpu_scan_operator] scan_operator_with_pinned_table_input has null "
+        "gpu_memory_space; prepare_for_processing must run before execute().");
+    }
     auto pinned_view = sirius::get_cudf_table_view(*pinned->batch);
     table = _ingestible->post_filter_and_project(pinned_view, *pinned->filter_info, mr, stream);
-    mem_space = pinned->batch->get_memory_space();
+    mem_space = pinned->gpu_memory_space;
   } else {
     throw std::runtime_error(
       "[sirius_gpu_scan_operator] execute() called with unexpected operator_data type; "

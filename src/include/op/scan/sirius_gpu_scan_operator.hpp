@@ -43,16 +43,14 @@ namespace sirius::op::scan {
  *        and post-scan filter / projection to a @c io::gpu_ingestible
  *        implementation.
  *
- * The operator carries an @c io::ingestible_table_info populated upstream;
- * an external setup step (later: scan_manager) constructs a matching
- * @c io::gpu_ingestible from it via @c take_table_info() and installs it via
- * @c set_ingestible(). Splits — one @c scan_operator_input per fresh-read
- * partition or one @c scan_operator_with_pinned_table_input per cached
- * batch — are pushed into the operator's bound @c split_connector by the
- * setup step's split provider. The operator pulls splits via
- * @c get_next_task_input_data, which blocks inside
- * @c split_connector::get_next_split until a split arrives or the connector
- * is closed.
+ * The operator's constructor consumes an @c io::ingestible_table_info and
+ * builds the matching @c io::gpu_ingestible via @c io::make_gpu_ingestible.
+ * Splits — one @c scan_operator_input per fresh-read partition or one
+ * @c scan_operator_with_pinned_table_input per cached batch — are pushed
+ * into the operator's bound @c split_connector by an external split
+ * provider. The operator pulls splits via @c get_next_task_input_data, which
+ * blocks inside @c split_connector::get_next_split until a split arrives or
+ * the connector is closed.
  */
 class sirius_gpu_scan_operator : public sirius_physical_operator {
  public:
@@ -62,8 +60,9 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /**
    * @param types                  Output column types.
    * @param estimated_cardinality  Estimated row count.
-   * @param table_info             Bind-data extracted upstream; consumed by the setup
-   *                               step that builds the @c io::gpu_ingestible.
+   * @param table_info             Bind-data extracted upstream; consumed by
+   *                               @c io::make_gpu_ingestible to build the
+   *                               concrete ingestible owned by this operator.
    */
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
                            duckdb::idx_t estimated_cardinality,
@@ -107,49 +106,33 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    *     @c io::gpu_ingestible::materialize_table; if the carried metadata
    *     reports @c has_filter, the result is then passed through
    *     @c io::gpu_ingestible::post_filter_and_project. The output table is
-   *     wrapped in a data_batch using the operator's configured default GPU
-   *     memory space (set via @c set_gpu_memory_space).
+   *     wrapped in a data_batch using the memory space captured by the
+   *     input's @c prepare_for_processing.
    *   - @c scan_operator_with_pinned_table_input: when @c filter_info is null
    *     the pinned batch is forwarded unchanged; otherwise the batch's view
    *     is run through @c io::gpu_ingestible::post_filter_and_project and the
-   *     result is wrapped in a new batch tied to the pinned batch's memory
-   *     space.
+   *     result is wrapped in a new batch tied to the memory space captured
+   *     by the input's @c prepare_for_processing.
    *
    * @param input_data  Must be either @c scan_operator_input or
    *                    @c scan_operator_with_pinned_table_input.
    * @param stream      CUDA stream.
    * @return gpu_table_representation data batch wrapped as
    *         pipelineable_operator_data.
-   * @throws std::runtime_error if @p input_data is of an unsupported type, or
-   *         if the ingestible / default memory space have not been installed.
+   * @throws std::runtime_error if @p input_data is of an unsupported type.
    */
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  //===----------Setup hooks----------===//
-  /// \brief Move out the bind-data so an external setup step can build a
-  ///        @c io::gpu_ingestible. Returns nullptr after the first call.
-  std::unique_ptr<io::ingestible_table_info> take_table_info();
-
-  /// \brief Install the ingestible implementation that backs @c execute().
-  void set_ingestible(std::unique_ptr<io::gpu_ingestible> ingestible);
-
-  /// \brief Install the split connector that the setup step will feed.
-  void set_split_connector(std::unique_ptr<scan_manager::split_connector> connector);
-
-  /// \brief Connector accessor for the setup driver.
+  //===----------Connector access----------===//
+  /// \brief Accessor used by the external split provider to push splits and
+  ///        close the connector when production is done.
   scan_manager::split_connector* get_split_connector() noexcept { return _split_connector.get(); }
-
-  /// \brief Install the default GPU memory space (the same one used for pinned
-  ///        tables) that @c execute() uses to wrap freshly-materialized tables.
-  void set_gpu_memory_space(cucascade::memory::memory_space* space) { _gpu_memory_space = space; }
 
  private:
   //===----------Fields----------===//
   std::unique_ptr<scan_manager::split_connector> _split_connector;
-  std::unique_ptr<io::ingestible_table_info> _table_info;
   std::unique_ptr<io::gpu_ingestible> _ingestible;
-  cucascade::memory::memory_space* _gpu_memory_space = nullptr;
 };
 
 }  // namespace sirius::op::scan
