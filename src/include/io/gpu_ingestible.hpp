@@ -30,6 +30,16 @@
 namespace sirius::io {
 
 /**
+ * @brief Polymorphic description of a post-scan filter and/or projection that
+ *        must be applied to a materialized table.
+ */
+class post_filter_and_projection_info {
+ public:
+  virtual ~post_filter_and_projection_info() = default;
+};
+
+
+/**
  * @brief Opaque polymorphic payload handed to a @c gpu_ingestible on
  *        construction. Concrete implementations subclass this and interpret
  *        their own derived state.
@@ -37,6 +47,10 @@ namespace sirius::io {
 class ingestible_table_info {
  public:
   virtual ~ingestible_table_info() = default;
+
+  virtual bool is_injestible_with(std::string_view filename) = 0;
+
+  [[nodiscard]] virtual std::unique_ptr<post_filter_and_projection_info> get_filter_and_pojection_info() const = 0;
 };
 
 /**
@@ -57,14 +71,7 @@ class scan_info {
     const = 0;
 };
 
-/**
- * @brief Polymorphic description of a post-scan filter and/or projection that
- *        must be applied to a materialized table.
- */
-class post_filter_and_projection_info {
- public:
-  virtual ~post_filter_and_projection_info() = default;
-};
+
 
 /**
  * @brief Per-split metadata returned from @c gpu_ingestible::get_next_split.
