@@ -40,8 +40,12 @@ namespace sirius::scan_manager {
 sirius_scan_manager::sirius_scan_manager(scan_manager_config config) : _config(std::move(config))
 {
   if (_config.use_sirius_datasource) {
-    _io_ctx = std::make_shared<sirius::io::uring_ioctx>();
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx)");
+    _io_ctx = std::make_shared<sirius::io::uring_ioctx>(_config.uring_ring_entries,
+                                                        _config.uring_n_reactors);
+    SIRIUS_LOG_DEBUG(
+      "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
+      _config.uring_n_reactors,
+      _config.uring_ring_entries);
   } else {
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] sirius_datasource disabled — falling back to "
@@ -185,17 +189,18 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   } catch (...) {
     SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
   }
-  return std::make_unique<parquet_split_provider>(info->returned_types,
-                                                  info->file_paths,
-                                                  info->column_ids,
-                                                  info->projection_ids,
-                                                  info->names,
-                                                  op->get_types().size(),
-                                                  std::move(info->table_filters),
-                                                  info->partition_indices,
-                                                  info->approximate_batch_size,
-                                                  parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
-                                                  _io_ctx.get());
+  return std::make_unique<parquet_split_provider>(
+    info->returned_types,
+    info->file_paths,
+    info->column_ids,
+    info->projection_ids,
+    info->names,
+    op->get_types().size(),
+    std::move(info->table_filters),
+    info->partition_indices,
+    info->approximate_batch_size,
+    parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
+    _io_ctx.get());
 }
 
 void sirius_scan_manager::run_driver_loop()
