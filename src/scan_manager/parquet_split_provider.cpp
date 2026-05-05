@@ -18,6 +18,8 @@
 
 #include "exec/thread_pool.hpp"
 #include "expression_executor/gpu_expression_translator_internal.hpp"
+#include "io/io_context.hpp"
+#include "io/prefetching_cache.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
@@ -68,11 +70,13 @@ parquet_split_provider::parquet_split_provider(
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
-  std::size_t max_file_processed)
+  std::size_t max_file_processed,
+  sirius::io::sirius_ioctx* io_ctx)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
-    _total_files(file_paths.size())
+    _total_files(file_paths.size()),
+    _io_ctx(io_ctx)
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /
@@ -256,7 +260,18 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     }
 
     //===----------Read metadata footers----------===//
-    auto datasource    = cudf::io::datasource::create(file_path);
+    // When the manager exposes a sirius_ioctx, mint an io_object up-front and
+    // route the footer fetch through sirius_datasource so the same io_object
+    // can be threaded onto every emitted row_group_slice.  Falls through to
+    // cudf's path when the manager was configured with use_sirius_datasource=false.
+    std::shared_ptr<sirius::io::sirius_io_object> file_io_object;
+    std::unique_ptr<cudf::io::datasource> datasource;
+    if (_io_ctx != nullptr) {
+      file_io_object = _io_ctx->create_io_object(file_path);
+      datasource     = _io_ctx->make_datasource(file_io_object);
+    } else {
+      datasource = cudf::io::datasource::create(file_path);
+    }
     auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
 
     //===----------Parse metadata----------===//

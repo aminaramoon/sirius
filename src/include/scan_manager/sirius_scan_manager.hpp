@@ -31,6 +31,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace sirius::io {
+class sirius_ioctx;
+}  // namespace sirius::io
+
 namespace sirius::op::scan {
 class sirius_gpu_parquet_scan_operator;
 }  // namespace sirius::op::scan
@@ -40,6 +44,19 @@ class query;
 }  // namespace sirius::planner
 
 namespace sirius::scan_manager {
+
+/**
+ * @brief Configuration for the scan_manager.
+ *
+ * @c use_sirius_datasource controls whether the manager builds a
+ * @c sirius_ioctx and routes parquet reads through @c sirius_datasource.
+ * Set to @c false to fall back to @c cudf::io::datasource::create() at
+ * every read site (e.g. when the sirius IO path is misbehaving).
+ */
+struct scan_manager_config {
+  exec::thread_pool_config thread_pool{.num_threads = 2, .thread_name_prefix = "scan_manager"};
+  bool use_sirius_datasource{true};
+};
 
 /**
  * @brief A single pinned-table entry, keyed by table name in the scan_manager.
@@ -76,9 +93,9 @@ class sirius_scan_manager {
   /**
    * @brief Construct a new source manager.
    *
-   * @param config Configuration for the thread pool (thread count, name prefix, CPU affinity).
+   * @param config Scan-manager configuration (thread pool + sirius_datasource toggle).
    */
-  explicit sirius_scan_manager(exec::thread_pool_config config);
+  explicit sirius_scan_manager(scan_manager_config config);
 
   ~sirius_scan_manager();
 
@@ -140,6 +157,11 @@ class sirius_scan_manager {
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
 
+  /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
+  ///        Returns nullptr when the manager was configured with
+  ///        @c use_sirius_datasource=false.
+  [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
+
  private:
   /// \brief Build a split_provider for @p op by reading its parquet scan_info.
   ///        Returns a cached_split_provider when a pinned entry matches, otherwise
@@ -151,7 +173,8 @@ class sirius_scan_manager {
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void run_driver_loop();
 
-  exec::thread_pool_config _config;
+  scan_manager_config _config;
+  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
   std::unique_ptr<exec::static_thread_pool> _thread_pool;
   std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;

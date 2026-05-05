@@ -17,6 +17,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include "exec/thread_pool.hpp"
+#include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/scan_plan.hpp"
@@ -36,9 +37,16 @@
 
 namespace sirius::scan_manager {
 
-sirius_scan_manager::sirius_scan_manager(exec::thread_pool_config config)
-  : _config(std::move(config))
+sirius_scan_manager::sirius_scan_manager(scan_manager_config config) : _config(std::move(config))
 {
+  if (_config.use_sirius_datasource) {
+    _io_ctx = std::make_shared<sirius::io::uring_ioctx>();
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx)");
+  } else {
+    SIRIUS_LOG_DEBUG(
+      "[sirius_scan_manager] sirius_datasource disabled — falling back to "
+      "cudf::io::datasource::create");
+  }
 }
 
 sirius_scan_manager::~sirius_scan_manager() { stop(); }
@@ -185,7 +193,9 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
                                                   op->get_types().size(),
                                                   std::move(info->table_filters),
                                                   info->partition_indices,
-                                                  info->approximate_batch_size);
+                                                  info->approximate_batch_size,
+                                                  parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
+                                                  _io_ctx.get());
 }
 
 void sirius_scan_manager::run_driver_loop()
@@ -217,8 +227,9 @@ void sirius_scan_manager::reset()
 void sirius_scan_manager::start()
 {
   if (_thread_pool) { return; }
-  _thread_pool = std::make_unique<exec::static_thread_pool>(
-    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
+  _thread_pool = std::make_unique<exec::static_thread_pool>(_config.thread_pool.num_threads,
+                                                            _config.thread_pool.thread_name_prefix,
+                                                            _config.thread_pool.cpu_affinity_list);
 }
 
 void sirius_scan_manager::stop()

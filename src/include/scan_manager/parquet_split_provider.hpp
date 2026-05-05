@@ -37,6 +37,10 @@ class Expression;
 class TableFilterSet;
 }  // namespace duckdb
 
+namespace sirius::io {
+class sirius_ioctx;
+}  // namespace sirius::io
+
 namespace sirius::scan_manager {
 
 /**
@@ -81,7 +85,12 @@ class parquet_split_provider : public split_provider {
     duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set            = nullptr,
     duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices = {},
     std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
-    std::size_t max_file_processed     = DEFAULT_MAX_FILE_PROCESSED);
+    std::size_t max_file_processed     = DEFAULT_MAX_FILE_PROCESSED,
+    /// Optional sirius IO context.  When non-null, footer fetches go through
+    /// @c sirius_datasource and the resulting io_object is attached to each
+    /// emitted @c row_group_slice; when null, the provider falls back to
+    /// @c cudf::io::datasource::create() and slices carry no io_object.
+    sirius::io::sirius_ioctx* io_ctx = nullptr);
 
   ~parquet_split_provider() override;
 
@@ -118,6 +127,9 @@ class parquet_split_provider : public split_provider {
   std::size_t _max_file_processed;
   std::size_t _total_files;
   std::size_t _next_file_idx{0};
+  /// Optional ioctx for routing reads through @c sirius_datasource.
+  /// Lifetime is owned by @c sirius_scan_manager — outlives the provider.
+  sirius::io::sirius_ioctx* _io_ctx{nullptr};
 };
 
 }  // namespace sirius::scan_manager

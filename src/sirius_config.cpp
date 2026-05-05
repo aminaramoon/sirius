@@ -80,6 +80,16 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
+{
+  yaml::reader r(node, "scan_manager");
+  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
+  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
+  r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
+  r.optional("use_sirius_datasource", opt.use_sirius_datasource);
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
@@ -403,7 +413,7 @@ const exec::thread_pool_config& sirius_config::get_task_creator_config() const n
   return _task_creator_config;
 }
 
-const exec::thread_pool_config& sirius_config::get_scan_manager_config() const noexcept
+const scan_manager::scan_manager_config& sirius_config::get_scan_manager_config() const noexcept
 {
   return _scan_manager_config;
 }
