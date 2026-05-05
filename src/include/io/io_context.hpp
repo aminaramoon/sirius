@@ -61,18 +61,16 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst);
 
-  void host_read_async(
-    sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, io_completion_handler handler);
+  std::future<size_t> host_read_async(sirius_io_object& obj,
+                                      size_t offset,
+                                      size_t size,
+                                      uint8_t* dst);
 
   size_t device_read(
     sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
 
-  void device_read_async(sirius_io_object& obj,
-                         size_t offset,
-                         size_t size,
-                         uint8_t* dst,
-                         rmm::cuda_stream_view stream,
-                         io_completion_handler handler);
+  std::future<size_t> device_read_async(
+    sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
 
   ///
 

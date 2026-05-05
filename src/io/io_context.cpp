@@ -16,6 +16,7 @@
 
 #include "io/io_context.hpp"
 
+#include "cuda/event.hpp"
 #include "io/prefetching_cache.hpp"
 
 #include <rmm/device_buffer.hpp>
@@ -123,7 +124,7 @@ size_t copy_pinned_slices_to_device(
 size_t sirius_ioctx::host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst)
 {
   if (_cache) {
-    if (auto view = _cache->read(obj, offset, size, 0); view) {
+    if (auto view = _cache->read(obj, offset, size, nullptr); view) {
       auto slices   = view.slice(offset, size);
       size_t copied = 0;
       for (auto const& s : slices) {
@@ -136,11 +137,13 @@ size_t sirius_ioctx::host_read(sirius_io_object& obj, size_t offset, size_t size
   return host_read_io(obj, offset, size, dst);
 }
 
-void sirius_ioctx::host_read_async(
-  sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, io_completion_handler handler)
+std::future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
+                                                  size_t offset,
+                                                  size_t size,
+                                                  uint8_t* dst)
 {
   if (_cache) {
-    if (auto view = _cache->read(obj, offset, size, 0); view) {
+    if (auto view = _cache->read(obj, offset, size, nullptr); view) {
       auto slices = view.slice(offset, size);
       try {
         size_t copied = 0;
@@ -148,14 +151,22 @@ void sirius_ioctx::host_read_async(
           std::memcpy(dst + copied, s.data(), s.size());
           copied += s.size();
         }
-        handler(copied, nullptr);
+        return std::async(std::launch::deferred, [copied]() { return copied; });
       } catch (...) {
-        handler(0, std::current_exception());
+        return std::async(std::launch::deferred, []() -> size_t { throw; });
       }
-      return;
     }
   }
-  host_read_async_io(obj, offset, size, dst, std::move(handler));
+  auto promise = std::make_shared<std::promise<size_t>>();
+  host_read_async_io(
+    obj, offset, size, dst, [promise](size_t bytes_transferred, std::exception_ptr ep) {
+      if (ep) {
+        promise->set_exception(std::move(ep));
+      } else {
+        promise->set_value(bytes_transferred);
+      }
+    });
+  return promise->get_future();
 }
 
 size_t sirius_ioctx::device_read(
@@ -170,26 +181,36 @@ size_t sirius_ioctx::device_read(
   return device_read_io(obj, offset, size, dst, stream);
 }
 
-void sirius_ioctx::device_read_async(sirius_io_object& obj,
-                                     size_t offset,
-                                     size_t size,
-                                     uint8_t* dst,
-                                     rmm::cuda_stream_view stream,
-                                     io_completion_handler handler)
+std::future<size_t> sirius_ioctx::device_read_async(
+  sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
   if (_cache) {
     if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
       auto slices = view.slice(offset, size);
       try {
         auto copied = copy_pinned_slices_to_device(slices, dst, stream);
-        handler(copied, nullptr);
+
+        cuda::cuda_event event(cudaEventDisableTiming);
+        event.record(stream);
+        return std::async(std::launch::deferred, [copied, e = std::move(event), stream]() mutable {
+          e.synchronize();
+          return copied;
+        });
       } catch (...) {
-        handler(0, std::current_exception());
+        return std::async(std::launch::deferred, []() -> size_t { throw; });
       }
-      return;
     }
   }
-  device_read_async_io(obj, offset, size, dst, stream, std::move(handler));
+  auto promise = std::make_shared<std::promise<size_t>>();
+  device_read_async_io(
+    obj, offset, size, dst, stream, [promise](size_t bytes_transferred, std::exception_ptr ep) {
+      if (ep) {
+        promise->set_exception(std::move(ep));
+      } else {
+        promise->set_value(bytes_transferred);
+      }
+    });
+  return promise->get_future();
 }
 
 }  // namespace sirius::io

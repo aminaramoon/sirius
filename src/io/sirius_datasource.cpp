@@ -57,15 +57,7 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  auto p = std::make_shared<std::promise<size_t>>();
-  auto f = p->get_future();
-  _io_ctx->host_read_async(*_io_object, offset, size, dst, [p](size_t n, std::exception_ptr ep) {
-    if (ep)
-      p->set_exception(ep);
-    else
-      p->set_value(n);
-  });
-  return f;
+  return _io_ctx->host_read_async(*_io_object, offset, size, dst);
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
@@ -73,18 +65,13 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
 {
   size     = std::min(size, _io_object->size() > offset ? _io_object->size() - offset : size_t{0});
   auto buf = std::make_shared<std::vector<uint8_t>>(size);
-  auto p   = std::make_shared<std::promise<std::unique_ptr<datasource::buffer>>>();
-  auto f   = p->get_future();
-  _io_ctx->host_read_async(
-    *_io_object, offset, size, buf->data(), [p, buf](size_t n, std::exception_ptr ep) {
-      if (ep) {
-        p->set_exception(ep);
-        return;
-      }
-      buf->resize(n);
-      p->set_value(datasource::buffer::create(std::move(*buf)));
-    });
-  return f;
+  auto inner_fut =
+    std::make_shared<std::future<size_t>>(_io_ctx->host_read_async(*_io_object, offset, size, buf->data()));
+  return std::async(std::launch::deferred, [buf, inner_fut]() mutable {
+    auto n = inner_fut->get();
+    buf->resize(n);
+    return datasource::buffer::create(std::move(*buf));
+  });
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
@@ -110,16 +97,7 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          rmm::cuda_stream_view stream)
 {
-  auto p = std::make_shared<std::promise<size_t>>();
-  auto f = p->get_future();
-  _io_ctx->device_read_async(
-    *_io_object, offset, size, dst, stream, [p](size_t n, std::exception_ptr ep) {
-      if (ep)
-        p->set_exception(ep);
-      else
-        p->set_value(n);
-    });
-  return f;
+  return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream);
 }
 
 }  // namespace sirius::io
