@@ -50,10 +50,9 @@ sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
   std::unique_ptr<parquet_scan_info> scan_info)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality),
-    _split_connector(std::make_unique<scan_manager::split_connector>()),
     _scan_info(std::move(scan_info))
 {
-  _split_connector->close();
+  // _split_connector->close();
 }
 
 sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
@@ -69,7 +68,7 @@ std::unique_ptr<parquet_scan_info> sirius_gpu_parquet_scan_operator::take_scan_i
 void sirius_gpu_parquet_scan_operator::set_split_connector(
   std::unique_ptr<scan_manager::split_connector> connector)
 {
-  _split_connector = std::move(connector);
+  // _split_connector = std::move(connector);
 }
 
 //===----------------------------------------------------------------------===//
@@ -99,9 +98,10 @@ bool sirius_gpu_parquet_scan_operator::all_ports_empty()
 
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {
-  auto next = _split_connector->get_next_split();
-  if (!next.has_value()) { return nullptr; }
-  return std::move(*next);
+  return nullptr;
+  // auto next = _split_connector->get_next_split();
+  // if (!next.has_value()) { return nullptr; }
+  // return std::move(*next);
 }
 
 //===----------------------------------------------------------------------===//

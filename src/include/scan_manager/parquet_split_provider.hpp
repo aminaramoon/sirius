@@ -18,7 +18,6 @@
 
 #include "helper/logical_type.hpp"
 #include "op/scan/scan_plan.hpp"
-#include "scan_manager/split_provider.hpp"
 #include "sirius_config.hpp"
 
 #include <duckdb/common/column_index.hpp>

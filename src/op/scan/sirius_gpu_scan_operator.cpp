@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "io/gpu_ingestible.hpp"
+
 #include <data/data_batch_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -44,7 +46,6 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
   std::unique_ptr<io::ingestible_table_info> table_info)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_SCAN, std::move(types), estimated_cardinality),
-    _split_connector(std::make_unique<scan_manager::split_connector>()),
     _ingestible(io::make_gpu_ingestible(std::move(table_info)))
 {
 }
@@ -82,6 +83,7 @@ std::unique_ptr<operator_data> sirius_gpu_scan_operator::execute(const operator_
 
   std::unique_ptr<cudf::table> table;
   cucascade::memory::memory_space* mem_space = nullptr;
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
 
   if (auto const* fresh = dynamic_cast<const scan_operator_input*>(&input_data)) {
     if (!fresh->gpu_memory_space) {
@@ -90,18 +92,22 @@ std::unique_ptr<operator_data> sirius_gpu_scan_operator::execute(const operator_
         "prepare_for_processing must run before execute().");
     }
     auto const& metadata = *fresh->metadata;
-    table                = _ingestible->materialize_table(metadata.scan(), mr, stream);
-    if (metadata.has_filter()) {
-      auto input_table = std::move(table);
-      table            = _ingestible->post_filter_and_project(
-        input_table->view(), metadata.filter_and_project(), mr, stream);
+    auto filtered_table  = _ingestible->materialize_table(metadata.get_scan_infos(), mr, stream);
+    if (metadata.has_filter() &&
+        filtered_table.state != io::gpu_ingestible::filter_state::ROW_FILTERED_AND_PROJECTED) {
+      table = _ingestible->post_filter_and_project(filtered_table.table->view(),
+                                                   filtered_table.state,
+                                                   metadata.filter_and_project(),
+                                                   mr,
+                                                   stream);
+    } else {
+      table = std::move(filtered_table.table);
     }
     mem_space = fresh->gpu_memory_space;
   } else if (auto const* pinned =
                dynamic_cast<const scan_operator_with_pinned_table_input*>(&input_data)) {
     if (!pinned->filter_info) {
       // Fast path: no post-scan work — forward the pinned batch unchanged.
-      std::vector<std::shared_ptr<cucascade::data_batch>> batches;
       batches.push_back(pinned->batch);
       return std::make_unique<pipelineable_operator_data>(std::move(batches));
     }
@@ -111,7 +117,8 @@ std::unique_ptr<operator_data> sirius_gpu_scan_operator::execute(const operator_
         "gpu_memory_space; prepare_for_processing must run before execute().");
     }
     auto pinned_view = sirius::get_cudf_table_view(*pinned->batch);
-    table = _ingestible->post_filter_and_project(pinned_view, *pinned->filter_info, mr, stream);
+    table            = _ingestible->post_filter_and_project(
+      pinned_view, io::gpu_ingestible::UNFILTERED, *pinned->filter_info, mr, stream);
     mem_space = pinned->gpu_memory_space;
   } else {
     throw std::runtime_error(
@@ -120,7 +127,6 @@ std::unique_ptr<operator_data> sirius_gpu_scan_operator::execute(const operator_
   }
 
   auto batch = sirius::make_data_batch(std::move(table), *mem_space);
-  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   batches.push_back(std::move(batch));
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }

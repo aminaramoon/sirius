@@ -20,19 +20,15 @@
 
 namespace sirius::io {
 
-std::unique_ptr<gpu_ingestible> make_gpu_ingestible(
+std::shared_ptr<gpu_ingestible> make_gpu_ingestible(
   std::unique_ptr<ingestible_table_info> table_info)
 {
-  if (!table_info) {
-    throw std::runtime_error("[make_gpu_ingestible] table_info is null.");
-  }
+  if (!table_info) { throw std::runtime_error("[make_gpu_ingestible] table_info is null."); }
   switch (table_info->type()) {
     case ingestible_type::PARQUET:
-      throw std::runtime_error(
-        "[make_gpu_ingestible] PARQUET ingestible is not yet implemented.");
+      throw std::runtime_error("[make_gpu_ingestible] DUCKDB ingestible is not yet implemented.");
     case ingestible_type::DUCKDB:
-      throw std::runtime_error(
-        "[make_gpu_ingestible] DUCKDB ingestible is not yet implemented.");
+      throw std::runtime_error("[make_gpu_ingestible] DUCKDB ingestible is not yet implemented.");
   }
   throw std::runtime_error("[make_gpu_ingestible] unknown ingestible_type.");
 }

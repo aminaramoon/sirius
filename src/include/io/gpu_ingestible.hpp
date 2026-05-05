@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "io/types.hpp"
+
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -23,6 +25,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -49,7 +52,6 @@ class post_filter_and_projection_info {
   virtual ~post_filter_and_projection_info() = default;
 };
 
-
 /**
  * @brief Opaque polymorphic payload handed to a @c gpu_ingestible on
  *        construction. Concrete implementations subclass this and interpret
@@ -64,7 +66,13 @@ class ingestible_table_info {
 
   virtual bool is_injestible_with(std::string_view filename) = 0;
 
-  [[nodiscard]] virtual std::unique_ptr<post_filter_and_projection_info> get_filter_and_pojection_info() const = 0;
+  /// @brief checks if the files in the table_info match the given files in the function
+  /// @param files the files to check
+  /// @return true if the files match, false otherwise
+  [[nodiscard]] virtual bool matches_files(std::span<std::string> files) const = 0;
+
+  [[nodiscard]] virtual std::unique_ptr<post_filter_and_projection_info>
+  get_filter_and_pojection_info() const = 0;
 };
 
 /**
@@ -81,11 +89,11 @@ class scan_info {
 
   [[nodiscard]] virtual bool is_prefetchable() const = 0;
 
+  [[nodiscard]] virtual std::shared_ptr<sirius::io::sirius_io_object> get_io_object() const = 0;
+
   [[nodiscard]] virtual std::span<cudf::io::text::byte_range_info> get_prefetching_ranges()
     const = 0;
 };
-
-
 
 /**
  * @brief Per-split metadata returned from @c gpu_ingestible::get_next_split.
@@ -96,7 +104,7 @@ class scan_info {
  */
 class scan_and_filter_metadata {
  public:
-  scan_and_filter_metadata(std::unique_ptr<scan_info> scan,
+  scan_and_filter_metadata(std::vector<std::unique_ptr<scan_info>> scan,
                            std::unique_ptr<post_filter_and_projection_info> filter_and_project)
     : _scan(std::move(scan)), _filter_and_project(std::move(filter_and_project))
   {
@@ -104,7 +112,10 @@ class scan_and_filter_metadata {
 
   [[nodiscard]] bool has_filter() const noexcept { return _filter_and_project != nullptr; }
 
-  [[nodiscard]] scan_info const& scan() const noexcept { return *_scan; }
+  [[nodiscard]] const std::vector<std::unique_ptr<scan_info>>& get_scan_infos() const noexcept
+  {
+    return _scan;
+  }
 
   [[nodiscard]] post_filter_and_projection_info const& filter_and_project() const noexcept
   {
@@ -112,7 +123,7 @@ class scan_and_filter_metadata {
   }
 
  private:
-  std::unique_ptr<scan_info> _scan;
+  std::vector<std::unique_ptr<scan_info>> _scan;
   std::unique_ptr<post_filter_and_projection_info> _filter_and_project;
 };
 
@@ -124,8 +135,20 @@ class scan_and_filter_metadata {
  * Implementations may opt in to prefetching by returning @c true from
  * @c supports_prefetching().
  */
-class gpu_ingestible {
+class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
  public:
+  enum filter_state {
+    UNFILTERED,
+    ROWGROUP_FILTERED,
+    ROW_FILTERED,
+    ROW_FILTERED_AND_PROJECTED,
+  };
+
+  struct filtered_result {
+    std::unique_ptr<cudf::table> table;
+    filter_state state{UNFILTERED};
+  };
+
   explicit gpu_ingestible(std::unique_ptr<ingestible_table_info> info)
     : _table_info(std::move(info))
   {
@@ -136,6 +159,8 @@ class gpu_ingestible {
   gpu_ingestible(gpu_ingestible const&)            = delete;
   gpu_ingestible& operator=(gpu_ingestible const&) = delete;
 
+  virtual std::unique_ptr<scan_info> process_next_metadata() = 0;
+
   /**
    * @brief Pull the next split of work.
    *
@@ -143,20 +168,21 @@ class gpu_ingestible {
    *         Prefetch hints, if any, are reachable via the wrapped
    *         @c scan_info (see @c scan_info::is_prefetchable).
    */
-  virtual std::unique_ptr<scan_and_filter_metadata> get_next_split() = 0;
+  virtual std::unique_ptr<scan_and_filter_metadata> get_next_split(std::size_t batch_size) = 0;
 
   /**
    * @brief Materialize a split into a cuDF table on the GPU.
    */
-  virtual std::unique_ptr<cudf::table> materialize_table(scan_info const& info,
-                                                         rmm::device_async_resource_ref mr,
-                                                         rmm::cuda_stream_view stream) = 0;
+  virtual filtered_result materialize_table(const std::vector<std::unique_ptr<scan_info>>& info,
+                                            rmm::device_async_resource_ref mr,
+                                            rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Apply post-scan filters and projections to a materialized table.
    */
   virtual std::unique_ptr<cudf::table> post_filter_and_project(
     cudf::table_view input,
+    filter_state filter_state,
     post_filter_and_projection_info const& info,
     rmm::device_async_resource_ref mr,
     rmm::cuda_stream_view stream) = 0;
@@ -166,6 +192,8 @@ class gpu_ingestible {
    *        from @c get_next_split().
    */
   [[nodiscard]] virtual bool supports_prefetching() const = 0;
+
+  [[nodiscard]] const ingestible_table_info& table_info() const noexcept { return *_table_info; }
 
  protected:
   std::unique_ptr<ingestible_table_info> _table_info;
@@ -178,7 +206,7 @@ class gpu_ingestible {
  * @throws std::runtime_error if no implementation is registered for the
  *         carried type.
  */
-std::unique_ptr<gpu_ingestible> make_gpu_ingestible(
+std::shared_ptr<gpu_ingestible> make_gpu_ingestible(
   std::unique_ptr<ingestible_table_info> table_info);
 
 }  // namespace sirius::io

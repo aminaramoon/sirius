@@ -16,10 +16,7 @@
 
 #pragma once
 
-#include <condition_variable>
-#include <deque>
 #include <memory>
-#include <mutex>
 #include <optional>
 
 namespace sirius::op {
@@ -41,36 +38,21 @@ namespace sirius::scan_manager {
  */
 class split_connector {
  public:
-  split_connector();
-  ~split_connector();
-
-  split_connector(const split_connector&)            = delete;
-  split_connector& operator=(const split_connector&) = delete;
-  split_connector(split_connector&&)                 = delete;
-  split_connector& operator=(split_connector&&)      = delete;
-
-  /// \brief Enqueue a ready split. Producer side. Wakes a waiting consumer.
-  void push_split(std::unique_ptr<op::operator_data> split);
-
-  /// \brief Mark the connector as closed: no more splits will be pushed. Idempotent.
-  ///        Wakes all waiting consumers.
-  void close();
+  virtual ~split_connector();
 
   /// \brief Pull the next split, blocking until one is available or the connector
   ///        is closed and drained.
   /// \return std::nullopt when closed and drained; the next split otherwise.
-  std::optional<std::unique_ptr<op::operator_data>> get_next_split();
+  /// \throws std::runtime_error if producer has raised an error and the connector is closed.
+  virtual std::optional<std::unique_ptr<op::operator_data>> get_next_split() = 0;
 
-  /// \brief True iff close() has been called and the queue is drained.
-  [[nodiscard]] bool is_closed() const;
+  /// \brief True if no more splits will arrive. Note that this does not necessarily mean the queue
+  /// is empty.
+  [[nodiscard]] virtual bool is_closed() const = 0;
 
-  [[nodiscard]] bool has_more_splits() const;
-
- private:
-  mutable std::mutex _mutex;
-  std::condition_variable _cv;
-  std::deque<std::unique_ptr<op::operator_data>> _splits;
-  bool _closed{false};
+  /// \brief returns true if the connector is closed and the queue is empty, meaning no more splits
+  /// will arrive.
+  [[nodiscard]] virtual bool has_more_splits() const = 0;
 };
 
 }  // namespace sirius::scan_manager

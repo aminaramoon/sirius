@@ -17,7 +17,7 @@
 #pragma once
 
 #include "op/scan/scan_plan.hpp"
-#include "scan_manager/split_provider.hpp"
+#include "scan_manager/split_connector.hpp"
 
 #include <cudf/column/column.hpp>
 
@@ -51,16 +51,24 @@ namespace sirius::scan_manager {
  *     reshape the cached batch — when false, the cached batch is forwarded
  *     straight through (no permute, no prune -> no copy).
  */
-class cached_split_provider : public split_provider {
+class cached_split_connector : public split_connector {
  public:
-  cached_split_provider(std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
-                        cucascade::memory::memory_space& memory_space,
-                        std::shared_ptr<duckdb::Expression> filter_expression,
-                        std::shared_ptr<op::scan::scan_plan const> plan);
+  cached_split_connector(
+    std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
+    cucascade::memory::memory_space& memory_space,
+    std::shared_ptr<duckdb::Expression> filter_expression,
+    std::shared_ptr<op::scan::scan_plan const> plan);
 
-  std::future<void> start(exec::static_thread_pool& pool, split_connector& connector) override;
+  ~cached_split_connector() override = default;
+
+  std::optional<std::unique_ptr<op::operator_data>> get_next_split() override;
+
+  [[nodiscard]] bool is_closed() const override;
+
+  [[nodiscard]] bool has_more_splits() const override;
 
  private:
+  std::atomic<std::size_t> _next_batch_idx{0};
   std::vector<std::vector<std::shared_ptr<cudf::column>>> _columns_per_request;
   cucascade::memory::memory_space* _memory_space;
   std::shared_ptr<duckdb::Expression> _filter_expression;

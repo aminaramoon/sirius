@@ -70,6 +70,15 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
   ~sirius_gpu_scan_operator() override;
 
+  io::gpu_ingestible& get_ingestible() const { return *_ingestible; }
+
+  void set_split_connector(std::unique_ptr<scan_manager::split_connector> connector)
+  {
+    _split_connector = std::move(connector);
+  }
+
+  const io::ingestible_table_info& get_table_info() const { return _ingestible->table_info(); }
+
   //===----------Source interface----------===//
   bool is_source() const override { return true; }
 
@@ -132,7 +141,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
  private:
   //===----------Fields----------===//
   std::unique_ptr<scan_manager::split_connector> _split_connector;
-  std::unique_ptr<io::gpu_ingestible> _ingestible;
+  std::shared_ptr<io::gpu_ingestible> _ingestible;
 };
 
 }  // namespace sirius::op::scan

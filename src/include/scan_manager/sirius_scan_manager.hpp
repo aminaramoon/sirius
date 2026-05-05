@@ -17,15 +17,22 @@
 #pragma once
 
 #include "exec/config.hpp"
+#include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
-#include "scan_manager/split_provider.hpp"
+#include "io/gpu_ingestible.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "scan_manager/split_connector.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
+#include <exception>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -141,23 +148,33 @@ class sirius_scan_manager {
   void remove_pinned_entry(const std::string& name);
 
  private:
+  std::unique_ptr<op::operator_data> get_next_metadata_for(op::scan::sirius_gpu_scan_operator* op);
+
   /// \brief Build a split_provider for @p op by reading its parquet scan_info.
   ///        Returns a cached_split_provider when a pinned entry matches, otherwise
   ///        a parquet_split_provider; in both cases the provider carries the
   ///        scan_plan that the operator's execute() consults for output assembly.
-  std::unique_ptr<split_provider> create_provider_for(
-    op::scan::sirius_gpu_parquet_scan_operator* op);
+  std::unique_ptr<split_connector> create_connector_for(op::scan::sirius_gpu_scan_operator* op);
 
-  /// \brief Run providers sequentially: start each, wait on its future, advance.
-  void run_driver_loop();
+  struct scan_metadata_entry {
+    std::unique_ptr<op::operator_data> get_next_metadata_for(
+      op::scan::sirius_gpu_scan_operator* op);
+
+    std::shared_ptr<io::gpu_ingestible> ingestible;
+    std::mutex mt;
+    std::exception_ptr eptr{nullptr};
+    bool is_closed{false};
+    std::queue<std::unique_ptr<io::scan_info>> scan_info_queue;
+  };
 
   exec::thread_pool_config _config;
-  std::unique_ptr<exec::static_thread_pool> _thread_pool;
-  std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
+  exec::static_thread_pool _thread_pool;
+  std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
+
+  std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<scan_metadata_entry>>
     _providers_by_op;
-  std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _scan_op_order;
+  std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
-  std::thread _driver_thread;
 };
 
 }  // namespace sirius::scan_manager
