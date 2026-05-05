@@ -95,14 +95,6 @@ struct pinned_deleter {
 };
 using unique_pinned_buf = std::unique_ptr<void, pinned_deleter>;
 
-/**
- * @brief Converts a byte count to mebibytes.
- */
-inline double to_mb(size_t bytes) noexcept
-{
-  return static_cast<double>(bytes) / (1024.0 * 1024.0);
-}
-
 // ---- bounce_slot -----------------------------------------------------------
 
 /**

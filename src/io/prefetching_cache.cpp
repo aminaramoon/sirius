@@ -16,6 +16,8 @@
 
 #include "io/prefetching_cache.hpp"
 
+#include "io/io_context.hpp"
+
 #include <cuda_runtime.h>
 
 #include <spdlog/spdlog.h>
@@ -1004,7 +1006,7 @@ void prefetching_cache::worker_loop(std::stop_token stop)
 
     {
       auto& obj_ref = *item.io_obj;
-      _io_ctx->host_read_ranges_async(
+      _io_ctx->host_read_ranges_async_io(
         obj_ref,
         io_ranges,
         io_dsts,

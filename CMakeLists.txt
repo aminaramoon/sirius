@@ -163,6 +163,7 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_reference.cpp
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
+    src/io/io_context.cpp
     src/io/prefetching_cache.cpp
     src/io/sirius_datasource.cpp
     src/io/uri_parser.cpp

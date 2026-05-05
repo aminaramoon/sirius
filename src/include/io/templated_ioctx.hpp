@@ -16,8 +16,8 @@
 
 #pragma once
 
+#include "io/io_context.hpp"
 #include "io/sirius_datasource.hpp"
-#include "io/types.hpp"
 
 #include <rmm/device_buffer.hpp>
 
@@ -132,7 +132,7 @@ class templated_ioctx : public sirius_ioctx {
 
   // -- Host reads (generic: delegate to io_object_type + std::async) --------
 
-  size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) override
+  size_t host_read_io(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) override
   {
     auto& tobj = as_typed(obj);
     size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
@@ -140,22 +140,11 @@ class templated_ioctx : public sirius_ioctx {
     return next_reactor().host_read(tobj.host_handle(), offset, size, dst);
   }
 
-  std::unique_ptr<cudf::io::datasource::buffer> host_read(sirius_io_object& obj,
-                                                          size_t offset,
-                                                          size_t size) override
-  {
-    size = std::min(size, obj.size() > offset ? obj.size() - offset : size_t{0});
-    std::vector<uint8_t> buf(size);
-    size_t n = host_read(obj, offset, size, buf.data());
-    buf.resize(n);
-    return cudf::io::datasource::buffer::create(std::move(buf));
-  }
-
-  void host_read_async(sirius_io_object& obj,
-                       size_t offset,
-                       size_t size,
-                       uint8_t* dst,
-                       io_completion_handler handler) override
+  void host_read_async_io(sirius_io_object& obj,
+                          size_t offset,
+                          size_t size,
+                          uint8_t* dst,
+                          io_completion_handler handler) override
   {
     auto& tobj = as_typed(obj);
     size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
@@ -179,21 +168,6 @@ class templated_ioctx : public sirius_ioctx {
 
   // -- Device reads (generic chunking; reactor-backed) ----------------------
 
-  std::unique_ptr<cudf::io::datasource::buffer> device_read_io(
-    sirius_io_object& obj, size_t offset, size_t size, rmm::cuda_stream_view stream) override
-  {
-    rmm::device_buffer dbuf(size, stream);
-    sync_via_promise([&](io_completion_handler h) {
-      enqueue_device_read(as_typed(obj),
-                          offset,
-                          size,
-                          static_cast<uint8_t*>(dbuf.data()),
-                          stream.value(),
-                          std::move(h));
-    });
-    return cudf::io::datasource::buffer::create(std::move(dbuf));
-  }
-
   size_t device_read_io(sirius_io_object& obj,
                         size_t offset,
                         size_t size,
@@ -205,7 +179,7 @@ class templated_ioctx : public sirius_ioctx {
     });
   }
 
-  void device_read_io_async(sirius_io_object& obj,
+  void device_read_async_io(sirius_io_object& obj,
                             size_t offset,
                             size_t size,
                             uint8_t* dst,
@@ -217,10 +191,10 @@ class templated_ioctx : public sirius_ioctx {
 
   // -- Batch host reads (generic: dispatch to reactor host_read_async) ------
 
-  void host_read_ranges_async(sirius_io_object& obj,
-                              std::vector<cudf::io::text::byte_range_info> const& ranges,
-                              std::span<cudf::host_span<std::byte>> dst,
-                              io_completion_handler handler) override
+  void host_read_ranges_async_io(sirius_io_object& obj,
+                                 std::vector<cudf::io::text::byte_range_info> const& ranges,
+                                 std::span<cudf::host_span<std::byte>> dst,
+                                 io_completion_handler handler) override
   {
     auto& tobj     = as_typed(obj);
     auto file_size = tobj.size();
@@ -278,21 +252,6 @@ class templated_ioctx : public sirius_ioctx {
         std::span<host_read_req_type>(reqs.data() + off, group_size));
       off += group_size;
     }
-  }
-
-  size_t host_read_ranges(sirius_io_object& obj,
-                          std::vector<cudf::io::text::byte_range_info> const& ranges,
-                          std::span<cudf::host_span<std::byte>> dst) override
-  {
-    std::promise<size_t> p;
-    auto fut = p.get_future();
-    host_read_ranges_async(obj, ranges, dst, [&p](size_t bytes, std::exception_ptr ep) {
-      if (ep)
-        p.set_exception(ep);
-      else
-        p.set_value(bytes);
-    });
-    return fut.get();
   }
 
   cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,

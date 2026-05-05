@@ -16,181 +16,19 @@
 
 #include "io/sirius_datasource.hpp"
 
-#include "io/prefetching_cache.hpp"
-#include "io/types.hpp"
-
 #include <rmm/device_buffer.hpp>
-
-#include <cuda_runtime.h>
 
 #include <fcntl.h>
 #include <spdlog/spdlog.h>
 #include <sys/stat.h>
 
 #include <algorithm>
-#include <ranges>
-#include <stdexcept>
+#include <future>
+#include <memory>
+#include <utility>
+#include <vector>
 
 namespace sirius::io {
-
-// ---------------------------------------------------------------------------
-// sirius_ioctx
-// ---------------------------------------------------------------------------
-
-sirius_ioctx::sirius_ioctx()  = default;
-sirius_ioctx::~sirius_ioctx() = default;
-
-void sirius_ioctx::initialize_cache(buffer_pool& pool, size_t inflight_budget_chunks)
-{
-  _cache = std::make_unique<prefetching_cache>(pool, this, inflight_budget_chunks);
-}
-
-namespace {
-
-// Copy each pinned-host slice to the device buffer on @p stream.
-// Returns the total bytes issued (== sum of slice sizes).
-size_t copy_pinned_slices_to_device(
-  std::vector<cudf::io::datasource::non_owning_buffer> const& slices,
-  uint8_t* dst,
-  rmm::cuda_stream_view stream)
-{
-  // Skip empty slices without touching CUDA.
-  size_t n_nonempty = 0;
-  for (auto const& s : slices)
-    if (s.size() > 0) ++n_nonempty;
-
-  if (n_nonempty == 0) return 0;
-
-  // Fast path: one slice (common after pinned_view::slice coalescing when
-  // chunks are contiguous in slab memory).  Plain cudaMemcpyAsync avoids the
-  // batch-API per-call overhead.
-  if (n_nonempty == 1) {
-    size_t copied = 0;
-    for (auto const& s : slices) {
-      if (s.size() == 0) continue;
-      auto err =
-        cudaMemcpyAsync(dst + copied, s.data(), s.size(), cudaMemcpyHostToDevice, stream.value());
-      if (err != cudaSuccess)
-        throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyAsync failed: ") +
-                                 cudaGetErrorString(err));
-      copied += s.size();
-    }
-    return copied;
-  }
-
-  // Batch path: hand all non-contiguous slices to the driver in one call.
-  // Copies within a batch are unordered with respect to each other but the
-  // whole batch is stream-ordered — fine here, all copies have disjoint
-  // destination ranges.
-  std::vector<void*> dsts;
-  std::vector<void const*> srcs;
-  std::vector<size_t> sizes;
-  dsts.reserve(n_nonempty);
-  srcs.reserve(n_nonempty);
-  sizes.reserve(n_nonempty);
-
-  size_t copied = 0;
-  for (auto const& s : slices) {
-    auto n = s.size();
-    if (n == 0) continue;
-    dsts.push_back(dst + copied);
-    srcs.push_back(s.data());
-    sizes.push_back(n);
-    copied += n;
-  }
-
-#if CUDA_VERSION >= 12080
-  // cudaMemcpyBatchAsync available since CUDA 12.8 — issue all copies in one driver call.
-  cudaMemcpyAttributes attrs{};
-  attrs.srcAccessOrder  = cudaMemcpySrcAccessOrderStream;
-  attrs.srcLocHint.type = cudaMemLocationTypeHost;
-  attrs.dstLocHint.type = cudaMemLocationTypeDevice;
-  attrs.flags           = 0;
-  size_t attrs_idx      = 0;
-  size_t fail_idx       = 0;
-
-#if CUDART_VERSION < 13000
-  auto err = cudaMemcpyBatchAsync(dsts.data(),
-                                  srcs.data(),
-                                  sizes.data(),
-                                  n_nonempty,
-                                  &attrs,
-                                  &attrs_idx,
-                                  1,
-                                  nullptr,
-                                  stream.value());
-#else
-  auto err = cudaMemcpyBatchAsync(
-    dsts.data(), srcs.data(), sizes.data(), n_nonempty, &attrs, &attrs_idx, 1, stream.value());
-#endif
-  if (err != cudaSuccess)
-    throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyBatchAsync failed at idx ") +
-                             std::to_string(fail_idx) + ": " + cudaGetErrorString(err));
-#else
-  // Fallback for CUDA < 12.8: sequential stream-ordered copies.
-  for (size_t i = 0; i < n_nonempty; ++i) {
-    auto err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, stream.value());
-    if (err != cudaSuccess)
-      throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyAsync failed at idx ") +
-                               std::to_string(i) + ": " + cudaGetErrorString(err));
-  }
-#endif
-  return copied;
-}
-
-}  // namespace
-
-size_t sirius_ioctx::device_read(
-  sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
-{
-  if (_cache) {
-    if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
-      auto slices = view.slice(offset, size);
-      return copy_pinned_slices_to_device(slices, dst, stream);
-    }
-  }
-  return device_read_io(obj, offset, size, dst, stream);
-}
-
-std::unique_ptr<cudf::io::datasource::buffer> sirius_ioctx::device_read(
-  sirius_io_object& obj, size_t offset, size_t size, rmm::cuda_stream_view stream)
-{
-  if (_cache) {
-    if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
-      auto slices = view.slice(offset, size);
-      rmm::device_buffer dbuf(size, stream);
-      copy_pinned_slices_to_device(slices, static_cast<uint8_t*>(dbuf.data()), stream);
-      return cudf::io::datasource::buffer::create(std::move(dbuf));
-    }
-  }
-  return device_read_io(obj, offset, size, stream);
-}
-
-void sirius_ioctx::device_read_async(sirius_io_object& obj,
-                                     size_t offset,
-                                     size_t size,
-                                     uint8_t* dst,
-                                     rmm::cuda_stream_view stream,
-                                     io_completion_handler handler)
-{
-  if (_cache) {
-    if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
-      auto slices = view.slice(offset, size);
-      try {
-        auto copied = copy_pinned_slices_to_device(slices, dst, stream);
-        handler(copied, nullptr);
-      } catch (...) {
-        handler(0, std::current_exception());
-      }
-      return;
-    }
-  }
-  device_read_io_async(obj, offset, size, dst, stream, std::move(handler));
-}
-
-// ---------------------------------------------------------------------------
-// sirius_datasource
-// ---------------------------------------------------------------------------
 
 sirius_datasource::sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
                                      std::shared_ptr<sirius_io_object> io_object)
@@ -212,7 +50,9 @@ size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_t offset,
                                                                            size_t size)
 {
-  return _io_ctx->host_read(*_io_object, offset, size);
+  std::vector<uint8_t> buf(size);
+  _io_ctx->host_read(*_io_object, offset, size, buf.data());
+  return cudf::io::datasource::buffer::create(std::move(buf));
 }
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
@@ -250,7 +90,11 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
   size_t offset, size_t size, rmm::cuda_stream_view stream)
 {
-  return _io_ctx->device_read(*_io_object, offset, size, stream);
+  rmm::device_buffer buf(size, stream);
+  size_t n =
+    _io_ctx->device_read(*_io_object, offset, size, static_cast<uint8_t*>(buf.data()), stream);
+  buf.resize(n, stream);
+  return cudf::io::datasource::buffer::create(std::move(buf));
 }
 
 size_t sirius_datasource::device_read(size_t offset,
@@ -276,21 +120,6 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
         p->set_value(n);
     });
   return f;
-}
-
-void sirius_datasource::host_read_ranges_async(
-  std::vector<cudf::io::text::byte_range_info> const& ranges,
-  std::span<cudf::host_span<std::byte>> dst,
-  io_completion_handler handler)
-{
-  _io_ctx->host_read_ranges_async(*_io_object, ranges, dst, std::move(handler));
-}
-
-size_t sirius_datasource::host_read_ranges(
-  std::vector<cudf::io::text::byte_range_info> const& ranges,
-  std::span<cudf::host_span<std::byte>> dst)
-{
-  return _io_ctx->host_read_ranges(*_io_object, ranges, dst);
 }
 
 }  // namespace sirius::io

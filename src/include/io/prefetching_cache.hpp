@@ -41,6 +41,8 @@
 
 namespace sirius::io {
 
+class sirius_ioctx;
+
 // ---------------------------------------------------------------------------
 // buffer_pool — growable multi-slab pool of 1MB pinned chunks
 // ---------------------------------------------------------------------------

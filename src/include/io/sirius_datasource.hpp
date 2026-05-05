@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include "io/types.hpp"
+#include "io/io_context.hpp"
+#include <cudf/io/datasource.hpp>
 
 namespace sirius::io {
 
@@ -30,7 +31,7 @@ namespace sirius::io {
  * Thin delegate: every read method forwards to @c sirius_ioctx, passing the
  * owned @c sirius_io_object by reference.
  */
-class sirius_datasource : public io_datasource {
+class sirius_datasource : public cudf::io::datasource {
  public:
   static constexpr size_t NUM_BUFFERS = NUM_CHUNKS;
   static constexpr size_t BUFFER_SIZE = CHUNK_SIZE;
@@ -76,15 +77,6 @@ class sirius_datasource : public io_datasource {
                                         size_t size,
                                         uint8_t* dst,
                                         rmm::cuda_stream_view stream) override;
-
-  // ---- sirius_datasource overrides ------------------------------------------
-
-  void host_read_ranges_async(std::vector<cudf::io::text::byte_range_info> const& ranges,
-                              std::span<cudf::host_span<std::byte>> dst,
-                              io_completion_handler handler) override;
-
-  size_t host_read_ranges(std::vector<cudf::io::text::byte_range_info> const& ranges,
-                          std::span<cudf::host_span<std::byte>> dst) override;
 
  private:
   std::shared_ptr<sirius_ioctx> _io_ctx;

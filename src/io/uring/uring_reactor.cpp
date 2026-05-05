@@ -19,10 +19,11 @@
 #include <fcntl.h>
 #include <spdlog/spdlog.h>
 #include <sys/stat.h>
+#include <cstring>
+#include <ranges>
 
 #include <algorithm>
 #include <deque>
-#include <ranges>
 #include <stdexcept>
 
 namespace sirius::io {
@@ -205,11 +206,6 @@ void uring_reactor::worker_loop()
       io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
       if (!sqe) break;
       auto& req = pending.front();
-      spdlog::trace("reactor submit slot={} fd={} file_off={} io_size={:.2f}MB",
-                    si,
-                    req.handle,
-                    req.file_off,
-                    to_mb(req.io_size));
       io_uring_prep_read(
         sqe, req.handle, _bounce[si].buf.get(), (unsigned)req.io_size, (__u64)req.file_off);
       io_uring_sqe_set_data64(sqe, (uint64_t)si);
@@ -225,10 +221,6 @@ void uring_reactor::worker_loop()
       if (!sqe) break;
       auto* req = new host_read_req_type(std::move(pending_host.front()));
       pending_host.pop_front();
-      spdlog::trace("reactor host submit fd={} offset={} size={:.2f}MB",
-                    req->handle,
-                    req->offset,
-                    to_mb(req->size));
       io_uring_prep_read(sqe, req->handle, req->dst, (unsigned)req->size, (__u64)req->offset);
       io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(req) | HOST_TAG);
       ++inflight;
@@ -252,10 +244,6 @@ void uring_reactor::worker_loop()
           req->ctx->chunk_failed(std::make_exception_ptr(
             std::runtime_error("reactor host read: " + std::string(strerror(-res)))));
         } else {
-          spdlog::trace("reactor host done fd={} offset={} rd={:.2f}MB",
-                        req->handle,
-                        req->offset,
-                        to_mb((size_t)res));
           req->ctx->chunk_done();
         }
         delete req;
