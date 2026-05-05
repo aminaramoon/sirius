@@ -33,6 +33,7 @@
 
 namespace sirius::io {
 class sirius_ioctx;
+class buffer_pool;
 }  // namespace sirius::io
 
 namespace sirius::op::scan {
@@ -62,6 +63,17 @@ struct scan_manager_config {
   /// io_uring submission/completion queue depth per reactor.  Ignored when
   /// @c use_sirius_datasource is false.
   unsigned uring_ring_entries{64};
+  /// Enable the prefetching cache.  Requires @c use_sirius_datasource=true;
+  /// when true, the scan_manager allocates a pinned-host buffer_pool and
+  /// initializes the ioctx's cache.  Off by default.
+  bool enable_prefetch_cache{false};
+  /// Total pinned-host bytes reserved for the prefetch cache.  Rounded
+  /// up to the nearest 500 MiB slab.  Ignored when
+  /// @c enable_prefetch_cache is false.
+  std::size_t prefetch_buffer_pool_bytes{20ULL << 30};
+  /// Maximum chunks the cache may have in flight at once (admission
+  /// control).  Ignored when @c enable_prefetch_cache is false.
+  std::size_t prefetch_inflight_budget_chunks{2048};
 };
 
 /**
@@ -180,6 +192,11 @@ class sirius_scan_manager {
   void run_driver_loop();
 
   scan_manager_config _config;
+  /// Pinned-host buffer pool backing the ioctx's prefetching cache.
+  /// Constructed only when @c _config.enable_prefetch_cache is set.
+  /// MUST be declared before @c _io_ctx so the ioctx (and its cache,
+  /// which references the pool) is destroyed first.
+  std::unique_ptr<sirius::io::buffer_pool> _buffer_pool;
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
   std::unique_ptr<exec::static_thread_pool> _thread_pool;
   std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>

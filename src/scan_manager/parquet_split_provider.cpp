@@ -329,6 +329,67 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
       // clang-format on
     }
 
+    //===----------Prefetch cache prewarm----------===//
+    // When the ioctx has a cache, hand it the exact byte ranges scan_task
+    // will request: PAR1 header + (merged) column-chunk ranges for every
+    // surviving row group + footer/trailer.  insert() must use the same
+    // merged ranges scan_task computes — the cache only serves reads that
+    // are fully covered by an inserted range.
+    if (file_io_object && _io_ctx != nullptr && _io_ctx->cache() != nullptr &&
+        !row_group_indices.empty()) {
+      using range_t = cudf::io::text::byte_range_info;
+
+      auto chunk_ranges =
+        reader.all_column_chunks_byte_ranges(row_group_indices, *reader_options);
+
+      // Inline merge: parquet_scan_task::detail::merge_byte_ranges is TU-local;
+      // duplicating the ~10-line walk avoids cross-component coupling.
+      std::sort(chunk_ranges.begin(), chunk_ranges.end(), [](auto const& a, auto const& b) {
+        return a.offset() < b.offset();
+      });
+      std::vector<range_t> merged;
+      merged.reserve(chunk_ranges.size());
+      if (!chunk_ranges.empty()) {
+        auto cur_start = chunk_ranges[0].offset();
+        auto cur_end   = cur_start + chunk_ranges[0].size();
+        for (auto const& r : chunk_ranges) {
+          auto const rs = r.offset();
+          auto const re = rs + r.size();
+          if (rs <= cur_end) {
+            cur_end = std::max(cur_end, re);
+          } else {
+            merged.emplace_back(cur_start, cur_end - cur_start);
+            cur_start = rs;
+            cur_end   = re;
+          }
+        }
+        merged.emplace_back(cur_start, cur_end - cur_start);
+      }
+
+      // footer_offset / footer_size mirror parquet_scan_task's computation:
+      // the trailer is 8 bytes (4 footer_len + 4 magic) and footer_buffer
+      // returns the footer body alone.
+      constexpr std::size_t FOOTER_TAIL_SIZE = 8;
+      auto const file_size                   = file_io_object->size();
+      auto const footer_len                  = footer_buffer->size();
+      auto const footer_off  = static_cast<int64_t>(file_size - FOOTER_TAIL_SIZE - footer_len);
+      auto const footer_size = static_cast<int64_t>(FOOTER_TAIL_SIZE + footer_len);
+
+      std::vector<range_t> ranges;
+      ranges.reserve(merged.size() + 2);
+      ranges.emplace_back(0, 4);  // PAR1 header
+      ranges.insert(ranges.end(), merged.begin(), merged.end());
+      ranges.emplace_back(footer_off, footer_size);
+      // Cache requires sorted-by-offset.  Header is at 0, footer is at file end,
+      // and merged column chunks live in between — a defensive sort handles any
+      // pathological layout where a column chunk starts before the header.
+      std::sort(ranges.begin(), ranges.end(), [](auto const& a, auto const& b) {
+        return a.offset() < b.offset();
+      });
+
+      _io_ctx->cache()->insert(*file_io_object, /*metadata=*/nullptr, ranges);
+    }
+
     std::vector<cudf::size_type> cur_rgs;
     std::size_t cur_uncompressed_bytes = 0;
     std::size_t cur_compressed_bytes   = 0;

@@ -17,6 +17,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include "exec/thread_pool.hpp"
+#include "io/prefetching_cache.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
@@ -46,6 +47,22 @@ sirius_scan_manager::sirius_scan_manager(scan_manager_config config) : _config(s
       "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
       _config.uring_n_reactors,
       _config.uring_ring_entries);
+
+    if (_config.enable_prefetch_cache) {
+      // buffer_pool sizes by slabs (500 chunks * 1 MiB = 500 MiB each); round
+      // the byte budget up so the user gets at least what they asked for.
+      auto const slab_bytes = sirius::io::buffer_pool::SLAB_BYTES;
+      auto const max_slabs =
+        static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
+      _buffer_pool = std::make_unique<sirius::io::buffer_pool>(max_slabs);
+      _io_ctx->initialize_cache(*_buffer_pool, _config.prefetch_inflight_budget_chunks);
+      SIRIUS_LOG_DEBUG(
+        "[sirius_scan_manager] prefetch cache enabled (slabs={} budget_bytes={} "
+        "inflight_chunks={})",
+        max_slabs,
+        max_slabs * slab_bytes,
+        _config.prefetch_inflight_budget_chunks);
+    }
   } else {
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] sirius_datasource disabled — falling back to "
@@ -58,6 +75,10 @@ sirius_scan_manager::~sirius_scan_manager() { stop(); }
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 {
   reset();
+
+  // Advance the cache age so the evictor can score this query's inserts
+  // against entries left over from prior queries.
+  if (_io_ctx && _io_ctx->cache()) { _io_ctx->cache()->refresh_cache(); }
 
   SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={}",
                    query.get_pipelines().size());
