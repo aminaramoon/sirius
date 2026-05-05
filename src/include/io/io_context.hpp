@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -48,8 +49,20 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   virtual void shutdown() = 0;
 
+  /// Backend-specific factory: open native handles for @p path and
+  /// return a populated io_object.  Throws on unsupported / unreachable
+  /// paths (callers that want a check-without-open should use
+  /// @c supports()).
+  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path) = 0;
+
   virtual std::unique_ptr<cudf::io::datasource> make_datasource(
     std::shared_ptr<sirius_io_object> io_object) = 0;
+
+  /// Convenience: @c create_io_object + @c make_datasource in one shot.
+  std::unique_ptr<cudf::io::datasource> open_datasource(std::string path)
+  {
+    return make_datasource(create_io_object(std::move(path)));
+  }
 
   /// Whether this backend can serve reads for @p path.  Backends should
   /// validate scheme/protocol support and any backend-specific

@@ -31,9 +31,9 @@ namespace sirius::io {
  */
 class uring_ioctx : public templated_ioctx<uring_reactor> {
  public:
-  explicit uring_ioctx(unsigned ring_entries    = 64,
-                       size_t n_reactors        = 4,
-                       size_t bounce_slot_size  = 1UL * 1024 * 1024);
+  explicit uring_ioctx(unsigned ring_entries   = 64,
+                       size_t n_reactors       = 4,
+                       size_t bounce_slot_size = 1UL * 1024 * 1024);
 };
 
 }  // namespace sirius::io

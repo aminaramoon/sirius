@@ -17,6 +17,7 @@
 #pragma once
 
 #include "io/io_context.hpp"
+
 #include <cudf/io/datasource.hpp>
 
 namespace sirius::io {

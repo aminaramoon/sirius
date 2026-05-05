@@ -52,9 +52,9 @@ static constexpr size_t IO_BLOCK_SIZE = 4096;       ///< O_DIRECT alignment requ
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Abstract per-file handle that provides file identity to a datasource.
- *
- * Decouples file location / cache-key logic from I/O mechanics.
+ * @brief Abstract per-file handle.  A passive bag of native handles
+ * produced by a backend reactor (e.g. file descriptors, CURL easy
+ * handles, S3 client state).  Performs no I/O of its own.
  *
  * Inherits from @c std::enable_shared_from_this so the prefetching cache can
  * take a reference to an io_object and safely extend its lifetime via
@@ -65,8 +65,17 @@ class sirius_io_object : public std::enable_shared_from_this<sirius_io_object> {
  public:
   virtual ~sirius_io_object() = default;
 
+  /// Stable identifier used as the prefetching-cache key.  Often equal to
+  /// @c object_path() but may differ for backends that need to distinguish
+  /// otherwise-equal paths (versioned S3 keys, normalized URLs, …).
   [[nodiscard]] virtual const std::string& raw_file_cache_id() const noexcept = 0;
-  [[nodiscard]] virtual size_t size() const noexcept                          = 0;
+
+  /// The path / URL / key the caller used to construct this object.
+  [[nodiscard]] virtual const std::string& object_path() const noexcept = 0;
+
+  /// Total size of the underlying object, populated by the reactor at
+  /// construction time and stored on the io_object thereafter.
+  [[nodiscard]] virtual size_t size() const noexcept = 0;
 };
 
 class sirius_io_object_metadata {

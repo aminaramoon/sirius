@@ -32,29 +32,36 @@
 namespace sirius::io {
 
 // ---------------------------------------------------------------------------
-// uring_io_object
-// ---------------------------------------------------------------------------
-
-uring_io_object::uring_io_object(std::string path) : _path(std::move(path))
-{
-  _fd = file_descriptor(::open(_path.c_str(), O_RDONLY));
-  if (!_fd)
-    throw std::runtime_error("uring_io_object: open failed: " + _path + ": " + strerror(errno));
-
-  struct stat st{};
-  if (::fstat(_fd.get(), &st) < 0)
-    throw std::runtime_error("uring_io_object: fstat failed: " + std::string(strerror(errno)));
-  _file_size = static_cast<size_t>(st.st_size);
-
-  _fd_direct = file_descriptor(::open(_path.c_str(), O_RDONLY | O_DIRECT));
-  if (!_fd_direct)
-    throw std::runtime_error("uring_io_object: O_DIRECT open failed: " + _path + ": " +
-                             strerror(errno));
-}
-
-// ---------------------------------------------------------------------------
 // uring_reactor
 // ---------------------------------------------------------------------------
+
+std::unique_ptr<uring_io_object> uring_reactor::create_io_object(std::string path)
+{
+  if (!supports(path))
+    throw std::runtime_error("uring_reactor::create_io_object: unsupported path: " + path);
+
+  file_descriptor fd{::open(path.c_str(), O_RDONLY)};
+  if (!fd)
+    throw std::runtime_error("uring_reactor::create_io_object: open failed: " + path + ": " +
+                             strerror(errno));
+
+  file_descriptor fd_direct{::open(path.c_str(), O_RDONLY | O_DIRECT)};
+  if (!fd_direct)
+    throw std::runtime_error("uring_reactor::create_io_object: O_DIRECT open failed: " + path +
+                             ": " + strerror(errno));
+
+  auto file_size = size(fd.get());
+  return std::make_unique<uring_io_object>(
+    std::move(path), std::move(fd), std::move(fd_direct), file_size);
+}
+
+size_t uring_reactor::size(int fd)
+{
+  struct stat st{};
+  if (::fstat(fd, &st) != 0)
+    throw std::runtime_error("uring_reactor::size: fstat failed: " + std::string(strerror(errno)));
+  return static_cast<size_t>(st.st_size);
+}
 
 uring_reactor::uring_reactor(unsigned ring_entries, size_t bounce_slot_size)
   : _ring_entries(ring_entries)
@@ -202,9 +209,8 @@ void uring_reactor::worker_loop()
           // Clear the sticky error so unrelated subsequent runtime calls
           // don't observe it.
           cudaGetLastError();
-          slots[i].req.ctx->chunk_failed(std::make_exception_ptr(
-            std::runtime_error(std::string("uring_reactor: H2D copy failed: ") +
-                               cudaGetErrorString(err))));
+          slots[i].req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+            std::string("uring_reactor: H2D copy failed: ") + cudaGetErrorString(err))));
         } else {
           slots[i].req.ctx->chunk_done();
         }

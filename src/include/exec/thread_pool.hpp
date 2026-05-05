@@ -36,9 +36,9 @@ namespace sirius::exec {
 class static_thread_pool {
  public:
   explicit static_thread_pool(int num_threads,
-                       const std::string& name                             = "thread_pool",
-                       std::vector<int> cpu_ids                            = {},
-                       absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
+                              const std::string& name                             = "thread_pool",
+                              std::vector<int> cpu_ids                            = {},
+                              absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
   {
     threads_.reserve(num_threads);
 

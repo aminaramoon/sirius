@@ -63,10 +63,11 @@ std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t siz
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
   size_t offset, size_t size)
 {
-  size     = std::min(size, _io_object->size() > offset ? _io_object->size() - offset : size_t{0});
-  auto buf = std::make_shared<std::vector<uint8_t>>(size);
-  auto inner_fut =
-    std::make_shared<std::future<size_t>>(_io_ctx->host_read_async(*_io_object, offset, size, buf->data()));
+  auto file_size = _io_object->size();
+  size           = std::min(size, file_size > offset ? file_size - offset : size_t{0});
+  auto buf       = std::make_shared<std::vector<uint8_t>>(size);
+  auto inner_fut = std::make_shared<std::future<size_t>>(
+    _io_ctx->host_read_async(*_io_object, offset, size, buf->data()));
   return std::async(std::launch::deferred, [buf, inner_fut]() mutable {
     auto n = inner_fut->get();
     buf->resize(n);

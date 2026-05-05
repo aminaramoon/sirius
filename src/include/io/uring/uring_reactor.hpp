@@ -113,15 +113,23 @@ struct bounce_slot {
 /**
  * @brief Concrete @c sirius_io_object backed by a filesystem path.
  *
- * Opens a buffered @c O_RDONLY fd (for @c pread / host_read) and an
- * @c O_DIRECT fd (for reactor-driven device reads).  The two file
- * descriptors are the native handles consumed by @c uring_reactor.
+ * Passive bag of native handles.  The buffered @c O_RDONLY fd
+ * (for @c pread / host_read) and the @c O_DIRECT fd (for reactor-driven
+ * device reads) are produced by @c uring_reactor::create_io_object — this
+ * class does no I/O of its own.
  */
 class uring_io_object : public sirius_io_object {
  public:
-  explicit uring_io_object(std::string path);
+  uring_io_object(std::string path, file_descriptor fd, file_descriptor fd_direct, size_t file_size)
+    : _path(std::move(path)),
+      _fd(std::move(fd)),
+      _fd_direct(std::move(fd_direct)),
+      _file_size(file_size)
+  {
+  }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
+  [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
 
   [[nodiscard]] int fd() const noexcept { return _fd.get(); }
@@ -192,6 +200,14 @@ class uring_reactor {
   /// Whether @p path can be served by this reactor.  Local-disk only:
   /// returns true iff the path refers to an existing, accessible file.
   [[nodiscard]] static bool supports(std::string_view path);
+
+  /// Open the buffered + O_DIRECT fds for @p path and return them
+  /// packaged in a @c uring_io_object.  Throws on unsupported paths or
+  /// open() failure.
+  static std::unique_ptr<uring_io_object> create_io_object(std::string path);
+
+  /// fstat the open fd to get the file's current size.
+  static size_t size(int fd);
 
  private:
   void worker_loop();

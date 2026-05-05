@@ -62,7 +62,8 @@ concept io_reactor_c = requires(R r,
                                 uint8_t* dst,
                                 cudf::io::text::byte_range_info logical,
                                 size_t file_size,
-                                std::string_view path) {
+                                std::string_view path,
+                                std::string path_str) {
   typename R::native_handle_type;
   typename R::io_object_type;
   typename R::device_read_req_type;
@@ -77,6 +78,10 @@ concept io_reactor_c = requires(R r,
   { r.shutdown() };
   { R::align_to_physical(logical, file_size) } -> std::same_as<cudf::io::text::byte_range_info>;
   { R::supports(path) } -> std::same_as<bool>;
+  {
+    R::create_io_object(std::move(path_str))
+  } -> std::same_as<std::unique_ptr<typename R::io_object_type>>;
+  { R::size(handle) } -> std::same_as<size_t>;
 };
 
 // ---------------------------------------------------------------------------
@@ -125,6 +130,11 @@ class templated_ioctx : public sirius_ioctx {
     std::shared_ptr<sirius_io_object> io_object) override
   {
     return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
+  }
+
+  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override
+  {
+    return std::shared_ptr<sirius_io_object>(Reactor::create_io_object(std::move(path)));
   }
 
   [[nodiscard]] bool supports(std::string_view path) const override
