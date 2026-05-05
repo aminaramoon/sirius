@@ -16,6 +16,7 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
+#include "exec/thread_pool.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/scan_plan.hpp"
@@ -216,7 +217,7 @@ void sirius_scan_manager::reset()
 void sirius_scan_manager::start()
 {
   if (_thread_pool) { return; }
-  _thread_pool = std::make_unique<exec::thread_pool>(
+  _thread_pool = std::make_unique<exec::static_thread_pool>(
     _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
 }
 

@@ -17,6 +17,7 @@
 #include "scan_manager/cached_split_provider.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "exec/thread_pool.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "scan_manager/split_connector.hpp"
@@ -46,7 +47,7 @@ cached_split_provider::cached_split_provider(
 {
 }
 
-std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
+std::future<void> cached_split_provider::start(exec::static_thread_pool& /*pool*/,
                                                split_connector& connector)
 {
   std::promise<void> promise;

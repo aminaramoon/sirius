@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "exec/thread_pool.hpp"
+
 #include <future>
 
 namespace sirius::exec {
@@ -59,7 +61,7 @@ class split_provider {
    *         background-task exception. Allows a sequential driver to wait on
    *         one provider before starting the next.
    */
-  virtual std::future<void> start(exec::thread_pool& pool, split_connector& connector) = 0;
+  virtual std::future<void> start(exec::static_thread_pool& pool, split_connector& connector) = 0;
 };
 
 }  // namespace sirius::scan_manager

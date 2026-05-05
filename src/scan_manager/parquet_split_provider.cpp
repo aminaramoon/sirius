@@ -119,7 +119,8 @@ std::optional<parquet_split_provider::file_batch> parquet_split_provider::next_t
   return batch;
 }
 
-std::future<void> parquet_split_provider::start(exec::thread_pool& pool, split_connector& connector)
+std::future<void> parquet_split_provider::start(exec::static_thread_pool& pool,
+                                                split_connector& connector)
 {
   // Drain all batches up-front so we can size the remaining-task counter
   // precisely; the connector closes when the last batch lands.
