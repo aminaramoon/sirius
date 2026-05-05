@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace sirius::io {
@@ -49,6 +50,11 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   virtual std::unique_ptr<cudf::io::datasource> make_datasource(
     std::shared_ptr<sirius_io_object> io_object) = 0;
+
+  /// Whether this backend can serve reads for @p path.  Backends should
+  /// validate scheme/protocol support and any backend-specific
+  /// preconditions (e.g. file existence for local-disk backends).
+  [[nodiscard]] virtual bool supports(std::string_view path) const = 0;
 
   /// Construct the owned prefetching_cache.  Must be called before any
   /// read that should consult the cache; until then device_read falls

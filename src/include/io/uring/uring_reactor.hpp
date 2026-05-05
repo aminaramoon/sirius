@@ -28,6 +28,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace {
@@ -187,6 +188,10 @@ class uring_reactor {
   /// O_DIRECT requires 4 KiB alignment of both file offset and length.
   static cudf::io::text::byte_range_info align_to_physical(cudf::io::text::byte_range_info logical,
                                                            size_t file_size);
+
+  /// Whether @p path can be served by this reactor.  Local-disk only:
+  /// returns true iff the path refers to an existing, accessible file.
+  [[nodiscard]] static bool supports(std::string_view path);
 
  private:
   void worker_loop();

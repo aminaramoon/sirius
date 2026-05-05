@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -60,7 +61,8 @@ concept io_reactor_c = requires(R r,
                                 size_t size,
                                 uint8_t* dst,
                                 cudf::io::text::byte_range_info logical,
-                                size_t file_size) {
+                                size_t file_size,
+                                std::string_view path) {
   typename R::native_handle_type;
   typename R::io_object_type;
   typename R::device_read_req_type;
@@ -74,6 +76,7 @@ concept io_reactor_c = requires(R r,
   { r.host_enqueue_bulk(hbatch) };
   { r.shutdown() };
   { R::align_to_physical(logical, file_size) } -> std::same_as<cudf::io::text::byte_range_info>;
+  { R::supports(path) } -> std::same_as<bool>;
 };
 
 // ---------------------------------------------------------------------------
@@ -122,6 +125,11 @@ class templated_ioctx : public sirius_ioctx {
     std::shared_ptr<sirius_io_object> io_object) override
   {
     return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
+  }
+
+  [[nodiscard]] bool supports(std::string_view path) const override
+  {
+    return Reactor::supports(path);
   }
 
   Reactor& next_reactor()

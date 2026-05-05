@@ -20,6 +20,7 @@
 #include <spdlog/spdlog.h>
 #include <sys/stat.h>
 #include <cstring>
+#include <filesystem>
 #include <ranges>
 
 #include <algorithm>
@@ -102,6 +103,13 @@ cudf::io::text::byte_range_info uring_reactor::align_to_physical(
   size_t a_end   = std::min((offset + size + IO_BLOCK_SIZE - 1) & ~(IO_BLOCK_SIZE - 1),
                           (file_size + IO_BLOCK_SIZE - 1) & ~(IO_BLOCK_SIZE - 1));
   return {static_cast<int64_t>(a_start), static_cast<int64_t>(a_end - a_start)};
+}
+
+bool uring_reactor::supports(std::string_view path)
+{
+  std::error_code ec;
+  std::filesystem::path p{path};
+  return std::filesystem::is_regular_file(p, ec) && !ec;
 }
 
 void uring_reactor::enqueue_bulk(std::span<device_read_req_type> batch)
