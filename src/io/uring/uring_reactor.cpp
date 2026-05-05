@@ -16,15 +16,17 @@
 
 #include "io/uring/uring_reactor.hpp"
 
+#include "driver_types.h"
+
 #include <fcntl.h>
 #include <spdlog/spdlog.h>
 #include <sys/stat.h>
-#include <cstring>
-#include <filesystem>
-#include <ranges>
 
 #include <algorithm>
+#include <cstring>
 #include <deque>
+#include <filesystem>
+#include <ranges>
 #include <stdexcept>
 
 namespace sirius::io {
@@ -192,7 +194,20 @@ void uring_reactor::worker_loop()
     for (auto i : std::views::iota(size_t{0}, NUM_CHUNKS)) {
       if (slots[i].state == slot_state::COPYING &&
           _bounce[i].cuda_done.load(std::memory_order_acquire)) {
-        slots[i].req.ctx->chunk_done();
+        // Host callback fired, so all stream work up to and including the
+        // H2D copy is complete; any residual cudaStreamQuery status reflects
+        // a sticky failure on that stream.
+        cudaError_t err = cudaStreamQuery(slots[i].req.stream);
+        if (err != cudaSuccess) {
+          // Clear the sticky error so unrelated subsequent runtime calls
+          // don't observe it.
+          cudaGetLastError();
+          slots[i].req.ctx->chunk_failed(std::make_exception_ptr(
+            std::runtime_error(std::string("uring_reactor: H2D copy failed: ") +
+                               cudaGetErrorString(err))));
+        } else {
+          slots[i].req.ctx->chunk_done();
+        }
         slots[i] = slot_info{};
       }
     }
