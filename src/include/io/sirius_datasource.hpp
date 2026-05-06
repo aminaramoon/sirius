@@ -40,7 +40,7 @@ class sirius_datasource : public cudf::io::datasource {
   explicit sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
                              std::shared_ptr<sirius_io_object> io_object);
 
-  ~sirius_datasource() override = default;
+  ~sirius_datasource() override;
 
   sirius_datasource(sirius_datasource const&)            = delete;
   sirius_datasource& operator=(sirius_datasource const&) = delete;

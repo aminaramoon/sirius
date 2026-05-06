@@ -70,7 +70,13 @@ sirius_scan_manager::sirius_scan_manager(scan_manager_config config) : _config(s
   }
 }
 
-sirius_scan_manager::~sirius_scan_manager() { stop(); }
+sirius_scan_manager::~sirius_scan_manager()
+{
+  if (_io_ctx && _io_ctx->cache() != nullptr) {
+    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
+  }
+  stop();
+}
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 {
