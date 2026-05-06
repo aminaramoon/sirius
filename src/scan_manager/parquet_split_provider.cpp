@@ -395,8 +395,13 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
 
     auto seal_current_file = [&]() {
       if (cur_rgs.empty()) { return; }
-      accum.slices.emplace_back(
-        file_metadata, file_path, std::move(cur_rgs), cur_uncompressed_bytes, cur_compressed_bytes);
+      accum.slices.emplace_back(file_metadata,
+                                file_path,
+                                std::move(cur_rgs),
+                                cur_uncompressed_bytes,
+                                cur_compressed_bytes,
+                                _io_ctx,
+                                file_io_object);
       // Promote the just-sealed slice's uncompressed bytes into the cross-file accumulator.
       accum.total_uncompressed_bytes += cur_uncompressed_bytes;
       cur_rgs.clear();

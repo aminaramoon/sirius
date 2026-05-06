@@ -107,7 +107,7 @@ duckdb::vector<sirius::logical_type> default_returned_types()
 std::vector<std::unique_ptr<parquet_scan_data>> drive_provider(parquet_split_provider& provider,
                                                                int n_threads = 2)
 {
-  exec::thread_pool pool(n_threads, "psp_test_pool");
+  exec::static_thread_pool pool(n_threads, "psp_test_pool");
   split_connector connector;
   auto fut = provider.start(pool, connector);
 
