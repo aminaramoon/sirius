@@ -36,24 +36,9 @@ sirius_datasource::sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
                                      std::shared_ptr<sirius_io_object> io_object)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_object))
 {
-  spdlog::debug("sirius_datasource[{}]: opened size={}B cache={}",
-                _io_object->object_path(),
-                _io_object->size(),
-                _io_ctx->cache() != nullptr ? "on" : "off");
 }
 
-sirius_datasource::~sirius_datasource()
-{
-  // Cache summary is process-wide, so logging it per-datasource over-reports;
-  // do it only when the cache is on, gated to debug.
-  if (_io_ctx && _io_ctx->cache() != nullptr) {
-    spdlog::debug("sirius_datasource[{}]: closing — {}",
-                  _io_object->object_path(),
-                  _io_ctx->cache()->summary());
-  } else {
-    spdlog::debug("sirius_datasource[{}]: closing (no cache)", _io_object->object_path());
-  }
-}
+sirius_datasource::~sirius_datasource() {}
 
 size_t sirius_datasource::size() const { return _io_object->size(); }
 
@@ -63,18 +48,12 @@ bool sirius_datasource::is_device_read_preferred(size_t) const { return true; }
 
 size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
-  spdlog::trace(
-    "sirius_datasource[{}]: host_read offset={} size={}", _io_object->object_path(), offset, size);
   return _io_ctx->host_read(*_io_object, offset, size, dst);
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_t offset,
                                                                            size_t size)
 {
-  spdlog::trace("sirius_datasource[{}]: host_read(buf) offset={} size={}",
-                _io_object->object_path(),
-                offset,
-                size);
   std::vector<uint8_t> buf(size);
   _io_ctx->host_read(*_io_object, offset, size, buf.data());
   return cudf::io::datasource::buffer::create(std::move(buf));
@@ -82,10 +61,6 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  spdlog::trace("sirius_datasource[{}]: host_read_async offset={} size={}",
-                _io_object->object_path(),
-                offset,
-                size);
   return _io_ctx->host_read_async(*_io_object, offset, size, dst);
 }
 
@@ -94,10 +69,6 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
 {
   auto file_size = _io_object->size();
   size           = std::min(size, file_size > offset ? file_size - offset : size_t{0});
-  spdlog::trace("sirius_datasource[{}]: host_read_async(buf) offset={} size={}",
-                _io_object->object_path(),
-                offset,
-                size);
   auto buf       = std::make_shared<std::vector<uint8_t>>(size);
   auto inner_fut = std::make_shared<std::future<size_t>>(
     _io_ctx->host_read_async(*_io_object, offset, size, buf->data()));
@@ -111,10 +82,6 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
   size_t offset, size_t size, rmm::cuda_stream_view stream)
 {
-  spdlog::trace("sirius_datasource[{}]: device_read(buf) offset={} size={}",
-                _io_object->object_path(),
-                offset,
-                size);
   rmm::device_buffer buf(size, stream);
   size_t n =
     _io_ctx->device_read(*_io_object, offset, size, static_cast<uint8_t*>(buf.data()), stream);
@@ -127,10 +94,6 @@ size_t sirius_datasource::device_read(size_t offset,
                                       uint8_t* dst,
                                       rmm::cuda_stream_view stream)
 {
-  spdlog::trace("sirius_datasource[{}]: device_read offset={} size={}",
-                _io_object->object_path(),
-                offset,
-                size);
   return _io_ctx->device_read(*_io_object, offset, size, dst, stream);
 }
 
@@ -139,10 +102,6 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          rmm::cuda_stream_view stream)
 {
-  spdlog::trace("sirius_datasource[{}]: device_read_async offset={} size={}",
-                _io_object->object_path(),
-                offset,
-                size);
   return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream);
 }
 

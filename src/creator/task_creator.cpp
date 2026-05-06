@@ -16,6 +16,7 @@
 
 #include "creator/task_creator.hpp"
 
+#include "cucascade/memory/common.hpp"
 #include "log/logging.hpp"
 #include "op/scan/cpu_source_task.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
@@ -33,6 +34,7 @@
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 
+#include <limits>
 #include <optional>
 
 namespace sirius::creator {
@@ -292,12 +294,6 @@ void task_creator::manager_loop()
             auto partition = parquet_task_global_state->claim_next_rg_partition();
             if (!partition.has_value()) {
               pipeline->mark_task_completed();
-              if (pipeline->is_pipeline_finished()) {
-                auto output_consumers = pipeline->get_output_consumers();
-                for (auto& output_consumer : output_consumers) {
-                  schedule(output_consumer);
-                }
-              }
               return;
             }
             if (!parquet_task_global_state->has_more_partitions()) {
@@ -346,8 +342,10 @@ void task_creator::manager_loop()
                            destination_data_repositories.size());
           _task_scheduler->schedule(std::move(task));
         } else {
+          auto is_gpu_parquet_scan = node->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN;
+          std::size_t count = is_gpu_parquet_scan ? 1 : std::numeric_limits<std::size_t>::max();
           // need to exhaust input batches until all ports are empty
-          while (!node->all_ports_empty()) {
+          while (!node->all_ports_empty() && count-- > 0) {
             // Mark task created BEFORE popping data from ports to prevent a race
             // condition where update_pipeline_status() sees empty ports and matching
             // task counters, prematurely marking the pipeline as finished.
@@ -363,12 +361,6 @@ void task_creator::manager_loop()
               // which is correct: if all ports are truly empty and all real tasks have
               // completed, the pipeline should finish.
               pipeline->mark_task_completed();
-              if (pipeline->is_pipeline_finished()) {
-                auto output_consumers = pipeline->get_output_consumers();
-                for (auto& output_consumer : output_consumers) {
-                  this->schedule(output_consumer);
-                }
-              }
               break;
             }
 

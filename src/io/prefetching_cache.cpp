@@ -608,8 +608,7 @@ void prefetching_cache::refresh_cache()
     }
   }
 
-  // Log the stats snapshot at each aging event.
-  (void)summary();
+  spdlog::info("cache being refreshed: closing — {}", summary());
 }
 
 std::string prefetching_cache::summary() const
