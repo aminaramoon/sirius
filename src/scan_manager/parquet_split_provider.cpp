@@ -71,12 +71,12 @@ parquet_split_provider::parquet_split_provider(
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
   std::size_t max_file_processed,
-  sirius::io::sirius_ioctx* io_ctx)
+  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
     _total_files(file_paths.size()),
-    _io_ctx(io_ctx)
+    _io_ctx(std::move(io_ctx))
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /
@@ -339,8 +339,7 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
         !row_group_indices.empty()) {
       using range_t = cudf::io::text::byte_range_info;
 
-      auto chunk_ranges =
-        reader.all_column_chunks_byte_ranges(row_group_indices, *reader_options);
+      auto chunk_ranges = reader.all_column_chunks_byte_ranges(row_group_indices, *reader_options);
 
       // Inline merge: parquet_scan_task::detail::merge_byte_ranges is TU-local;
       // duplicating the ~10-line walk avoids cross-component coupling.

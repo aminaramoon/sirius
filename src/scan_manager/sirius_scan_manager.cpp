@@ -227,7 +227,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
     info->partition_indices,
     info->approximate_batch_size,
     parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
-    _io_ctx.get());
+    _io_ctx);
 }
 
 void sirius_scan_manager::run_driver_loop()

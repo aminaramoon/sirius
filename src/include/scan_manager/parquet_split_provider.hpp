@@ -87,10 +87,10 @@ class parquet_split_provider : public split_provider {
     std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
     std::size_t max_file_processed     = DEFAULT_MAX_FILE_PROCESSED,
     /// Optional sirius IO context.  When non-null, footer fetches go through
-    /// @c sirius_datasource and the resulting io_object is attached to each
-    /// emitted @c row_group_slice; when null, the provider falls back to
-    /// @c cudf::io::datasource::create() and slices carry no io_object.
-    sirius::io::sirius_ioctx* io_ctx = nullptr);
+    /// @c sirius_datasource, and both the io_object and the ioctx itself are
+    /// attached to each emitted @c row_group_slice so the scan operator can
+    /// reuse the same path for data reads.
+    std::shared_ptr<sirius::io::sirius_ioctx> io_ctx = nullptr);
 
   ~parquet_split_provider() override;
 
@@ -128,8 +128,9 @@ class parquet_split_provider : public split_provider {
   std::size_t _total_files;
   std::size_t _next_file_idx{0};
   /// Optional ioctx for routing reads through @c sirius_datasource.
-  /// Lifetime is owned by @c sirius_scan_manager — outlives the provider.
-  sirius::io::sirius_ioctx* _io_ctx{nullptr};
+  /// Held as a shared_ptr so it stays alive as long as any emitted slice
+  /// references it.
+  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
 };
 
 }  // namespace sirius::scan_manager
