@@ -115,8 +115,7 @@ class parquet_split_provider : public split_provider {
 
   /// \brief Run the metadata-scan logic for one batch, appending one
   ///        @c parquet_scan_data per emitted partition to @p out.
-  void run_batch(file_batch const& batch,
-                 std::vector<std::unique_ptr<op::operator_data>>& out);
+  void run_batch(file_batch const& batch, std::vector<std::unique_ptr<op::operator_data>>& out);
 
   std::vector<std::string> _file_paths;
   /// Canonical scan plan — data columns (D order), partition columns, output layout,

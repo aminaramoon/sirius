@@ -58,7 +58,7 @@ struct row_group_slice {
                   std::vector<cudf::size_type> row_group_indices,
                   std::size_t reserved_uncompressed_bytes,
                   std::size_t reserved_compressed_bytes,
-                  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx       = nullptr,
+                  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx        = nullptr,
                   std::shared_ptr<sirius::io::sirius_io_object> io_object = nullptr)
     : file_metadata(file_metadata),
       file_path(file_path),

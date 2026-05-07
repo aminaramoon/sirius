@@ -63,11 +63,8 @@ class mock_ioctx : public sirius_ioctx {
     throw std::logic_error("unused");
   }
 
-  void host_read_async_io(sirius_io_object&,
-                          size_t,
-                          size_t,
-                          uint8_t*,
-                          io_completion_handler) override
+  void host_read_async_io(
+    sirius_io_object&, size_t, size_t, uint8_t*, io_completion_handler) override
   {
     throw std::logic_error("unused");
   }

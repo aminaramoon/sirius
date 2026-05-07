@@ -29,6 +29,8 @@ class operator_data;
 
 namespace sirius::scan_manager {
 
+class split_provider;
+
 /**
  * @brief Bridge between a scan-side producer (the scan manager) and a scan source operator.
  *
@@ -41,6 +43,11 @@ namespace sirius::scan_manager {
  *   - returns a non-null unique_ptr  → next split.
  *   - throws                         → producer surfaced an error via close(exception_ptr)
  *                                       and the queue is drained.
+ *
+ * Pushes are gated: only @ref split_provider may enqueue splits (via the
+ * @c friend relationship and @ref split_provider::push_to_connector helper).
+ * close() and the consumer-side methods remain public so the scan manager
+ * (driver loop) and the scan operator can drive the lifecycle.
  */
 class split_connector {
  public:
@@ -51,9 +58,6 @@ class split_connector {
   split_connector& operator=(const split_connector&) = delete;
   split_connector(split_connector&&)                 = delete;
   split_connector& operator=(split_connector&&)      = delete;
-
-  /// \brief Enqueue a ready split. Producer side. Wakes a waiting consumer.
-  void push_split(std::unique_ptr<op::operator_data> split);
 
   /// \brief Mark the connector as closed: no more splits will be pushed. Idempotent.
   ///        Wakes all waiting consumers.
@@ -78,6 +82,13 @@ class split_connector {
   [[nodiscard]] bool has_more_splits() const;
 
  private:
+  friend class split_provider;
+
+  /// \brief Enqueue a ready split. Producer side. Wakes a waiting consumer.
+  ///        Reachable only via @ref split_provider::push_to_connector so all
+  ///        producers route through the provider's friendship channel.
+  void push_split(std::unique_ptr<op::operator_data> split);
+
   mutable std::mutex _mutex;
   std::condition_variable _cv;
   std::deque<std::unique_ptr<op::operator_data>> _splits;

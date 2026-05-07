@@ -256,6 +256,7 @@ set(EXTENSION_SOURCES
     src/scan_manager/parquet_split_provider.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
+    src/scan_manager/split_provider.cpp
     src/sirius_config.cpp
     src/sirius_context.cpp
     src/sirius_engine.cpp

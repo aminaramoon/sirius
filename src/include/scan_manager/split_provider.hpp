@@ -85,6 +85,21 @@ class split_provider {
    */
   virtual std::vector<std::unique_ptr<op::operator_data>> create_split() = 0;
 
+  /**
+   * @brief Push a split into a connector.
+   *
+   * The only entry point for enqueueing splits: @ref split_connector::push_split
+   * is private and reaches in only via the @c friend relationship between
+   * @ref split_connector and this class. Because the helper is a protected
+   * static, only @ref split_provider and its subclasses can call it, so
+   * unrelated code cannot bypass the provider abstraction.
+   *
+   * Defined out-of-line because the unique_ptr's deleter needs the complete
+   * @c op::operator_data type, which we keep forward-declared in this header.
+   */
+  static void push_to_connector(split_connector& connector,
+                                std::unique_ptr<op::operator_data> split);
+
  private:
   /// RAII coordination shared across the task chain. Destructor closes the
   /// connector with the captured exception (if any) once the last task drops
@@ -95,7 +110,16 @@ class split_provider {
     std::atomic<bool> error_set{false};
     std::exception_ptr error_ptr;
 
-    explicit worker_state(split_connector& c) : connector(c) {}
+    static std::shared_ptr<worker_state> create(split_connector& connector)
+    {
+      return std::shared_ptr<worker_state>(new worker_state(connector));
+    }
+
+    void set_error(std::exception_ptr eptr)
+    {
+      bool expected = false;
+      if (error_set.compare_exchange_strong(expected, true)) { error_ptr = std::move(eptr); }
+    }
 
     ~worker_state()
     {
@@ -106,6 +130,9 @@ class split_provider {
       } catch (...) {
       }
     }
+
+   private:
+    explicit worker_state(split_connector& c) : connector(c) {}
   };
 
   template <typename Scheduler>
@@ -115,12 +142,11 @@ class split_provider {
 template <typename Scheduler>
 void split_provider::run(Scheduler& scheduler, split_connector& connector)
 {
-  schedule_worker(scheduler, std::make_shared<worker_state>(connector));
+  schedule_worker(scheduler, worker_state::create(connector));
 }
 
 template <typename Scheduler>
-void split_provider::schedule_worker(Scheduler& scheduler,
-                                     std::shared_ptr<worker_state> state)
+void split_provider::schedule_worker(Scheduler& scheduler, std::shared_ptr<worker_state> state)
 {
   scheduler.enqueue([this, state = std::move(state), &scheduler]() {
     try {
@@ -129,14 +155,10 @@ void split_provider::schedule_worker(Scheduler& scheduler,
       // Spawn a sibling so the next batch can run while we push ours.
       schedule_worker(scheduler, state);
       for (auto& split : splits) {
-        state->connector.push_split(std::move(split));
+        push_to_connector(state->connector, std::move(split));
       }
     } catch (...) {
-      // First exception wins so the consumer surfaces the original cause.
-      bool expected = false;
-      if (state->error_set.compare_exchange_strong(expected, true)) {
-        state->error_ptr = std::current_exception();
-      }
+      state->set_error(std::current_exception());
     }
   });
 }
