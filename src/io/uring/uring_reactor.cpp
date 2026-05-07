@@ -132,10 +132,21 @@ void uring_reactor::enqueue_bulk(std::span<device_read_req_type> batch)
 size_t uring_reactor::host_read(int fd, size_t offset, size_t size, uint8_t* dst)
 {
   if (size == 0) return 0;
-  ssize_t n = ::pread(fd, dst, size, static_cast<off_t>(offset));
-  if (n < 0)
-    throw std::runtime_error("uring_reactor::host_read pread: " + std::string(strerror(errno)));
-  return static_cast<size_t>(n);
+  // Loop until either the full requested size is read, EOF (n == 0), or a
+  // real error. pread on a regular file should only return short on EOF, but
+  // we retry defensively against EINTR and any unexpected short-read paths
+  // so callers don't have to.
+  size_t total = 0;
+  while (total < size) {
+    ssize_t n = ::pread(fd, dst + total, size - total, static_cast<off_t>(offset + total));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      throw std::runtime_error("uring_reactor::host_read pread: " + std::string(strerror(errno)));
+    }
+    if (n == 0) break;  // EOF
+    total += static_cast<size_t>(n);
+  }
+  return total;
 }
 
 void uring_reactor::host_read_async(host_read_req_type req)
@@ -183,6 +194,17 @@ void uring_reactor::worker_loop()
   struct slot_info {
     slot_state state{slot_state::FREE};
     device_read_req_type req{};
+    // Cumulative bytes read for the current request across short-read retries.
+    // Reset to 0 on slot acquisition; on each completion we add `cqe->res` and
+    // either re-submit the remainder or proceed to the H2D path.
+    size_t bytes_read{0};
+  };
+  // Heap-allocated wrapper for in-flight host reads. Mirrors the device
+  // slot's bytes_read tracking so we can retry short reads at the same
+  // user_data identity across multiple SQE submissions.
+  struct host_in_flight {
+    host_read_req_type req;
+    size_t bytes_read{0};
   };
   std::array<slot_info, NUM_CHUNKS> slots{};
   std::deque<device_read_req_type> pending;
@@ -241,20 +263,23 @@ void uring_reactor::worker_loop()
       io_uring_prep_read(
         sqe, req.handle, _bounce[si].buf.get(), (unsigned)req.io_size, (__u64)req.file_off);
       io_uring_sqe_set_data64(sqe, (uint64_t)si);
-      slots[si].state = slot_state::READING;
-      slots[si].req   = std::move(req);
+      slots[si].state      = slot_state::READING;
+      slots[si].bytes_read = 0;  // fresh request → reset retry accumulator
+      slots[si].req        = std::move(req);
       pending.pop_front();
       ++inflight;
       ++added;
     }
-    // Host reads: heap-allocate the req and tag the pointer in user_data.
+    // Host reads: heap-allocate a host_in_flight wrapper so we can carry
+    // cumulative bytes across short-read retries via the same user_data tag.
     while (!pending_host.empty()) {
       io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
       if (!sqe) break;
-      auto* req = new host_read_req_type(std::move(pending_host.front()));
+      auto* hf = new host_in_flight{std::move(pending_host.front()), 0};
       pending_host.pop_front();
-      io_uring_prep_read(sqe, req->handle, req->dst, (unsigned)req->size, (__u64)req->offset);
-      io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(req) | HOST_TAG);
+      io_uring_prep_read(
+        sqe, hf->req.handle, hf->req.dst, (unsigned)hf->req.size, (__u64)hf->req.offset);
+      io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(hf) | HOST_TAG);
       ++inflight;
       ++added;
     }
@@ -262,7 +287,8 @@ void uring_reactor::worker_loop()
   };
   auto reap_cqes = [&]() {
     io_uring_cqe* cqes[NUM_CHUNKS];
-    unsigned n = io_uring_peek_batch_cqe(ring.get(), cqes, NUM_CHUNKS);
+    unsigned n             = io_uring_peek_batch_cqe(ring.get(), cqes, NUM_CHUNKS);
+    bool need_resubmit     = false;  // any retry SQE prepared in this pass?
     for (auto* cqe : std::span{cqes, n}) {
       uint64_t data = io_uring_cqe_get_data64(cqe);
       int res       = cqe->res;
@@ -271,14 +297,48 @@ void uring_reactor::worker_loop()
 
       if (data & HOST_TAG) {
         // Host read completion.
-        auto* req = reinterpret_cast<host_read_req_type*>(data & ~HOST_TAG);
+        auto* hf = reinterpret_cast<host_in_flight*>(data & ~HOST_TAG);
         if (res < 0) {
-          req->ctx->chunk_failed(std::make_exception_ptr(
+          hf->req.ctx->chunk_failed(std::make_exception_ptr(
             std::runtime_error("reactor host read: " + std::string(strerror(-res)))));
-        } else {
-          req->ctx->chunk_done();
+          delete hf;
+          continue;
         }
-        delete req;
+        size_t rd = static_cast<size_t>(res);
+        hf->bytes_read += rd;
+        bool const fully_read = hf->bytes_read >= hf->req.size;
+        bool const eof        = (rd == 0);
+        if (!fully_read && !eof) {
+          // Short read mid-file: queue a follow-up SQE for the unread tail.
+          // We re-use the same host_in_flight identity so subsequent CQEs
+          // continue to accumulate bytes_read against this request.
+          io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
+          if (sqe) {
+            io_uring_prep_read(sqe,
+                               hf->req.handle,
+                               hf->req.dst + hf->bytes_read,
+                               (unsigned)(hf->req.size - hf->bytes_read),
+                               (__u64)(hf->req.offset + hf->bytes_read));
+            io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(hf) | HOST_TAG);
+            ++inflight;
+            need_resubmit = true;
+            spdlog::warn(
+              "uring_reactor: host short read, retrying tail. fd={} offset={} size={} "
+              "bytes_read={} this_rd={}",
+              hf->req.handle,
+              hf->req.offset,
+              hf->req.size,
+              hf->bytes_read,
+              rd);
+            continue;
+          }
+          // SQE exhaustion is unexpected (we have _ring_entries SQEs and
+          // never more than NUM_CHUNKS in flight); fall through and complete
+          // with whatever we have rather than spin.
+          spdlog::warn("uring_reactor: SQE exhausted on host short-read retry");
+        }
+        hf->req.ctx->chunk_done();
+        delete hf;
       } else {
         // Device read completion.
         int si      = static_cast<int>(data);
@@ -288,26 +348,78 @@ void uring_reactor::worker_loop()
           req.ctx->chunk_failed(std::make_exception_ptr(
             std::runtime_error("reactor read: " + std::string(strerror(-res)))));
           sinfo = slot_info{};
-        } else {
-          size_t rd     = (size_t)res;
-          size_t actual = rd > req.data_off ? std::min(req.data_size, rd - req.data_off) : 0;
-          if (actual > 0 && !req.ctx->failed.load(std::memory_order_relaxed)) {
-            _bounce[si].cuda_done.store(false, std::memory_order_relaxed);
-            if (req.device_id >= 0) cudaSetDevice(req.device_id);
-            cudaMemcpyAsync(req.dst,
-                            (uint8_t*)_bounce[si].buf.get() + req.data_off,
-                            actual,
-                            cudaMemcpyHostToDevice,
-                            req.stream);
-            cudaLaunchHostFunc(req.stream, cuda_copy_cb, &_cb_args[si]);
-            sinfo.state = slot_state::COPYING;
-          } else {
-            req.ctx->chunk_done();
-            sinfo = slot_info{};
+          continue;
+        }
+        size_t rd = static_cast<size_t>(res);
+        sinfo.bytes_read += rd;
+        bool const fully_read = sinfo.bytes_read >= req.io_size;
+        bool const eof        = (rd == 0);
+        if (!fully_read && !eof) {
+          // Short read mid-file: queue a follow-up SQE for the unread tail
+          // into the same bounce slot at the next-byte offset. The slot
+          // stays in READING; once we get the full io_size (or EOF), we
+          // proceed to the H2D path below using sinfo.bytes_read.
+          io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
+          if (sqe) {
+            io_uring_prep_read(sqe,
+                               req.handle,
+                               (uint8_t*)_bounce[si].buf.get() + sinfo.bytes_read,
+                               (unsigned)(req.io_size - sinfo.bytes_read),
+                               (__u64)(req.file_off + sinfo.bytes_read));
+            io_uring_sqe_set_data64(sqe, (uint64_t)si);
+            ++inflight;
+            need_resubmit = true;
+            spdlog::warn(
+              "uring_reactor: device short read, retrying tail. slot={} file_off={} "
+              "io_size={} bytes_read={} this_rd={}",
+              si,
+              req.file_off,
+              req.io_size,
+              sinfo.bytes_read,
+              rd);
+            continue;
           }
+          spdlog::warn("uring_reactor: SQE exhausted on device short-read retry");
+        }
+        // Fully read or true EOF: compute user-visible bytes from the
+        // accumulated bytes_read, not just this CQE's `rd`.
+        size_t actual = sinfo.bytes_read > req.data_off
+                          ? std::min(req.data_size, sinfo.bytes_read - req.data_off)
+                          : 0;
+        if (actual > 0 && !req.ctx->failed.load(std::memory_order_relaxed)) {
+          _bounce[si].cuda_done.store(false, std::memory_order_relaxed);
+          if (req.device_id >= 0) cudaSetDevice(req.device_id);
+          cudaMemcpyAsync(req.dst,
+                          (uint8_t*)_bounce[si].buf.get() + req.data_off,
+                          actual,
+                          cudaMemcpyHostToDevice,
+                          req.stream);
+          cudaLaunchHostFunc(req.stream, cuda_copy_cb, &_cb_args[si]);
+          sinfo.state = slot_state::COPYING;
+        } else {
+          // After retry-to-completion this only fires when the file truly
+          // ends inside the alignment prefix (actual == 0) or when another
+          // chunk of the same request already failed. The handler still
+          // resolves with total_bytes, so anything in `req.dst` past what
+          // we could read is left untouched — log so it surfaces.
+          spdlog::warn(
+            "uring_reactor: chunk completed with no H2D after retry. "
+            "slot={} file_off={} io_size={} data_off={} data_size={} bytes_read={} actual={} "
+            "ctx_failed={}",
+            si,
+            req.file_off,
+            req.io_size,
+            req.data_off,
+            req.data_size,
+            sinfo.bytes_read,
+            actual,
+            req.ctx->failed.load(std::memory_order_relaxed));
+          req.ctx->chunk_done();
+          sinfo = slot_info{};
         }
       }
     }
+    if (need_resubmit) io_uring_submit(ring.get());
   };
 
   while (true) {
