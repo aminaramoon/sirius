@@ -287,8 +287,8 @@ void uring_reactor::worker_loop()
   };
   auto reap_cqes = [&]() {
     io_uring_cqe* cqes[NUM_CHUNKS];
-    unsigned n             = io_uring_peek_batch_cqe(ring.get(), cqes, NUM_CHUNKS);
-    bool need_resubmit     = false;  // any retry SQE prepared in this pass?
+    unsigned n         = io_uring_peek_batch_cqe(ring.get(), cqes, NUM_CHUNKS);
+    bool need_resubmit = false;  // any retry SQE prepared in this pass?
     for (auto* cqe : std::span{cqes, n}) {
       uint64_t data = io_uring_cqe_get_data64(cqe);
       int res       = cqe->res;
@@ -310,7 +310,7 @@ void uring_reactor::worker_loop()
         bool const eof        = (rd == 0);
         if (!fully_read && !eof) {
           // Short read mid-file: queue a follow-up SQE for the unread tail.
-          // We re-use the same host_in_flight identity so subsequent CQEs
+          // We reuse the same host_in_flight identity so subsequent CQEs
           // continue to accumulate bytes_read against this request.
           io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
           if (sqe) {

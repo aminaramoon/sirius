@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <memory>
 #include <stdexcept>
 
 namespace sirius::io {
@@ -175,6 +176,22 @@ void buffer_pool::deallocate(std::byte* p)
 // pinned_view
 // ===========================================================================
 
+namespace {
+
+// Carries a strong ref to the entry until the host callback fires, so the
+// entry can't be destroyed mid-flight even if the cache map drops it.
+struct release_callback_args {
+  std::shared_ptr<cache_entry> entry;
+};
+
+void CUDART_CB release_read_host_callback(void* p) noexcept
+{
+  std::unique_ptr<release_callback_args> args(static_cast<release_callback_args*>(p));
+  args->entry->state.release_read();
+}
+
+}  // namespace
+
 pinned_view::pinned_view(std::shared_ptr<cache_entry> entry,
                          duckdb_moodycamel::ConcurrentQueue<eviction_candidate>& candidate_queue,
                          cudaStream_t stream)
@@ -208,22 +225,29 @@ pinned_view& pinned_view::operator=(pinned_view&& o) noexcept
 void pinned_view::unpin()
 {
   if (!_entry) return;
-  // release_read returns true only when this was the *last* active reader
-  // (state transitioned in_use → cached).  That's exactly the edge that makes
-  // the entry newly evictable, so post a candidate hint then and only then.
-  if (_entry->state.release_read()) {
-    // Record an event on the reader's stream BEFORE handing the entry to
-    // the evictor.  The evictor checks cudaEventQuery(read_event) before
-    // releasing chunks, so any cudaMemcpyAsync the reader submitted earlier
-    // against this entry's pinned chunks is guaranteed complete before we
-    // recycle those chunks.
-    if (_stream && _entry->read_event) cudaEventRecord(_entry->read_event, _stream);
-    // Silent post: no semaphore release.  The evictor drains candidates on
-    // its next poll tick (EVICTOR_POLL_INTERVAL) or whenever a chunk request
-    // wakes it — whichever comes first.
-    _candidate_queue->enqueue({std::weak_ptr<cache_entry>(_entry)});
+
+  // Always enqueue an eviction candidate — the evictor's state.get_state()
+  // gate skips entries still in_use, so a candidate whose deferred
+  // release_read is still pending on a stream callback simply isn't evicted
+  // until the callback runs.  Silent post: no semaphore release.  The
+  // evictor drains candidates on its next poll tick (EVICTOR_POLL_INTERVAL)
+  // or whenever a chunk request wakes it — whichever comes first.
+  _candidate_queue->enqueue({std::weak_ptr<cache_entry>(_entry)});
+
+  if (_stream == nullptr) {
+    // Synchronous path (host reads): no async ops outstanding, release now.
+    _entry->state.release_read();
+    _entry.reset();
+  } else {
+    // Async path (device reads): defer release_read via a host callback so
+    // it fires only after the caller's stream reaches this point.  Any
+    // cudaMemcpyAsync submitted earlier against this entry's pinned chunks
+    // therefore completes before pin_count drops to zero — at which point
+    // the entry transitions in_use → cached and becomes evictable.
+    auto args   = std::make_unique<release_callback_args>();
+    args->entry = std::move(_entry);
+    cudaLaunchHostFunc(_stream, &release_read_host_callback, args.release());
   }
-  _entry.reset();
 }
 
 size_t pinned_view::num_chunks() const noexcept { return _entry ? _entry->chunks.size() : 0; }
@@ -733,16 +757,16 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
   std::stop_callback stop_cb(stop, [this] { _request_sem.release(); });
 
   // Free one cached entry's chunks back to the pool.  Returns the number
-  // of chunks freed, or 0 if the entry isn't eligible right now (racing
-  // reader, in-flight cudaMemcpyAsync, etc.).  Caller removes the entry
-  // from the LRU on non-zero return.
+  // of chunks freed, or 0 if the entry isn't eligible right now.  Caller
+  // removes the entry from the LRU on non-zero return.
+  //
+  // The state-machine gate (state == cached, pin_count == 0) is the only
+  // in-use check needed: pinned_view::unpin defers release_read via a host
+  // callback on the reader's stream, so an entry stays in_use until any
+  // cudaMemcpyAsync the reader submitted has completed.
   auto try_evict_raw = [this](cache_entry* entry, int64_t age) -> size_t {
     if (entry->state.get_state() != entry_state::cached) return 0;
     if (!entry->is_consumed_or_stale(static_cast<uint64_t>(age))) return 0;
-    if (entry->read_event) {
-      auto q = cudaEventQuery(entry->read_event);
-      if (q != cudaSuccess) return 0;
-    }
     if (!entry->state.try_start_evicting()) return 0;
     size_t n = entry->chunks.size();
     _pool.deallocate_bulk(entry->chunks);

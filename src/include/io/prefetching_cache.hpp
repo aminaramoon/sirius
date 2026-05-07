@@ -308,12 +308,6 @@ struct alignas(64) cache_entry {
   /// consumption_ts < request_ts.
   std::atomic<uint64_t> consumption_ts{0};
 
-  /// Recorded on the last reader's stream when @c pinned_view goes out of
-  /// scope.  The evictor queries this before releasing chunks so a still
-  /// in-flight cudaMemcpyAsync can't read from pinned memory that we've
-  /// just handed back to the pool.
-  cudaEvent_t read_event{nullptr};
-
   /// Set to true while this entry sits in the evictor's LRU list, cleared
   /// when the evictor pops it out (eviction or otherwise).  Only mutated
   /// by the evictor thread, so no synchronisation is required.
@@ -322,12 +316,6 @@ struct alignas(64) cache_entry {
   cache_entry(cudf::io::text::byte_range_info logical, cudf::io::text::byte_range_info physical)
     : logical_range(logical), physical_range(physical)
   {
-    cudaEventCreateWithFlags(&read_event, cudaEventDisableTiming);
-  }
-
-  ~cache_entry()
-  {
-    if (read_event) cudaEventDestroy(read_event);
   }
 
   cache_entry(cache_entry const&)            = delete;
@@ -383,10 +371,12 @@ struct eviction_request {
 class pinned_view {
  public:
   pinned_view() = default;
-  /// @p stream is the caller's CUDA stream; on the last release, we record
-  /// an event on it so the evictor can be certain any in-flight
-  /// cudaMemcpyAsync reading from this entry's chunks has completed before
-  /// the chunks are recycled.
+  /// @p stream is the caller's CUDA stream.  When non-null, the read pin
+  /// is released via a host callback enqueued on this stream, so the entry
+  /// stays in_use (and therefore non-evictable) until any cudaMemcpyAsync
+  /// the caller submitted earlier has finished consuming the chunks.  When
+  /// null, the read is released synchronously on destruction (host-only
+  /// reads have no async work to wait on).
   pinned_view(std::shared_ptr<cache_entry> entry,
               duckdb_moodycamel::ConcurrentQueue<eviction_candidate>& candidate_queue,
               cudaStream_t stream);
@@ -468,9 +458,9 @@ class prefetching_cache {
   /// Non-blocking read of a single range.
   /// Returns an empty pinned_view if the range is not cached or the cached
   /// entry does not fully cover [offset, offset+size).  Updates hit / miss
-  /// counters (see summary()).  @p stream is used by the returned
-  /// pinned_view to record an event on release so the evictor can tell
-  /// when any in-flight async memcpys have finished.
+  /// counters (see summary()).  @p stream, when non-null, defers the
+  /// returned pinned_view's read release until the stream reaches the
+  /// release point — see @c pinned_view's ctor for the full contract.
   [[nodiscard]] pinned_view read(const sirius_io_object& obj,
                                  size_t offset,
                                  size_t size,
