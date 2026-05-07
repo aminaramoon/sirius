@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exec/config.hpp"
+#include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -189,7 +190,7 @@ class sirius_scan_manager {
     op::scan::sirius_gpu_parquet_scan_operator* op);
 
   /// \brief Run providers sequentially: start each, wait on its future, advance.
-  void run_driver_loop();
+  void start_metadata_processing();
 
   scan_manager_config _config;
   /// Pinned-host buffer pool backing the ioctx's prefetching cache.
@@ -197,13 +198,13 @@ class sirius_scan_manager {
   /// MUST be declared before @c _io_ctx so the ioctx (and its cache,
   /// which references the pool) is destroyed first.
   std::unique_ptr<sirius::io::buffer_pool> _buffer_pool;
+  exec::static_thread_pool _thread_pool;
+  std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
-  std::unique_ptr<exec::static_thread_pool> _thread_pool;
   std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
-  std::thread _driver_thread;
 };
 
 }  // namespace sirius::scan_manager

@@ -98,6 +98,11 @@ class static_thread_pool {
     cv_.notify_one();
   }
 
+  /// \brief Alias for schedule(). Lets static_thread_pool satisfy the same
+  ///        scheduler shape as scoped_dispatcher (which exposes enqueue()),
+  ///        so generic dispatchers can target either.
+  void enqueue(std::invocable auto&& fn) { schedule(std::forward<decltype(fn)>(fn)); }
+
   [[nodiscard]] std::size_t num_threads() const noexcept { return threads_.size(); }
 
   void stop() noexcept

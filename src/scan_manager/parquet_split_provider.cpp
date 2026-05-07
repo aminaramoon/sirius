@@ -16,7 +16,6 @@
 
 #include "scan_manager/parquet_split_provider.hpp"
 
-#include "exec/thread_pool.hpp"
 #include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "io/io_context.hpp"
 #include "io/prefetching_cache.hpp"
@@ -24,7 +23,6 @@
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
 #include "op/scan/scan_utils.hpp"
-#include "scan_manager/split_connector.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
@@ -36,13 +34,11 @@
 #include <duckdb/common/hive_partitioning.hpp>
 
 #include <algorithm>
-#include <atomic>
-#include <exception>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace sirius::scan_manager {
 
@@ -106,88 +102,36 @@ parquet_split_provider::parquet_split_provider(
                                               _plan->partition_primary_indices);
     if (duckdb_expression) { _duckdb_filter_expression = std::move(duckdb_expression); }
   }
+
+  // Pre-decompose the file list into per-task batches once; create_split() iterates this
+  // list one batch at a time, buffering each batch's emitted splits in _pending.
+  for (std::size_t start = 0; start < _total_files; start += _max_file_processed) {
+    auto const end = std::min(start + _max_file_processed, _total_files);
+    file_batch batch;
+    batch.file_paths.assign(_file_paths.begin() + static_cast<std::ptrdiff_t>(start),
+                            _file_paths.begin() + static_cast<std::ptrdiff_t>(end));
+    _batches.push_back(std::move(batch));
+  }
 }
 
 parquet_split_provider::~parquet_split_provider() = default;
 
-std::optional<parquet_split_provider::file_batch> parquet_split_provider::next_task_input()
+std::vector<std::unique_ptr<op::operator_data>> parquet_split_provider::create_split()
 {
-  if (_next_file_idx >= _total_files) { return std::nullopt; }
-  auto const start = _next_file_idx;
-  auto const end   = std::min(start + _max_file_processed, _total_files);
-  _next_file_idx   = end;
+  // Atomic claim of the next batch index lets multiple workers call
+  // create_split concurrently without a mutex. fetch_add can briefly observe
+  // an index past the end (when more workers run than batches); the bounds
+  // check below filters those.
+  auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
+  if (batch_idx >= _batches.size()) { return {}; }
 
-  file_batch batch;
-  batch.file_paths.assign(_file_paths.begin() + static_cast<std::ptrdiff_t>(start),
-                          _file_paths.begin() + static_cast<std::ptrdiff_t>(end));
-  return batch;
+  std::vector<std::unique_ptr<op::operator_data>> out;
+  run_batch(_batches[batch_idx], out);
+  return out;
 }
 
-std::future<void> parquet_split_provider::start(exec::static_thread_pool& pool,
-                                                split_connector& connector)
-{
-  // Drain all batches up-front so we can size the remaining-task counter
-  // precisely; the connector closes when the last batch lands.
-  std::vector<file_batch> batches;
-  while (auto next = next_task_input()) {
-    batches.push_back(std::move(*next));
-  }
-
-  auto promise = std::make_shared<std::promise<void>>();
-  auto future  = promise->get_future();
-
-  if (batches.empty()) {
-    connector.close();
-    promise->set_value();
-    return future;
-  }
-
-  auto remaining   = std::make_shared<std::atomic<std::size_t>>(batches.size());
-  auto first_error = std::make_shared<std::atomic<bool>>(false);
-  auto error_ptr   = std::make_shared<std::exception_ptr>();
-  auto error_mutex = std::make_shared<std::mutex>();
-
-  for (auto& batch : batches) {
-    pool.schedule([this,
-                   batch = std::move(batch),
-                   &connector,
-                   remaining,
-                   promise,
-                   first_error,
-                   error_ptr,
-                   error_mutex]() {
-      try {
-        run_batch(batch, connector);
-      } catch (const std::exception& e) {
-        SIRIUS_LOG_ERROR("[parquet_split_provider] metadata scan task failed: {}", e.what());
-        bool expected = false;
-        if (first_error->compare_exchange_strong(expected, true)) {
-          std::lock_guard<std::mutex> lock(*error_mutex);
-          *error_ptr = std::current_exception();
-        }
-      } catch (...) {
-        SIRIUS_LOG_ERROR("[parquet_split_provider] metadata scan task failed (unknown)");
-        bool expected = false;
-        if (first_error->compare_exchange_strong(expected, true)) {
-          std::lock_guard<std::mutex> lock(*error_mutex);
-          *error_ptr = std::current_exception();
-        }
-      }
-      if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        connector.close();
-        if (first_error->load(std::memory_order_acquire)) {
-          std::lock_guard<std::mutex> lock(*error_mutex);
-          promise->set_exception(*error_ptr);
-        } else {
-          promise->set_value();
-        }
-      }
-    });
-  }
-  return future;
-}
-
-void parquet_split_provider::run_batch(file_batch const& batch, split_connector& connector)
+void parquet_split_provider::run_batch(file_batch const& batch,
+                                       std::vector<std::unique_ptr<op::operator_data>>& out)
 {
   auto stream = cudf::get_default_stream();
 
@@ -225,12 +169,12 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
 
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
   rg_accumulator accum;
-  // flush() pushes the bundled slices but does NOT reset partition_values. The file loop owns
-  // partition_values and re-seeds it on every file iteration; clearing it here would orphan the
-  // post-flush tail of a mid-file overflow.
+  // flush() appends the bundled slices to `out` but does NOT reset partition_values. The file
+  // loop owns partition_values and re-seeds it on every file iteration; clearing it here would
+  // orphan the post-flush tail of a mid-file overflow.
   auto flush = [&]() {
     if (accum.slices.empty()) { return; }
-    connector.push_split(std::make_unique<op::scan::parquet_scan_data>(
+    out.push_back(std::make_unique<op::scan::parquet_scan_data>(
       std::move(accum.slices),
       reader_options,
       _duckdb_filter_expression,

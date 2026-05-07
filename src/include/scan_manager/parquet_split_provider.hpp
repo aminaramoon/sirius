@@ -26,9 +26,9 @@
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -47,9 +47,12 @@ namespace sirius::scan_manager {
  * @brief Split provider that parses parquet metadata and emits one
  *        @c parquet_scan_data per row-group partition.
  *
- * This provider performs up-front filter / projection / hive partition setup, and start() drives
- * the metadata-scan iteration on the provided thread pool, pushing parquet_scan_data into the
- * connector.
+ * The constructor performs up-front filter / projection / hive partition setup
+ * and pre-decomposes the file list into immutable per-task @c file_batch
+ * entries. @ref create_split is thread-safe: each call atomically claims the
+ * next batch index and runs the metadata scan on the calling thread, returning
+ * the resulting splits as a vector. When the index has overshot the batch
+ * list, it returns an empty vector.
  */
 class parquet_split_provider : public split_provider {
  public:
@@ -99,20 +102,21 @@ class parquet_split_provider : public split_provider {
   parquet_split_provider(parquet_split_provider&&)                 = delete;
   parquet_split_provider& operator=(parquet_split_provider&&)      = delete;
 
-  std::future<void> start(exec::static_thread_pool& pool, split_connector& connector) override;
+ protected:
+  /// \brief Thread-safe iterator. Atomically claims the next batch index and
+  ///        runs the metadata scan, returning the batch's splits. Returns an
+  ///        empty vector once every batch has been claimed.
+  std::vector<std::unique_ptr<op::operator_data>> create_split() override;
 
  private:
   struct file_batch {
     std::vector<std::string> file_paths;
   };
 
-  /// \brief Pop the next file batch (up to @c _max_file_processed files).
-  ///        Returns nullopt when all files have been dispatched.
-  std::optional<file_batch> next_task_input();
-
-  /// \brief Run the metadata-scan logic for one batch and push parquet_scan_data
-  ///        per partition into @p connector.
-  void run_batch(file_batch const& batch, split_connector& connector);
+  /// \brief Run the metadata-scan logic for one batch, appending one
+  ///        @c parquet_scan_data per emitted partition to @p out.
+  void run_batch(file_batch const& batch,
+                 std::vector<std::unique_ptr<op::operator_data>>& out);
 
   std::vector<std::string> _file_paths;
   /// Canonical scan plan — data columns (D order), partition columns, output layout,
@@ -126,11 +130,17 @@ class parquet_split_provider : public split_provider {
   std::size_t _approximate_batch_size;
   std::size_t _max_file_processed;
   std::size_t _total_files;
-  std::size_t _next_file_idx{0};
   /// Optional ioctx for routing reads through @c sirius_datasource.
   /// Held as a shared_ptr so it stays alive as long as any emitted slice
   /// references it.
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
+
+  /// Pre-decomposed file batches built once in the constructor; immutable
+  /// thereafter. Each call to create_split() processes one entry.
+  std::vector<file_batch> _batches;
+  /// Atomically incremented to claim the next batch index. Lets multiple
+  /// workers process distinct batches in parallel with no mutex.
+  std::atomic<std::size_t> _next_batch_idx{0};
 };
 
 }  // namespace sirius::scan_manager

@@ -201,11 +201,14 @@ void uring_reactor::worker_loop()
     for (auto i : std::views::iota(size_t{0}, NUM_CHUNKS)) {
       if (slots[i].state == slot_state::COPYING &&
           _bounce[i].cuda_done.load(std::memory_order_acquire)) {
-        // Host callback fired, so all stream work up to and including the
-        // H2D copy is complete; any residual cudaStreamQuery status reflects
-        // a sticky failure on that stream.
+        // Host callback fired, so all stream work up to and including the H2D
+        // copy is complete. cudaStreamQuery may still return cudaErrorNotReady
+        // if the consumer queued more work on this stream after our copy —
+        // that is NOT a failure of our copy, just unrelated in-flight work, so
+        // treat it as success. Any other non-success is a sticky failure on
+        // the stream that affected our copy.
         cudaError_t err = cudaStreamQuery(slots[i].req.stream);
-        if (err != cudaSuccess) {
+        if (err != cudaSuccess && err != cudaErrorNotReady) {
           // Clear the sticky error so unrelated subsequent runtime calls
           // don't observe it.
           cudaGetLastError();

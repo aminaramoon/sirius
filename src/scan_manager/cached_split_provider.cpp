@@ -17,10 +17,8 @@
 #include "scan_manager/cached_split_provider.hpp"
 
 #include "data/data_batch_utils.hpp"
-#include "exec/thread_pool.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "scan_manager/split_connector.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
@@ -45,54 +43,50 @@ cached_split_provider::cached_split_provider(
     _filter_expression(std::move(filter_expression)),
     _plan(std::move(plan))
 {
-}
+  _num_batches = _columns_per_request.empty() ? 0 : _columns_per_request.front().size();
 
-std::future<void> cached_split_provider::start(exec::static_thread_pool& /*pool*/,
-                                               split_connector& connector)
-{
-  std::promise<void> promise;
-  auto future = promise.get_future();
-
-  std::size_t const num_batches =
-    _columns_per_request.empty() ? 0 : _columns_per_request.front().size();
-
-  // Sanity-check: every column must contribute the same number of chunks.
+  // Sanity-check: every column must contribute the same number of chunks. Done in the
+  // constructor so failure surfaces synchronously to the caller before run().
   for (auto const& col_chunks : _columns_per_request) {
-    if (col_chunks.size() != num_batches) {
+    if (col_chunks.size() != _num_batches) {
       throw std::runtime_error(
         "[cached_split_provider] mismatched chunk count across requested columns");
     }
   }
+}
 
-  for (std::size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-    std::vector<cudf::column_view> col_views;
-    col_views.reserve(_columns_per_request.size());
-    // Owner keeps the shared_ptr<column> chunks alive for the lifetime of the
-    // emitted data_batch, so the table_view's pointers stay valid even though
-    // the gpu_table_representation does not own the underlying memory.
-    std::vector<std::shared_ptr<cudf::column>> owner;
-    owner.reserve(_columns_per_request.size());
-    std::size_t alloc_size = 0;
-    for (auto const& col_chunks : _columns_per_request) {
-      auto const& col_ptr = col_chunks[batch_idx];
-      col_views.emplace_back(col_ptr->view());
-      alloc_size += col_ptr->alloc_size();
-      owner.push_back(col_ptr);
-    }
+std::vector<std::unique_ptr<op::operator_data>> cached_split_provider::create_split()
+{
+  // Atomic claim of the next batch index lets multiple workers run create_split
+  // in parallel without a mutex.
+  auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
+  if (batch_idx >= _num_batches) { return {}; }
 
-    cudf::table_view view(col_views);
-    auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
-      view, std::move(owner), alloc_size, *_memory_space);
-    auto batch =
-      std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
-
-    connector.push_split(std::make_unique<op::scan::scan_cached_operator_data>(
-      std::move(batch), _filter_expression, _plan));
+  std::vector<cudf::column_view> col_views;
+  col_views.reserve(_columns_per_request.size());
+  // Owner keeps the shared_ptr<column> chunks alive for the lifetime of the
+  // emitted data_batch, so the table_view's pointers stay valid even though
+  // the gpu_table_representation does not own the underlying memory.
+  std::vector<std::shared_ptr<cudf::column>> owner;
+  owner.reserve(_columns_per_request.size());
+  std::size_t alloc_size = 0;
+  for (auto const& col_chunks : _columns_per_request) {
+    auto const& col_ptr = col_chunks[batch_idx];
+    col_views.emplace_back(col_ptr->view());
+    alloc_size += col_ptr->alloc_size();
+    owner.push_back(col_ptr);
   }
 
-  connector.close();
-  promise.set_value();
-  return future;
+  cudf::table_view view(col_views);
+  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+    view, std::move(owner), alloc_size, *_memory_space);
+  auto batch =
+    std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
+
+  std::vector<std::unique_ptr<op::operator_data>> out;
+  out.push_back(std::make_unique<op::scan::scan_cached_operator_data>(
+    std::move(batch), _filter_expression, _plan));
+  return out;
 }
 
 }  // namespace sirius::scan_manager

@@ -38,7 +38,13 @@
 
 namespace sirius::scan_manager {
 
-sirius_scan_manager::sirius_scan_manager(scan_manager_config config) : _config(std::move(config))
+sirius_scan_manager::sirius_scan_manager(scan_manager_config config)
+  : _config(std::move(config)),
+    _thread_pool(_config.thread_pool.num_threads,
+                 _config.thread_pool.thread_name_prefix,
+                 _config.thread_pool.cpu_affinity_list),
+    _dispatcher(
+      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads))
 {
   if (_config.use_sirius_datasource) {
     _io_ctx = std::make_shared<sirius::io::uring_ioctx>(_config.uring_ring_entries,
@@ -114,11 +120,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 
   if (_scan_op_order.empty()) { return; }
 
-  if (!_thread_pool) {
-    throw std::runtime_error("[sirius_scan_manager::prepare_for_query] thread pool not started");
-  }
-
-  _driver_thread = std::thread(&sirius_scan_manager::run_driver_loop, this);
+  start_metadata_processing();
 }
 
 std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
@@ -230,7 +232,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
     _io_ctx);
 }
 
-void sirius_scan_manager::run_driver_loop()
+void sirius_scan_manager::start_metadata_processing()
 {
   for (auto* op : _scan_op_order) {
     auto it = _providers_by_op.find(op);
@@ -239,37 +241,36 @@ void sirius_scan_manager::run_driver_loop()
     if (connector == nullptr) { continue; }
 
     try {
-      auto future = it->second->start(*_thread_pool, *connector);
-      future.get();
+      // run() is fire-and-forget: it enqueues workers and returns immediately.
+      // Worker exceptions ride on connector.close(exception_ptr) and surface
+      // when the consumer drains via get_next_split().
+      it->second->run(*_dispatcher, *connector);
     } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed: {}", e.what());
-      // Make sure the consumer is unblocked even on failure.
-      connector->close();
+      SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed to start: {}", e.what());
+      // Synchronous failure inside run() (e.g. scheduler.enqueue throwing)
+      // bypasses the worker error path, so forward it through the connector
+      // here. close() is idempotent and keeps the first stored exception.
+      connector->close(std::current_exception());
     }
   }
 }
 
 void sirius_scan_manager::reset()
 {
-  if (_driver_thread.joinable()) { _driver_thread.join(); }
+  _dispatcher->request_stop();
+  _dispatcher->wait_for_all();
   _scan_op_order.clear();
   _providers_by_op.clear();
+  _dispatcher =
+    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads);
 }
 
-void sirius_scan_manager::start()
-{
-  if (_thread_pool) { return; }
-  _thread_pool = std::make_unique<exec::static_thread_pool>(_config.thread_pool.num_threads,
-                                                            _config.thread_pool.thread_name_prefix,
-                                                            _config.thread_pool.cpu_affinity_list);
-}
+void sirius_scan_manager::start() {}
 
 void sirius_scan_manager::stop()
 {
-  if (_driver_thread.joinable()) { _driver_thread.join(); }
-  if (!_thread_pool) { return; }
-  _thread_pool->stop();
-  _thread_pool.reset();
+  reset();
+  _thread_pool.stop();
 }
 
 void sirius_scan_manager::insert_pinned_entry(const std::string& name,
