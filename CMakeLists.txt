@@ -469,3 +469,38 @@ if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
   target_compile_definitions(sirius_unittest
                              PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
 endif()
+
+# -----------------------------------------------------------------------------
+# test/io/parquet_benchmark — standalone benchmark binary for sirius_datasource
+# -----------------------------------------------------------------------------
+add_executable(parquet_benchmark test/io/parquet_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(parquet_benchmark PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(parquet_benchmark BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  parquet_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  parquet_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(parquet_benchmark "")
+
+target_link_options(parquet_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  parquet_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
