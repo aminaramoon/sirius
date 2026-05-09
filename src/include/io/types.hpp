@@ -44,7 +44,7 @@ using io_completion_handler = std::function<void(size_t bytes_transferred, std::
 // ---------------------------------------------------------------------------
 
 static constexpr size_t CHUNK_SIZE    = 1UL << 20;  ///< Bounce-buffer chunk size (1 MiB).
-static constexpr size_t NUM_CHUNKS    = 32;         ///< Number of bounce slots per reactor.
+static constexpr size_t NUM_CHUNKS    = 128;        ///< Number of bounce slots per reactor.
 static constexpr size_t IO_BLOCK_SIZE = 4096;       ///< O_DIRECT alignment requirement (bytes).
 
 // ---------------------------------------------------------------------------

@@ -33,7 +33,11 @@ namespace sirius::io {
 // buffer_pool
 // ===========================================================================
 
-buffer_pool::buffer_pool(uint32_t max_slabs) : _max_slabs(max_slabs) {}
+buffer_pool::buffer_pool(uint32_t max_slabs) : _max_slabs(max_slabs)
+{
+  for (uint32_t i = 0; i < std::min<uint32_t>(10, _max_slabs); ++i)
+    grow();
+}
 
 buffer_pool::~buffer_pool()
 {
