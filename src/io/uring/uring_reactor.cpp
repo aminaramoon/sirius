@@ -17,6 +17,7 @@
 #include "io/uring/uring_reactor.hpp"
 
 #include "driver_types.h"
+#include "io/types.hpp"
 
 #include <fcntl.h>
 #include <spdlog/spdlog.h>
@@ -64,13 +65,13 @@ size_t uring_reactor::size(int fd)
 }
 
 uring_reactor::uring_reactor(unsigned ring_entries, size_t bounce_slot_size)
-  : _ring_entries(ring_entries)
+  : _ring_entries(ring_entries), _bounce_slot_size(bounce_slot_size)
 {
   for (int i = 0; i < static_cast<int>(NUM_CHUNKS); ++i) {
     void* raw = nullptr;
     // Portable flag so these buffers are reachable from CUDA contexts
     // other than the one current at ioctx construction (multi-GPU usage).
-    CUDA_CHECK(cudaHostAlloc(&raw, bounce_slot_size, cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&raw, _bounce_slot_size, cudaHostAllocPortable | cudaHostAllocMapped));
     _bounce[i].buf.reset(raw);
     _cb_args[i] = {this, i};
   }
@@ -168,15 +169,20 @@ void uring_reactor::worker_loop()
 {
   unique_ring ring = [this]() -> unique_ring {
 #if defined(IORING_SETUP_SINGLE_ISSUER) && defined(IORING_SETUP_DEFER_TASKRUN)
-    auto r = std::make_unique<io_uring>();
-    int rc = io_uring_queue_init(
-      _ring_entries, r.get(), IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
+    auto r                   = std::make_unique<io_uring>();
+    struct io_uring_params p = {0};
+    // Disable kernel locks (assuming 1 thread per ring)
+    p.flags |= IORING_SETUP_SINGLE_ISSUER;
+
+    // Keep completions on the current CPU, avoid cache thrashing
+    p.flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN;
+    int rc = io_uring_queue_init_params(_ring_entries, r.get(), &p);
     if (rc == 0) {
-      spdlog::debug("uring_reactor: ring using SINGLE_ISSUER|DEFER_TASKRUN");
+      spdlog::debug("uring_device_reactor: ring using SINGLE_ISSUER|DEFER_TASKRUN");
       return unique_ring{r.release()};
     }
     spdlog::debug(
-      "uring_reactor: SINGLE_ISSUER|DEFER_TASKRUN unsupported "
+      "uring_device_reactor: SINGLE_ISSUER|DEFER_TASKRUN unsupported "
       "({}), falling back to plain flags",
       strerror(-rc));
 #endif
@@ -187,6 +193,13 @@ void uring_reactor::worker_loop()
     spdlog::debug("uring_reactor: ring using plain flags");
     return unique_ring{r2.release()};
   }();
+
+  std::array<iovec, NUM_CHUNKS> iovecs{};
+  for (size_t i = 0; i < NUM_CHUNKS; ++i)
+    iovecs[i] = {_bounce[i].buf.get(), _bounce_slot_size};
+  if (int rc = io_uring_register_buffers(ring.get(), iovecs.data(), NUM_CHUNKS); rc < 0)
+    throw std::runtime_error("uring_device_reactor: io_uring_register_buffers: " +
+                             std::string(strerror(-rc)));
 
   static constexpr uint64_t HOST_TAG = 1ULL << 63;
 

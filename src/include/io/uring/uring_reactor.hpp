@@ -218,6 +218,7 @@ class uring_reactor {
   };
   static void cuda_copy_cb(void* p) noexcept;
 
+  std::size_t _bounce_slot_size;
   std::array<bounce_slot, NUM_CHUNKS> _bounce;
   std::array<cb_arg, NUM_CHUNKS> _cb_args;
   unsigned _ring_entries;
