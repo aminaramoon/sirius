@@ -64,9 +64,11 @@ sirius_scan_manager::sirius_scan_manager(
       _config.uring_ring_entries);
 
     if (_config.enable_prefetch_cache) {
-      // buffer_pool sizes by slabs (500 chunks * 1 MiB = 500 MiB each); round
-      // the byte budget up so the user gets at least what they asked for.
-      auto const slab_bytes = sirius::io::buffer_pool::SLAB_BYTES;
+      // Slab size = CHUNKS_PER_SLAB blocks at the resource's block size.
+      // Round the byte budget up so the user gets at least what they asked for.
+      auto const slab_bytes =
+        host_mr->get_block_size() *
+        static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
       auto const max_slabs =
         static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
       _buffer_pool = std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs);

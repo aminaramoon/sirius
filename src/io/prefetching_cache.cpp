@@ -35,14 +35,8 @@ namespace sirius::io {
 
 buffer_pool::buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr,
                          uint32_t max_slabs)
-  : _mr(mr), _max_slabs(max_slabs)
+  : _mr(mr), _chunk_bytes(mr.get_block_size()), _max_slabs(max_slabs)
 {
-  if (mr.get_block_size() != CHUNK_BYTES) {
-    throw std::runtime_error(
-      "buffer_pool: upstream fixed_size_host_memory_resource block_size (" +
-      std::to_string(mr.get_block_size()) + ") does not match required CHUNK_BYTES (" +
-      std::to_string(CHUNK_BYTES) + ")");
-  }
   std::unique_lock lk(_mtx);
   for (uint32_t i = 0; i < std::min<uint32_t>(10, _max_slabs); ++i) {
     if (!grow_locked()) break;
@@ -55,12 +49,13 @@ bool buffer_pool::grow_locked()
 {
   if (_allocations.size() >= _max_slabs) return false;
 
+  auto const bytes = slab_bytes();
   cucascade::memory::fixed_multiple_blocks_allocation alloc;
   try {
-    alloc = _mr.allocate_multiple_blocks(SLAB_BYTES);
+    alloc = _mr.allocate_multiple_blocks(bytes);
   } catch (std::exception const& e) {
     spdlog::warn("buffer_pool: allocate_multiple_blocks({:.0f}MB) failed: {}",
-                 static_cast<double>(SLAB_BYTES) / (1024.0 * 1024.0),
+                 static_cast<double>(bytes) / (1024.0 * 1024.0),
                  e.what());
     return false;
   }
@@ -78,7 +73,7 @@ bool buffer_pool::grow_locked()
   spdlog::debug("buffer_pool: allocated slab {} ({} chunks, {:.0f}MB)",
                 _allocations.size(),
                 n,
-                static_cast<double>(SLAB_BYTES) / (1024.0 * 1024.0));
+                static_cast<double>(bytes) / (1024.0 * 1024.0));
   return true;
 }
 
@@ -213,8 +208,9 @@ std::span<const std::byte> pinned_view::operator[](size_t i) const noexcept
 {
   if (!_entry || i >= _entry->chunks.size()) return {};
   auto phys_size   = static_cast<size_t>(_entry->physical_range.size());
-  auto chunk_start = i * buffer_pool::CHUNK_BYTES;
-  auto chunk_sz    = std::min(buffer_pool::CHUNK_BYTES, phys_size - chunk_start);
+  auto chunk_bytes = _entry->chunk_bytes;
+  auto chunk_start = i * chunk_bytes;
+  auto chunk_sz    = std::min(chunk_bytes, phys_size - chunk_start);
   return {_entry->chunks[i], chunk_sz};
 }
 
@@ -253,12 +249,13 @@ std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t o
   size_t remaining  = size;
 
   // Walk the chunks that span [phys_start, phys_start + size).
-  size_t chunk_idx    = phys_start / buffer_pool::CHUNK_BYTES;
-  size_t off_in_chunk = phys_start % buffer_pool::CHUNK_BYTES;
+  auto const chunk_bytes = _entry->chunk_bytes;
+  size_t chunk_idx       = phys_start / chunk_bytes;
+  size_t off_in_chunk    = phys_start % chunk_bytes;
 
   while (remaining > 0 && chunk_idx < _entry->chunks.size()) {
-    auto chunk_avail = std::min(buffer_pool::CHUNK_BYTES - off_in_chunk,
-                                phys_size - chunk_idx * buffer_pool::CHUNK_BYTES - off_in_chunk);
+    auto chunk_avail = std::min(chunk_bytes - off_in_chunk,
+                                phys_size - chunk_idx * chunk_bytes - off_in_chunk);
     auto n           = std::min(remaining, chunk_avail);
     auto* p          = reinterpret_cast<uint8_t const*>(_entry->chunks[chunk_idx]) + off_in_chunk;
 
@@ -433,7 +430,7 @@ void prefetching_cache::insert(sirius_io_object& obj,
       ++ex_it;
     } else {
       auto physical = _io_ctx->compute_physical_range(logical, file_size);
-      auto e        = std::make_shared<cache_entry>(logical, physical);
+      auto e = std::make_shared<cache_entry>(logical, physical, _pool.chunk_bytes());
       e->n_total_request.fetch_add(1, std::memory_order_relaxed);
       e->n_request.store(1, std::memory_order_relaxed);
       e->request_ts.store(tick, std::memory_order_release);
@@ -871,13 +868,14 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     // filtered again in Phase 4 by try_start_loading.
     std::vector<size_t> per_entry_chunks(item.entries.size(), 0);
     size_t upper_bound_chunks = 0;
+    auto const chunk_bytes    = _pool.chunk_bytes();
     for (size_t i = 0; i < item.entries.size(); ++i) {
       auto const& e = item.entries[i];
       if (e->n_request.load(std::memory_order_acquire) <= 0) continue;
       auto st = e->state.get_state();
       if (st != entry_state::empty && st != entry_state::queued) continue;
       auto phys_size      = static_cast<size_t>(e->physical_range.size());
-      auto n              = (phys_size + buffer_pool::CHUNK_BYTES - 1) / buffer_pool::CHUNK_BYTES;
+      auto n              = (phys_size + chunk_bytes - 1) / chunk_bytes;
       per_entry_chunks[i] = n;
       upper_bound_chunks += n;
     }
@@ -970,11 +968,12 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     std::vector<cudf::io::text::byte_range_info> io_ranges;
     std::vector<cudf::host_span<std::byte>> io_dsts;
     for (auto const& e : batch) {
-      auto phys_off  = static_cast<size_t>(e->physical_range.offset());
-      auto phys_size = static_cast<size_t>(e->physical_range.size());
+      auto phys_off          = static_cast<size_t>(e->physical_range.offset());
+      auto phys_size         = static_cast<size_t>(e->physical_range.size());
+      auto const chunk_bytes = e->chunk_bytes;
       for (size_t i = 0; i < e->chunks.size(); ++i) {
-        auto off = phys_off + i * buffer_pool::CHUNK_BYTES;
-        auto sz  = std::min(buffer_pool::CHUNK_BYTES, phys_size - i * buffer_pool::CHUNK_BYTES);
+        auto off = phys_off + i * chunk_bytes;
+        auto sz  = std::min(chunk_bytes, phys_size - i * chunk_bytes);
         io_ranges.emplace_back(static_cast<int64_t>(off), static_cast<int64_t>(sz));
         io_dsts.emplace_back(e->chunks[i], sz);
       }

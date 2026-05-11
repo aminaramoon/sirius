@@ -46,7 +46,7 @@ namespace sirius::io {
 class sirius_ioctx;
 
 // ---------------------------------------------------------------------------
-// buffer_pool — growable pool of 1MB pinned chunks
+// buffer_pool — growable pool of pinned chunks
 // ---------------------------------------------------------------------------
 //
 // Backed by a @c cucascade::memory::fixed_size_host_memory_resource.  Each
@@ -55,15 +55,12 @@ class sirius_ioctx;
 // returned to the upstream resource until the pool is destroyed; allocate()
 // pops from the free list and deallocate() pushes back.
 //
-// The upstream resource's block size must equal CHUNK_BYTES — the cache
-// layout (chunk index arithmetic in pinned_view::slice etc.) assumes a
-// fixed 1 MiB chunk.
+// The chunk size is taken from @c mr.get_block_size() — all cache layout
+// arithmetic that needs the chunk size reads it from @c chunk_bytes().
 
 class buffer_pool {
  public:
-  static constexpr size_t CHUNK_BYTES       = 1UL << 20;  // 1MB
-  static constexpr uint32_t CHUNKS_PER_SLAB = 500;        // 500 chunks per slab
-  static constexpr size_t SLAB_BYTES        = static_cast<size_t>(CHUNKS_PER_SLAB) * CHUNK_BYTES;
+  static constexpr uint32_t CHUNKS_PER_SLAB = 500;  // 500 chunks per slab
 
   buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr, uint32_t max_slabs);
   ~buffer_pool();
@@ -71,8 +68,8 @@ class buffer_pool {
   buffer_pool(buffer_pool const&)            = delete;
   buffer_pool& operator=(buffer_pool const&) = delete;
 
-  /// Allocate a single 1MB chunk.  Returns nullptr when the pool is
-  /// exhausted and the upstream resource cannot supply a fresh slab.
+  /// Allocate a single chunk.  Returns nullptr when the pool is exhausted
+  /// and the upstream resource cannot supply a fresh slab.
   std::byte* allocate();
 
   /// Bulk-allocate up to @p n chunks, appending pointers to @p out.
@@ -85,12 +82,23 @@ class buffer_pool {
   /// Return a chunk to the pool.
   void deallocate(std::byte* p);
 
-  size_t capacity() const noexcept
+  [[nodiscard]] size_t chunk_bytes() const noexcept { return _chunk_bytes; }
+  [[nodiscard]] size_t slab_bytes() const noexcept
   {
-    return static_cast<size_t>(_total_chunks.load(std::memory_order_relaxed)) * CHUNK_BYTES;
+    return static_cast<size_t>(CHUNKS_PER_SLAB) * _chunk_bytes;
   }
-  uint32_t free_count() const noexcept { return _total_free.load(std::memory_order_relaxed); }
-  uint32_t total_chunks() const noexcept { return _total_chunks.load(std::memory_order_relaxed); }
+  [[nodiscard]] size_t capacity() const noexcept
+  {
+    return static_cast<size_t>(_total_chunks.load(std::memory_order_relaxed)) * _chunk_bytes;
+  }
+  [[nodiscard]] uint32_t free_count() const noexcept
+  {
+    return _total_free.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] uint32_t total_chunks() const noexcept
+  {
+    return _total_chunks.load(std::memory_order_relaxed);
+  }
 
  private:
   /// Pull one slab worth of blocks from the upstream resource and append
@@ -98,6 +106,7 @@ class buffer_pool {
   bool grow_locked();
 
   cucascade::memory::fixed_size_host_memory_resource& _mr;
+  size_t _chunk_bytes;
   uint32_t _max_slabs;
 
   // Protects _allocations and _free_list.
@@ -284,7 +293,13 @@ struct alignas(64) cache_entry {
   cudf::io::text::byte_range_info logical_range;
   cudf::io::text::byte_range_info physical_range;
 
-  /// Pointers to 1MB chunks from buffer_pool backing this range.
+  /// Size of each chunk in @c chunks (== buffer_pool::chunk_bytes() at the
+  /// time of entry creation).  Stored on the entry so pinned_view doesn't
+  /// need a pool reference to do chunk-index arithmetic.
+  size_t chunk_bytes{0};
+
+  /// Pointers to pinned chunks (each of size @c chunk_bytes) from buffer_pool
+  /// backing this range.
   std::vector<std::byte*> chunks;
 
   /// Packed state + pin_count.  All state transitions go through this.
@@ -315,8 +330,10 @@ struct alignas(64) cache_entry {
   /// by the evictor thread, so no synchronisation is required.
   bool in_lru{false};
 
-  cache_entry(cudf::io::text::byte_range_info logical, cudf::io::text::byte_range_info physical)
-    : logical_range(logical), physical_range(physical)
+  cache_entry(cudf::io::text::byte_range_info logical,
+              cudf::io::text::byte_range_info physical,
+              size_t chunk_bytes)
+    : logical_range(logical), physical_range(physical), chunk_bytes(chunk_bytes)
   {
   }
 
