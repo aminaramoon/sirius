@@ -47,8 +47,8 @@ sirius_scan_manager::sirius_scan_manager(scan_manager_config config)
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads))
 {
   if (_config.use_sirius_datasource) {
-    _io_ctx = std::make_shared<sirius::io::uring_ioctx>(_config.uring_ring_entries,
-                                                        _config.uring_n_reactors);
+    _io_ctx = std::make_shared<sirius::io::uring_ioctx>(_config.uring_n_reactors,
+                                                        _config.uring_ring_entries);
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
       _config.uring_n_reactors,

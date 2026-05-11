@@ -20,7 +20,7 @@
 
 namespace sirius::io {
 
-uring_ioctx::uring_ioctx(unsigned ring_entries, size_t n_reactors, size_t bounce_slot_size)
+uring_ioctx::uring_ioctx(size_t n_reactors, unsigned ring_entries, size_t bounce_slot_size)
   : templated_ioctx<uring_reactor>(n_reactors, [ring_entries, bounce_slot_size] {
       return std::make_unique<uring_reactor>(ring_entries, bounce_slot_size);
     })
