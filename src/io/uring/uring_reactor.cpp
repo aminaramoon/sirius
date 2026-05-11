@@ -277,8 +277,15 @@ void uring_reactor::worker_loop()
       io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
       if (!sqe) break;
       auto& req = pending.front();
-      io_uring_prep_read(
-        sqe, req.handle, _bounce[si].buf, (unsigned)req.io_size, (__u64)req.file_off);
+      // Bounce slots are pre-registered via io_uring_register_buffers, so
+      // submit through the fixed-buffer fast path — skips per-IO buffer
+      // pin/unmap overhead in the kernel.
+      io_uring_prep_read_fixed(sqe,
+                               req.handle,
+                               _bounce[si].buf,
+                               (unsigned)req.io_size,
+                               (unsigned long long)req.file_off,
+                               si);
       io_uring_sqe_set_data64(sqe, (uint64_t)si);
       slots[si].state      = slot_state::READING;
       slots[si].bytes_read = 0;  // fresh request → reset retry accumulator
@@ -378,11 +385,12 @@ void uring_reactor::worker_loop()
           // proceed to the H2D path below using sinfo.bytes_read.
           io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
           if (sqe) {
-            io_uring_prep_read(sqe,
-                               req.handle,
-                               (uint8_t*)_bounce[si].buf + sinfo.bytes_read,
-                               (unsigned)(req.io_size - sinfo.bytes_read),
-                               (__u64)(req.file_off + sinfo.bytes_read));
+            io_uring_prep_read_fixed(sqe,
+                                     req.handle,
+                                     (uint8_t*)_bounce[si].buf + sinfo.bytes_read,
+                                     (unsigned)(req.io_size - sinfo.bytes_read),
+                                     (__u64)(req.file_off + sinfo.bytes_read),
+                                     si);
             io_uring_sqe_set_data64(sqe, (uint64_t)si);
             ++inflight;
             need_resubmit = true;
