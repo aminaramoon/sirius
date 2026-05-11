@@ -1,4 +1,6 @@
+#include "io/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/types.hpp"
 #include "io/uring/uring_ioctx.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -18,6 +20,7 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <fcntl.h>
+#include <glob.h>
 #include <spdlog/common.h>
 #include <spdlog/spdlog.h>
 #include <unistd.h>
@@ -60,43 +63,84 @@ static bool drop_caches()
   return ok;
 }
 
+// Expand @p spec to a sorted list of file paths.  If it contains '*', POSIX
+// glob expansion is used; otherwise the spec is returned as a single path.
+static std::vector<std::string> expand_paths(std::string const& spec)
+{
+  if (spec.find('*') == std::string::npos) return {spec};
+
+  std::vector<std::string> paths;
+  glob_t g{};
+  int rc = ::glob(spec.c_str(), GLOB_TILDE, nullptr, &g);
+  if (rc == 0) {
+    paths.reserve(g.gl_pathc);
+    for (size_t i = 0; i < g.gl_pathc; ++i)
+      paths.emplace_back(g.gl_pathv[i]);
+  }
+  ::globfree(&g);
+  std::sort(paths.begin(), paths.end());
+  return paths;
+}
+
 static void usage(char const* prog)
 {
-  std::cerr << "usage: " << prog << " <cudf|uring> <num_rows>\n"
-            << "  cudf     – cudf default (mmap/pread)\n"
-            << "  uring    – O_DIRECT io_uring + DMA to GPU\n"
-            << "  num_rows – rows to read (0 = all)\n";
+  std::cerr << "usage: " << prog << " <path|glob> <cudf|uring> <num_rows> [n_reactors]\n"
+            << "  path|glob  – parquet file path, or shell glob (e.g. "
+               "'dir/*.parquet')\n"
+            << "  cudf       – cudf default (mmap/pread)\n"
+            << "  uring      – O_DIRECT io_uring + DMA to GPU\n"
+            << "  num_rows   – rows to read (0 = all)\n"
+            << "  n_reactors – uring reactor threads (default 2; uring only)\n";
 }
 
 int main(int argc, char** argv)
 {
-  if (argc != 3) {
+  if (argc != 4 && argc != 5) {
     usage(argv[0]);
     return 1;
   }
 
+  std::string path_spec = argv[1];
+
   DataSource source;
   try {
-    source = parse_source(argv[1]);
+    source = parse_source(argv[2]);
   } catch (std::invalid_argument const& e) {
     std::cerr << e.what() << "\n";
     usage(argv[0]);
     return 1;
   }
 
-  long long num_rows_arg = std::stoll(argv[2]);
+  long long num_rows_arg = std::stoll(argv[3]);
   if (num_rows_arg < 0) {
     std::cerr << "num_rows must be >= 0\n";
     return 1;
   }
   size_t num_rows = static_cast<size_t>(num_rows_arg);  // 0 means all
 
-  std::string path = "/home/aaramoon/Documents/tpch/sf100/parquet/lineitem_indexed.parquet";
+  size_t n_reactors = 2;
+  if (argc == 5) {
+    long long n_reactors_arg = std::stoll(argv[4]);
+    if (n_reactors_arg <= 0) {
+      std::cerr << "n_reactors must be > 0\n";
+      return 1;
+    }
+    n_reactors = static_cast<size_t>(n_reactors_arg);
+  }
+
+  auto paths = expand_paths(path_spec);
+  if (paths.empty()) {
+    std::cerr << "no files matched: " << path_spec << "\n";
+    return 1;
+  }
 
   spdlog::set_level(spdlog::level::info);  // show per-read trace
 
-  std::cout << "Source : " << argv[1] << "\n"
-            << "Rows   : " << (num_rows == 0 ? "all" : std::to_string(num_rows)) << "\n"
+  std::cout << "Source : " << argv[2] << "\n"
+            << "Files  : " << paths.size() << "\n";
+  for (auto const& p : paths)
+    std::cout << "  " << p << "\n";
+  std::cout << "Rows   : " << (num_rows == 0 ? "all" : std::to_string(num_rows)) << "\n"
             << "Columns: ";
   for (auto const& c : COLUMNS)
     std::cout << c << "  ";
@@ -139,47 +183,51 @@ int main(int argc, char** argv)
   };
   (void)log_table;
 
-  // Read Parquet footer metadata once using cudf's default datasource so that
-  // neither the cudf nor the uring timed path pays the cost of a metadata scan.
-  std::vector<uint8_t> footer_buf;
-  {
-    auto probe_sources = cudf::io::make_datasources(cudf::io::source_info{{path}});
-    auto& probe_ds     = *probe_sources.front();
-    auto file_size     = probe_ds.size();
-    cudf::io::parquet::file_ender_s ender{};
-    probe_ds.host_read(
-      file_size - sizeof(ender), sizeof(ender), reinterpret_cast<uint8_t*>(&ender));
-    footer_buf.resize(ender.footer_len);
-    probe_ds.host_read(
-      file_size - sizeof(ender) - ender.footer_len, ender.footer_len, footer_buf.data());
-  }
+  auto scan_opts = cudf::io::parquet_reader_options::builder().column_names(COLUMNS).build();
 
-  auto scan_opts = cudf::io::parquet_reader_options::builder().columns(COLUMNS).build();
-  cudf::io::parquet::experimental::hybrid_scan_reader scanner{
-    cudf::host_span<uint8_t const>{footer_buf.data(), footer_buf.size()}, scan_opts};
-  auto file_metadata = scanner.parquet_metadata();
+  // Per-file: probe the footer with cudf's default datasource (so timed paths
+  // don't pay metadata cost), then run hybrid_scan to collect the byte ranges
+  // we'd touch for the selected columns.  The num_rows budget is consumed
+  // in file order — we stop adding row groups once we've covered it.
+  std::vector<cudf::io::parquet::FileMetaData> metadatas;
+  metadatas.reserve(paths.size());
+  size_t total_range_bytes = 0;
+  size_t total_row_groups  = 0;
+  size_t total_ranges      = 0;
+  int64_t accumulated_rows = 0;
 
-  // Walk row groups in order until we cover the requested row count, then use
-  // hybrid_scan to ask which file byte ranges those row groups depend on for
-  // the selected columns.
-  std::vector<cudf::size_type> selected_row_groups;
-  if (num_rows == 0) {
-    selected_row_groups = scanner.all_row_groups(scan_opts);
-  } else {
-    int64_t accumulated = 0;
-    for (cudf::size_type i = 0; i < static_cast<cudf::size_type>(file_metadata.row_groups.size()) &&
-                                accumulated < static_cast<int64_t>(num_rows);
-         ++i) {
-      selected_row_groups.push_back(i);
-      accumulated += file_metadata.row_groups[i].num_rows;
+  for (auto const& path : paths) {
+    std::vector<uint8_t> footer_buf;
+    {
+      auto probe_sources = cudf::io::make_datasources(cudf::io::source_info{{path}});
+      auto& probe_ds     = *probe_sources.front();
+      auto file_size     = probe_ds.size();
+      cudf::io::parquet::file_ender_s ender{};
+      probe_ds.host_read(
+        file_size - sizeof(ender), sizeof(ender), reinterpret_cast<uint8_t*>(&ender));
+      footer_buf.resize(ender.footer_len);
+      probe_ds.host_read(
+        file_size - sizeof(ender) - ender.footer_len, ender.footer_len, footer_buf.data());
     }
-  }
-  auto byte_ranges = scanner.all_column_chunks_byte_ranges(selected_row_groups, scan_opts);
 
-  // Coalesce adjacent / overlapping ranges so the allowed-range filter sees a
-  // minimal, non-overlapping set.  Column chunks within a row group are stored
-  // contiguously per column, so neighboring ranges frequently touch.
-  {
+    cudf::io::parquet::experimental::hybrid_scan_reader scanner{
+      cudf::host_span<uint8_t const>{footer_buf.data(), footer_buf.size()}, scan_opts};
+    auto file_metadata = scanner.parquet_metadata();
+
+    std::vector<cudf::size_type> selected_row_groups;
+    if (num_rows == 0) {
+      selected_row_groups = scanner.all_row_groups(scan_opts);
+    } else if (accumulated_rows < static_cast<int64_t>(num_rows)) {
+      for (cudf::size_type i = 0;
+           i < static_cast<cudf::size_type>(file_metadata.row_groups.size()) &&
+           accumulated_rows < static_cast<int64_t>(num_rows);
+           ++i) {
+        selected_row_groups.push_back(i);
+        accumulated_rows += file_metadata.row_groups[i].num_rows;
+      }
+    }
+
+    auto byte_ranges = scanner.all_column_chunks_byte_ranges(selected_row_groups, scan_opts);
     std::sort(byte_ranges.begin(), byte_ranges.end(), [](auto const& a, auto const& b) {
       return a.offset() < b.offset();
     });
@@ -199,19 +247,22 @@ int main(int argc, char** argv)
       }
       coalesced.push_back(br);
     }
-    byte_ranges = std::move(coalesced);
+
+    for (auto const& br : coalesced)
+      total_range_bytes += static_cast<size_t>(br.size());
+    total_row_groups += selected_row_groups.size();
+    total_ranges += coalesced.size();
+
+    metadatas.push_back(std::move(file_metadata));
   }
 
-  size_t total_range_bytes = 0;
-  for (auto const& br : byte_ranges)
-    total_range_bytes += static_cast<size_t>(br.size());
-  std::cout << "Hybrid scan: " << selected_row_groups.size() << " row group(s), "
-            << byte_ranges.size() << " byte range(s), " << std::fixed << std::setprecision(2)
+  std::cout << "Hybrid scan: " << total_row_groups << " row group(s), " << total_ranges
+            << " byte range(s), " << std::fixed << std::setprecision(2)
             << static_cast<double>(total_range_bytes) / (1024.0 * 1024.0) << " MiB total\n\n";
 
   // Build read options (no source — provided separately as a datasource
   // vector).
-  auto read_opts_builder = cudf::io::parquet_reader_options::builder().columns(COLUMNS);
+  auto read_opts_builder = cudf::io::parquet_reader_options::builder().column_names(COLUMNS);
   if (num_rows > 0) read_opts_builder.num_rows(num_rows);
   auto read_opts = read_opts_builder.build();
 
@@ -223,37 +274,51 @@ int main(int argc, char** argv)
   // Timed run.
   double ms = 0;
   if (source == DataSource::cudf) {
-    auto sources = cudf::io::make_datasources(cudf::io::source_info{{path}});
+    std::vector<std::string> path_list = paths;
+    auto sources = cudf::io::make_datasources(cudf::io::source_info{path_list});
     ms           = time_ms([&] {
       auto tbl =
-        cudf::io::read_parquet(std::move(sources), {file_metadata}, read_opts, stream.view());
+        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream.view());
     });
   } else {
+    // Size the buffer pool to fit the working set, plus headroom.
+    constexpr uint32_t POOL_MAX_SLABS       = 20;
+    constexpr size_t INFLIGHT_BUDGET_CHUNKS = 2048;
+    constexpr size_t POOL_CAPACITY          = static_cast<size_t>(POOL_MAX_SLABS) *
+                                     static_cast<size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB) *
+                                     sirius::io::CHUNK_SIZE;
+
     cucascade::memory::numa_region_pinned_host_memory_resource upstream(0, /*make_portable=*/true);
     cucascade::memory::fixed_size_host_memory_resource host_mr(
-      0,                         // device_id
-      upstream,                  // upstream allocator
-      4ULL * 1024 * 1024 * 1024, /*mem_limit*/
-      4ULL * 1024 * 1024 * 1024, /*capacity*/
-      1UL << 20,                 // block_size = 1MB
-      512,                       // pool_size
-      1);                        // initial_pools
+      0,                                                              // device_id
+      upstream,                                                       // upstream allocator
+      POOL_CAPACITY,                                                  // mem_limit
+      POOL_CAPACITY,                                                  // capacity
+      sirius::io::CHUNK_SIZE,                                         // block_size = 1 MiB
+      static_cast<size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB),  // pool_size
+      1);                                                             // initial_pools
 
-    auto io_ctx = std::make_shared<sirius::io::uring_ioctx>(4, 64, host_mr);
-    auto io_obj = io_ctx->create_io_object(path);
-    auto ds     = std::make_unique<sirius::io::sirius_datasource>(io_ctx, io_obj);
-    // io_ctx->cache()->insert(*io_obj, /*metadata=*/nullptr, {});
-    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    sirius::io::buffer_pool pool(host_mr, POOL_MAX_SLABS);
+
+    auto io_ctx =
+      std::make_shared<sirius::io::uring_ioctx>(n_reactors, 2 * sirius::io::NUM_CHUNKS, host_mr);
+    // io_ctx->initialize_cache(pool, INFLIGHT_BUDGET_CHUNKS);
 
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
-    sources.push_back(std::move(ds));
+    sources.reserve(paths.size());
+    for (auto const& path : paths) {
+      auto io_obj = io_ctx->create_io_object(path);
+      sources.push_back(std::make_unique<sirius::io::sirius_datasource>(io_ctx, io_obj));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
 
     ms = time_ms([&] {
       auto tbl =
-        cudf::io::read_parquet(std::move(sources), {file_metadata}, read_opts, stream.view());
+        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream.view());
     });
 
-    // std::cout << "cache summary : " << io_ctx->cache()->summary() << std::endl;
+    // std::cout << "cache summary : " << io_ctx->cache()->summary() <<
+    // std::endl;
   }
 
   std::cout << std::fixed << std::setprecision(1) << ms << " ms\n";
