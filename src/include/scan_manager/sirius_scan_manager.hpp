@@ -26,6 +26,10 @@
 
 #include <cucascade/memory/memory_space.hpp>
 
+namespace cucascade::memory {
+class fixed_size_host_memory_resource;
+}  // namespace cucascade::memory
+
 #include <memory>
 #include <string>
 #include <thread>
@@ -56,7 +60,7 @@ namespace sirius::scan_manager {
  * every read site (e.g. when the sirius IO path is misbehaving).
  */
 struct scan_manager_config {
-  exec::thread_pool_config thread_pool{.num_threads = 2, .thread_name_prefix = "scan_manager"};
+  exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
   bool use_sirius_datasource{true};
   /// Number of @c uring_reactor instances in the ioctx pool.  Ignored when
   /// @c use_sirius_datasource is false.
@@ -113,8 +117,12 @@ class sirius_scan_manager {
    * @brief Construct a new source manager.
    *
    * @param config Scan-manager configuration (thread pool + sirius_datasource toggle).
+   * @param host_mr Host memory resource backing the prefetch buffer_pool.  Required
+   *        when @c config.enable_prefetch_cache is true; ignored otherwise.
    */
-  explicit sirius_scan_manager(scan_manager_config config);
+  explicit sirius_scan_manager(
+    scan_manager_config config,
+    cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr);
 
   ~sirius_scan_manager();
 

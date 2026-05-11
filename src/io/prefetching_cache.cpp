@@ -33,146 +33,93 @@ namespace sirius::io {
 // buffer_pool
 // ===========================================================================
 
-buffer_pool::buffer_pool(uint32_t max_slabs) : _max_slabs(max_slabs)
+buffer_pool::buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr,
+                         uint32_t max_slabs)
+  : _mr(mr), _max_slabs(max_slabs)
 {
-  for (uint32_t i = 0; i < std::min<uint32_t>(10, _max_slabs); ++i)
-    grow();
+  std::unique_lock lk(_mtx);
+  for (uint32_t i = 0; i < std::min<uint32_t>(10, _max_slabs); ++i) {
+    if (!grow_locked()) break;
+  }
 }
 
-buffer_pool::~buffer_pool()
-{
-  for (auto& s : _slabs)
-    cudaFreeHost(s->base);
-}
+buffer_pool::~buffer_pool() = default;
 
-bool buffer_pool::grow()
+bool buffer_pool::grow_locked()
 {
-  std::unique_lock lk(_grow_mtx);
-  if (_slabs.size() >= _max_slabs) return false;
+  if (_allocations.size() >= _max_slabs) return false;
 
-  void* raw = nullptr;
-  // Portable so multi-GPU ioctx users can H2D-copy from these slabs on any
-  // device's stream.
-  auto err = cudaHostAlloc(&raw, SLAB_BYTES, cudaHostAllocPortable);
-  if (err != cudaSuccess) {
-    spdlog::warn("buffer_pool: cudaHostAlloc({:.0f}MB) failed: {}",
+  cucascade::memory::fixed_multiple_blocks_allocation alloc;
+  try {
+    alloc = _mr.allocate_multiple_blocks(SLAB_BYTES);
+  } catch (std::exception const& e) {
+    spdlog::warn("buffer_pool: allocate_multiple_blocks({:.0f}MB) failed: {}",
                  static_cast<double>(SLAB_BYTES) / (1024.0 * 1024.0),
-                 cudaGetErrorString(err));
+                 e.what());
     return false;
   }
+  if (!alloc) return false;
 
-  auto s  = std::make_unique<slab>();
-  s->base = static_cast<std::byte*>(raw);
-  s->free_count.store(CHUNKS_PER_SLAB, std::memory_order_relaxed);
-  for (uint32_t i = 0; i < CHUNKS_PER_SLAB; ++i)
-    s->free_chunks.enqueue(s->base + static_cast<size_t>(i) * CHUNK_BYTES);
+  auto blocks = alloc->get_blocks();
+  _free_list.reserve(_free_list.size() + blocks.size());
+  for (auto* p : blocks)
+    _free_list.push_back(p);
+  auto const n = static_cast<uint32_t>(blocks.size());
+  _allocations.push_back(std::move(alloc));
+  _total_chunks.fetch_add(n, std::memory_order_relaxed);
+  _total_free.fetch_add(n, std::memory_order_relaxed);
 
-  _slab_map[s->base] = s.get();
-  _slabs.push_back(std::move(s));
-  _total_chunks.fetch_add(CHUNKS_PER_SLAB, std::memory_order_relaxed);
-  _total_free.fetch_add(CHUNKS_PER_SLAB, std::memory_order_relaxed);
-
-  spdlog::debug("buffer_pool: allocated slab {} ({:.0f}MB)",
-                _slabs.size(),
+  spdlog::debug("buffer_pool: allocated slab {} ({} chunks, {:.0f}MB)",
+                _allocations.size(),
+                n,
                 static_cast<double>(SLAB_BYTES) / (1024.0 * 1024.0));
   return true;
 }
 
-buffer_pool::slab* buffer_pool::find_slab(std::byte* p)
-{
-  std::shared_lock lk(_grow_mtx);
-  auto it = _slab_map.upper_bound(p);
-  if (it == _slab_map.begin()) return nullptr;
-  --it;
-  if (p >= it->first && p < it->first + SLAB_BYTES) return it->second;
-  return nullptr;
-}
-
 std::byte* buffer_pool::allocate()
 {
-  // Try existing slabs, most recent first (likely to have free chunks).
-  {
-    std::shared_lock lk(_grow_mtx);
-    for (auto it = _slabs.rbegin(); it != _slabs.rend(); ++it) {
-      std::byte* p;
-      if ((*it)->free_chunks.try_dequeue(p)) {
-        (*it)->free_count.fetch_sub(1, std::memory_order_relaxed);
-        _total_free.fetch_sub(1, std::memory_order_relaxed);
-        return p;
-      }
-    }
-  }
-
-  // All slabs exhausted — try to grow.
-  if (!grow()) return nullptr;
-
-  std::shared_lock lk(_grow_mtx);
-  std::byte* p;
-  if (_slabs.back()->free_chunks.try_dequeue(p)) {
-    _slabs.back()->free_count.fetch_sub(1, std::memory_order_relaxed);
-    _total_free.fetch_sub(1, std::memory_order_relaxed);
-    return p;
-  }
-  return nullptr;
+  std::unique_lock lk(_mtx);
+  if (_free_list.empty() && !grow_locked()) return nullptr;
+  std::byte* p = _free_list.back();
+  _free_list.pop_back();
+  _total_free.fetch_sub(1, std::memory_order_relaxed);
+  return p;
 }
 
 size_t buffer_pool::allocate_bulk(size_t n, std::vector<std::byte*>& out)
 {
   if (n == 0) return 0;
 
-  // Scratch buffer for try_dequeue_bulk (stack-allocated for small n,
-  // heap for large).
-  constexpr size_t STACK_MAX = 64;
-  std::byte* stack_buf[STACK_MAX];
-  std::unique_ptr<std::byte*[]> heap_buf;
-  std::byte** buf = stack_buf;
-  if (n > STACK_MAX) {
-    heap_buf = std::make_unique<std::byte*[]>(n);
-    buf      = heap_buf.get();
-  }
-
-  size_t remaining = n;
-  size_t total_got = 0;
-
-  auto drain_slabs = [&]() {
-    std::shared_lock lk(_grow_mtx);
-    for (auto it = _slabs.rbegin(); it != _slabs.rend() && remaining > 0; ++it) {
-      auto got = (*it)->free_chunks.try_dequeue_bulk(buf + total_got, remaining);
-      if (got > 0) {
-        (*it)->free_count.fetch_sub(static_cast<uint32_t>(got), std::memory_order_relaxed);
-        _total_free.fetch_sub(static_cast<uint32_t>(got), std::memory_order_relaxed);
-        total_got += got;
-        remaining -= got;
-      }
+  std::unique_lock lk(_mtx);
+  size_t got = 0;
+  while (got < n) {
+    auto take = std::min(n - got, _free_list.size());
+    if (take > 0) {
+      out.insert(out.end(), _free_list.end() - static_cast<ptrdiff_t>(take), _free_list.end());
+      _free_list.resize(_free_list.size() - take);
+      got += take;
     }
-  };
-
-  drain_slabs();
-
-  // If we still need more, grow and drain the new slab.
-  while (remaining > 0) {
-    if (!grow()) break;
-    drain_slabs();
+    if (got == n) break;
+    if (!grow_locked()) break;
   }
-
-  out.insert(out.end(), buf, buf + total_got);
-  return total_got;
+  _total_free.fetch_sub(static_cast<uint32_t>(got), std::memory_order_relaxed);
+  return got;
 }
 
 void buffer_pool::deallocate_bulk(std::vector<std::byte*>& out)
 {
-  for (auto* p : out) {
-    deallocate(p);
-  }
+  if (out.empty()) return;
+  std::unique_lock lk(_mtx);
+  _free_list.insert(_free_list.end(), out.begin(), out.end());
+  _total_free.fetch_add(static_cast<uint32_t>(out.size()), std::memory_order_relaxed);
+  lk.unlock();
   out.clear();
 }
 
 void buffer_pool::deallocate(std::byte* p)
 {
-  auto* s = find_slab(p);
-  assert(s && "buffer_pool::deallocate: pointer does not belong to any slab");
-  s->free_chunks.enqueue(p);
-  s->free_count.fetch_add(1, std::memory_order_relaxed);
+  std::unique_lock lk(_mtx);
+  _free_list.push_back(p);
   _total_free.fetch_add(1, std::memory_order_relaxed);
 }
 

@@ -200,28 +200,34 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
 
-  // Configure cuDF to use our pinned slab allocator for small internal host buffers
-  // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
-  // the pageable H2D transfers that cuDF issues by default.
+  // Resolve the host-tier fixed_size_host_memory_resource once — used both for
+  // configuring cuDF's pinned allocator and for backing the scan_manager's
+  // prefetch buffer_pool further down.
+  cucascade::memory::fixed_size_host_memory_resource* host_fsmr = nullptr;
   {
     auto host_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!host_spaces.empty()) {
-      auto* fsmr = host_spaces[0]
-                     ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
-      if (fsmr != nullptr) {
-        small_pinned_allocator_ =
-          std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*fsmr);
-        small_pinned_allocator_view_.emplace(
-          sirius::memory::make_host_device_resource_view_checked(small_pinned_allocator_.get()));
-        prev_pinned_threshold_ = cudf::get_allocate_host_as_pinned_threshold();
-        prev_pinned_mr_        = cudf::set_pinned_memory_resource(
-          rmm::host_device_async_resource_ref{*small_pinned_allocator_view_});
-        cudf::set_allocate_host_as_pinned_threshold(
-          cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
-        spdlog::info("SiriusContext: cuDF pinned memory resource configured (max slab {} B)",
-                     cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
-      }
+      // TODO(amin): what do we want to do fo r multi-socket machines with separate NUMA nodes?
+      host_fsmr = host_spaces[0]
+                    ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
     }
+  }
+
+  // Configure cuDF to use our pinned slab allocator for small internal host buffers
+  // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
+  // the pageable H2D transfers that cuDF issues by default.
+  if (host_fsmr != nullptr) {
+    small_pinned_allocator_ =
+      std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*host_fsmr);
+    small_pinned_allocator_view_.emplace(
+      sirius::memory::make_host_device_resource_view_checked(small_pinned_allocator_.get()));
+    prev_pinned_threshold_ = cudf::get_allocate_host_as_pinned_threshold();
+    prev_pinned_mr_        = cudf::set_pinned_memory_resource(
+      rmm::host_device_async_resource_ref{*small_pinned_allocator_view_});
+    cudf::set_allocate_host_as_pinned_threshold(
+      cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
+    spdlog::info("SiriusContext: cuDF pinned memory resource configured (max slab {} B)",
+                 cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
   }
 
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
@@ -259,8 +265,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
-  scan_manager_ =
-    std::make_unique<sirius::scan_manager::sirius_scan_manager>(config_.get_scan_manager_config());
+  scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
+    config_.get_scan_manager_config(), host_fsmr);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.

@@ -1,4 +1,3 @@
-#include "io/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/uring/uring_ioctx.hpp"
 
@@ -228,13 +227,7 @@ int main(int argc, char** argv)
         cudf::io::read_parquet(std::move(sources), {file_metadata}, read_opts, stream.view());
     });
   } else {
-    // Size the buffer pool to fit the working set, plus headroom.
-    constexpr uint32_t POOL_MAX_SLABS       = 20;
-    constexpr size_t INFLIGHT_BUDGET_CHUNKS = 2048;
-    sirius::io::buffer_pool pool(POOL_MAX_SLABS);
-
     auto io_ctx = std::make_shared<sirius::io::uring_ioctx>();
-    // io_ctx->initialize_cache(pool, INFLIGHT_BUDGET_CHUNKS);
     auto io_obj = io_ctx->create_io_object(path);
     auto ds     = std::make_unique<sirius::io::sirius_datasource>(io_ctx, io_obj);
     // io_ctx->cache()->insert(*io_obj, /*metadata=*/nullptr, {});

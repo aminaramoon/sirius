@@ -32,13 +32,17 @@
 #include "scan_manager/split_connector.hpp"
 #include "scan_manager/split_provider.hpp"
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+
 #include <algorithm>
 #include <exception>
+#include <stdexcept>
 #include <utility>
 
 namespace sirius::scan_manager {
 
-sirius_scan_manager::sirius_scan_manager(scan_manager_config config)
+sirius_scan_manager::sirius_scan_manager(
+  scan_manager_config config, cucascade::memory::fixed_size_host_memory_resource* host_mr)
   : _config(std::move(config)),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
@@ -55,12 +59,17 @@ sirius_scan_manager::sirius_scan_manager(scan_manager_config config)
       _config.uring_ring_entries);
 
     if (_config.enable_prefetch_cache) {
+      if (host_mr == nullptr) {
+        throw std::runtime_error(
+          "[sirius_scan_manager] enable_prefetch_cache is true but no host "
+          "fixed_size_host_memory_resource was provided");
+      }
       // buffer_pool sizes by slabs (500 chunks * 1 MiB = 500 MiB each); round
       // the byte budget up so the user gets at least what they asked for.
       auto const slab_bytes = sirius::io::buffer_pool::SLAB_BYTES;
       auto const max_slabs =
         static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-      _buffer_pool = std::make_unique<sirius::io::buffer_pool>(max_slabs);
+      _buffer_pool = std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs);
       _io_ctx->initialize_cache(*_buffer_pool, _config.prefetch_inflight_budget_chunks);
       SIRIUS_LOG_DEBUG(
         "[sirius_scan_manager] prefetch cache enabled (slabs={} budget_bytes={} "
