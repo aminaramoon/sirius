@@ -16,12 +16,13 @@
 
 #include "io/io_context.hpp"
 
-#include "cuda/event.hpp"
 #include "io/prefetching_cache.hpp"
 
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
+
+#include <cucascade/cuda/event.hpp>
 
 #include <exception>
 #include <memory>
@@ -204,14 +205,16 @@ std::future<size_t> sirius_ioctx::device_read_async(
       try {
         auto copied = copy_pinned_slices_to_device(slices, dst, stream);
 
-        cuda::cuda_event event(cudaEventDisableTiming);
+        cucascade::cuda::cuda_event event(cudaEventDisableTiming);
         event.record(stream);
         return std::async(std::launch::deferred, [copied, e = std::move(event), stream]() mutable {
           e.synchronize();
           return copied;
         });
       } catch (...) {
-        return std::async(std::launch::deferred, []() -> size_t { throw; });
+        return std::async(std::launch::deferred, [e = std::current_exception()]() -> size_t {
+          std::rethrow_exception(e);
+        });
       }
     }
   }
