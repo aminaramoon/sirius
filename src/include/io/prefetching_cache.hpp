@@ -21,11 +21,10 @@
 
 #include <cudf/io/datasource.hpp>
 
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-
 #include <cuda_runtime.h>
 
 #include <concurrentqueue.h>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <array>
 #include <atomic>

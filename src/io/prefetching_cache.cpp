@@ -33,8 +33,7 @@ namespace sirius::io {
 // buffer_pool
 // ===========================================================================
 
-buffer_pool::buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr,
-                         uint32_t max_slabs)
+buffer_pool::buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr, uint32_t max_slabs)
   : _mr(mr), _chunk_bytes(mr.get_block_size()), _max_slabs(max_slabs)
 {
   std::unique_lock lk(_mtx);
@@ -254,10 +253,10 @@ std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t o
   size_t off_in_chunk    = phys_start % chunk_bytes;
 
   while (remaining > 0 && chunk_idx < _entry->chunks.size()) {
-    auto chunk_avail = std::min(chunk_bytes - off_in_chunk,
-                                phys_size - chunk_idx * chunk_bytes - off_in_chunk);
-    auto n           = std::min(remaining, chunk_avail);
-    auto* p          = reinterpret_cast<uint8_t const*>(_entry->chunks[chunk_idx]) + off_in_chunk;
+    auto chunk_avail =
+      std::min(chunk_bytes - off_in_chunk, phys_size - chunk_idx * chunk_bytes - off_in_chunk);
+    auto n  = std::min(remaining, chunk_avail);
+    auto* p = reinterpret_cast<uint8_t const*>(_entry->chunks[chunk_idx]) + off_in_chunk;
 
     // Coalesce with the previous slice if this chunk is contiguous with the
     // tail of the previous slice in the pinned host address space.  Adjacent
@@ -430,7 +429,7 @@ void prefetching_cache::insert(sirius_io_object& obj,
       ++ex_it;
     } else {
       auto physical = _io_ctx->compute_physical_range(logical, file_size);
-      auto e = std::make_shared<cache_entry>(logical, physical, _pool.chunk_bytes());
+      auto e        = std::make_shared<cache_entry>(logical, physical, _pool.chunk_bytes());
       e->n_total_request.fetch_add(1, std::memory_order_relaxed);
       e->n_request.store(1, std::memory_order_relaxed);
       e->request_ts.store(tick, std::memory_order_release);

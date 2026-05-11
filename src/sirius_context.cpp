@@ -207,7 +207,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   {
     auto host_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!host_spaces.empty()) {
-      // TODO(amin): what do we want to do fo r multi-socket machines with separate NUMA nodes?
+      // TODO(amin): what do we want to do for multi-socket machines with separate NUMA nodes?
       host_fsmr = host_spaces[0]
                     ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
     }
