@@ -64,16 +64,20 @@ size_t uring_reactor::size(int fd)
   return static_cast<size_t>(st.st_size);
 }
 
-uring_reactor::uring_reactor(unsigned ring_entries, size_t bounce_slot_size)
-  : _ring_entries(ring_entries), _bounce_slot_size(bounce_slot_size)
+uring_reactor::uring_reactor(cucascade::memory::fixed_size_host_memory_resource& mr,
+                             unsigned ring_entries)
+  : _bounce_slot_size(mr.get_block_size()), _ring_entries(ring_entries)
 {
+  _bounce_storage = mr.allocate_multiple_blocks(NUM_CHUNKS * _bounce_slot_size);
+  auto blocks     = _bounce_storage->get_blocks();
+  if (blocks.size() < NUM_CHUNKS) {
+    throw std::runtime_error(
+      "uring_reactor: fixed_size_host_memory_resource returned fewer blocks (" +
+      std::to_string(blocks.size()) + ") than required (" + std::to_string(NUM_CHUNKS) + ")");
+  }
   for (int i = 0; i < static_cast<int>(NUM_CHUNKS); ++i) {
-    void* raw = nullptr;
-    // Portable flag so these buffers are reachable from CUDA contexts
-    // other than the one current at ioctx construction (multi-GPU usage).
-    CUDA_CHECK(cudaHostAlloc(&raw, _bounce_slot_size, cudaHostAllocPortable | cudaHostAllocMapped));
-    _bounce[i].buf.reset(raw);
-    _cb_args[i] = {this, i};
+    _bounce[i].buf = blocks[i];
+    _cb_args[i]    = {this, i};
   }
 
   _worker = std::thread([this] { worker_loop(); });
@@ -196,7 +200,7 @@ void uring_reactor::worker_loop()
 
   std::array<iovec, NUM_CHUNKS> iovecs{};
   for (size_t i = 0; i < NUM_CHUNKS; ++i)
-    iovecs[i] = {_bounce[i].buf.get(), _bounce_slot_size};
+    iovecs[i] = {_bounce[i].buf, _bounce_slot_size};
   if (int rc = io_uring_register_buffers(ring.get(), iovecs.data(), NUM_CHUNKS); rc < 0)
     throw std::runtime_error("uring_device_reactor: io_uring_register_buffers: " +
                              std::string(strerror(-rc)));
@@ -274,7 +278,7 @@ void uring_reactor::worker_loop()
       if (!sqe) break;
       auto& req = pending.front();
       io_uring_prep_read(
-        sqe, req.handle, _bounce[si].buf.get(), (unsigned)req.io_size, (__u64)req.file_off);
+        sqe, req.handle, _bounce[si].buf, (unsigned)req.io_size, (__u64)req.file_off);
       io_uring_sqe_set_data64(sqe, (uint64_t)si);
       slots[si].state      = slot_state::READING;
       slots[si].bytes_read = 0;  // fresh request → reset retry accumulator
@@ -376,7 +380,7 @@ void uring_reactor::worker_loop()
           if (sqe) {
             io_uring_prep_read(sqe,
                                req.handle,
-                               (uint8_t*)_bounce[si].buf.get() + sinfo.bytes_read,
+                               (uint8_t*)_bounce[si].buf + sinfo.bytes_read,
                                (unsigned)(req.io_size - sinfo.bytes_read),
                                (__u64)(req.file_off + sinfo.bytes_read));
             io_uring_sqe_set_data64(sqe, (uint64_t)si);
@@ -403,7 +407,7 @@ void uring_reactor::worker_loop()
           _bounce[si].cuda_done.store(false, std::memory_order_relaxed);
           if (req.device_id >= 0) cudaSetDevice(req.device_id);
           cudaMemcpyAsync(req.dst,
-                          (uint8_t*)_bounce[si].buf.get() + req.data_off,
+                          (uint8_t*)_bounce[si].buf + req.data_off,
                           actual,
                           cudaMemcpyHostToDevice,
                           req.stream);

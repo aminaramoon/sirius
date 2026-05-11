@@ -54,6 +54,10 @@ class sirius_ioctx;
 // appends the raw pointers to an internal free list.  Blocks are never
 // returned to the upstream resource until the pool is destroyed; allocate()
 // pops from the free list and deallocate() pushes back.
+//
+// The upstream resource's block size must equal CHUNK_BYTES — the cache
+// layout (chunk index arithmetic in pinned_view::slice etc.) assumes a
+// fixed 1 MiB chunk.
 
 class buffer_pool {
  public:

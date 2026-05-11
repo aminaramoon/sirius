@@ -1,6 +1,9 @@
 #include "io/sirius_datasource.hpp"
 #include "io/uring/uring_ioctx.hpp"
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
@@ -227,7 +230,17 @@ int main(int argc, char** argv)
         cudf::io::read_parquet(std::move(sources), {file_metadata}, read_opts, stream.view());
     });
   } else {
-    auto io_ctx = std::make_shared<sirius::io::uring_ioctx>();
+    cucascade::memory::numa_region_pinned_host_memory_resource upstream(0, /*make_portable=*/true);
+    cucascade::memory::fixed_size_host_memory_resource host_mr(
+      0,                       // device_id
+      upstream,                // upstream allocator
+      4ULL * 1024 * 1024 * 1024, /*mem_limit*/
+      4ULL * 1024 * 1024 * 1024, /*capacity*/
+      1UL << 20,               // block_size = 1MB
+      512,                     // pool_size
+      1);                      // initial_pools
+
+    auto io_ctx = std::make_shared<sirius::io::uring_ioctx>(4, 64, host_mr);
     auto io_obj = io_ctx->create_io_object(path);
     auto ds     = std::make_unique<sirius::io::sirius_datasource>(io_ctx, io_obj);
     // io_ctx->cache()->insert(*io_obj, /*metadata=*/nullptr, {});

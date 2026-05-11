@@ -37,6 +37,12 @@ buffer_pool::buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr,
                          uint32_t max_slabs)
   : _mr(mr), _max_slabs(max_slabs)
 {
+  if (mr.get_block_size() != CHUNK_BYTES) {
+    throw std::runtime_error(
+      "buffer_pool: upstream fixed_size_host_memory_resource block_size (" +
+      std::to_string(mr.get_block_size()) + ") does not match required CHUNK_BYTES (" +
+      std::to_string(CHUNK_BYTES) + ")");
+  }
   std::unique_lock lk(_mtx);
   for (uint32_t i = 0; i < std::min<uint32_t>(10, _max_slabs); ++i) {
     if (!grow_locked()) break;

@@ -18,6 +18,8 @@
 
 #include "io/types.hpp"
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+
 #include <cuda_runtime.h>
 
 #include <concurrentqueue.h>
@@ -87,22 +89,17 @@ struct ring_deleter {
 };
 using unique_ring = std::unique_ptr<io_uring, ring_deleter>;
 
-/**
- * @brief Custom deleter for CUDA pinned (host) memory allocated with
- *        @c cudaHostAlloc.
- */
-struct pinned_deleter {
-  void operator()(void* p) const noexcept { cudaFreeHost(p); }
-};
-using unique_pinned_buf = std::unique_ptr<void, pinned_deleter>;
-
 // ---- bounce_slot -----------------------------------------------------------
 
 /**
  * @brief One pinned-memory staging buffer with a completion flag.
+ *
+ * The buffer is a non-owning pointer into a block owned by the reactor's
+ * @c fixed_size_host_memory_resource allocation — the resource frees the
+ * memory when the reactor is destroyed.
  */
 struct bounce_slot {
-  unique_pinned_buf buf;
+  void* buf{nullptr};
   std::atomic<bool> cuda_done{false};
 };
 
@@ -164,7 +161,11 @@ class uring_reactor {
   using device_read_req_type = device_read_req<native_handle_type>;
   using host_read_req_type   = host_read_req<native_handle_type>;
 
-  explicit uring_reactor(unsigned ring_entries = 64, size_t bounce_slot_size = CHUNK_SIZE);
+  /// Bounce slots are allocated from @p mr; their size is taken from
+  /// @c mr.get_block_size().  The reactor keeps the @c multiple_blocks_allocation
+  /// alive for its lifetime — blocks return to the resource on destruction.
+  explicit uring_reactor(cucascade::memory::fixed_size_host_memory_resource& mr,
+                         unsigned ring_entries = 64);
 
   ~uring_reactor();
 
@@ -218,6 +219,10 @@ class uring_reactor {
   };
   static void cuda_copy_cb(void* p) noexcept;
 
+  // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
+  // multiple_blocks_allocation destructor returns the blocks to the upstream
+  // resource when the reactor is destroyed.
+  cucascade::memory::fixed_multiple_blocks_allocation _bounce_storage;
   std::size_t _bounce_slot_size;
   std::array<bounce_slot, NUM_CHUNKS> _bounce;
   std::array<cb_arg, NUM_CHUNKS> _cb_args;

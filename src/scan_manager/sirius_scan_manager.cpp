@@ -51,19 +51,19 @@ sirius_scan_manager::sirius_scan_manager(
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads))
 {
   if (_config.use_sirius_datasource) {
-    _io_ctx = std::make_shared<sirius::io::uring_ioctx>(_config.uring_n_reactors,
-                                                        _config.uring_ring_entries);
+    if (host_mr == nullptr) {
+      throw std::runtime_error(
+        "[sirius_scan_manager] use_sirius_datasource is true but no host "
+        "fixed_size_host_memory_resource was provided");
+    }
+    _io_ctx = std::make_shared<sirius::io::uring_ioctx>(
+      _config.uring_n_reactors, _config.uring_ring_entries, *host_mr);
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
       _config.uring_n_reactors,
       _config.uring_ring_entries);
 
     if (_config.enable_prefetch_cache) {
-      if (host_mr == nullptr) {
-        throw std::runtime_error(
-          "[sirius_scan_manager] enable_prefetch_cache is true but no host "
-          "fixed_size_host_memory_resource was provided");
-      }
       // buffer_pool sizes by slabs (500 chunks * 1 MiB = 500 MiB each); round
       // the byte budget up so the user gets at least what they asked for.
       auto const slab_bytes = sirius::io::buffer_pool::SLAB_BYTES;

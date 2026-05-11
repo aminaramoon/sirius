@@ -31,9 +31,12 @@ namespace sirius::io {
  */
 class uring_ioctx : public templated_ioctx<uring_reactor> {
  public:
-  explicit uring_ioctx(size_t n_reactors       = 4,
-                       unsigned ring_entries   = 64,
-                       size_t bounce_slot_size = 1UL * 1024 * 1024);
+  /// Each @c uring_reactor in the pool allocates its bounce slots from
+  /// @p mr; @p mr must outlive this ioctx.  The bounce-slot size is taken
+  /// from @c mr.get_block_size().
+  uring_ioctx(size_t n_reactors,
+              unsigned ring_entries,
+              cucascade::memory::fixed_size_host_memory_resource& mr);
 };
 
 }  // namespace sirius::io
