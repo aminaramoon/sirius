@@ -515,7 +515,15 @@ void uring_reactor::worker_loop()
 
     if (inflight > 0) {
       io_uring_cqe* tmp = nullptr;
-      io_uring_wait_cqe(ring.get(), &tmp);
+      int rc            = io_uring_wait_cqe(ring.get(), &tmp);
+      if (rc < 0 && rc != -EINTR) {
+        // Ring is in an unknown state — bail out rather than spin
+        // silently.  Pending reqs' ctx->pending stays non-zero (handlers
+        // won't fire), which is a worse failure mode for those readers,
+        // but at least the cause surfaces in logs.
+        spdlog::error("uring_reactor: io_uring_wait_cqe failed: {}", strerror(-rc));
+        break;
+      }
       reap_cqes();
     }
 
