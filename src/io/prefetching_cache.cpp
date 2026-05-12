@@ -496,7 +496,14 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
     }
     if (st == entry_state::loading) {
       waited_on_loading = true;
+      // Release file_lk across the wait: the entry is pinned by our local
+      // shared_ptr, and file.mtx no longer protects anything we touch while
+      // parked.  Holding it shared would stall every concurrent insert() on
+      // this file (and, under writer-preference shared_mutex, every reader
+      // queued behind that insert).
+      file_lk.unlock();
       entry->state.wait_while_loading();
+      file_lk.lock();
       continue;
     }
     _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
@@ -559,7 +566,12 @@ std::vector<pinned_view> prefetching_cache::read_ranges(
       }
       if (st == entry_state::loading) {
         waited_on_loading = true;
+        // Release file_lk across the wait: see read() for the rationale.
+        // The entry is pinned by our local shared_ptr; the next find_entry()
+        // call (for the next range in the batch) will re-take file_lk.
+        file_lk.unlock();
         entry->state.wait_while_loading();
+        file_lk.lock();
         continue;
       }
       _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
