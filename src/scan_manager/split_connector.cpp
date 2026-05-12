@@ -54,8 +54,7 @@ std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_spli
 {
   std::unique_lock<std::mutex> lock(_mutex);
   _cv.wait(lock, [this] { return !_splits.empty() || _closed; });
-  // Drained and closed. If the producer captured an error via close(exception_ptr),
-  // surface it here so the consumer sees the failure rather than a silent EOF.
+  // if there is an exception, propagate it to the consumer instead of returning more splits
   if (_exception) { std::rethrow_exception(_exception); }
   if (!_splits.empty()) {
     auto split = std::move(_splits.front());

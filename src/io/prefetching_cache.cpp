@@ -995,7 +995,7 @@ void prefetching_cache::worker_loop(std::stop_token stop)
          key    = std::move(item.file_key)](size_t /*bytes*/, std::exception_ptr ep) {
           if (ep) {
             try {
-              std::rethrow_exception(ep);
+              std::rethrow_exception(std::move(ep));
             } catch (std::exception const& ex) {
               spdlog::error("prefetching_cache: IO failed for {}: {}", key, ex.what());
             }
