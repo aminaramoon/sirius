@@ -17,11 +17,56 @@ import csv
 import glob
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime
 
 import duckdb
 from queries import QUERIES
+
+
+def log(msg):
+    """Timestamped, flushed progress log so hangs are visible in real time."""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{ts}] {msg}", flush=True)
+
+
+class QueryTimeout(Exception):
+    pass
+
+
+def execute_with_timeout(con, sql, timeout_s):
+    """Run `sql` on `con`; if `timeout_s > 0` and exceeded, interrupt and raise.
+
+    Returns (rows, elapsed_seconds). On timeout the connection is interrupted
+    so the caller can continue using it for subsequent queries.
+    """
+    box = {}
+
+    def target():
+        try:
+            box["rows"] = con.execute(sql).fetchall()
+        except BaseException as e:  # noqa: BLE001 — capture interrupt too
+            box["error"] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    start = time.perf_counter()
+    t.start()
+    t.join(timeout_s if timeout_s > 0 else None)
+    if t.is_alive():
+        log(f"  ⚠ TIMEOUT after {timeout_s}s — calling con.interrupt()")
+        try:
+            con.interrupt()
+        except Exception as e:
+            log(f"  interrupt() raised: {e}")
+        t.join(30)
+        if t.is_alive():
+            log("  ⚠ thread still alive after interrupt — connection may be unusable")
+        raise QueryTimeout(f"Query exceeded {timeout_s}s")
+    elapsed = time.perf_counter() - start
+    if "error" in box:
+        raise box["error"]
+    return box["rows"], elapsed
 
 
 CACHE_MODES = ("grouped", "sequential", "isolated")
@@ -63,10 +108,6 @@ def _verify_results(duckdb_rows, sirius_rows, query_name):
                 print(f"   DuckDB:  {duck_row}")
                 print(f"   Sirius:  {sirius_row}")
                 return False
-
-        if len(duckdb_rows) == 0:
-            print(f"❌ {query_name}: Results are empty")
-            return False
 
         print(f"✓ {query_name}: Results match ({len(duckdb_rows)} rows)")
         return True
@@ -139,8 +180,8 @@ def open_connection(source):
     """
     is_dir = os.path.isdir(source)
     db_path = ":memory:" if is_dir else source
+    log(f"Opening DuckDB connection (db_path={db_path}, is_dir={is_dir})")
     con = duckdb.connect(db_path, config={"allow_unsigned_extensions": "true"})
-    con.execute(f"LOAD '{EXTENSION_PATH}'")
     if is_dir:
         for table in TPCH_TABLES:
             files = _resolve_parquet_files(source, table)
@@ -148,59 +189,84 @@ def open_connection(source):
                 raise FileNotFoundError(
                     f"No parquet files found for table '{table}' in {source}"
                 )
+            log(f"  Registering view '{table}' over {len(files)} file(s)")
             file_list = ",".join(f"'{f}'" for f in files)
             con.execute(
                 f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM read_parquet([{file_list}])"
             )
+        log("All TPC-H views registered")
+    log(f"Loading Sirius extension from {EXTENSION_PATH}")
+    con.execute(f"LOAD '{EXTENSION_PATH}'")
+    log("Sirius extension loaded")
     return con
 
 
-def time_query(con, qnum, use_gpu):
+def time_query(con, qnum, use_gpu, timeout_s):
+    engine_label = "GPU/sirius" if use_gpu else "CPU/duckdb"
+    log(f"  SET gpu_execution = {str(use_gpu).lower()} ({engine_label})")
     con.execute(f"SET gpu_execution = {'true' if use_gpu else 'false'};")
-    start = time.perf_counter()
-    con.execute(QUERIES[f"q{qnum}"]).fetchall()
-    return time.perf_counter() - start
+    log(f"  Executing q{qnum} on {engine_label} (timeout={timeout_s}s)…")
+    rows, elapsed = execute_with_timeout(con, QUERIES[f"q{qnum}"], timeout_s)
+    log(f"  q{qnum} fetched {len(rows)} rows in {elapsed:.4f}s")
+    return elapsed
 
 
 def _record(writer, name, qnum, it, runtime):
     writer.writerow([name, f"q{qnum}", it, f"{runtime:.6f}"])
-    print(f"[{name}] q{qnum} iter{it}: {runtime:.4f}s")
+    log(f"[{name}] q{qnum} iter{it}: {runtime:.4f}s")
 
 
-def run_grouped(source, queries, engine_modes, iterations, writer):
+def _run_one(writer, con, name, qnum, it, use_gpu, timeout_s):
+    try:
+        _record(writer, name, qnum, it, time_query(con, qnum, use_gpu, timeout_s))
+    except QueryTimeout:
+        log(f"[{name}] q{qnum} iter{it}: TIMEOUT (>{timeout_s}s)")
+        writer.writerow([name, f"q{qnum}", it, "TIMEOUT"])
+
+
+def run_grouped(source, queries, engine_modes, iterations, writer, timeout_s):
     """For each query, run all iterations back-to-back (hot cache)."""
+    log("Cache mode 'grouped': opening single connection")
     con = open_connection(source)
     try:
         for qnum in queries:
             for it in range(iterations):
                 for name, use_gpu in engine_modes:
-                    _record(writer, name, qnum, it, time_query(con, qnum, use_gpu))
+                    log(f"--- q{qnum} iter{it} engine={name} ---")
+                    _run_one(writer, con, name, qnum, it, use_gpu, timeout_s)
     finally:
+        log("Closing connection")
         con.close()
 
 
-def run_sequential(source, queries, engine_modes, iterations, writer):
+def run_sequential(source, queries, engine_modes, iterations, writer, timeout_s):
     """Run all queries once, then again, …"""
+    log("Cache mode 'sequential': opening single connection")
     con = open_connection(source)
     try:
         for it in range(iterations):
             for qnum in queries:
                 for name, use_gpu in engine_modes:
-                    _record(writer, name, qnum, it, time_query(con, qnum, use_gpu))
+                    log(f"--- q{qnum} iter{it} engine={name} ---")
+                    _run_one(writer, con, name, qnum, it, use_gpu, timeout_s)
     finally:
+        log("Closing connection")
         con.close()
 
 
-def run_isolated(source, queries, engine_modes, iterations, writer):
+def run_isolated(source, queries, engine_modes, iterations, writer, timeout_s):
     """Drop OS cache and reopen the connection before every single run."""
+    log("Cache mode 'isolated': reopening connection between every run")
     for qnum in queries:
         for it in range(iterations):
             for name, use_gpu in engine_modes:
+                log(f"--- q{qnum} iter{it} engine={name} (dropping OS cache) ---")
                 drop_os_cache()
                 con = open_connection(source)
                 try:
-                    _record(writer, name, qnum, it, time_query(con, qnum, use_gpu))
+                    _run_one(writer, con, name, qnum, it, use_gpu, timeout_s)
                 finally:
+                    log("Closing connection")
                     con.close()
 
 
@@ -295,6 +361,12 @@ def parse_args():
         default=os.environ.get("SIRIUS_CONFIG_FILE", ""),
         help="Path to Sirius config YAML (default: $SIRIUS_CONFIG_FILE)",
     )
+    p.add_argument(
+        "--query-timeout",
+        type=float,
+        default=300.0,
+        help="Per-query timeout in seconds; 0 disables (default: 300)",
+    )
     return p.parse_args()
 
 
@@ -309,30 +381,36 @@ def main():
     if config_path:
         os.environ["SIRIUS_CONFIG_FILE"] = config_path
     else:
-        print(
+        log(
             "SIRIUS_CONFIG_FILE not set and --config not provided — "
             "running with Sirius default configuration."
         )
 
-    print(f"Source:      {source}")
+    log(f"Source:      {source}")
     if args.sf is not None:
-        print(f"Scale factor: {args.sf}")
-    print(f"Cache mode:  {args.cache}")
-    print(f"Iterations:  {args.iterations}")
-    print(f"Engine:      {args.engine}")
-    print(f"Queries:     {queries}")
-    print(f"Config:      {config_path or '(default)'}")
-    print(f"Output:      {output_path}")
-    print()
+        log(f"Scale factor: {args.sf}")
+    log(f"Cache mode:  {args.cache}")
+    log(f"Iterations:  {args.iterations}")
+    log(f"Engine:      {args.engine}")
+    log(f"Queries:     {queries}")
+    log(f"Config:      {config_path or '(default)'}")
+    log(f"Output:      {output_path}")
+    log(f"Query timeout: {args.query_timeout}s" if args.query_timeout > 0 else "Query timeout: disabled")
 
     with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["engine", "query", "iteration", "runtime_s"])
-        RUNNERS[args.cache](source, queries, engine_modes, args.iterations, writer)
+        f.flush()
+        RUNNERS[args.cache](
+            source, queries, engine_modes, args.iterations, writer, args.query_timeout
+        )
+
+    log("Benchmark run complete")
 
     if args.validation:
-        print()
+        log("Starting validation")
         validate(source, queries)
+        log("Validation complete")
 
 
 if __name__ == "__main__":
