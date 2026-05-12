@@ -129,7 +129,25 @@ bool uring_reactor::supports(std::string_view path)
 void uring_reactor::enqueue_bulk(std::span<device_read_req_type> batch)
 {
   if (batch.empty()) return;
-  _queue.enqueue_bulk(std::make_move_iterator(batch.begin()), batch.size());
+
+  // Capture ctxs before bulk-enqueue: on failure (OOM in moodycamel) items
+  // may already be moved-from, so batch[i].ctx could be null.  The captured
+  // shared_ptrs let us drain ctx->pending via chunk_failed so the
+  // completion handler still fires instead of stranding readers in
+  // wait_while_loading().
+  std::vector<std::shared_ptr<request_context>> ctxs;
+  ctxs.reserve(batch.size());
+  for (auto& r : batch)
+    ctxs.push_back(r.ctx);
+
+  if (!_queue.enqueue_bulk(std::make_move_iterator(batch.begin()), batch.size())) {
+    auto e = std::make_exception_ptr(
+      std::runtime_error("uring_reactor::enqueue_bulk: queue enqueue failed"));
+    for (auto& ctx : ctxs)
+      ctx->chunk_failed(e);
+    return;
+  }
+
   _wake_seq.fetch_add(1, std::memory_order_release);
   _wake_seq.notify_one();
 }
@@ -156,7 +174,14 @@ size_t uring_reactor::host_read(int fd, size_t offset, size_t size, uint8_t* dst
 
 void uring_reactor::host_read_async(host_read_req_type req)
 {
-  _host_queue.enqueue(std::move(req));
+  // Hold the ctx separately so we can drain pending via chunk_failed if the
+  // enqueue itself fails (otherwise req.ctx may be moved-from and lost).
+  auto ctx = req.ctx;
+  if (!_host_queue.enqueue(std::move(req))) {
+    ctx->chunk_failed(std::make_exception_ptr(
+      std::runtime_error("uring_reactor::host_read_async: queue enqueue failed")));
+    return;
+  }
   _wake_seq.fetch_add(1, std::memory_order_release);
   _wake_seq.notify_one();
 }
@@ -164,7 +189,23 @@ void uring_reactor::host_read_async(host_read_req_type req)
 void uring_reactor::host_enqueue_bulk(std::span<host_read_req_type> batch)
 {
   if (batch.empty()) return;
-  _host_queue.enqueue_bulk(std::make_move_iterator(batch.begin()), batch.size());
+
+  // See enqueue_bulk() above for the rationale: snapshot ctxs first so a
+  // partial-move failure on the moodycamel queue still drains ctx->pending
+  // and fires the completion handler instead of deadlocking readers.
+  std::vector<std::shared_ptr<request_context>> ctxs;
+  ctxs.reserve(batch.size());
+  for (auto& r : batch)
+    ctxs.push_back(r.ctx);
+
+  if (!_host_queue.enqueue_bulk(std::make_move_iterator(batch.begin()), batch.size())) {
+    auto e = std::make_exception_ptr(
+      std::runtime_error("uring_reactor::host_enqueue_bulk: queue enqueue failed"));
+    for (auto& ctx : ctxs)
+      ctx->chunk_failed(e);
+    return;
+  }
+
   _wake_seq.fetch_add(1, std::memory_order_release);
   _wake_seq.notify_one();
 }
