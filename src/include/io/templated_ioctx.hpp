@@ -166,14 +166,11 @@ class templated_ioctx : public sirius_ioctx {
   {
     auto& tobj = as_typed(obj);
     size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
-    if (size == 0) {
-      handler(0, nullptr);
-      return;
-    }
-    auto ctx         = std::make_shared<request_context>();
-    ctx->handler     = std::move(handler);
-    ctx->total_bytes = size;
-    ctx->pending.store(1, std::memory_order_relaxed);
+
+    // size==0 case is folded into create(): it fires the handler with
+    // (0, nullptr) and returns nullptr.
+    auto ctx = request_context::create(size == 0 ? 0 : 1, size, std::move(handler));
+    if (!ctx) return;
 
     host_read_req_type req;
     req.handle = tobj.host_handle();
@@ -241,15 +238,11 @@ class templated_ioctx : public sirius_ioctx {
       reqs.push_back(std::move(req));
       total += sz;
     }
-    if (reqs.empty()) {
-      handler(0, nullptr);
-      return;
-    }
-
-    auto ctx         = std::make_shared<request_context>();
-    ctx->handler     = std::move(handler);
-    ctx->total_bytes = total;
-    ctx->pending.store(reqs.size(), std::memory_order_relaxed);
+    // reqs.empty() case is folded into create(): it fires the handler with
+    // (0, nullptr) and returns nullptr.  Early-return retained as a fast
+    // path that skips the per-reactor split loop below.
+    auto ctx = request_context::create(reqs.size(), total, std::move(handler));
+    if (!ctx) return;
     for (auto& r : reqs)
       r.ctx = ctx;
 
@@ -300,7 +293,9 @@ class templated_ioctx : public sirius_ioctx {
   {
     auto file_size = obj.size();
     if (size == 0 || offset >= file_size) {
-      handler(0, nullptr);
+      // Nothing to read — fire the handler now via a no-chunk create.
+      // The returned nullptr is intentionally discarded.
+      [[maybe_unused]] auto _ = request_context::create(0, 0, std::move(handler));
       return;
     }
     size = std::min(size, file_size - offset);
@@ -313,10 +308,8 @@ class templated_ioctx : public sirius_ioctx {
 
     size_t n_chunks = (a_end - a_start + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-    auto ctx         = std::make_shared<request_context>();
-    ctx->handler     = std::move(handler);
-    ctx->total_bytes = size;
-    ctx->pending.store(n_chunks, std::memory_order_relaxed);
+    auto ctx = request_context::create(n_chunks, size, std::move(handler));
+    if (!ctx) return;
 
     // Capture the caller's CUDA device so the reactor thread can switch
     // to it before the H2D copy.  In multi-GPU usage a single reactor

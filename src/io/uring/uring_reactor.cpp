@@ -100,9 +100,7 @@ void uring_reactor::shutdown()
   }
 }
 
-void uring_reactor::cuda_copy_cb(cudaStream_t /*stream*/,
-                                 cudaError_t status,
-                                 void* p) noexcept
+void uring_reactor::cuda_copy_cb(cudaStream_t /*stream*/, cudaError_t status, void* p) noexcept
 {
   auto* arg = static_cast<cb_arg*>(p);
   // Write status BEFORE the release-store on cuda_done so a reader that
