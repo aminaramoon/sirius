@@ -107,8 +107,12 @@ void uring_reactor::cuda_copy_cb(cudaStream_t /*stream*/, cudaError_t status, vo
   // observes cuda_done == true via acquire also observes this status.
   arg->self->_bounce[arg->slot].cuda_status = status;
   arg->self->_bounce[arg->slot].cuda_done.store(true, std::memory_order_release);
-  arg->self->_cuda_seq.fetch_add(1, std::memory_order_release);
-  arg->self->_cuda_seq.notify_one();
+  // Bump the unified wake atomic — the same one queue enqueues and
+  // interrupt() bump.  The reactor's single park point on _wake_seq wakes
+  // on any event, so a stalled CUDA callback no longer blocks the reactor
+  // from observing new host reads or shutdown.
+  arg->self->_wake_seq.fetch_add(1, std::memory_order_release);
+  arg->self->_wake_seq.notify_one();
 }
 
 cudf::io::text::byte_range_info uring_reactor::align_to_physical(
@@ -503,59 +507,67 @@ void uring_reactor::worker_loop()
     if (need_resubmit) io_uring_submit(ring.get());
   };
 
-  while (true) {
-    // Always drain the moodycamel queues into local dequeues BEFORE checking
-    // has_active() — the dequeues are the only state has_active() looks at.
-    // Without this, a producer that enqueued + bumped wake_seq before our
-    // seq.load() will leave work sitting invisible in the moodycamel queue,
-    // and we'll park on seq=current_value and never wake.
-    drain_queue();
+  // Single park atomic: _wake_seq is bumped by every event source —
+  // queue enqueues, interrupt(), and cuda_copy_cb.  CQE delivery is the
+  // only exception: those are signalled by the kernel directly, so we
+  // wait on io_uring_wait_cqe_timeout when (and only when) there is
+  // in-flight IO that can produce one.
+  auto any_copying = [&]() {
+    return std::ranges::any_of(slots, [](auto& s) { return s.state == slot_state::COPYING; });
+  };
 
-    if (!has_active()) {
-      if (_stop.load(std::memory_order_acquire)) break;
+  while (true) {
+    drain_queue();
+    poll_cuda();  // retire COPYING slots whose callback has fired
+
+    if (_stop.load(std::memory_order_acquire)) break;
+
+    bool work_to_submit = !pending.empty() || !pending_host.empty();
+
+    if (!work_to_submit && inflight == 0 && !any_copying()) {
+      // Fully idle.  Park on _wake_seq with the standard race-guard:
+      // load the seq, re-drain, and only park if still idle.
       uint64_t seq = _wake_seq.load(std::memory_order_acquire);
-      // Re-drain AFTER the seq load.  Any producer whose enqueue is now
-      // observable either (a) landed before our load and is pulled in here,
-      // making has_active() true, or (b) landed after our load, in which
-      // case their fetch_add(1) made wake_seq != seq so the wait below
-      // returns immediately.  Either way, no lost wake-up.
       drain_queue();
-      if (!has_active()) { _wake_seq.wait(seq, std::memory_order_relaxed); }
-      if (_stop.load(std::memory_order_acquire)) break;
-      // Pull whatever work woke us up before the main body runs.
-      drain_queue();
+      poll_cuda();
+      if (pending.empty() && pending_host.empty() && inflight == 0 && !any_copying() &&
+          !_stop.load(std::memory_order_acquire)) {
+        _wake_seq.wait(seq, std::memory_order_relaxed);
+      }
+      continue;
     }
 
     submit_pending();
 
     if (inflight > 0) {
       io_uring_cqe* tmp = nullptr;
-      // Bounded wait so the top-of-loop _stop check is reachable even when
-      // no CQE arrives.  SINGLE_ISSUER means we can't post a NOP SQE from
-      // interrupt() to unblock a plain wait_cqe; the timeout bounds the
-      // shutdown latency to SHUTDOWN_POLL_MS instead.
+      // Bounded wait so the top-of-loop _stop check is reachable even
+      // when no CQE arrives.  SINGLE_ISSUER means we can't post a NOP
+      // SQE from interrupt() to unblock a plain wait_cqe; the timeout
+      // bounds shutdown latency to SHUTDOWN_POLL_MS instead.
       static constexpr long SHUTDOWN_POLL_MS = 100;
       __kernel_timespec ts{};
       ts.tv_sec  = SHUTDOWN_POLL_MS / 1000;
       ts.tv_nsec = (SHUTDOWN_POLL_MS % 1000) * 1'000'000L;
       int rc     = io_uring_wait_cqe_timeout(ring.get(), &tmp, &ts);
       if (rc < 0 && rc != -EINTR && rc != -ETIME) {
-        // Ring is in an unknown state — bail out rather than spin
-        // silently.  Pending reqs' ctx->pending stays non-zero (handlers
-        // won't fire), which is a worse failure mode for those readers,
-        // but at least the cause surfaces in logs.
         spdlog::error("uring_reactor: io_uring_wait_cqe_timeout failed: {}", strerror(-rc));
         break;
       }
       reap_cqes();
+      continue;  // loop top: drain_queue + poll_cuda handle any state change
     }
 
-    uint64_t cuda_seq = _cuda_seq.load(std::memory_order_acquire);
-    poll_cuda();
-
-    if (inflight == 0 && pending.empty() && has_active()) {
-      _cuda_seq.wait(cuda_seq, std::memory_order_acquire);
-    }
+    // Here: nothing to submit, no in-flight IO, but has_active is true
+    // because of COPYING slots.  Park on _wake_seq until cuda_copy_cb
+    // (or new queue work / interrupt) bumps it.
+    uint64_t seq = _wake_seq.load(std::memory_order_acquire);
+    poll_cuda();  // race-guard: a callback may have fired since the top
+    drain_queue();
+    if (!pending.empty() || !pending_host.empty() || !any_copying() ||
+        _stop.load(std::memory_order_acquire))
+      continue;
+    _wake_seq.wait(seq, std::memory_order_relaxed);
   }
 }
 

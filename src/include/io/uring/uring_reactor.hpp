@@ -241,7 +241,6 @@ class uring_reactor {
   std::thread _worker;
   duckdb_moodycamel::ConcurrentQueue<device_read_req_type> _queue;
   duckdb_moodycamel::ConcurrentQueue<host_read_req_type> _host_queue;
-  std::atomic<uint64_t> _cuda_seq{0};
 };
 
 }  // namespace sirius::io
