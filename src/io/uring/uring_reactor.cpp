@@ -515,13 +515,21 @@ void uring_reactor::worker_loop()
 
     if (inflight > 0) {
       io_uring_cqe* tmp = nullptr;
-      int rc            = io_uring_wait_cqe(ring.get(), &tmp);
-      if (rc < 0 && rc != -EINTR) {
+      // Bounded wait so the top-of-loop _stop check is reachable even when
+      // no CQE arrives.  SINGLE_ISSUER means we can't post a NOP SQE from
+      // interrupt() to unblock a plain wait_cqe; the timeout bounds the
+      // shutdown latency to SHUTDOWN_POLL_MS instead.
+      static constexpr long SHUTDOWN_POLL_MS = 100;
+      __kernel_timespec ts{};
+      ts.tv_sec     = SHUTDOWN_POLL_MS / 1000;
+      ts.tv_nsec    = (SHUTDOWN_POLL_MS % 1000) * 1'000'000L;
+      int rc        = io_uring_wait_cqe_timeout(ring.get(), &tmp, &ts);
+      if (rc < 0 && rc != -EINTR && rc != -ETIME) {
         // Ring is in an unknown state — bail out rather than spin
         // silently.  Pending reqs' ctx->pending stays non-zero (handlers
         // won't fire), which is a worse failure mode for those readers,
         // but at least the cause surfaces in logs.
-        spdlog::error("uring_reactor: io_uring_wait_cqe failed: {}", strerror(-rc));
+        spdlog::error("uring_reactor: io_uring_wait_cqe_timeout failed: {}", strerror(-rc));
         break;
       }
       reap_cqes();
