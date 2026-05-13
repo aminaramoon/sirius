@@ -16,6 +16,7 @@
 
 #include "io/io_context.hpp"
 
+#include "driver_types.h"
 #include "io/prefetching_cache.hpp"
 
 #include <rmm/device_buffer.hpp>
@@ -24,6 +25,7 @@
 
 #include <cucascade/cuda/event.hpp>
 
+#include <algorithm>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -43,22 +45,21 @@ void sirius_ioctx::initialize_cache(buffer_pool& pool, size_t inflight_budget_ch
 
 namespace {
 
-// Copy each pinned-host slice to the device buffer on @p stream.
-// Returns the total bytes issued (== sum of slice sizes).
-size_t copy_pinned_slices_to_device(
+std::future<size_t> copy_pinned_slices_to_device(
   std::vector<cudf::io::datasource::non_owning_buffer> const& slices,
   uint8_t* dst,
   rmm::cuda_stream_view stream)
 {
   // Skip empty slices without touching CUDA.
-  size_t n_nonempty = 0;
-  for (auto const& s : slices)
-    if (s.size() > 0) ++n_nonempty;
+  size_t n_nonempty =
+    std::count_if(slices.begin(), slices.end(), [](auto const& s) { return s.size() > 0; });
 
-  if (n_nonempty == 0) return 0;
+  if (n_nonempty == 0) return std::async(std::launch::deferred, []() { return size_t{0}; });
+
+  cucascade::cuda::cuda_event copy_done_event;
 
   // Fast path: one slice (common after pinned_view::slice coalescing when
-  // chunks are contiguous in slab memory).  Plain cudaMemcpyAsync avoids the
+  // chunks are contiguous in slab memory). Plain cudaMemcpyAsync avoids the
   // batch-API per-call overhead.
   if (n_nonempty == 1) {
     size_t copied = 0;
@@ -66,18 +67,22 @@ size_t copy_pinned_slices_to_device(
       if (s.size() == 0) continue;
       auto err =
         cudaMemcpyAsync(dst + copied, s.data(), s.size(), cudaMemcpyHostToDevice, stream.value());
-      if (err != cudaSuccess)
+      if (err != cudaSuccess) {
         throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyAsync failed: ") +
                                  cudaGetErrorString(err));
+      }
       copied += s.size();
     }
-    return copied;
+    copy_done_event.record(stream);
+    return std::async(std::launch::deferred, [e = std::move(copy_done_event), copied]() mutable {
+      e.synchronize();
+      return copied;
+    });
   }
 
-  // Batch path: hand all non-contiguous slices to the driver in one call.
-  // Copies within a batch are unordered with respect to each other but the
-  // whole batch is stream-ordered; all copies have disjoint
-  // destination ranges.
+  // Build the batch descriptors. Copies within a batch are unordered with
+  // respect to each other but the whole batch is stream-ordered; all copies
+  // have disjoint destination ranges.
   std::vector<void*> dsts;
   std::vector<void const*> srcs;
   std::vector<size_t> sizes;
@@ -95,15 +100,40 @@ size_t copy_pinned_slices_to_device(
     copied += n;
   }
 
-#if CUDA_VERSION >= 12080
-  // cudaMemcpyBatchAsync available since CUDA 12.8 — issue all copies in one driver call.
+#if CUDART_VERSION < 12080
+  // No batch API: fall back to sequential cudaMemcpyAsync on the caller's stream.
+  size_t total_copied = 0;
+  for (size_t i = 0; i < dsts.size(); ++i) {
+    auto err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, stream.value());
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyAsync failed at idx ") +
+                               std::to_string(i) + ": " + cudaGetErrorString(err));
+    }
+    total_copied += sizes[i];
+  }
+  copy_done_event.record(stream);
+  return std::async(std::launch::deferred,
+                    [e = std::move(copy_done_event), total_copied]() mutable {
+                      e.synchronize();
+                      return total_copied;
+                    });
+#else
+  // Batch API available. It does not support legacy/null streams, so in that
+  // case redirect to cudaStreamPerThread. The caller's legacy stream is *not*
+  // ordered against the work in that case — the function's contract is that
+  // the copy is observed-complete only after future.get()/wait() syncs the
+  // event recorded on stream_to_use.
+  bool const stream_is_legacy = (stream.value() == nullptr) || (stream.value() == cudaStreamLegacy);
+  cudaStream_t stream_to_use  = stream_is_legacy ? cudaStreamPerThread : stream.value();
+
   cudaMemcpyAttributes attrs{};
   attrs.srcAccessOrder  = cudaMemcpySrcAccessOrderStream;
   attrs.srcLocHint.type = cudaMemLocationTypeHost;
   attrs.dstLocHint.type = cudaMemLocationTypeDevice;
   attrs.flags           = 0;
-  size_t attrs_idx      = 0;
-  size_t fail_idx       = 0;
+
+  size_t attrs_idx = 0;  // attrs applies to all copies -> single entry at index 0
+  size_t fail_idx  = 0;  // out-param: driver writes failing copy index on error
 
 #if CUDART_VERSION < 13000
   auto err = cudaMemcpyBatchAsync(dsts.data(),
@@ -113,27 +143,23 @@ size_t copy_pinned_slices_to_device(
                                   &attrs,
                                   &attrs_idx,
                                   1,
-                                  nullptr,
-                                  stream.value());
+                                  &fail_idx,
+                                  stream_to_use);
 #else
   auto err = cudaMemcpyBatchAsync(
-    dsts.data(), srcs.data(), sizes.data(), n_nonempty, &attrs, &attrs_idx, 1, stream.value());
+    dsts.data(), srcs.data(), sizes.data(), n_nonempty, &attrs, &attrs_idx, 1, stream_to_use);
 #endif
-  if (err != cudaSuccess)
+  if (err != cudaSuccess) {
     throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyBatchAsync failed at idx ") +
                              std::to_string(fail_idx) + ": " + cudaGetErrorString(err));
-#else
-  // Fallback for CUDA < 12.8: sequential stream-ordered copies.
-  for (size_t i = 0; i < n_nonempty; ++i) {
-    auto err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, stream.value());
-    if (err != cudaSuccess)
-      throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyAsync failed at idx ") +
-                               std::to_string(i) + ": " + cudaGetErrorString(err));
   }
+  copy_done_event.record(stream_to_use);
+  return std::async(std::launch::deferred, [e = std::move(copy_done_event), copied]() mutable {
+    e.synchronize();
+    return copied;
+  });
 #endif
-  return copied;
 }
-
 }  // namespace
 
 size_t sirius_ioctx::host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst)
@@ -168,7 +194,9 @@ std::future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
         }
         return std::async(std::launch::deferred, [copied]() { return copied; });
       } catch (...) {
-        return std::async(std::launch::deferred, []() -> size_t { throw; });
+        return std::async(std::launch::deferred, [e = std::current_exception()]() -> size_t {
+          std::rethrow_exception(e);
+        });
       }
     }
   }
@@ -190,7 +218,8 @@ size_t sirius_ioctx::device_read(
   if (_cache) {
     if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
       auto slices = view.slice(offset, size);
-      return copy_pinned_slices_to_device(slices, dst, stream);
+      auto copied = copy_pinned_slices_to_device(slices, dst, stream);
+      return copied.get();
     }
   }
   return device_read_io(obj, offset, size, dst, stream);
@@ -203,14 +232,7 @@ std::future<size_t> sirius_ioctx::device_read_async(
     if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
       auto slices = view.slice(offset, size);
       try {
-        auto copied = copy_pinned_slices_to_device(slices, dst, stream);
-
-        cucascade::cuda::cuda_event event(cudaEventDisableTiming);
-        event.record(stream);
-        return std::async(std::launch::deferred, [copied, e = std::move(event), stream]() mutable {
-          e.synchronize();
-          return copied;
-        });
+        return copy_pinned_slices_to_device(slices, dst, stream);
       } catch (...) {
         return std::async(std::launch::deferred, [e = std::current_exception()]() -> size_t {
           std::rethrow_exception(e);
