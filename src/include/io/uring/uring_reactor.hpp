@@ -100,6 +100,12 @@ using unique_ring = std::unique_ptr<io_uring, ring_deleter>;
 struct bounce_slot {
   void* buf{nullptr};
   std::atomic<bool> cuda_done{false};
+  // Status captured by cuda_copy_cb at callback time.  Written before the
+  // release-store on cuda_done, read after the acquire-load — so the
+  // happens-before chain piggybacks on cuda_done.  Lets poll_cuda use the
+  // stream's state when our copy finished, ignoring later unrelated work
+  // the consumer may have queued onto the same stream.
+  cudaError_t cuda_status{cudaSuccess};
 };
 
 // ---------------------------------------------------------------------------
@@ -216,7 +222,11 @@ class uring_reactor {
     uring_reactor* self;
     int slot;
   };
-  static void cuda_copy_cb(void* p) noexcept;
+  // cudaStreamAddCallback signature (deprecated but used deliberately).
+  // Unlike cudaLaunchHostFunc, the callback fires even when the stream is
+  // already in an error state — so we never strand a slot in COPYING
+  // waiting for a callback that wouldn't otherwise come.
+  static void cuda_copy_cb(cudaStream_t stream, cudaError_t status, void* p) noexcept;
 
   // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
   // multiple_blocks_allocation destructor returns the blocks to the upstream

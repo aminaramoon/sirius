@@ -135,7 +135,14 @@ struct release_callback_args {
   std::shared_ptr<cache_entry> entry;
 };
 
-void CUDART_CB release_read_host_callback(void* p) noexcept
+// cudaStreamAddCallback signature (deprecated but used deliberately).
+// Unlike cudaLaunchHostFunc, this callback fires even when the stream is
+// already in an error state — so a poisoned stream cannot leak the entry's
+// pin and its pool chunks forever.  Status is intentionally ignored: the
+// read pin must be released regardless of whether the H2D copy succeeded.
+void CUDART_CB release_read_host_callback(cudaStream_t /*stream*/,
+                                          cudaError_t /*status*/,
+                                          void* p) noexcept
 {
   std::unique_ptr<release_callback_args> args(static_cast<release_callback_args*>(p));
   args->entry->state.release_read();
@@ -197,7 +204,11 @@ void pinned_view::unpin()
     // the entry transitions in_use → cached and becomes evictable.
     auto args   = std::make_unique<release_callback_args>();
     args->entry = std::move(_entry);
-    cudaLaunchHostFunc(_stream, &release_read_host_callback, args.release());
+    // cudaStreamAddCallback (not cudaLaunchHostFunc): fires on error too,
+    // so the release_read() is guaranteed even if the user's stream is
+    // poisoned by an unrelated failure.  Otherwise a single stream error
+    // would permanently leak this entry's pin and its pinned chunks.
+    cudaStreamAddCallback(_stream, &release_read_host_callback, args.release(), 0);
   }
 }
 

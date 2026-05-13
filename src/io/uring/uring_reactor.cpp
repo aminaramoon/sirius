@@ -100,9 +100,14 @@ void uring_reactor::shutdown()
   }
 }
 
-void uring_reactor::cuda_copy_cb(void* p) noexcept
+void uring_reactor::cuda_copy_cb(cudaStream_t /*stream*/,
+                                 cudaError_t status,
+                                 void* p) noexcept
 {
   auto* arg = static_cast<cb_arg*>(p);
+  // Write status BEFORE the release-store on cuda_done so a reader that
+  // observes cuda_done == true via acquire also observes this status.
+  arg->self->_bounce[arg->slot].cuda_status = status;
   arg->self->_bounce[arg->slot].cuda_done.store(true, std::memory_order_release);
   arg->self->_cuda_seq.fetch_add(1, std::memory_order_release);
   arg->self->_cuda_seq.notify_one();
@@ -281,17 +286,12 @@ void uring_reactor::worker_loop()
     for (auto i : std::views::iota(size_t{0}, NUM_CHUNKS)) {
       if (slots[i].state == slot_state::COPYING &&
           _bounce[i].cuda_done.load(std::memory_order_acquire)) {
-        // Host callback fired, so all stream work up to and including the H2D
-        // copy is complete. cudaStreamQuery may still return cudaErrorNotReady
-        // if the consumer queued more work on this stream after our copy —
-        // that is NOT a failure of our copy, just unrelated in-flight work, so
-        // treat it as success. Any other non-success is a sticky failure on
-        // the stream that affected our copy.
-        cudaError_t err = cudaStreamQuery(slots[i].req.stream);
-        if (err != cudaSuccess && err != cudaErrorNotReady) {
-          // Clear the sticky error so unrelated subsequent runtime calls
-          // don't observe it.
-          cudaGetLastError();
+        // cuda_copy_cb stored the stream's status at callback time, before
+        // the release-store on cuda_done.  Read it directly — this is the
+        // state of the stream when our copy finished, not the current state
+        // (which may also include later work the consumer queued).
+        cudaError_t err = _bounce[i].cuda_status;
+        if (err != cudaSuccess) {
           slots[i].req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
             std::string("uring_reactor: H2D copy failed: ") + cudaGetErrorString(err))));
         } else {
@@ -454,13 +454,30 @@ void uring_reactor::worker_loop()
                           : 0;
         if (actual > 0 && !req.ctx->failed.load(std::memory_order_relaxed)) {
           _bounce[si].cuda_done.store(false, std::memory_order_relaxed);
+          _bounce[si].cuda_status = cudaSuccess;
           if (req.device_id >= 0) cudaSetDevice(req.device_id);
-          cudaMemcpyAsync(req.dst,
-                          (uint8_t*)_bounce[si].buf + req.data_off,
-                          actual,
-                          cudaMemcpyHostToDevice,
-                          req.stream);
-          cudaLaunchHostFunc(req.stream, cuda_copy_cb, &_cb_args[si]);
+          cudaError_t cpy_err = cudaMemcpyAsync(req.dst,
+                                                (uint8_t*)_bounce[si].buf + req.data_off,
+                                                actual,
+                                                cudaMemcpyHostToDevice,
+                                                req.stream);
+          if (cpy_err != cudaSuccess) {
+            // Synchronous failure (e.g., invalid pointer / context).  Drain
+            // the sticky error so unrelated runtime calls don't observe it,
+            // fail the slot, and skip the callback registration — there's
+            // no stream work to attach a callback to.
+            cudaGetLastError();
+            req.ctx->chunk_failed(std::make_exception_ptr(
+              std::runtime_error(std::string("uring_reactor: cudaMemcpyAsync failed: ") +
+                                 cudaGetErrorString(cpy_err))));
+            sinfo = slot_info{};
+            continue;
+          }
+          // cudaStreamAddCallback (deprecated but used deliberately): unlike
+          // cudaLaunchHostFunc, the callback fires even if the stream is in
+          // an error state — guaranteeing we never strand the slot in
+          // COPYING waiting for a callback that won't come.
+          cudaStreamAddCallback(req.stream, cuda_copy_cb, &_cb_args[si], 0);
           sinfo.state = slot_state::COPYING;
         } else {
           // After retry-to-completion this only fires when the file truly
@@ -521,9 +538,9 @@ void uring_reactor::worker_loop()
       // shutdown latency to SHUTDOWN_POLL_MS instead.
       static constexpr long SHUTDOWN_POLL_MS = 100;
       __kernel_timespec ts{};
-      ts.tv_sec     = SHUTDOWN_POLL_MS / 1000;
-      ts.tv_nsec    = (SHUTDOWN_POLL_MS % 1000) * 1'000'000L;
-      int rc        = io_uring_wait_cqe_timeout(ring.get(), &tmp, &ts);
+      ts.tv_sec  = SHUTDOWN_POLL_MS / 1000;
+      ts.tv_nsec = (SHUTDOWN_POLL_MS % 1000) * 1'000'000L;
+      int rc     = io_uring_wait_cqe_timeout(ring.get(), &tmp, &ts);
       if (rc < 0 && rc != -EINTR && rc != -ETIME) {
         // Ring is in an unknown state — bail out rather than spin
         // silently.  Pending reqs' ctx->pending stays non-zero (handlers
