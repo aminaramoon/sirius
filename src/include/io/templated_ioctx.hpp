@@ -83,6 +83,11 @@ concept io_reactor_c = requires(R r,
     R::create_io_object(std::move(path_str))
   } -> std::same_as<std::unique_ptr<typename R::io_object_type>>;
   { R::size(handle) } -> std::same_as<size_t>;
+
+  // -- capabilities --------------------------------------------------------
+  { R::supports_device_read() } -> std::same_as<bool>;
+  { R::supports_vector_host_read() } -> std::same_as<bool>;
+  { R::preferred_prefetching_mode() } -> std::same_as<prefetching_mode>;
 };
 
 // ---------------------------------------------------------------------------
@@ -151,6 +156,26 @@ class templated_ioctx : public sirius_ioctx {
   [[nodiscard]] bool supports(std::string_view path) const override
   {
     return Reactor::supports(path);
+  }
+
+  // -- Capabilities (delegate to the reactor) -------------------------------
+
+  [[nodiscard]] bool supports_device_read() const override
+  {
+    return Reactor::supports_device_read();
+  }
+
+  [[nodiscard]] bool supports_vector_host_read() const override
+  {
+    return Reactor::supports_vector_host_read();
+  }
+
+  [[nodiscard]] prefetching_mode preferred_prefetching_mode() const override
+  {
+    // Vector host read is the cheap dispatch path the prefetcher relies on.
+    // Without it, force prefetching off regardless of the reactor's preference.
+    if (!Reactor::supports_vector_host_read()) return prefetching_mode::none;
+    return Reactor::preferred_prefetching_mode();
   }
 
   Reactor& next_reactor()

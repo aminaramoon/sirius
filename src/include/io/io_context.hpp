@@ -33,6 +33,22 @@ class buffer_pool;
 class prefetching_cache;
 
 // ---------------------------------------------------------------------------
+// prefetching_mode
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief How the prefetching layer should behave on top of a given backend.
+ *
+ * - @c none: no prefetching.  Either the backend does not support vector host
+ *   reads (so the prefetcher cannot batch range requests cheaply) or the
+ *   backend explicitly opted out.
+ * - @c eager: prefill the cache ahead of consumer demand.
+ * - @c lazy: read-ahead on demand — issue extra IO only when triggered by a
+ *   consumer read.
+ */
+enum class prefetching_mode { none, eager, lazy };
+
+// ---------------------------------------------------------------------------
 // sirius_ioctx
 // ---------------------------------------------------------------------------
 
@@ -68,6 +84,26 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// validate scheme/protocol support and any backend-specific
   /// preconditions (e.g. file existence for local-disk backends).
   [[nodiscard]] virtual bool supports(std::string_view path) const = 0;
+
+  // -- Backend capabilities ---------------------------------------------------
+
+  /// Whether the backend can stream data directly into device memory
+  /// (e.g. via O_DIRECT + GDS).  Used by @c sirius_datasource to answer the
+  /// equivalent cudf::io::datasource queries.
+  [[nodiscard]] virtual bool supports_device_read() const = 0;
+
+  /// Whether the backend can serve a batch of host reads in a single dispatch
+  /// (cf. @c host_read_ranges_async_io).  When false, the prefetching layer
+  /// cannot amortise per-request overhead and must fall back to
+  /// @c prefetching_mode::none.
+  [[nodiscard]] virtual bool supports_vector_host_read() const = 0;
+
+  /// Prefetching strategy the prefetching layer should use against this
+  /// backend.  Returns @c prefetching_mode::none whenever
+  /// @c supports_vector_host_read() is false; otherwise the backend picks
+  /// between eager prefill and on-demand read-ahead based on its IO
+  /// characteristics.
+  [[nodiscard]] virtual prefetching_mode preferred_prefetching_mode() const = 0;
 
   /// Construct the owned prefetching_cache.  Must be called before any
   /// read that should consult the cache; until then device_read falls

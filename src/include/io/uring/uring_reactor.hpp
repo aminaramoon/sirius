@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "io/io_context.hpp"
 #include "io/types.hpp"
 
 #include <cuda_runtime.h>
@@ -214,6 +215,20 @@ class uring_reactor {
 
   /// fstat the open fd to get the file's current size.
   static size_t size(int fd);
+
+  // ---- Backend capabilities --------------------------------------------
+  //
+  // io_uring + O_DIRECT serves device reads through the reactor's bounce
+  // slots, supports batched host reads via @c host_enqueue_bulk, and pairs
+  // well with eager prefill since local-disk latencies are low and we want
+  // to keep the device fed.
+
+  static constexpr bool supports_device_read() noexcept { return true; }
+  static constexpr bool supports_vector_host_read() noexcept { return true; }
+  static constexpr prefetching_mode preferred_prefetching_mode() noexcept
+  {
+    return prefetching_mode::eager;
+  }
 
  private:
   void worker_loop();
