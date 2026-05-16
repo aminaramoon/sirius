@@ -227,7 +227,7 @@ class uring_reactor {
   static constexpr bool supports_vector_host_read() noexcept { return true; }
   static constexpr prefetching_mode preferred_prefetching_mode() noexcept
   {
-    return prefetching_mode::eager;
+    return prefetching_mode::immediate;
   }
 
  private:

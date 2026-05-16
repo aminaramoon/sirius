@@ -38,11 +38,6 @@ namespace sirius::io {
 sirius_ioctx::sirius_ioctx()  = default;
 sirius_ioctx::~sirius_ioctx() = default;
 
-void sirius_ioctx::initialize_cache(buffer_pool& pool, size_t inflight_budget_chunks)
-{
-  _cache = std::make_unique<prefetching_cache>(pool, this, inflight_budget_chunks);
-}
-
 namespace {
 
 std::future<size_t> copy_pinned_slices_to_device(

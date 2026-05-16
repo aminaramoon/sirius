@@ -33,11 +33,14 @@ namespace sirius::io {
 // buffer_pool
 // ===========================================================================
 
-buffer_pool::buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr, uint32_t max_slabs)
+buffer_pool::buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr,
+                         uint32_t max_slabs,
+                         uint32_t initial_slabs)
   : _mr(mr), _chunk_bytes(mr.get_block_size()), _max_slabs(max_slabs)
 {
   std::unique_lock lk(_mtx);
-  for (uint32_t i = 0; i < std::min<uint32_t>(10, _max_slabs); ++i) {
+  auto const n = std::min(initial_slabs, _max_slabs);
+  for (uint32_t i = 0; i < n; ++i) {
     if (!grow_locked()) break;
   }
 }
@@ -121,6 +124,24 @@ void buffer_pool::deallocate(std::byte* p)
   std::unique_lock lk(_mtx);
   _free_list.push_back(p);
   _total_free.fetch_add(1, std::memory_order_relaxed);
+}
+
+void buffer_pool::reclaim_all()
+{
+  std::unique_lock lk(_mtx);
+  _free_list.clear();
+  // The slabs we already pulled from the upstream resource stay live; rebuild
+  // the free list from their per-block pointers.  No upstream traffic.
+  size_t total = 0;
+  for (auto const& alloc : _allocations) {
+    auto blocks = alloc->get_blocks();
+    _free_list.reserve(_free_list.size() + blocks.size());
+    for (auto* p : blocks)
+      _free_list.push_back(p);
+    total += blocks.size();
+  }
+  _total_free.store(static_cast<uint32_t>(total), std::memory_order_relaxed);
+  _total_chunks.store(static_cast<uint32_t>(total), std::memory_order_relaxed);
 }
 
 // ===========================================================================
@@ -297,14 +318,18 @@ std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t o
 // prefetching_cache — construction / destruction
 // ===========================================================================
 
-prefetching_cache::prefetching_cache(buffer_pool& pool,
-                                     sirius_ioctx* io_ctx,
-                                     size_t inflight_budget_chunks)
-  : _pool(pool), _io_ctx(io_ctx), _inflight_budget(inflight_budget_chunks)
+prefetching_cache::prefetching_cache(cucascade::memory::fixed_size_host_memory_resource& mr,
+                                     uint32_t max_slabs,
+                                     uint32_t initial_slabs)
+  : _pool_mr(&mr),
+    _pool_max_slabs(max_slabs),
+    _pool_initial_slabs(std::min(initial_slabs, max_slabs))
 {
   // Separators point past the (empty) list initially; every bucket is empty.
   _lru_buckets.fill(_lru_list.end());
-  // Start threads after all evictor-owned state is ready.
+  // Threads start dormant — _active is false until reset(non-null) flips it.
+  // Both still run so they can be re-armed cheaply without thread churn
+  // between queries.
   _evictor_thread = std::jthread([this](std::stop_token st) { evictor_loop(std::move(st)); });
   _worker_thread  = std::jthread([this](std::stop_token st) { worker_loop(std::move(st)); });
 }
@@ -316,6 +341,11 @@ prefetching_cache::~prefetching_cache()
   _work_seq.fetch_add(1, std::memory_order_release);
   _work_seq.notify_all();
   _request_sem.release();
+  {
+    std::unique_lock lk(_ctrl_mtx);
+    _active = false;
+    _ctrl_cv.notify_all();
+  }
 
   // Wake readers waiting on entries that were loading when shutdown began.
   // Outstanding backend requests may still resolve via their request_context
@@ -332,6 +362,92 @@ prefetching_cache::~prefetching_cache()
   abort_pending_entries();
 }
 
+void prefetching_cache::reset(std::shared_ptr<sirius_ioctx> io_ctx, size_t inflight_budget_chunks)
+{
+  // ----- Phase 1: take the cache offline ---------------------------------
+  // Flip _active to false so:
+  //   - insert() stops scheduling prefetch work (it still records metadata)
+  //   - the worker, when it loops back, parks on _ctrl_cv
+  // After flipping, drain the work queue ourselves so anything the worker
+  // hasn't picked up yet doesn't sit around with a stale io_ctx attached.
+  {
+    std::unique_lock lk(_ctrl_mtx);
+    _active = false;
+    _ctrl_cv.notify_all();
+  }
+  _work_seq.fetch_add(1, std::memory_order_release);
+  _work_seq.notify_all();
+
+  work_item drained;
+  while (_work_queue.try_dequeue(drained)) {
+    for (auto& entry : drained.entries) {
+      if (entry) entry->state.try_cancel_queued();
+    }
+  }
+
+  // ----- Phase 2: wait for in-flight backend IO --------------------------
+  // The worker may have dispatched host_read_ranges_async_io but the
+  // completion callback hasn't fired yet.  Those callbacks touch the pool
+  // and cache entries via the admission_control::slot captured in their
+  // closure; draining the admission_control's outstanding slots therefore
+  // proves no callback is mid-flight.  If we're transitioning null → null
+  // there's no budget to drain.
+  if (_inflight_budget) { _inflight_budget->wait_for_idle(); }
+
+  // ----- Phase 3: drain the eviction side --------------------------------
+  // Candidates are weak refs; just empty the queue.  Pending chunk
+  // requests would otherwise have the evictor block on backpressure for
+  // entries that are about to be wiped — fulfil them with an exception so
+  // any worker still parked in fut.get() unblocks.
+  eviction_candidate cand;
+  while (_candidate_queue.try_dequeue(cand)) {}
+
+  eviction_request ereq;
+  while (_request_queue.try_dequeue(ereq)) {
+    ereq.promise.set_exception(
+      std::make_exception_ptr(std::runtime_error("eviction aborted — cache reset")));
+  }
+
+  // The LRU list holds raw cache_entry* pointers into the file_cache map;
+  // drop it before the entries themselves go away.
+  _lru_list.clear();
+  _lru_buckets.fill(_lru_list.end());
+  _last_seen_age = 0;
+
+  // ----- Phase 4: drop all file entries ----------------------------------
+  // After waiting for in-flight IO, no callback references a cache_entry
+  // anymore — clearing the map releases every shared_ptr we own.
+  {
+    std::unique_lock map_lk(_map_mtx);
+    _file_cache.clear();
+  }
+
+  // ----- Phase 5: pool + budget lifecycle + re-arm -----------------------
+  std::unique_lock lk(_ctrl_mtx);
+  _io_ctx = io_ctx.get();
+  if (_io_ctx != nullptr) {
+    if (_pool) {
+      _pool->reclaim_all();
+    } else if (_pool_mr != nullptr) {
+      _pool = std::make_unique<buffer_pool>(*_pool_mr, _pool_max_slabs, _pool_initial_slabs);
+    }
+    // Rebuild the admission_control with the caller-supplied budget.  No
+    // outstanding slots survive across reset (Phase 2 drained them), so
+    // dropping the old instance is safe.
+    _inflight_budget = std::make_unique<admission_control>(inflight_budget_chunks);
+    _active          = true;
+    _ctrl_cv.notify_all();
+    _work_seq.fetch_add(1, std::memory_order_release);
+    _work_seq.notify_all();
+  } else {
+    // Detached: hand the slabs back to the upstream cucascade resource and
+    // release the admission_control.
+    _pool.reset();
+    _inflight_budget.reset();
+    // _active stays false until a future reset(non-null) re-arms us.
+  }
+}
+
 void prefetching_cache::enqueue_work(work_item item)
 {
   _work_queue.enqueue(std::move(item));
@@ -341,8 +457,10 @@ void prefetching_cache::enqueue_work(work_item item)
 
 void prefetching_cache::release_chunks(cache_entry& entry)
 {
-  for (auto* p : entry.chunks)
-    _pool.deallocate(p);
+  if (_pool) {
+    for (auto* p : entry.chunks)
+      _pool->deallocate(p);
+  }
   entry.chunks.clear();
 }
 
@@ -399,6 +517,33 @@ std::shared_ptr<cache_entry> prefetching_cache::find_entry(
 }
 
 // ===========================================================================
+// register_metadata
+// ===========================================================================
+
+void prefetching_cache::register_metadata(sirius_io_object& obj,
+                                          std::shared_ptr<sirius_io_object_metadata> metadata)
+{
+  // Match insert's contract: caller must own @p obj through a shared_ptr.
+  auto obj_sp     = obj.shared_from_this();
+  auto const& key = obj.raw_file_cache_id();
+  auto file_size  = obj.size();
+
+  std::unique_lock map_lk(_map_mtx);
+  auto [it, inserted] = _file_cache.try_emplace(key, nullptr);
+  if (inserted) it->second = std::make_unique<file_entry>();
+  auto& file = *it->second;
+
+  std::unique_lock file_lk(file.mtx);
+  map_lk.unlock();
+
+  file.io_obj    = std::move(obj_sp);
+  file.file_size = file_size;
+  // Symmetric with insert(): a null @p metadata leaves any existing
+  // metadata in place rather than clobbering it.
+  if (metadata) { file.metadata = std::move(metadata); }
+}
+
+// ===========================================================================
 // insert
 // ===========================================================================
 
@@ -418,10 +563,20 @@ void prefetching_cache::insert(sirius_io_object& obj,
   auto const& key = obj.raw_file_cache_id();
   auto file_size  = obj.size();
 
-  // _cache_age only advances via refresh_cache().  Sample it here so every
-  // range stamped in this call shares the same request_ts — they belong to
-  // the same epoch.
-  auto tick = _cache_age.load(std::memory_order_relaxed);
+  // Snapshot the lifecycle once.  Either piece going missing (no pool /
+  // no ioctx) puts insert() into the "metadata only" path the user asked
+  // for: still record the file entry + metadata so subsequent reads can
+  // observe it, but skip building per-range cache_entries that would need
+  // the pool's chunk_bytes and the ioctx's compute_physical_range.
+  buffer_pool* pool    = nullptr;
+  sirius_ioctx* io_ctx = nullptr;
+  bool active          = false;
+  {
+    std::unique_lock lk(_ctrl_mtx);
+    pool   = _pool.get();
+    io_ctx = _io_ctx;
+    active = _active;
+  }
 
   std::unique_lock map_lk(_map_mtx);
   auto [it, inserted] = _file_cache.try_emplace(key, nullptr);
@@ -437,6 +592,17 @@ void prefetching_cache::insert(sirius_io_object& obj,
   // a previous insert() left in place so callers can skip re-supplying it on
   // every prefetch insert.
   if (metadata) { file.metadata = std::move(metadata); }
+
+  if (!active || pool == nullptr || io_ctx == nullptr) {
+    // Dormant cache: file entry + metadata are stored; per-range
+    // prefetching needs the pool and ioctx and waits for the next reset.
+    return;
+  }
+
+  // _cache_age only advances via refresh_cache().  Sample it here so every
+  // range stamped in this call shares the same request_ts — they belong to
+  // the same epoch.
+  auto tick = _cache_age.load(std::memory_order_relaxed);
 
   // Every range in the insert becomes a prefetch request, regardless of the
   // entry's current state.  The worker decides at dispatch time whether the
@@ -472,8 +638,8 @@ void prefetching_cache::insert(sirius_io_object& obj,
       merged.push_back(std::move(existing));
       ++ex_it;
     } else {
-      auto physical = _io_ctx->compute_physical_range(logical, file_size);
-      auto e        = std::make_shared<cache_entry>(logical, physical, _pool.chunk_bytes());
+      auto physical = io_ctx->compute_physical_range(logical, file_size);
+      auto e        = std::make_shared<cache_entry>(logical, physical, pool->chunk_bytes());
       e->n_total_request.fetch_add(1, std::memory_order_relaxed);
       e->n_request.store(1, std::memory_order_relaxed);
       e->request_ts.store(tick, std::memory_order_release);
@@ -689,8 +855,8 @@ std::string prefetching_cache::summary() const
     worker_skip,
     evicted_entries,
     evicted_chunks,
-    _pool.free_count(),
-    _pool.total_chunks());
+    _pool ? _pool->free_count() : 0U,
+    _pool ? _pool->total_chunks() : 0U);
   spdlog::info("{}", s);
   return s;
 }
@@ -792,7 +958,11 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
     if (!entry->is_consumed_or_stale(static_cast<uint64_t>(age))) return 0;
     if (!entry->state.try_start_evicting()) return 0;
     size_t n = entry->chunks.size();
-    _pool.deallocate_bulk(entry->chunks);
+    // The pool can only be torn down after reset() has waited for the
+    // worker and in-flight IO to drain, so any cached entry still in the
+    // LRU points into a live pool — but assert for safety in case a future
+    // refactor races the evictor against pool teardown.
+    if (_pool) { _pool->deallocate_bulk(entry->chunks); }
     entry->state.mark_evicted();
     _evicted_entries.fetch_add(1, std::memory_order_relaxed);
     _evicted_chunks.fetch_add(n, std::memory_order_relaxed);
@@ -930,6 +1100,16 @@ void prefetching_cache::worker_loop(std::stop_token stop)
   });
 
   while (!stop.stop_requested()) {
+    // ---- Lifecycle gate ----------------------------------------------------
+    // The cache may be dormant (no io_ctx attached yet, or temporarily
+    // detached by reset()).  Park on _ctrl_cv until reset() arms us again
+    // rather than spinning on the work queue.
+    {
+      std::unique_lock lk(_ctrl_mtx);
+      _ctrl_cv.wait(lk, [&] { return _active || stop.stop_requested(); });
+    }
+    if (stop.stop_requested()) break;
+
     work_item item;
     if (!_work_queue.try_dequeue(item)) {
       auto seq = _work_seq.load(std::memory_order_acquire);
@@ -939,6 +1119,28 @@ void prefetching_cache::worker_loop(std::stop_token stop)
       }
     }
 
+    // Snapshot pool + io_ctx under the lifecycle lock so we can't race with
+    // a reset() that's about to clear them.  If the cache was detached
+    // between the gate above and here, the snapshot is null and we
+    // cancel-queued every entry so a re-arm sees them as fresh.
+    buffer_pool* pool    = nullptr;
+    sirius_ioctx* io_ctx = nullptr;
+    {
+      std::unique_lock lk(_ctrl_mtx);
+      if (!_active) {
+        for (auto& e : item.entries)
+          if (e) e->state.try_cancel_queued();
+        continue;
+      }
+      pool   = _pool.get();
+      io_ctx = _io_ctx;
+    }
+    if (pool == nullptr || io_ctx == nullptr) {
+      for (auto& e : item.entries)
+        if (e) e->state.try_cancel_queued();
+      continue;
+    }
+
     // ---- Phase 1: compute an upper bound on chunks for the whole item ------
     // Peek at each entry's state to skip ones that obviously don't need
     // loading (already cached / loading / etc.).  Peeks are racy, but only
@@ -946,7 +1148,7 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     // filtered again in Phase 4 by try_start_loading.
     std::vector<size_t> per_entry_chunks(item.entries.size(), 0);
     size_t upper_bound_chunks = 0;
-    auto const chunk_bytes    = _pool.chunk_bytes();
+    auto const chunk_bytes    = pool->chunk_bytes();
     for (size_t i = 0; i < item.entries.size(); ++i) {
       auto const& e = item.entries[i];
       if (e->n_request.load(std::memory_order_acquire) <= 0) continue;
@@ -966,7 +1168,7 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     // state (empty/cached/etc.) and take their normal paths.
     std::vector<std::byte*> ptrs;
     ptrs.reserve(upper_bound_chunks);
-    auto got                = _pool.allocate_bulk(upper_bound_chunks, ptrs);
+    auto got                = pool->allocate_bulk(upper_bound_chunks, ptrs);
     bool eviction_requested = false;
     if (got < upper_bound_chunks) {
       size_t shortfall = upper_bound_chunks - got;
@@ -980,13 +1182,13 @@ void prefetching_cache::worker_loop(std::stop_token stop)
       try {
         fut.get();
       } catch (...) {
-        _pool.deallocate_bulk(ptrs);
+        pool->deallocate_bulk(ptrs);
         continue;
       }
 
-      auto extra = _pool.allocate_bulk(shortfall, ptrs);
+      auto extra = pool->allocate_bulk(shortfall, ptrs);
       if (extra < shortfall) {
-        _pool.deallocate_bulk(ptrs);
+        pool->deallocate_bulk(ptrs);
         continue;
       }
     }
@@ -996,9 +1198,13 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     // but admission_control::slot is a fixed reservation — we hold the full
     // amount until IO completes.  This is a conservative over-reservation;
     // any excess chunks are returned to the pool immediately in Phase 4.
-    auto budget_slot = _inflight_budget.acquire(upper_bound_chunks, stop);
+    // _active==true (checked above under _ctrl_mtx) guarantees the budget
+    // unique_ptr is live; reset() can't drop it without first waiting for
+    // wait_for_idle, which only returns after this work item's callback
+    // (and every other outstanding callback) has released its slot.
+    auto budget_slot = _inflight_budget->acquire(upper_bound_chunks, stop);
     if (!budget_slot) {
-      _pool.deallocate_bulk(ptrs);
+      pool->deallocate_bulk(ptrs);
       break;
     }
 
@@ -1017,7 +1223,7 @@ void prefetching_cache::worker_loop(std::stop_token stop)
       auto const& e      = item.entries[i];
       auto return_chunks = [&] {
         for (size_t j = 0; j < n; ++j)
-          _pool.deallocate(ptrs[ptr_idx + j]);
+          pool->deallocate(ptrs[ptr_idx + j]);
         ptr_idx += n;
       };
 
@@ -1063,8 +1269,14 @@ void prefetching_cache::worker_loop(std::stop_token stop)
 
     {
       auto& obj_ref = *item.io_obj;
-      auto* pool    = &_pool;
-      _io_ctx->host_read_ranges_async_io(
+      // The admission_control slot captured in the lambda below is the
+      // single source of truth for "this IO is still in flight": its
+      // destructor (firing when the closure is destroyed at callback
+      // exit) calls back into admission_control::release, which is what
+      // reset() waits on via admission_control::wait_for_idle.  As long
+      // as the slot is alive, reset() blocks before touching the pool or
+      // io_ctx — so the callback can safely use both.
+      io_ctx->host_read_ranges_async_io(
         obj_ref,
         io_ranges,
         io_dsts,
@@ -1080,9 +1292,7 @@ void prefetching_cache::worker_loop(std::stop_token stop)
               spdlog::error("prefetching_cache: IO failed for {}: {}", key, ex.what());
             }
             for (auto const& e : batch) {
-              for (auto* p : e->chunks)
-                pool->deallocate(p);
-              e->chunks.clear();
+              pool->deallocate_bulk(e->chunks);
               e->state.try_mark_load_failed();
             }
           } else {
@@ -1090,7 +1300,8 @@ void prefetching_cache::worker_loop(std::stop_token stop)
               e->state.try_mark_cached();
           }
           // `slot` and `io_obj` destruct here — budget is returned to
-          // admission_control, and the file handle is released only
+          // admission_control (which wakes any wait_for_idle waiter once
+          // the last slot drops), and the file handle is released only
           // after the IO backend is done with it.
         });
     }

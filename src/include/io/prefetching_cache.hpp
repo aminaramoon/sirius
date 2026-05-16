@@ -28,6 +28,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <future>
 #include <list>
 #include <memory>
@@ -61,7 +62,12 @@ class buffer_pool {
  public:
   static constexpr uint32_t CHUNKS_PER_SLAB = 500;  // 500 chunks per slab
 
-  buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr, uint32_t max_slabs);
+  /// @p initial_slabs slabs are allocated up-front from @p mr (clamped to
+  /// @p max_slabs).  Default preserves the historical behaviour of warming
+  /// the pool with up to 10 slabs at construction.
+  buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr,
+              uint32_t max_slabs,
+              uint32_t initial_slabs = 10);
   ~buffer_pool();
 
   buffer_pool(buffer_pool const&)            = delete;
@@ -80,6 +86,13 @@ class buffer_pool {
 
   /// Return a chunk to the pool.
   void deallocate(std::byte* p);
+
+  /// Restore the free list to "all chunks free".  Caller must guarantee
+  /// every previously-handed-out chunk is no longer in use — the pool
+  /// rebuilds its free list from the slabs it already holds without
+  /// touching the upstream resource.  Slabs themselves are retained, so
+  /// no allocation happens; subsequent allocate() calls reuse them.
+  void reclaim_all();
 
   [[nodiscard]] size_t chunk_bytes() const noexcept { return _chunk_bytes; }
   [[nodiscard]] size_t slab_bytes() const noexcept
@@ -485,20 +498,40 @@ class pinned_view {
 
 class prefetching_cache {
  public:
-  /// @p inflight_budget_chunks caps the number of 1MB chunks the worker
-  /// may have submitted to the IO backend at once.  The worker acquires N
-  /// tokens before each dispatch and releases them in the completion
-  /// callback.  Default ~2 GB worth of in-flight IO.
-  ///
-  /// @p io_ctx is a non-owning pointer; the owning ioctx must outlive this
-  /// cache (the ioctx itself owns the cache via initialize_cache()).
-  explicit prefetching_cache(buffer_pool& pool,
-                             sirius_ioctx* io_ctx,
-                             size_t inflight_budget_chunks = 2048);
+  /// Construct dormant: the cache stores @p mr, @p max_slabs, and
+  /// @p initial_slabs as the pool configuration but does NOT allocate any
+  /// slabs yet.  The first @c reset(non-null io_ctx, budget) builds the
+  /// pool (warming it with @p initial_slabs slabs out of @p max_slabs) and
+  /// arms the worker.  @p mr must outlive the cache.
+  prefetching_cache(cucascade::memory::fixed_size_host_memory_resource& mr,
+                    uint32_t max_slabs,
+                    uint32_t initial_slabs = 0);
   ~prefetching_cache();
 
   prefetching_cache(prefetching_cache const&)            = delete;
   prefetching_cache& operator=(prefetching_cache const&) = delete;
+
+  /// Transition the cache between dormant and active states:
+  ///   - Stops accepting new prefetch requests and drains the work queue.
+  ///   - Waits for any in-flight backend IO to complete.
+  ///   - Drains the eviction queues (candidates and chunk requests).
+  ///   - Clears every per-file entry from the cache map.
+  ///   - When @p io_ctx is non-null: ensures the buffer_pool exists
+  ///     (reclaiming if it already does, allocating from the stored config
+  ///     if it doesn't), rebuilds the inflight admission_control with
+  ///     @p inflight_budget_chunks tokens, and re-arms the worker.
+  ///   - When @p io_ctx is null: drops the buffer_pool so its slabs return
+  ///     to the upstream resource, releases the admission_control, and
+  ///     leaves the cache dormant.  @p inflight_budget_chunks is ignored.
+  /// Safe to call repeatedly.
+  void reset(std::shared_ptr<sirius_ioctx> io_ctx, size_t inflight_budget_chunks = 2048);
+
+  /// Record (or overwrite) the metadata for @p obj's cache key without
+  /// registering any ranges or scheduling prefetch.  Used by callers that
+  /// have parsed file metadata before the cache is armed, or that want to
+  /// stash metadata for a file they will never prefetch.
+  void register_metadata(sirius_io_object& obj,
+                         std::shared_ptr<sirius_io_object_metadata> metadata);
 
   /// Register ranges for a file and trigger background prefetch.
   /// Ranges must be sorted by offset.  The cache retains @p obj via
@@ -510,6 +543,10 @@ class prefetching_cache {
   /// stored metadata for this file's cache key, while a null pointer leaves
   /// the existing entry untouched.  This lets repeat callers re-trigger
   /// prefetch without having to re-supply (or re-parse) the metadata.
+  ///
+  /// When the cache is dormant (no buffer pool or no @c sirius_ioctx
+  /// attached) the metadata and file entry are still recorded, but no
+  /// prefetch work is scheduled.
   void insert(sirius_io_object& obj,
               std::shared_ptr<sirius_io_object_metadata> metadata,
               const std::vector<cudf::io::text::byte_range_info>& ranges);
@@ -618,8 +655,34 @@ class prefetching_cache {
 
   // ---- members (destruction order matters: worker joined first) -------------
 
-  buffer_pool& _pool;
-  sirius_ioctx* _io_ctx;
+  /// Cache-owned pool.  Allocated lazily by @c reset(non-null) and dropped
+  /// by @c reset(null).  Workers and IO callbacks reach the pool via
+  /// @c _pool.get() and rely on the lifecycle-pause guarantees provided by
+  /// @c reset to keep the pointer live for the duration of any in-flight IO.
+  std::unique_ptr<buffer_pool> _pool;
+  /// Pool config captured at construction — used the first time @c reset
+  /// gets a non-null io_ctx (and on every subsequent rearm where the pool
+  /// was previously dropped).
+  cucascade::memory::fixed_size_host_memory_resource* _pool_mr{nullptr};
+  uint32_t _pool_max_slabs{0};
+  uint32_t _pool_initial_slabs{0};
+
+  /// Non-owning pointer to the attached ioctx.  Set/cleared exclusively
+  /// through @c reset; lifetime is the caller's responsibility (the owning
+  /// scan_manager keeps a shared_ptr that outlives the cache).
+  sirius_ioctx* _io_ctx{nullptr};
+
+  /// Lifecycle gate.  When @c _active is false: insert() short-circuits
+  /// (just records metadata + file_entry without enqueuing prefetch work);
+  /// the worker parks on @c _ctrl_cv instead of picking up new items.
+  /// Toggled exclusively by @c reset under @c _ctrl_mtx.  In-flight IO
+  /// is tracked by @c _inflight_budget's outstanding slot count, not by
+  /// a separate counter — @c admission_control::wait_for_idle is the
+  /// drain primitive @c reset uses.
+  bool _active{false};
+
+  mutable std::mutex _ctrl_mtx;
+  std::condition_variable _ctrl_cv;
   /// Monotonic age counter.  Advanced only by refresh_cache() — caller
   /// pulses it to age the cache (non-refreshed entries drift toward bucket 0).
   /// request_ts and consumption_ts on cache_entry snapshot this value.
@@ -659,8 +722,10 @@ class prefetching_cache {
 
   /// IO in-flight budget: units == chunks.  Worker acquires a slot sized to
   /// the batch before dispatching IO; the slot is carried into the completion
-  /// callback and releases on destruction.
-  admission_control _inflight_budget;
+  /// callback and releases on destruction.  Rebuilt by every non-null
+  /// @c reset so callers can vary the budget across queries; null while
+  /// the cache is dormant.
+  std::unique_ptr<admission_control> _inflight_budget;
 
   // ---- LRU-with-buckets eviction list (evictor-thread only) ---------------
   //

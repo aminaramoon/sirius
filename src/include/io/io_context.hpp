@@ -42,11 +42,12 @@ class prefetching_cache;
  * - @c none: no prefetching.  Either the backend does not support vector host
  *   reads (so the prefetcher cannot batch range requests cheaply) or the
  *   backend explicitly opted out.
- * - @c eager: prefill the cache ahead of consumer demand.
- * - @c lazy: read-ahead on demand — issue extra IO only when triggered by a
+ * - @c immediate: prefill the cache ahead of consumer demand.
+ * - @c speculative: read-ahead on demand — issue extra IO only when triggered by a
  *   consumer read.
+ * - @c disposable: prefetching is temporary and can be discarded when no longer needed.
  */
-enum class prefetching_mode { none, eager, lazy };
+enum class prefetching_mode { none, immediate, speculative, disposable };
 
 // ---------------------------------------------------------------------------
 // sirius_ioctx
@@ -105,12 +106,13 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// characteristics.
   [[nodiscard]] virtual prefetching_mode preferred_prefetching_mode() const = 0;
 
-  /// Construct the owned prefetching_cache.  Must be called before any
-  /// read that should consult the cache; until then device_read falls
-  /// through directly to device_read_io.
-  void initialize_cache(buffer_pool& pool, size_t inflight_budget_chunks = 2048);
+  /// Wire up a non-owning prefetching_cache so @c host_read / @c device_read
+  /// consult it before falling through to the backend.  The caller owns
+  /// the cache and must guarantee it outlives this ioctx.  Pass nullptr to
+  /// detach.
+  void attach_cache(prefetching_cache* cache) noexcept { _cache = cache; }
 
-  [[nodiscard]] prefetching_cache* cache() noexcept { return _cache.get(); }
+  [[nodiscard]] prefetching_cache* cache() noexcept { return _cache; }
 
   // -- Read API ---------------------------------------------------------------
 
@@ -161,7 +163,10 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
     cudf::io::text::byte_range_info logical, size_t file_size) const = 0;
 
  protected:
-  std::unique_ptr<prefetching_cache> _cache;
+  /// Non-owning pointer wired up by @c attach_cache.  Lifetime is the
+  /// caller's responsibility (typically a scan_manager that outlives any
+  /// ioctx using its cache).
+  prefetching_cache* _cache{nullptr};
 };
 
 }  // namespace sirius::io

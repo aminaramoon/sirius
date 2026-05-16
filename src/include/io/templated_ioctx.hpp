@@ -128,10 +128,10 @@ class templated_ioctx : public sirius_ioctx {
 
   ~templated_ioctx() override
   {
-    // sirius_ioctx owns the cache in the base class, which would normally be
-    // destroyed after this derived class's reactor pool. Stop the cache first
-    // so its worker cannot enqueue into reactors while they are shutting down.
-    _cache.reset();
+    // The attached prefetching_cache (if any) is owned externally — the
+    // owner is responsible for detaching it (via cache->reset(nullptr, 0))
+    // before destroying this ioctx, so reactors are not dispatched against
+    // a half-torn-down cache.
     shutdown();
   }
 

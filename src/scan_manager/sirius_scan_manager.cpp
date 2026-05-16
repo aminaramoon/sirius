@@ -63,15 +63,25 @@ sirius_scan_manager::sirius_scan_manager(
       _config.uring_n_reactors,
       _config.uring_ring_entries);
 
-    if (_config.enable_prefetch_cache) {
+    // Two gates have to be open before we stand up the cache:
+    //   1. the user hasn't disabled prefetching via config, and
+    //   2. the backend can serve a batch of host reads in one dispatch —
+    //      vector host read is the cheap dispatch path the prefetcher
+    //      relies on, and without it the cache would do strictly more
+    //      work than the direct path.
+    if (_config.enable_prefetch_cache && _io_ctx->supports_vector_host_read()) {
       // Slab size = CHUNKS_PER_SLAB blocks at the resource's block size.
       // Round the byte budget up so the user gets at least what they asked for.
       auto const slab_bytes = host_mr->get_block_size() *
                               static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
       auto const max_slabs =
         static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-      _buffer_pool = std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs);
-      _io_ctx->initialize_cache(*_buffer_pool, _config.prefetch_inflight_budget_chunks);
+      // Construct the cache with its pool config; it stays dormant until
+      // reset() below allocates the pool and arms the worker.
+      _cache = std::make_unique<sirius::io::prefetching_cache>(
+        *host_mr, max_slabs, /*initial_slabs=*/max_slabs);
+      _io_ctx->attach_cache(_cache.get());
+      _cache->reset(_io_ctx, _config.prefetch_inflight_budget_chunks);
       SIRIUS_LOG_DEBUG(
         "[sirius_scan_manager] prefetch cache enabled (slabs={} budget_bytes={} "
         "inflight_chunks={})",
@@ -88,9 +98,14 @@ sirius_scan_manager::sirius_scan_manager(
 
 sirius_scan_manager::~sirius_scan_manager()
 {
-  if (_io_ctx && _io_ctx->cache() != nullptr) {
-    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
-  }
+  if (_cache) { SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _cache->summary()); }
+  // Detach the cache from the ioctx before either is torn down so the
+  // ioctx doesn't observe a half-destroyed cache via @c host_read.  The
+  // cache's destructor will then drain its worker and queues; afterwards
+  // the ioctx and its reactors can be destroyed safely.
+  if (_io_ctx) { _io_ctx->attach_cache(nullptr); }
+  if (_cache) { _cache->reset(nullptr, 0); }
+  _cache.reset();
   stop();
 }
 
