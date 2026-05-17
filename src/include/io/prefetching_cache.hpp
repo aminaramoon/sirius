@@ -560,14 +560,7 @@ class prefetching_cache {
   [[nodiscard]] pinned_view read(const sirius_io_object& obj,
                                  size_t offset,
                                  size_t size,
-                                 cudaStream_t stream);
-
-  /// Non-blocking batch read. Returns one pinned_view per input range
-  /// (empty if that range is not yet cached).
-  [[nodiscard]] std::vector<pinned_view> read_ranges(
-    const sirius_io_object& obj,
-    const std::vector<cudf::io::text::byte_range_info>& ranges,
-    cudaStream_t stream);
+                                 cudaStream_t stream = nullptr);
 
   /// Look up the metadata that a previous insert() stored for @p obj.
   /// Returns nullptr if no entry exists for the object's cache key or no

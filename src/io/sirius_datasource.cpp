@@ -44,6 +44,11 @@ size_t sirius_datasource::size() const { return _io_object->size(); }
 
 bool sirius_datasource::supports_device_read() const { return _io_ctx->supports_device_read(); }
 
+bool sirius_datasource::supports_vector_host_read() const
+{
+  return _io_ctx->supports_vector_host_read();
+}
+
 bool sirius_datasource::is_device_read_preferred(size_t) const
 {
   return _io_ctx->supports_device_read();

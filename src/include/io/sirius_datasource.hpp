@@ -55,6 +55,8 @@ class sirius_datasource : public cudf::io::datasource {
 
   [[nodiscard]] bool supports_device_read() const override;
 
+  [[nodiscard]] bool supports_vector_host_read() const;
+
   [[nodiscard]] bool is_device_read_preferred(size_t) const override;
 
   size_t host_read(size_t offset, size_t size, uint8_t* dst) override;

@@ -160,7 +160,7 @@ std::future<size_t> copy_pinned_slices_to_device(
 size_t sirius_ioctx::host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst)
 {
   if (_cache) {
-    if (auto view = _cache->read(obj, offset, size, nullptr); view) {
+    if (auto view = _cache->read(obj, offset, size); view) {
       auto slices   = view.slice(offset, size);
       size_t copied = 0;
       for (auto const& s : slices) {
@@ -179,7 +179,7 @@ std::future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
                                                   uint8_t* dst)
 {
   if (_cache) {
-    if (auto view = _cache->read(obj, offset, size, nullptr); view) {
+    if (auto view = _cache->read(obj, offset, size); view) {
       auto slices = view.slice(offset, size);
       try {
         size_t copied = 0;
@@ -211,7 +211,7 @@ size_t sirius_ioctx::device_read(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
   if (_cache) {
-    if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
+    if (auto view = _cache->read(obj, offset, size); view) {
       auto slices = view.slice(offset, size);
       auto copied = copy_pinned_slices_to_device(slices, dst, stream);
       return copied.get();
