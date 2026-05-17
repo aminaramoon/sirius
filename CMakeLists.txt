@@ -166,6 +166,7 @@ set(EXTENSION_SOURCES
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
+    src/io/kvikio/kvikio_context.cpp
     src/io/prefetching_cache.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_sigv4_credential_provider.cpp

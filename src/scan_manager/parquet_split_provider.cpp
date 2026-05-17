@@ -18,6 +18,7 @@
 
 #include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "io/io_context.hpp"
+#include "io/kvikio/kvikio_context.hpp"
 #include "io/prefetching_cache.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
@@ -73,7 +74,10 @@ parquet_split_provider::parquet_split_provider(
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
     _total_files(file_paths.size()),
-    _io_ctx(std::move(io_ctx))
+    // Default to a kvikio_context when no ioctx is supplied — keeps test
+    // sites that construct the provider directly working without forcing
+    // each one to plumb an explicit ioctx.
+    _io_ctx(io_ctx ? std::move(io_ctx) : std::make_shared<sirius::io::kvikio_context>())
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /
@@ -214,18 +218,12 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
 
     //===----------Read metadata footers----------===//
-    // When the manager exposes a sirius_ioctx, mint an io_object up-front and
-    // route the footer fetch through sirius_datasource so the same io_object
-    // can be threaded onto every emitted row_group_slice.  Falls through to
-    // cudf's path when the manager was configured with use_sirius_datasource=false.
-    std::shared_ptr<sirius::io::sirius_io_object> file_io_object;
-    std::unique_ptr<cudf::io::datasource> datasource;
-    if (_io_ctx != nullptr) {
-      file_io_object = _io_ctx->create_io_object(file_path);
-      datasource     = _io_ctx->make_datasource(file_io_object);
-    } else {
-      datasource = cudf::io::datasource::create(file_path);
-    }
+    // scan_manager always supplies an io_ctx (sirius_datasource on the fast
+    // path, kvikio_context as fallback), so we unconditionally mint an
+    // io_object up-front and route the footer fetch through it.  The same
+    // io_object is threaded onto every emitted row_group_slice.
+    auto file_io_object = _io_ctx->create_io_object(file_path);
+    auto datasource     = _io_ctx->make_datasource(file_io_object);
 
     //===----------Parse metadata (with prefetch-cache reuse)----------===//
     // If the prefetching cache already has a parquet_metadata entry for this
@@ -237,7 +235,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     std::size_t footer_byte_len = 0;
     std::unique_ptr<op::scan::hybrid_scan_reader> reader_ptr;
 
-    if (file_io_object && _io_ctx != nullptr && _io_ctx->cache() != nullptr) {
+    if (_io_ctx->cache() != nullptr) {
       if (auto cached = _io_ctx->cache()->get_metadata(*file_io_object)) {
         cached_parquet_metadata = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached));
       }
@@ -312,8 +310,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     // surviving row group + footer/trailer.  insert() must use the same
     // merged ranges scan_task computes — the cache only serves reads that
     // are fully covered by an inserted range.
-    if (file_io_object && _io_ctx != nullptr && _io_ctx->cache() != nullptr &&
-        !row_group_indices.empty()) {
+    if (_io_ctx->cache() != nullptr && !row_group_indices.empty()) {
       using range_t = cudf::io::text::byte_range_info;
 
       auto chunk_ranges = reader.all_column_chunks_byte_ranges(row_group_indices, *reader_options);

@@ -56,10 +56,12 @@ namespace sirius::scan_manager {
 /**
  * @brief Configuration for the scan_manager.
  *
- * @c use_sirius_datasource controls whether the manager builds a
- * @c sirius_ioctx and routes parquet reads through @c sirius_datasource.
- * Set to @c false to fall back to @c cudf::io::datasource::create() at
- * every read site (e.g. when the sirius IO path is misbehaving).
+ * @c use_sirius_datasource controls which @c sirius_ioctx backs parquet
+ * reads.  When @c true, the manager builds a @c uring_ioctx that goes
+ * through the prefetch-capable sirius IO path.  When @c false, the
+ * manager falls back to a @c kvikio_context — same @c sirius_ioctx
+ * interface, but reads forward to cudf's default datasource so callers
+ * have a single uniform IO entry point regardless of the backend.
  */
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};

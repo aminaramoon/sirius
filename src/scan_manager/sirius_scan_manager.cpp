@@ -17,6 +17,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include "exec/thread_pool.hpp"
+#include "io/kvikio/kvikio_context.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
@@ -50,6 +51,11 @@ sirius_scan_manager::sirius_scan_manager(
     _dispatcher(
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads))
 {
+  // scan_manager always owns an io_ctx: sirius_datasource (uring) on the
+  // fast path, kvikio_context as the universal fallback so the rest of the
+  // scan path (parquet_split_provider, scan tasks) always has an ioctx to
+  // talk to.  kvikio_context wraps cudf::io::datasource so the read path
+  // is identical from the caller's point of view.
   if (_config.use_sirius_datasource) {
     if (host_mr == nullptr) {
       throw std::runtime_error(
@@ -62,37 +68,41 @@ sirius_scan_manager::sirius_scan_manager(
       "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
       _config.uring_n_reactors,
       _config.uring_ring_entries);
-
-    // Two gates have to be open before we stand up the cache:
-    //   1. the user hasn't disabled prefetching via config, and
-    //   2. the backend can serve a batch of host reads in one dispatch —
-    //      vector host read is the cheap dispatch path the prefetcher
-    //      relies on, and without it the cache would do strictly more
-    //      work than the direct path.
-    if (_config.enable_prefetch_cache && _io_ctx->supports_vector_host_read()) {
-      // Slab size = CHUNKS_PER_SLAB blocks at the resource's block size.
-      // Round the byte budget up so the user gets at least what they asked for.
-      auto const slab_bytes = host_mr->get_block_size() *
-                              static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
-      auto const max_slabs =
-        static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-      // Construct the cache with its pool config; it stays dormant until
-      // reset() below allocates the pool and arms the worker.
-      _cache = std::make_unique<sirius::io::prefetching_cache>(
-        *host_mr, max_slabs, /*initial_slabs=*/max_slabs);
-      _io_ctx->attach_cache(_cache.get());
-      _cache->reset(_io_ctx, _config.prefetch_inflight_budget_chunks);
-      SIRIUS_LOG_DEBUG(
-        "[sirius_scan_manager] prefetch cache enabled (slabs={} budget_bytes={} "
-        "inflight_chunks={})",
-        max_slabs,
-        max_slabs * slab_bytes,
-        _config.prefetch_inflight_budget_chunks);
-    }
   } else {
+    _io_ctx = std::make_shared<sirius::io::kvikio_context>();
     SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] sirius_datasource disabled — falling back to "
-      "cudf::io::datasource::create");
+      "[sirius_scan_manager] sirius_datasource disabled — using kvikio_context fallback");
+  }
+
+  // Cache stand-up requires two gates:
+  //   1. the user hasn't disabled prefetching via config, and
+  //   2. the active backend supports batched host reads — kvikio_context
+  //      reports false here, so the fallback path stays cache-less without
+  //      an explicit check.
+  if (_config.enable_prefetch_cache && _io_ctx->supports_vector_host_read()) {
+    if (host_mr == nullptr) {
+      throw std::runtime_error(
+        "[sirius_scan_manager] prefetch cache requested on a vector-host-read "
+        "backend but no host fixed_size_host_memory_resource was provided");
+    }
+    // Slab size = CHUNKS_PER_SLAB blocks at the resource's block size.
+    // Round the byte budget up so the user gets at least what they asked for.
+    auto const slab_bytes = host_mr->get_block_size() *
+                            static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
+    auto const max_slabs =
+      static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
+    // Construct the cache with its pool config; it stays dormant until
+    // reset() below allocates the pool and arms the worker.
+    _cache = std::make_unique<sirius::io::prefetching_cache>(
+      *host_mr, max_slabs, /*initial_slabs=*/max_slabs);
+    _io_ctx->attach_cache(_cache.get());
+    _cache->reset(_io_ctx, _config.prefetch_inflight_budget_chunks);
+    SIRIUS_LOG_DEBUG(
+      "[sirius_scan_manager] prefetch cache enabled (slabs={} budget_bytes={} "
+      "inflight_chunks={})",
+      max_slabs,
+      max_slabs * slab_bytes,
+      _config.prefetch_inflight_budget_chunks);
   }
 }
 

@@ -60,6 +60,13 @@ enum class prefetching_mode { none, immediate, speculative, disposable };
  * threads, ...). Extend this class to provide a concrete I/O backend.
  */
 class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
+  // prefetching_cache's worker_loop is the only caller of the protected
+  // host_read_ranges_async_io entry point through a sirius_ioctx* base
+  // pointer.  Friending the cache lets that single call site reach in
+  // without forcing the vector-read primitive (which most callers never
+  // touch) into the public API.
+  friend class prefetching_cache;
+
  public:
   sirius_ioctx();
   virtual ~sirius_ioctx();
@@ -116,21 +123,27 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   // -- Read API ---------------------------------------------------------------
 
-  size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst);
+  virtual size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst);
 
-  std::future<size_t> host_read_async(sirius_io_object& obj,
-                                      size_t offset,
-                                      size_t size,
-                                      uint8_t* dst);
+  virtual std::future<size_t> host_read_async(sirius_io_object& obj,
+                                              size_t offset,
+                                              size_t size,
+                                              uint8_t* dst);
 
-  size_t device_read(
+  virtual size_t device_read(
     sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
 
-  std::future<size_t> device_read_async(
+  virtual std::future<size_t> device_read_async(
     sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
+
+  // -- Physical range alignment ------------------------------------------------
+
+  virtual cudf::io::text::byte_range_info compute_physical_range(
+    cudf::io::text::byte_range_info logical, size_t file_size) const = 0;
 
   ///
 
+ protected:
   virtual size_t host_read_io(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
 
   virtual void host_read_async_io(sirius_io_object& obj,
@@ -156,11 +169,6 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
                                          std::vector<cudf::io::text::byte_range_info> const& ranges,
                                          std::span<cudf::host_span<std::byte>> dst,
                                          io_completion_handler handler) = 0;
-
-  // -- Physical range alignment ------------------------------------------------
-
-  virtual cudf::io::text::byte_range_info compute_physical_range(
-    cudf::io::text::byte_range_info logical, size_t file_size) const = 0;
 
  protected:
   /// Non-owning pointer wired up by @c attach_cache.  Lifetime is the
