@@ -547,9 +547,10 @@ void prefetching_cache::register_metadata(sirius_io_object& obj,
 // insert
 // ===========================================================================
 
-void prefetching_cache::insert(sirius_io_object& obj,
-                               std::shared_ptr<sirius_io_object_metadata> metadata,
-                               const std::vector<cudf::io::text::byte_range_info>& ranges)
+prefetching_handle prefetching_cache::insert(
+  sirius_io_object& obj,
+  std::shared_ptr<sirius_io_object_metadata> metadata,
+  const std::vector<cudf::io::text::byte_range_info>& ranges)
 {
   assert(std::is_sorted(ranges.begin(),
                         ranges.end(),
@@ -596,7 +597,9 @@ void prefetching_cache::insert(sirius_io_object& obj,
   if (!active || pool == nullptr || io_ctx == nullptr) {
     // Dormant cache: file entry + metadata are stored; per-range
     // prefetching needs the pool and ioctx and waits for the next reset.
-    return;
+    // Return an empty handle so the caller's `if (handle)` check skips
+    // the "store on the datasource" path.
+    return {};
   }
 
   // _cache_age only advances via refresh_cache().  Sample it here so every
@@ -655,8 +658,19 @@ void prefetching_cache::insert(sirius_io_object& obj,
 
   file_lk.unlock();
 
-  if (!new_entries.empty())
-    enqueue_work(prefetch_req{key, std::move(obj_sp), std::move(new_entries)});
+  if (new_entries.empty()) {
+    // Every range coalesced with an existing entry and no fresh prefetch
+    // was scheduled — nothing for the worker to do, so no handle to hand
+    // out.
+    return {};
+  }
+
+  // The cache and the caller share this flag.  Worker reads it on dequeue
+  // and again right before dispatch; the caller flips it via
+  // prefetching_handle::cancel when the consumer no longer wants the data.
+  auto alive = std::make_shared<std::atomic<bool>>(true);
+  enqueue_work(prefetch_req{key, std::move(obj_sp), std::move(new_entries), alive});
+  return prefetching_handle{std::move(alive)};
 }
 
 // ===========================================================================
@@ -1070,6 +1084,17 @@ void prefetching_cache::worker_loop(std::stop_token stop)
       continue;
     }
 
+    // ---- Cancellation gate -------------------------------------------------
+    // The caller-side prefetching_handle may have flipped alive to false
+    // between insert() and now (e.g. fadvise(disposable) fired before the
+    // worker drained the queue).  alive is never null on a dequeued item:
+    // insert() always constructs one before enqueuing.
+    if (!item.alive->load(std::memory_order_acquire)) {
+      for (auto& e : item.entries)
+        if (e) e->state.try_cancel_queued();
+      continue;
+    }
+
     // ---- Phase 1: compute an upper bound on chunks for the whole item ------
     // Peek at each entry's state to skip ones that obviously don't need
     // loading (already cached / loading / etc.).  Peeks are racy, but only
@@ -1174,6 +1199,18 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     if (batch.empty()) {
       // Every entry raced or resolved under us; budget_slot releases on scope
       // exit, pool chunks already returned.
+      continue;
+    }
+
+    // ---- Cancellation re-check ---------------------------------------------
+    // The eviction wait + chunk allocation above can take long enough for a
+    // late fadvise(disposable) to fire.  Roll back every entry we marked
+    // loading and return their chunks before issuing IO that nobody wants.
+    if (!item.alive->load(std::memory_order_acquire)) {
+      for (auto const& e : batch) {
+        pool->deallocate_bulk(e->chunks);
+        e->state.try_mark_load_failed();
+      }
       continue;
     }
 

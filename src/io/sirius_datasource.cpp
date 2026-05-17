@@ -113,4 +113,49 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
   return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream);
 }
 
+void sirius_datasource::fadvise(prefetching_mode site,
+                                std::span<const cudf::io::text::byte_range_info> ranges)
+{
+  // Disposable is always honored, regardless of the backend's preferred
+  // mode.  Cancel any handle a prior speculative/immediate call left on
+  // this datasource; if there's no handle, the cache worker has already
+  // taken (or never had) the request — nothing to do.
+  if (site == prefetching_mode::disposable) {
+    _prefetch_handle.cancel();
+    _prefetch_handle = {};
+    return;
+  }
+
+  // Speculative / immediate: only honored when the backend asked for this
+  // particular call site.  none falls through to no-op (the caller blindly
+  // calls fadvise at every tier and the backend's preference is what
+  // decides where the work actually lands).
+  auto const preferred = _io_ctx->preferred_prefetching_mode();
+  if (preferred == prefetching_mode::none || site != preferred) { return; }
+
+  // The contract is "one scan, one datasource": a second
+  // speculative/immediate fadvise on a datasource that already carries a
+  // handle is a caller bug.  Warn loudly; cancel the stale handle so the
+  // worker drops the old request and we don't leak both into the cache.
+  if (_prefetch_handle) {
+    spdlog::warn(
+      "sirius_datasource::fadvise: a prefetching_handle was already stored on "
+      "this datasource (path={}); cancelling the stale request.  Each scan "
+      "should own a unique datasource.",
+      _io_object->object_path());
+    _prefetch_handle.cancel();
+    _prefetch_handle = {};
+  }
+
+  auto* cache = _io_ctx->cache();
+  if (cache == nullptr) { return; }
+
+  // Hand the ranges to the cache.  insert() returns an empty handle when
+  // it didn't enqueue any new work (dormant cache, every range coalesced
+  // with an existing entry); we only stash a real handle.
+  std::vector<cudf::io::text::byte_range_info> owned_ranges(ranges.begin(), ranges.end());
+  auto handle = cache->insert(*_io_object, /*metadata=*/nullptr, owned_ranges);
+  if (handle) { _prefetch_handle = std::move(handle); }
+}
+
 }  // namespace sirius::io

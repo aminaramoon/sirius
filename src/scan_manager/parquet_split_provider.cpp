@@ -369,7 +369,12 @@ void parquet_split_provider::run_batch(file_batch const& batch,
           ? nullptr
           : std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
               std::make_shared<parquet_metadata>(file_metadata, footer_byte_len));
-      _io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), ranges);
+      // Discard the returned prefetching_handle for now — fadvise-driven
+      // call sites will own handles via the per-scan sirius_datasource in
+      // a follow-up.  This provider-level insert is the legacy path that
+      // pre-warms the cache without a per-scan cancellation point.
+      [[maybe_unused]] auto _ =
+        _io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), ranges);
     }
 
     std::vector<cudf::size_type> cur_rgs;

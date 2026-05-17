@@ -488,6 +488,53 @@ class pinned_view {
 };
 
 // ---------------------------------------------------------------------------
+// prefetching_handle
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Cancellation token returned from @c prefetching_cache::insert.
+ *
+ * The cache and the caller jointly hold a @c shared_ptr<atomic<bool>>.  The
+ * caller flips the flag to false (via @c cancel) when the consumer no longer
+ * needs the prefetched data; the cache's worker checks the flag before
+ * doing work on the corresponding @c work_item and skips when cancelled.
+ *
+ * Lifetime:
+ *   - The handle returned by @c insert outlives the @c work_item it
+ *     references (both hold the same @c shared_ptr).  Either side dropping
+ *     does not invalidate the other.
+ *   - A default-constructed handle is "empty": @c cancel is a no-op and
+ *     @c operator bool() returns false.  Returned by @c insert when the
+ *     cache is dormant or no new prefetch work was scheduled.
+ */
+class prefetching_handle {
+ public:
+  prefetching_handle() = default;
+
+  /// Mark the prefetch as no longer wanted.  Idempotent; safe on an empty
+  /// handle.  Thread-safe with respect to the worker's check.
+  void cancel() noexcept
+  {
+    if (_alive) _alive->store(false, std::memory_order_release);
+  }
+
+  /// True iff this handle is bound to a real prefetch request (i.e. came
+  /// from an @c insert that scheduled work).
+  explicit operator bool() const noexcept { return _alive != nullptr; }
+
+ private:
+  friend class prefetching_cache;
+  explicit prefetching_handle(std::shared_ptr<std::atomic<bool>> alive) noexcept
+    : _alive(std::move(alive))
+  {
+  }
+
+  /// Shared with the corresponding @c work_item.  true == still wanted;
+  /// false == cancelled, worker should drop.
+  std::shared_ptr<std::atomic<bool>> _alive;
+};
+
+// ---------------------------------------------------------------------------
 // prefetching_cache
 // ---------------------------------------------------------------------------
 //
@@ -544,12 +591,15 @@ class prefetching_cache {
   /// the existing entry untouched.  This lets repeat callers re-trigger
   /// prefetch without having to re-supply (or re-parse) the metadata.
   ///
-  /// When the cache is dormant (no buffer pool or no @c sirius_ioctx
-  /// attached) the metadata and file entry are still recorded, but no
-  /// prefetch work is scheduled.
-  void insert(sirius_io_object& obj,
-              std::shared_ptr<sirius_io_object_metadata> metadata,
-              const std::vector<cudf::io::text::byte_range_info>& ranges);
+  /// Returns a @c prefetching_handle the caller can use to cancel the
+  /// pending work via @c handle.cancel().  When the cache is dormant (no
+  /// buffer pool or no @c sirius_ioctx attached) or no new prefetch work
+  /// was scheduled, the returned handle is empty (its @c operator bool is
+  /// false) — the metadata and file_entry are still recorded.
+  [[nodiscard]] prefetching_handle insert(
+    sirius_io_object& obj,
+    std::shared_ptr<sirius_io_object_metadata> metadata,
+    const std::vector<cudf::io::text::byte_range_info>& ranges);
 
   /// Non-blocking read of a single range.
   /// Returns an empty pinned_view if the range is not cached or the cached
@@ -588,6 +638,12 @@ class prefetching_cache {
     /// until the worker has issued IO for this request.
     std::shared_ptr<sirius_io_object> io_obj;
     std::vector<std::shared_ptr<cache_entry>> entries;
+    /// Shared with the @c prefetching_handle returned to the caller.  The
+    /// caller flips this to false when the consumer no longer wants the
+    /// data; the worker checks it on dequeue (and again before dispatch)
+    /// and drops the request when stale.  Never null — @c insert always
+    /// constructs a flag when it enqueues work.
+    std::shared_ptr<std::atomic<bool>> alive;
   };
   using work_item = prefetch_req;
 
