@@ -113,6 +113,15 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
   return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream);
 }
 
+std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
+{
+  // Share the io_ctx and io_object — both are shared_ptr-managed and
+  // deliberately reused across splits of the same file.  The new
+  // datasource starts with a default-constructed prefetching_handle so
+  // its fadvise() calls can't accidentally cancel the original's work.
+  return std::make_unique<sirius_datasource>(_io_ctx, _io_object);
+}
+
 void sirius_datasource::fadvise(prefetching_mode site,
                                 std::span<const cudf::io::text::byte_range_info> ranges)
 {

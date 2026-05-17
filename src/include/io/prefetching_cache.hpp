@@ -544,6 +544,13 @@ class prefetching_handle {
 //   (independent): cache_entry atomics — lock-free
 
 class prefetching_cache {
+  // The cache only accepts new prefetch requests through
+  // sirius_datasource::fadvise — that's the single entry point for the
+  // fadvise(speculative/immediate/disposable) protocol.  Friending the
+  // datasource keeps insert() out of the public API while still letting
+  // fadvise dispatch through it.
+  friend class sirius_datasource;
+
  public:
   /// Construct dormant: the cache stores @p mr, @p max_slabs, and
   /// @p initial_slabs as the pool configuration but does NOT allocate any
@@ -580,26 +587,6 @@ class prefetching_cache {
   void register_metadata(sirius_io_object& obj,
                          std::shared_ptr<sirius_io_object_metadata> metadata);
 
-  /// Register ranges for a file and trigger background prefetch.
-  /// Ranges must be sorted by offset.  The cache retains @p obj via
-  /// @c shared_from_this() so the underlying file handles stay open
-  /// until all pending prefetch work for this file has completed.
-  /// @p obj must already be owned by a @c std::shared_ptr.
-  ///
-  /// Metadata is a separate concern: see @c register_metadata.  Callers
-  /// that have both a metadata object and a range set should call
-  /// @c register_metadata first (it's cheap and works even when the cache
-  /// is dormant) and then @c insert with just the ranges.
-  ///
-  /// Returns a @c prefetching_handle the caller can use to cancel the
-  /// pending work via @c handle.cancel().  When the cache is dormant (no
-  /// buffer pool or no @c sirius_ioctx attached) or no new prefetch work
-  /// was scheduled, the returned handle is empty (its @c operator bool is
-  /// false) — the file_entry is still recorded.
-  [[nodiscard]] prefetching_handle insert(
-    sirius_io_object& obj,
-    const std::vector<cudf::io::text::byte_range_info>& ranges);
-
   /// Non-blocking read of a single range.
   /// Returns an empty pinned_view if the range is not cached or the cached
   /// entry does not fully cover [offset, offset+size).  Updates hit / miss
@@ -629,6 +616,23 @@ class prefetching_cache {
   [[nodiscard]] std::string summary() const;
 
  private:
+  /// Register ranges for a file and trigger background prefetch.  Private
+  /// entry point: callers reach this through @c sirius_datasource::fadvise,
+  /// which is the only friend.  See @c prefetching_handle for the
+  /// cancellation contract.
+  ///
+  /// Ranges must be sorted by offset.  The cache retains @p obj via
+  /// @c shared_from_this() so the underlying file handles stay open
+  /// until all pending prefetch work for this file has completed.
+  /// @p obj must already be owned by a @c std::shared_ptr.
+  ///
+  /// Metadata is a separate concern — see @c register_metadata.
+  ///
+  /// Returns an empty handle when the cache is dormant or no new prefetch
+  /// work was scheduled; the file_entry is still recorded either way.
+  [[nodiscard]] prefetching_handle insert(
+    sirius_io_object& obj, const std::vector<cudf::io::text::byte_range_info>& ranges);
+
   // ---- work items dispatched through the queue ------------------------------
 
   struct prefetch_req {

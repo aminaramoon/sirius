@@ -129,7 +129,9 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   /// Read the parquet byte ranges described by @p scan_data and apply the post-read
   /// filter (when not pushed down) and the scan_plan's output assembly. Used by
   /// execute() when the input split is a parquet_scan_data.
-  std::unique_ptr<cudf::table> read_table_from_metadata(const parquet_scan_data& scan_data,
+  // Takes scan_data by mutable reference because we move the per-slice
+  // sirius_datasource out into cudf's sources vector at read time.
+  std::unique_ptr<cudf::table> read_table_from_metadata(parquet_scan_data& scan_data,
                                                         rmm::cuda_stream_view stream);
 
   // The scan_manager owns the wiring between this operator and its split_provider.

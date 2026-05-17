@@ -20,6 +20,7 @@
 #include "io/io_context.hpp"
 #include "io/kvikio/kvikio_context.hpp"
 #include "io/prefetching_cache.hpp"
+#include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
@@ -218,12 +219,15 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
 
     //===----------Read metadata footers----------===//
-    // scan_manager always supplies an io_ctx (sirius_datasource on the fast
-    // path, kvikio_context as fallback), so we unconditionally mint an
-    // io_object up-front and route the footer fetch through it.  The same
-    // io_object is threaded onto every emitted row_group_slice.
-    auto file_io_object = _io_ctx->create_io_object(file_path);
-    auto datasource     = _io_ctx->make_datasource(file_io_object);
+    // Mint a per-file master sirius_datasource.  scan_manager always supplies
+    // an io_ctx (sirius_datasource on the fast path, kvikio_context as
+    // fallback), so this works uniformly.  The master is used for the
+    // footer read here and the speculative fadvise below; each emitted
+    // slice gets its own duplicate so per-slice fadvise(immediate/
+    // disposable) calls don't share a handle with another scan.
+    auto file_io_object   = _io_ctx->create_io_object(file_path);
+    auto file_datasource  = std::make_shared<sirius::io::sirius_datasource>(_io_ctx, file_io_object);
+    auto& datasource_ref  = *file_datasource;
 
     //===----------Parse metadata (with prefetch-cache reuse)----------===//
     // If the prefetching cache already has a parquet_metadata entry for this
@@ -246,7 +250,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       footer_byte_len = cached_parquet_metadata->footer_byte_len();
       reader_ptr = std::make_unique<op::scan::hybrid_scan_reader>(*file_metadata, *reader_options);
     } else {
-      auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
+      auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(datasource_ref);
       footer_byte_len    = footer_buffer->size();
       reader_ptr         = std::make_unique<op::scan::hybrid_scan_reader>(
         cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
@@ -304,15 +308,16 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       // clang-format on
     }
 
-    //===----------Prefetch cache prewarm----------===//
-    // When the ioctx has a cache, hand it the exact byte ranges scan_task
-    // will request: PAR1 header + (merged) column-chunk ranges for every
-    // surviving row group + footer/trailer.  insert() must use the same
-    // merged ranges scan_task computes — the cache only serves reads that
-    // are fully covered by an inserted range.
-    if (_io_ctx->cache() != nullptr && !row_group_indices.empty()) {
-      using range_t = cudf::io::text::byte_range_info;
-
+    //===----------Per-file byte ranges----------===//
+    // Compute the merged byte ranges this file's scan will read: PAR1
+    // header + (merged) column-chunk ranges for every surviving row group
+    // + footer/trailer.  The same merged set is used for:
+    //   - the speculative fadvise on the master (whole-file prewarm), and
+    //   - the per-slice ranges attached to each emitted row_group_slice
+    //     (used later for fadvise(immediate/disposable) at task time).
+    using range_t = cudf::io::text::byte_range_info;
+    std::vector<range_t> file_ranges;
+    if (!row_group_indices.empty()) {
       auto chunk_ranges = reader.all_column_chunks_byte_ranges(row_group_indices, *reader_options);
 
       // Inline merge: parquet_scan_task::detail::merge_byte_ranges is TU-local;
@@ -348,33 +353,36 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       auto const footer_off  = static_cast<int64_t>(file_size - FOOTER_TAIL_SIZE - footer_byte_len);
       auto const footer_size = static_cast<int64_t>(FOOTER_TAIL_SIZE + footer_byte_len);
 
-      std::vector<range_t> ranges;
-      ranges.reserve(merged.size() + 2);
-      ranges.emplace_back(0, 4);  // PAR1 header
-      ranges.insert(ranges.end(), merged.begin(), merged.end());
-      ranges.emplace_back(footer_off, footer_size);
+      file_ranges.reserve(merged.size() + 2);
+      file_ranges.emplace_back(0, 4);  // PAR1 header
+      file_ranges.insert(file_ranges.end(), merged.begin(), merged.end());
+      file_ranges.emplace_back(footer_off, footer_size);
       // Cache requires sorted-by-offset.  Header is at 0, footer is at file end,
       // and merged column chunks live in between — a defensive sort handles any
       // pathological layout where a column chunk starts before the header.
-      std::sort(ranges.begin(), ranges.end(), [](auto const& a, auto const& b) {
+      std::sort(file_ranges.begin(), file_ranges.end(), [](auto const& a, auto const& b) {
         return a.offset() < b.offset();
       });
+    }
 
-      // When the cache already had parquet_metadata for this file we
-      // reused it above; otherwise we just parsed the footer here.  In the
-      // not-reused case, stash it for the next scan via register_metadata
-      // — independent of any prefetch work the insert below may schedule.
-      if (!cached_parquet_metadata) {
-        _io_ctx->cache()->register_metadata(
-          *file_io_object,
-          std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
-            std::make_shared<parquet_metadata>(file_metadata, footer_byte_len)));
-      }
-      // Discard the returned prefetching_handle for now — fadvise-driven
-      // call sites will own handles via the per-scan sirius_datasource in
-      // a follow-up.  This provider-level insert is the legacy path that
-      // pre-warms the cache without a per-scan cancellation point.
-      [[maybe_unused]] auto _ = _io_ctx->cache()->insert(*file_io_object, ranges);
+    // Stash freshly-parsed metadata so a subsequent scan of this file can
+    // skip the footer fetch.  Independent of any prefetch work that
+    // fadvise schedules below.
+    if (!cached_parquet_metadata && _io_ctx->cache() != nullptr) {
+      _io_ctx->cache()->register_metadata(
+        *file_io_object,
+        std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
+          std::make_shared<parquet_metadata>(file_metadata, footer_byte_len)));
+    }
+
+    // Speculative prewarm.  Honored only when the io_ctx's preferred
+    // prefetching_mode is speculative (e.g. slow IO backends that want
+    // lots of lead time); otherwise this is a no-op and the per-slice
+    // immediate fadvise below carries the work.  Either way the cache
+    // discards the handle since the provider has no per-file cancel
+    // point — slice-level disposable is what cancels in-flight work.
+    if (!file_ranges.empty()) {
+      file_datasource->fadvise(sirius::io::prefetching_mode::speculative, file_ranges);
     }
 
     std::vector<cudf::size_type> cur_rgs;
@@ -383,13 +391,22 @@ void parquet_split_provider::run_batch(file_batch const& batch,
 
     auto seal_current_file = [&]() {
       if (cur_rgs.empty()) { return; }
+      // Each slice gets its own datasource via duplicate() so per-slice
+      // fadvise(immediate/disposable) calls can't cancel one another's
+      // work.  Ranges are copied from the file-level set — every slice's
+      // task will read the same byte ranges (the cudf parquet reader
+      // touches header + footer in addition to its row groups), so for
+      // now we just hand each slice the file's full range list.  A
+      // per-slice subset (column chunks for the slice's row groups + the
+      // header / footer) would be tighter but requires reaching back into
+      // the reader; the current set is a correct superset.
       accum.slices.emplace_back(file_metadata,
                                 file_path,
                                 std::move(cur_rgs),
                                 cur_uncompressed_bytes,
                                 cur_compressed_bytes,
-                                _io_ctx,
-                                file_io_object);
+                                file_datasource->duplicate(),
+                                file_ranges);
       // Promote the just-sealed slice's uncompressed bytes into the cross-file accumulator.
       accum.total_uncompressed_bytes += cur_uncompressed_bytes;
       cur_rgs.clear();

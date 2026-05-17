@@ -20,6 +20,7 @@
 #include <data/sirius_converter_registry.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <io/io_context.hpp>
+#include <io/sirius_datasource.hpp>
 #include <io/types.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -60,15 +61,15 @@ struct row_group_slice {
                   std::vector<cudf::size_type> row_group_indices,
                   std::size_t reserved_uncompressed_bytes,
                   std::size_t reserved_compressed_bytes,
-                  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx        = nullptr,
-                  std::shared_ptr<sirius::io::sirius_io_object> io_object = nullptr)
-    : file_metadata(file_metadata),
-      file_path(file_path),
+                  std::unique_ptr<sirius::io::sirius_datasource> datasource = nullptr,
+                  std::vector<cudf::io::text::byte_range_info> ranges       = {})
+    : file_metadata(std::move(file_metadata)),
+      file_path(std::move(file_path)),
       row_group_indices(std::move(row_group_indices)),
       reserved_uncompressed_bytes(reserved_uncompressed_bytes),
       reserved_compressed_bytes(reserved_compressed_bytes),
-      io_ctx(std::move(io_ctx)),
-      io_object(std::move(io_object))
+      datasource(std::move(datasource)),
+      ranges(std::move(ranges))
   {
   }
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
@@ -76,13 +77,17 @@ struct row_group_slice {
   std::vector<cudf::size_type> row_group_indices;
   std::size_t reserved_uncompressed_bytes;
   std::size_t reserved_compressed_bytes;
-  /// Sirius IO context that minted @c io_object.  When non-null, the scan
-  /// operator builds a @c sirius_datasource via @c io_ctx->make_datasource;
-  /// when null, it falls back to @c cudf::io::datasource::create.
-  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx;
-  /// Sirius io_object created by the split provider for this file.  Shared
-  /// across every slice from the same parquet file.
-  std::shared_ptr<sirius::io::sirius_io_object> io_object;
+  /// Per-slice @c sirius_datasource minted by the split provider via
+  /// @c master->duplicate().  Each slice owns its own datasource so that
+  /// fadvise(immediate/disposable) calls don't share a handle with any
+  /// other slice from the same file.  Moved out by the scan operator at
+  /// execute time; until then the slice's fadvise call sites consult it
+  /// in-place.
+  std::unique_ptr<sirius::io::sirius_datasource> datasource;
+  /// Byte ranges this slice will actually read (column chunks for the
+  /// slice's row_group_indices + the parquet header / footer).  Passed
+  /// into the per-slice fadvise(immediate) call at task creation time.
+  std::vector<cudf::io::text::byte_range_info> ranges;
 };
 
 //===----------------------------------------------------------------------===//
@@ -168,6 +173,17 @@ class parquet_scan_data : public op::operator_data {
                               rmm::cuda_stream_view stream) override
   {
     gpu_memory_space = const_cast<cucascade::memory::memory_space*>(requested_memory_space);
+    // Disposable fadvise: tells each slice's datasource "we're about to
+    // read; if anything we asked for is still pending on the prefetch
+    // worker, drop it — we'd rather hit the backend directly than wait."
+    // disposable is always honored regardless of the backend's preferred
+    // mode; on backends with no pending work (e.g. kvikio fallback) it's
+    // a cheap no-op because the stored handle is empty.
+    for (auto& slice : rg_slices) {
+      if (slice.datasource) {
+        slice.datasource->fadvise(sirius::io::prefetching_mode::disposable, {});
+      }
+    }
   };
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
