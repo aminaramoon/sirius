@@ -548,9 +548,7 @@ void prefetching_cache::register_metadata(sirius_io_object& obj,
 // ===========================================================================
 
 prefetching_handle prefetching_cache::insert(
-  sirius_io_object& obj,
-  std::shared_ptr<sirius_io_object_metadata> metadata,
-  const std::vector<cudf::io::text::byte_range_info>& ranges)
+  sirius_io_object& obj, const std::vector<cudf::io::text::byte_range_info>& ranges)
 {
   assert(std::is_sorted(ranges.begin(),
                         ranges.end(),
@@ -589,16 +587,15 @@ prefetching_handle prefetching_cache::insert(
 
   file.io_obj    = obj_sp;
   file.file_size = file_size;
-  // A nullptr @p metadata means "no new metadata to store" — preserve whatever
-  // a previous insert() left in place so callers can skip re-supplying it on
-  // every prefetch insert.
-  if (metadata) { file.metadata = std::move(metadata); }
+  // Metadata is set via register_metadata() and is left untouched here —
+  // separating that concern keeps insert() about ranges only, and lets
+  // metadata be recorded by callers that have no prefetch work to schedule.
 
   if (!active || pool == nullptr || io_ctx == nullptr) {
-    // Dormant cache: file entry + metadata are stored; per-range
-    // prefetching needs the pool and ioctx and waits for the next reset.
-    // Return an empty handle so the caller's `if (handle)` check skips
-    // the "store on the datasource" path.
+    // Dormant cache: the file_entry is recorded; per-range prefetching
+    // needs the pool and ioctx and waits for the next reset.  Return an
+    // empty handle so the caller's `if (handle)` check skips the
+    // "store on the datasource" path.
     return {};
   }
 

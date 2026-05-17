@@ -360,21 +360,21 @@ void parquet_split_provider::run_batch(file_batch const& batch,
         return a.offset() < b.offset();
       });
 
-      // When the cache already had parquet_metadata for this file we reused it
-      // and don't need to re-store it; otherwise we just parsed the footer and
-      // hand the freshly-built parquet_metadata to the cache so the next scan
-      // of this file can skip the footer fetch.
-      std::shared_ptr<sirius::io::sirius_io_object_metadata> metadata_to_store =
-        cached_parquet_metadata
-          ? nullptr
-          : std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
-              std::make_shared<parquet_metadata>(file_metadata, footer_byte_len));
+      // When the cache already had parquet_metadata for this file we
+      // reused it above; otherwise we just parsed the footer here.  In the
+      // not-reused case, stash it for the next scan via register_metadata
+      // — independent of any prefetch work the insert below may schedule.
+      if (!cached_parquet_metadata) {
+        _io_ctx->cache()->register_metadata(
+          *file_io_object,
+          std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
+            std::make_shared<parquet_metadata>(file_metadata, footer_byte_len)));
+      }
       // Discard the returned prefetching_handle for now — fadvise-driven
       // call sites will own handles via the per-scan sirius_datasource in
       // a follow-up.  This provider-level insert is the legacy path that
       // pre-warms the cache without a per-scan cancellation point.
-      [[maybe_unused]] auto _ =
-        _io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), ranges);
+      [[maybe_unused]] auto _ = _io_ctx->cache()->insert(*file_io_object, ranges);
     }
 
     std::vector<cudf::size_type> cur_rgs;

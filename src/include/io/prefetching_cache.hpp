@@ -586,19 +586,18 @@ class prefetching_cache {
   /// until all pending prefetch work for this file has completed.
   /// @p obj must already be owned by a @c std::shared_ptr.
   ///
-  /// @p metadata is optional: a non-null pointer overwrites any previously
-  /// stored metadata for this file's cache key, while a null pointer leaves
-  /// the existing entry untouched.  This lets repeat callers re-trigger
-  /// prefetch without having to re-supply (or re-parse) the metadata.
+  /// Metadata is a separate concern: see @c register_metadata.  Callers
+  /// that have both a metadata object and a range set should call
+  /// @c register_metadata first (it's cheap and works even when the cache
+  /// is dormant) and then @c insert with just the ranges.
   ///
   /// Returns a @c prefetching_handle the caller can use to cancel the
   /// pending work via @c handle.cancel().  When the cache is dormant (no
   /// buffer pool or no @c sirius_ioctx attached) or no new prefetch work
   /// was scheduled, the returned handle is empty (its @c operator bool is
-  /// false) — the metadata and file_entry are still recorded.
+  /// false) — the file_entry is still recorded.
   [[nodiscard]] prefetching_handle insert(
     sirius_io_object& obj,
-    std::shared_ptr<sirius_io_object_metadata> metadata,
     const std::vector<cudf::io::text::byte_range_info>& ranges);
 
   /// Non-blocking read of a single range.

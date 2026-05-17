@@ -154,7 +154,7 @@ void sirius_datasource::fadvise(prefetching_mode site,
   // it didn't enqueue any new work (dormant cache, every range coalesced
   // with an existing entry); we only stash a real handle.
   std::vector<cudf::io::text::byte_range_info> owned_ranges(ranges.begin(), ranges.end());
-  auto handle = cache->insert(*_io_object, /*metadata=*/nullptr, owned_ranges);
+  auto handle = cache->insert(*_io_object, owned_ranges);
   if (handle) { _prefetch_handle = std::move(handle); }
 }
 
