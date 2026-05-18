@@ -159,7 +159,11 @@ std::future<size_t> copy_pinned_slices_to_device(
 
 size_t sirius_ioctx::host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst)
 {
-  if (_cache) {
+  // _prefetching_enabled, not _cache: a cache may be attached purely
+  // for metadata (kvikio fallback path) without supporting the vector
+  // host reads the prefetcher needs.  Consulting cache->read on those
+  // backends costs a map lookup that will never hit.
+  if (_prefetching_enabled) {
     if (auto view = _cache->read(obj, offset, size); view) {
       auto slices   = view.slice(offset, size);
       size_t copied = 0;
@@ -178,7 +182,7 @@ std::future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
                                                   size_t size,
                                                   uint8_t* dst)
 {
-  if (_cache) {
+  if (_prefetching_enabled) {
     if (auto view = _cache->read(obj, offset, size); view) {
       auto slices = view.slice(offset, size);
       try {
@@ -210,7 +214,7 @@ std::future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
 size_t sirius_ioctx::device_read(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
-  if (_cache) {
+  if (_prefetching_enabled) {
     if (auto view = _cache->read(obj, offset, size); view) {
       auto slices = view.slice(offset, size);
       auto copied = copy_pinned_slices_to_device(slices, dst, stream);
@@ -223,7 +227,7 @@ size_t sirius_ioctx::device_read(
 std::future<size_t> sirius_ioctx::device_read_async(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
-  if (_cache) {
+  if (_prefetching_enabled) {
     if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
       auto slices = view.slice(offset, size);
       try {

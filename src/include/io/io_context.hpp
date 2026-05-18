@@ -113,13 +113,31 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// characteristics.
   [[nodiscard]] virtual prefetching_mode preferred_prefetching_mode() const = 0;
 
-  /// Wire up a non-owning prefetching_cache so @c host_read / @c device_read
-  /// consult it before falling through to the backend.  The caller owns
-  /// the cache and must guarantee it outlives this ioctx.  Pass nullptr to
-  /// detach.
-  void attach_cache(prefetching_cache* cache) noexcept { _cache = cache; }
+  /// Wire up a non-owning prefetching_cache.  The caller owns the cache
+  /// and must guarantee it outlives this ioctx.  Pass nullptr to detach.
+  ///
+  /// @c cache() always returns the attached pointer so callers can hit
+  /// @c register_metadata / @c get_metadata regardless of prefetching
+  /// capability — the metadata store works on dormant caches too.
+  ///
+  /// Whether @c host_read / @c device_read actually consult the cache is
+  /// a separate question, gated on @c uses_prefetching_cache().  The
+  /// flag is set here based on the backend's capability:
+  /// (cache != nullptr) && supports_vector_host_read() — backends that
+  /// can't serve vector host reads (e.g. kvikio_context) never use the
+  /// cache for read lookups even when a cache is attached for metadata.
+  void attach_cache(prefetching_cache* cache) noexcept
+  {
+    _cache               = cache;
+    _prefetching_enabled = (cache != nullptr) && supports_vector_host_read();
+  }
 
   [[nodiscard]] prefetching_cache* cache() noexcept { return _cache; }
+
+  /// True iff @c host_read / @c device_read should consult the cache
+  /// before falling through to the backend.  See @c attach_cache for the
+  /// gating condition.
+  [[nodiscard]] bool uses_prefetching_cache() const noexcept { return _prefetching_enabled; }
 
   // -- Read API ---------------------------------------------------------------
 
@@ -175,6 +193,12 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// caller's responsibility (typically a scan_manager that outlives any
   /// ioctx using its cache).
   prefetching_cache* _cache{nullptr};
+
+  /// Derived from @c _cache and @c supports_vector_host_read at
+  /// @c attach_cache time.  True when reads should route through the
+  /// cache; false when the cache is attached purely for metadata
+  /// (kvikio fallback) or when no cache is attached at all.
+  bool _prefetching_enabled{false};
 };
 
 }  // namespace sirius::io
