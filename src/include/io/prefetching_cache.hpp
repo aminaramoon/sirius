@@ -560,16 +560,26 @@ class prefetching_cache {
   prefetching_cache(cucascade::memory::fixed_size_host_memory_resource& mr,
                     uint32_t max_slabs,
                     uint32_t initial_slabs = 0);
+
+  /// Construct a metadata-only cache: no pool config, no slabs.
+  /// @c register_metadata and @c get_metadata still work, but any
+  /// fadvise insert short-circuits because there's no @c buffer_pool to
+  /// allocate from.  Used on backends (e.g. kvikio fallback) that have
+  /// no @c fixed_size_host_memory_resource to back a pool but still want
+  /// metadata caching across scans.
+  prefetching_cache();
   ~prefetching_cache();
 
   prefetching_cache(prefetching_cache const&)            = delete;
   prefetching_cache& operator=(prefetching_cache const&) = delete;
 
-  /// Transition the cache between dormant and active states:
+  /// Arm (or rearm) the cache against a specific ioctx for prefetching.
+  /// Always quiesces first:
   ///   - Stops accepting new prefetch requests and drains the work queue.
   ///   - Waits for any in-flight backend IO to complete.
   ///   - Drains the eviction queues (candidates and chunk requests).
   ///   - Clears every per-file entry from the cache map.
+  /// Then transitions:
   ///   - When @p io_ctx is non-null: ensures the buffer_pool exists
   ///     (reclaiming if it already does, allocating from the stored config
   ///     if it doesn't), rebuilds the inflight admission_control with
@@ -578,7 +588,15 @@ class prefetching_cache {
   ///     to the upstream resource, releases the admission_control, and
   ///     leaves the cache dormant.  @p inflight_budget_chunks is ignored.
   /// Safe to call repeatedly.
-  void reset(std::shared_ptr<sirius_ioctx> io_ctx, size_t inflight_budget_chunks = 2048);
+  void prefetch_using(std::shared_ptr<sirius_ioctx> io_ctx,
+                      size_t inflight_budget_chunks = 2048);
+
+  /// Detach the cache from any ioctx and tear down prefetching state.
+  /// Convenience wrapper that calls @c prefetch_using(nullptr, 0); see
+  /// that method for the full quiesce + teardown sequence.  Used at
+  /// destruction time and whenever the caller wants to drop the pool
+  /// without immediately rearming against a different ioctx.
+  void reset() { prefetch_using(nullptr, 0); }
 
   /// Record (or overwrite) the metadata for @p obj's cache key without
   /// registering any ranges or scheduling prefetch.  Used by callers that

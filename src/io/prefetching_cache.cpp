@@ -334,6 +334,18 @@ prefetching_cache::prefetching_cache(cucascade::memory::fixed_size_host_memory_r
   _worker_thread  = std::jthread([this](std::stop_token st) { worker_loop(std::move(st)); });
 }
 
+prefetching_cache::prefetching_cache()
+{
+  // Metadata-only cache: no pool config, no mr.  reset(non-null) on this
+  // cache will set _active=true but leave _pool null, so the worker's
+  // pool-null check (in worker_loop) bails on every dequeued item.
+  // register_metadata / get_metadata still work because they only touch
+  // the file_entry map.
+  _lru_buckets.fill(_lru_list.end());
+  _evictor_thread = std::jthread([this](std::stop_token st) { evictor_loop(std::move(st)); });
+  _worker_thread  = std::jthread([this](std::stop_token st) { worker_loop(std::move(st)); });
+}
+
 prefetching_cache::~prefetching_cache()
 {
   _worker_thread.request_stop();
@@ -362,7 +374,8 @@ prefetching_cache::~prefetching_cache()
   abort_pending_entries();
 }
 
-void prefetching_cache::reset(std::shared_ptr<sirius_ioctx> io_ctx, size_t inflight_budget_chunks)
+void prefetching_cache::prefetch_using(std::shared_ptr<sirius_ioctx> io_ctx,
+                                       size_t inflight_budget_chunks)
 {
   // ----- Phase 1: take the cache offline ---------------------------------
   // Flip _active to false so:

@@ -225,9 +225,9 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     // footer read here and the speculative fadvise below; each emitted
     // slice gets its own duplicate so per-slice fadvise(immediate/
     // disposable) calls don't share a handle with another scan.
-    auto file_io_object   = _io_ctx->create_io_object(file_path);
-    auto file_datasource  = std::make_shared<sirius::io::sirius_datasource>(_io_ctx, file_io_object);
-    auto& datasource_ref  = *file_datasource;
+    auto file_io_object  = _io_ctx->create_io_object(file_path);
+    auto file_datasource = std::make_shared<sirius::io::sirius_datasource>(_io_ctx, file_io_object);
+    auto& datasource_ref = *file_datasource;
 
     //===----------Parse metadata (with prefetch-cache reuse)----------===//
     // If the prefetching cache already has a parquet_metadata entry for this
@@ -382,7 +382,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     // discards the handle since the provider has no per-file cancel
     // point — slice-level disposable is what cancels in-flight work.
     if (!file_ranges.empty()) {
-      file_datasource->fadvise(sirius::io::prefetching_mode::speculative, file_ranges);
+      file_datasource->fadvise(sirius::io::prefetching_mode::opportunistic, file_ranges);
     }
 
     std::vector<cudf::size_type> cur_rgs;

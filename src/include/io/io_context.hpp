@@ -43,11 +43,11 @@ class prefetching_cache;
  *   reads (so the prefetcher cannot batch range requests cheaply) or the
  *   backend explicitly opted out.
  * - @c immediate: prefill the cache ahead of consumer demand.
- * - @c speculative: read-ahead on demand — issue extra IO only when triggered by a
+ * - @c opportunistic: read-ahead on demand — issue extra IO only when triggered by a
  *   consumer read.
  * - @c disposable: prefetching is temporary and can be discarded when no longer needed.
  */
-enum class prefetching_mode { none, immediate, speculative, disposable };
+enum class prefetching_mode { none, immediate, opportunistic, disposable };
 
 // ---------------------------------------------------------------------------
 // sirius_ioctx
