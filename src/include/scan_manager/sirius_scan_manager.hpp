@@ -37,6 +37,10 @@ class fixed_size_host_memory_resource;
 #include <unordered_map>
 #include <vector>
 
+namespace cucascade::memory {
+class memory_reservation_manager;
+}  // namespace cucascade::memory
+
 namespace sirius::io {
 class sirius_ioctx;
 class buffer_pool;
@@ -130,12 +134,19 @@ class sirius_scan_manager {
    * @brief Construct a new source manager.
    *
    * @param config Scan-manager configuration (thread pool + sirius_datasource toggle).
-   * @param host_mr Host memory resource backing the prefetch buffer_pool.  Required
-   *        when @c config.enable_prefetch_cache is true; ignored otherwise.
+   * @param reservation_manager The active memory reservation manager.  The
+   *        scan manager pulls the HOST-tier
+   *        @c fixed_size_host_memory_resource from it to back the prefetch
+   *        buffer pool, and counts GPU-tier memory spaces to enforce the
+   *        kvikio fallback's single-GPU requirement.
+   *
+   * @throws std::runtime_error when the kvikio fallback would be selected
+   *         (i.e. @c config.use_sirius_datasource is false) on a system
+   *         that exposes more than one GPU memory space — kvikio's
+   *         datasource doesn't support multi-GPU.
    */
-  explicit sirius_scan_manager(
-    scan_manager_config config,
-    cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr);
+  explicit sirius_scan_manager(scan_manager_config config,
+                               cucascade::memory::memory_reservation_manager& reservation_manager);
 
   ~sirius_scan_manager();
 

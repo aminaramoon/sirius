@@ -34,6 +34,8 @@
 #include "scan_manager/split_provider.hpp"
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <exception>
@@ -43,7 +45,7 @@
 namespace sirius::scan_manager {
 
 sirius_scan_manager::sirius_scan_manager(
-  scan_manager_config config, cucascade::memory::fixed_size_host_memory_resource* host_mr)
+  scan_manager_config config, cucascade::memory::memory_reservation_manager& reservation_manager)
   : _config(std::move(config)),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
@@ -51,6 +53,24 @@ sirius_scan_manager::sirius_scan_manager(
     _dispatcher(
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads))
 {
+  // Pull the host memory resource out of the reservation manager.  Both
+  // the uring backend's bounce-slot pool and the prefetching_cache's
+  // buffer pool need a fixed_size_host_memory_resource; we use the
+  // first HOST-tier space's resource for both.  Null is OK on the
+  // kvikio path — the cache falls back to metadata-only construction.
+  cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr;
+  {
+    auto host_spaces =
+      reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    if (!host_spaces.empty()) {
+      // get_memory_spaces_for_tier returns const memory_space*, but
+      // get_memory_resource_as is const so the cast through the public
+      // accessor is fine.
+      host_mr = host_spaces[0]
+                  ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+    }
+  }
+
   // scan_manager always owns an io_ctx: sirius_datasource (uring) on the
   // fast path, kvikio_context as the universal fallback so the rest of the
   // scan path (parquet_split_provider, scan tasks) always has an ioctx to
@@ -59,8 +79,8 @@ sirius_scan_manager::sirius_scan_manager(
   if (_config.use_sirius_datasource) {
     if (host_mr == nullptr) {
       throw std::runtime_error(
-        "[sirius_scan_manager] use_sirius_datasource is true but no host "
-        "fixed_size_host_memory_resource was provided");
+        "[sirius_scan_manager] use_sirius_datasource is true but the reservation "
+        "manager has no HOST-tier fixed_size_host_memory_resource");
     }
     _io_ctx = std::make_shared<sirius::io::uring_ioctx>(
       _config.uring_n_reactors, _config.uring_ring_entries, *host_mr);
@@ -69,6 +89,18 @@ sirius_scan_manager::sirius_scan_manager(
       _config.uring_n_reactors,
       _config.uring_ring_entries);
   } else {
+    // kvikio's cudf datasource doesn't model per-device file handles, so
+    // it only works correctly when there's a single active GPU.  Fail
+    // fast on multi-GPU rather than silently mis-routing IO.
+    auto gpu_spaces =
+      reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    if (gpu_spaces.size() > 1) {
+      throw std::runtime_error(
+        "[sirius_scan_manager] kvikio_context fallback (use_sirius_datasource=false) "
+        "does not support multi-GPU; reservation_manager reports " +
+        std::to_string(gpu_spaces.size()) +
+        " GPU memory spaces.  Enable use_sirius_datasource for multi-GPU runs.");
+    }
     _io_ctx = std::make_shared<sirius::io::kvikio_context>();
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] sirius_datasource disabled — using kvikio_context fallback");
