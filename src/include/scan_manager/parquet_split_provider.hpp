@@ -95,7 +95,13 @@ class parquet_split_provider : public split_provider {
     /// @c sirius_datasource, and both the io_object and the ioctx itself are
     /// attached to each emitted @c row_group_slice so the scan operator can
     /// reuse the same path for data reads.
-    std::shared_ptr<sirius::io::sirius_ioctx> io_ctx = nullptr);
+    std::shared_ptr<sirius::io::sirius_ioctx> io_ctx = nullptr,
+    /// Identity of the scan operator this provider is feeding.  Only used
+    /// to label the fadvise INFO logs so the engine trace shows which
+    /// operator each prefetch advisory belongs to.
+    std::string op_name      = {},
+    std::size_t op_id        = 0,
+    std::size_t pipeline_id  = 0);
 
   ~parquet_split_provider() override;
 
@@ -136,6 +142,14 @@ class parquet_split_provider : public split_provider {
   /// Held as a shared_ptr so it stays alive as long as any emitted slice
   /// references it.
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
+
+  /// Operator identity carried purely for the fadvise INFO log trail.
+  /// Threaded through to every @c parquet_scan_data this provider emits
+  /// so the disposable-fadvise log site can name the source operator
+  /// without an extra back-pointer.
+  std::string _op_name;
+  std::size_t _op_id{0};
+  std::size_t _pipeline_id{0};
 
   /// Pre-decomposed file batches built once in the constructor; immutable
   /// thereafter. Each callable returned by next_split_provider() processes

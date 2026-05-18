@@ -92,8 +92,7 @@ sirius_scan_manager::sirius_scan_manager(
     // kvikio's cudf datasource doesn't model per-device file handles, so
     // it only works correctly when there's a single active GPU.  Fail
     // fast on multi-GPU rather than silently mis-routing IO.
-    auto gpu_spaces =
-      reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    auto gpu_spaces = reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     if (gpu_spaces.size() > 1) {
       throw std::runtime_error(
         "[sirius_scan_manager] kvikio_context fallback (use_sirius_datasource=false) "
@@ -140,8 +139,7 @@ sirius_scan_manager::sirius_scan_manager(
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] prefetch cache armed (inflight_chunks={})",
                      _config.prefetch_inflight_budget_chunks);
   } else {
-    SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] cache present but unarmed (metadata-only path)");
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] cache present but unarmed (metadata-only path)");
   }
 }
 
@@ -327,6 +325,8 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   } catch (...) {
     SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
   }
+  auto const pipeline    = op->get_pipeline();
+  auto const pipeline_id = pipeline ? pipeline->get_pipeline_id() : std::size_t{0};
   return std::make_unique<parquet_split_provider>(
     info->returned_types,
     info->file_paths,
@@ -338,7 +338,10 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
     info->partition_indices,
     info->approximate_batch_size,
     parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
-    _io_ctx);
+    _io_ctx,
+    op->get_name(),
+    op->get_operator_id(),
+    pipeline_id);
 }
 
 void sirius_scan_manager::start_metadata_processing()

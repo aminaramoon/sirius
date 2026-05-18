@@ -22,6 +22,7 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <io/types.hpp>
+#include <log/logging.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/sirius_physical_operator.hpp>
 
@@ -136,12 +137,18 @@ class parquet_scan_data : public op::operator_data {
                     std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                     std::shared_ptr<duckdb::Expression> filter_expression,
                     std::shared_ptr<scan_plan const> plan,
-                    std::vector<std::string> partition_values)
+                    std::vector<std::string> partition_values,
+                    std::string op_name      = {},
+                    std::size_t op_id        = 0,
+                    std::size_t pipeline_id  = 0)
     : rg_slices(std::move(rg_slices)),
       reader_options(std::move(reader_options)),
       filter_expression(std::move(filter_expression)),
       plan(std::move(plan)),
-      partition_values(std::move(partition_values))
+      partition_values(std::move(partition_values)),
+      op_name(std::move(op_name)),
+      op_id(op_id),
+      pipeline_id(pipeline_id)
   {
   }
 
@@ -179,6 +186,12 @@ class parquet_scan_data : public op::operator_data {
     // disposable is always honored regardless of the backend's preferred
     // mode; on backends with no pending work (e.g. kvikio fallback) it's
     // a cheap no-op because the stored handle is empty.
+    SIRIUS_LOG_INFO(
+      "[fadvise disposable] op='{}' op_id={} pipeline_id={} slices={}",
+      op_name,
+      op_id,
+      pipeline_id,
+      rg_slices.size());
     for (auto& slice : rg_slices) {
       if (slice.datasource) {
         slice.datasource->fadvise(sirius::io::prefetching_mode::disposable, {});
@@ -209,6 +222,13 @@ class parquet_scan_data : public op::operator_data {
   std::vector<std::string> partition_values;
   /// GPU memory space for allocating output tables produced by execute().
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
+  /// Source-operator identity for the fadvise INFO trail.  Set by the
+  /// split provider at construction time so prepare_for_processing's
+  /// disposable-fadvise log can name the originating operator without a
+  /// back-pointer.
+  std::string op_name;
+  std::size_t op_id{0};
+  std::size_t pipeline_id{0};
 };
 
 //===----------------------------------------------------------------------===//

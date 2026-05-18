@@ -70,7 +70,10 @@ parquet_split_provider::parquet_split_provider(
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
   std::size_t max_file_processed,
-  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx)
+  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx,
+  std::string op_name,
+  std::size_t op_id,
+  std::size_t pipeline_id)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
@@ -78,7 +81,10 @@ parquet_split_provider::parquet_split_provider(
     // Default to a kvikio_context when no ioctx is supplied — keeps test
     // sites that construct the provider directly working without forcing
     // each one to plumb an explicit ioctx.
-    _io_ctx(io_ctx ? std::move(io_ctx) : std::make_shared<sirius::io::kvikio_context>())
+    _io_ctx(io_ctx ? std::move(io_ctx) : std::make_shared<sirius::io::kvikio_context>()),
+    _op_name(std::move(op_name)),
+    _op_id(op_id),
+    _pipeline_id(pipeline_id)
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /
@@ -194,7 +200,10 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       reader_options,
       _duckdb_filter_expression,
       _plan,
-      accum.partition_values.value_or(std::vector<std::string>{})));
+      accum.partition_values.value_or(std::vector<std::string>{}),
+      _op_name,
+      _op_id,
+      _pipeline_id));
     accum.slices.clear();
     accum.total_uncompressed_bytes = 0;
   };
@@ -376,12 +385,19 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
 
     // Speculative prewarm.  Honored only when the io_ctx's preferred
-    // prefetching_mode is speculative (e.g. slow IO backends that want
+    // prefetching_mode is opportunistic (e.g. slow IO backends that want
     // lots of lead time); otherwise this is a no-op and the per-slice
     // immediate fadvise below carries the work.  Either way the cache
     // discards the handle since the provider has no per-file cancel
     // point — slice-level disposable is what cancels in-flight work.
     if (!file_ranges.empty()) {
+      SIRIUS_LOG_INFO(
+        "[fadvise opportunistic] op='{}' op_id={} pipeline_id={} file='{}' ranges={}",
+        _op_name,
+        _op_id,
+        _pipeline_id,
+        file_path,
+        file_ranges.size());
       file_datasource->fadvise(sirius::io::prefetching_mode::opportunistic, file_ranges);
     }
 

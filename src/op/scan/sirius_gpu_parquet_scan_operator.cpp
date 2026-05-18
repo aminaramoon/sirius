@@ -104,9 +104,17 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_i
   // task is being created; if your backend prefers immediate prefetch
   // (fast local IO), kick off the work now."  Honored only when the
   // ioctx's preferred_prefetching_mode is immediate; otherwise the call
-  // is a no-op (the provider's speculative fadvise already covered slow
+  // is a no-op (the provider's opportunistic fadvise already covered slow
   // backends).  The matching disposable fires from prepare_for_processing.
   if (auto* scan_data = dynamic_cast<parquet_scan_data*>(data.get())) {
+    auto const pipeline = get_pipeline();
+    auto const pid      = pipeline ? pipeline->get_pipeline_id() : std::size_t{0};
+    SIRIUS_LOG_INFO(
+      "[fadvise immediate] op='{}' op_id={} pipeline_id={} slices={}",
+      get_name(),
+      get_operator_id(),
+      pid,
+      scan_data->rg_slices.size());
     for (auto& slice : scan_data->rg_slices) {
       if (slice.datasource) {
         slice.datasource->fadvise(sirius::io::prefetching_mode::immediate, slice.ranges);
