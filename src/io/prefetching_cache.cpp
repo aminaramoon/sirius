@@ -348,16 +348,22 @@ prefetching_cache::prefetching_cache()
 
 prefetching_cache::~prefetching_cache()
 {
-  _worker_thread.request_stop();
-  _evictor_thread.request_stop();
-  _work_seq.fetch_add(1, std::memory_order_release);
-  _work_seq.notify_all();
-  _request_sem.release();
+  // Flip _active first so any worker mid-iteration observes the
+  // shutdown when it hits the pre-dispatch gate and rolls back instead
+  // of dispatching new IO.  This must happen before request_stop so an
+  // already-spinning worker doesn't fire a final dispatch between us
+  // requesting stop and us draining in-flight.
   {
     std::unique_lock lk(_ctrl_mtx);
     _active = false;
     _ctrl_cv.notify_all();
   }
+
+  _worker_thread.request_stop();
+  _evictor_thread.request_stop();
+  _work_seq.fetch_add(1, std::memory_order_release);
+  _work_seq.notify_all();
+  _request_sem.release();
 
   // Wake readers waiting on entries that were loading when shutdown began.
   // Outstanding backend requests may still resolve via their request_context
@@ -370,6 +376,28 @@ prefetching_cache::~prefetching_cache()
   // the worker observed stop.
   if (_worker_thread.joinable()) { _worker_thread.join(); }
   if (_evictor_thread.joinable()) { _evictor_thread.join(); }
+
+  // Wait for every IO the worker dispatched (before observing stop) to
+  // complete and release its admission_control slot.  Each IO callback
+  // captures raw pointers into @c _pool and @c _inflight_budget; if we
+  // returned now those members would be destroyed underneath any
+  // still-pending callback.  The reactor — owned by the io_ctx, declared
+  // before this cache in @c sirius_scan_manager so it outlives us — is
+  // still alive here and will either complete the IO normally or surface
+  // it via @c request_context's safety-net handler on reactor shutdown;
+  // either path releases the slot, so this wait is bounded by the
+  // reactor making progress.
+  //
+  // Wrapped in try/catch because a destructor must be noexcept; a
+  // throwing condvar (e.g. system_error) shouldn't propagate out and a
+  // hang here is preferable to a UAF after the dtor returns.
+  if (_inflight_budget) {
+    try {
+      _inflight_budget->wait_for_idle();
+    } catch (...) {
+      // Best-effort drain; no useful recovery in a dtor.
+    }
+  }
 
   abort_pending_entries();
 }
@@ -1072,22 +1100,32 @@ void prefetching_cache::worker_loop(std::stop_token stop)
       }
     }
 
-    // Snapshot pool + io_ctx under the lifecycle lock so we can't race with
-    // a reset() that's about to clear them.  If the cache was detached
-    // between the gate above and here, the snapshot is null and we
-    // cancel-queued every entry so a re-arm sees them as fresh.
-    buffer_pool* pool    = nullptr;
-    sirius_ioctx* io_ctx = nullptr;
-    {
-      std::unique_lock lk(_ctrl_mtx);
-      if (!_active) {
-        for (auto& e : item.entries)
-          if (e) e->state.try_cancel_queued();
-        continue;
-      }
-      pool   = _pool.get();
-      io_ctx = _io_ctx;
+    // Hold _ctrl_mtx for the ENTIRE iteration body — snapshot + Phase
+    // 1-5 + dispatch.  Rationale: the worker takes raw pointers to
+    // @c _pool and @c _io_ctx and walks across long-running operations
+    // (Phase 2's eviction wait, Phase 3's admission_control acquire).
+    // Without the lock held, prefetch_using() could observe an empty
+    // admission_control (active_slots == 0 because we haven't reached
+    // Phase 3 yet), return from wait_for_idle, drop _pool and
+    // _inflight_budget, and leave us using dangling pointers.
+    //
+    // The mutex window is bounded by other threads making progress:
+    //   - The evictor doesn't take _ctrl_mtx, so eviction waits don't
+    //     deadlock against this hold.
+    //   - admission_control has its own mutex, so admission waits don't
+    //     deadlock either.
+    //   - prefetch_using just waits for the lock — that's the desired
+    //     behaviour: it blocks until our iteration completes (or until
+    //     we bail at the gate below), after which the lock is free.
+    std::unique_lock ctrl_lk(_ctrl_mtx);
+
+    if (!_active) {
+      for (auto& e : item.entries)
+        if (e) e->state.try_cancel_queued();
+      continue;
     }
+    buffer_pool* pool    = _pool.get();
+    sirius_ioctx* io_ctx = _io_ctx;
     if (pool == nullptr || io_ctx == nullptr) {
       for (auto& e : item.entries)
         if (e) e->state.try_cancel_queued();
@@ -1212,18 +1250,6 @@ void prefetching_cache::worker_loop(std::stop_token stop)
       continue;
     }
 
-    // ---- Cancellation re-check ---------------------------------------------
-    // The eviction wait + chunk allocation above can take long enough for a
-    // late fadvise(disposable) to fire.  Roll back every entry we marked
-    // loading and return their chunks before issuing IO that nobody wants.
-    if (!item.alive->load(std::memory_order_acquire)) {
-      for (auto const& e : batch) {
-        pool->deallocate_bulk(e->chunks);
-        e->state.try_mark_load_failed();
-      }
-      continue;
-    }
-
     // ---- Phase 5: build IO ranges and dispatch -----------------------------
     std::vector<cudf::io::text::byte_range_info> io_ranges;
     std::vector<cudf::host_span<std::byte>> io_dsts;
@@ -1245,13 +1271,12 @@ void prefetching_cache::worker_loop(std::stop_token stop)
 
     {
       auto& obj_ref = *item.io_obj;
-      // The admission_control slot captured in the lambda below is the
-      // single source of truth for "this IO is still in flight": its
-      // destructor (firing when the closure is destroyed at callback
+      // We're still inside the outer ctrl_lk that wraps this whole
+      // iteration.  The admission_control slot captured in the lambda
+      // below is the source of truth for "this IO is still in flight":
+      // its destructor (firing when the closure is destroyed at callback
       // exit) calls back into admission_control::release, which is what
-      // reset() waits on via admission_control::wait_for_idle.  As long
-      // as the slot is alive, reset() blocks before touching the pool or
-      // io_ctx — so the callback can safely use both.
+      // prefetch_using waits on via admission_control::wait_for_idle.
       io_ctx->host_read_ranges_async_io(
         obj_ref,
         io_ranges,
