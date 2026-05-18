@@ -1250,42 +1250,85 @@ void prefetching_cache::worker_loop(std::stop_token stop)
       continue;
     }
 
-    // ---- Phase 5: build IO ranges and dispatch -----------------------------
-    std::vector<cudf::io::text::byte_range_info> io_ranges;
-    std::vector<cudf::host_span<std::byte>> io_dsts;
-    for (auto const& e : batch) {
-      auto phys_off          = static_cast<size_t>(e->physical_range.offset());
-      auto phys_size         = static_cast<size_t>(e->physical_range.size());
-      auto const chunk_bytes = e->chunk_bytes;
-      for (size_t i = 0; i < e->chunks.size(); ++i) {
-        auto off = phys_off + i * chunk_bytes;
-        auto sz  = std::min(chunk_bytes, phys_size - i * chunk_bytes);
-        io_ranges.emplace_back(static_cast<int64_t>(off), static_cast<int64_t>(sz));
-        io_dsts.emplace_back(e->chunks[i], sz);
-      }
-    }
+    // ---- Phase 5: dispatch IO in sub-batches -------------------------------
+    // Issue host_read_ranges_async_io for SUBBATCH-entry slices instead of
+    // the whole item, so a reader waiting on the first entry can wake as
+    // soon as the first sub-batch's callback fires — without waiting for
+    // the slowest IO across all (potentially 600+) entries.  Each sub-
+    // batch's lambda marks ITS entries cached/failed independently; the
+    // per-entry state-machine CAS already supports out-of-order
+    // transitions.
+    //
+    // Resources shared across sub-batches:
+    //   - slot_holder (shared_ptr<admission_control::slot>): one slot
+    //     covers the entire work_item's chunk count.  Per-sub-batch slot
+    //     acquisition would deadlock — if the cumulative request exceeds
+    //     the budget, later sub-batches' acquire() would block waiting
+    //     for slots that can't free until IOs we haven't dispatched yet
+    //     complete.  The single slot releases only when the LAST sub-
+    //     batch's callback (and thus the last shared_ptr) drops.
+    //   - io_obj, key, alive, pool: copied into each lambda (cheap —
+    //     shared_ptr ref-counts + a string copy).
+    //
+    // SUBBATCH at 16 trades dispatch count for HOL latency: a 600-range
+    // request becomes ~38 sub-dispatches; first-byte latency for the
+    // head reader drops from max(600 IOs) to max(16 IOs).
+    constexpr size_t SUBBATCH = 16;
 
-    // io_completion_handler is std::function (copy-constructible), so the
-    // move-only slot must be wrapped in a shared_ptr to survive the copy.
     auto slot_holder = std::make_shared<admission_control::slot>(std::move(budget_slot));
+    auto& obj_ref    = *item.io_obj;
 
-    {
-      auto& obj_ref = *item.io_obj;
-      // We're still inside the outer ctrl_lk that wraps this whole
-      // iteration.  The admission_control slot captured in the lambda
-      // below is the source of truth for "this IO is still in flight":
-      // its destructor (firing when the closure is destroyed at callback
-      // exit) calls back into admission_control::release, which is what
-      // prefetch_using waits on via admission_control::wait_for_idle.
+    for (size_t sb_start = 0; sb_start < batch.size(); sb_start += SUBBATCH) {
+      // Cancellation re-check between sub-batches: a fadvise(disposable)
+      // that fires after we already dispatched some sub-batches can still
+      // cancel the remaining ones.  Already-dispatched callbacks complete
+      // normally — their `alive` was true at dispatch time, and stopping
+      // them mid-flight requires reactor-level cancellation we don't have.
+      if (!item.alive->load(std::memory_order_acquire)) {
+        // Roll back the still-undispatched tail.
+        for (size_t i = sb_start; i < batch.size(); ++i) {
+          pool->deallocate_bulk(batch[i]->chunks);
+          batch[i]->state.try_mark_load_failed();
+        }
+        break;
+      }
+
+      size_t const sb_end = std::min(sb_start + SUBBATCH, batch.size());
+
+      // Build the chunk-flat io_ranges/io_dsts for this sub-batch.
+      std::vector<cudf::io::text::byte_range_info> sb_ranges;
+      std::vector<cudf::host_span<std::byte>> sb_dsts;
+      for (size_t i = sb_start; i < sb_end; ++i) {
+        auto const& e          = batch[i];
+        auto phys_off          = static_cast<size_t>(e->physical_range.offset());
+        auto phys_size         = static_cast<size_t>(e->physical_range.size());
+        auto const chunk_bytes = e->chunk_bytes;
+        for (size_t c = 0; c < e->chunks.size(); ++c) {
+          auto off = phys_off + c * chunk_bytes;
+          auto sz  = std::min(chunk_bytes, phys_size - c * chunk_bytes);
+          sb_ranges.emplace_back(static_cast<int64_t>(off), static_cast<int64_t>(sz));
+          sb_dsts.emplace_back(e->chunks[c], sz);
+        }
+      }
+
+      // Slice this sub-batch's entries into their own vector — each
+      // lambda owns its subset so the per-entry mark_cached/mark_load_failed
+      // in the callback below operates only on its sub-batch's entries.
+      std::vector<std::shared_ptr<cache_entry>> sb_batch(batch.begin() +
+                                                           static_cast<std::ptrdiff_t>(sb_start),
+                                                         batch.begin() +
+                                                           static_cast<std::ptrdiff_t>(sb_end));
+
       io_ctx->host_read_ranges_async_io(
         obj_ref,
-        io_ranges,
-        io_dsts,
+        sb_ranges,
+        sb_dsts,
         [pool,
-         batch  = std::move(batch),
-         slot   = std::move(slot_holder),
-         io_obj = std::move(item.io_obj),
-         key    = std::move(item.file_key)](size_t /*bytes*/, std::exception_ptr ep) {
+         batch  = std::move(sb_batch),
+         slot   = slot_holder,    // shared across sub-batches
+         io_obj = item.io_obj,    // copy, not move — used by later sub-batches
+         key    = item.file_key]  // copy, not move
+        (size_t /*bytes*/, std::exception_ptr ep) {
           if (ep) {
             try {
               std::rethrow_exception(std::move(ep));
