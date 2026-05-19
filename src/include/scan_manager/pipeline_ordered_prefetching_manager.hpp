@@ -18,8 +18,9 @@
 
 #include "io/sirius_datasource.hpp"
 
-#include <concurrentqueue.h>
 #include <cudf/io/text/byte_range_info.hpp>
+
+#include <concurrentqueue.h>
 
 #include <chrono>
 #include <cstddef>
@@ -87,8 +88,8 @@ class pipeline_ordered_prefetching_manager {
     void close() { push({}); }
   };
 
-  pipeline_ordered_prefetching_manager()                                                 = default;
-  pipeline_ordered_prefetching_manager(pipeline_ordered_prefetching_manager const&)      = delete;
+  pipeline_ordered_prefetching_manager()                                            = default;
+  pipeline_ordered_prefetching_manager(pipeline_ordered_prefetching_manager const&) = delete;
   pipeline_ordered_prefetching_manager& operator=(pipeline_ordered_prefetching_manager const&) =
     delete;
 

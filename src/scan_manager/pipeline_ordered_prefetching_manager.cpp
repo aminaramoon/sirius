@@ -48,8 +48,8 @@ void pipeline_ordered_prefetching_manager::run_sequencer(std::stop_token const& 
         // Closure sentinel — provider is done with this pipeline.
         // Drop any leftover entries (there shouldn't be any if the
         // provider pushes sentinel last, but be defensive).
-        SIRIUS_LOG_DEBUG(
-          "[pipeline_ordered_prefetching_manager] pipeline_id={} closed", slot.pipeline_id);
+        SIRIUS_LOG_DEBUG("[pipeline_ordered_prefetching_manager] pipeline_id={} closed",
+                         slot.pipeline_id);
         break;
       }
 

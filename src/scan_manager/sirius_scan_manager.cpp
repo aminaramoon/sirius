@@ -30,6 +30,7 @@
 #include "planner/query.hpp"
 #include "scan_manager/cached_split_provider.hpp"
 #include "scan_manager/parquet_split_provider.hpp"
+#include "scan_manager/pipeline_ordered_prefetching_manager.hpp"
 #include "scan_manager/split_connector.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -162,6 +163,14 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={}",
                    query.get_pipelines().size());
 
+  // Build a fresh sequencer for this query.  Slots are added by
+  // create_provider_for() whenever it chooses the parquet path; the
+  // cached path skips slot allocation since there's no IO to prefetch.
+  // A fresh stop_source goes with it — once stop is requested it stays
+  // requested, so we can't reuse the previous query's source.
+  _prefetch_manager     = std::make_unique<pipeline_ordered_prefetching_manager>();
+  _prefetch_stop_source = std::stop_source{};
+
   for (auto const& pipeline : query.get_pipelines()) {
     if (!pipeline) { continue; }
     auto source = pipeline->get_source();
@@ -186,6 +195,13 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   }
 
   if (_scan_op_order.empty()) { return; }
+
+  // Spawn the sequencer task on the dispatcher.  Must happen after all
+  // slots have been added (create_provider_for allocates them above) so
+  // the task captures the full slot list in insertion order.  Safe to
+  // skip when no slots were added (purely-cached query) — the manager
+  // is fine with zero slots.
+  _prefetch_manager->register_ranges(_prefetch_stop_source.get_token(), *_dispatcher);
 
   start_metadata_processing();
 }
@@ -322,6 +338,17 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   }
   auto const pipeline    = op->get_pipeline();
   auto const pipeline_id = pipeline ? pipeline->get_pipeline_id() : std::size_t{0};
+  // Allocate a sequencer slot for this pipeline so its opportunistic
+  // fadvise calls are serialised with the other parquet pipelines in
+  // this query.  Slots are gated on the cache being armed: a
+  // metadata-only cache (no buffer pool, or unarmed io_ctx) doesn't
+  // honor opportunistic fadvise, so a slot would only add unnecessary
+  // sequencer overhead.  Null slot keeps the provider on the legacy
+  // direct-fadvise path (also a no-op when the cache is unarmed).
+  pipeline_ordered_prefetching_manager::pipeline_slot* prefetch_slot = nullptr;
+  if (_prefetch_manager && _cache && _cache->is_armed()) {
+    prefetch_slot = _prefetch_manager->add_pipeline_slot(pipeline_id);
+  }
   return std::make_unique<parquet_split_provider>(
     info->returned_types,
     info->file_paths,
@@ -336,7 +363,8 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
     _io_ctx,
     op->get_name(),
     op->get_operator_id(),
-    pipeline_id);
+    pipeline_id,
+    prefetch_slot);
 }
 
 void sirius_scan_manager::start_metadata_processing()
@@ -364,10 +392,20 @@ void sirius_scan_manager::start_metadata_processing()
 
 void sirius_scan_manager::reset()
 {
+  // Signal the sequencer first so it bails before we drain the
+  // dispatcher; its poll loop wakes within @c SEQUENCER_POLL_INTERVAL.
+  // request_stop on a default-constructed source is a no-op, so this is
+  // safe to call when prepare_for_query was never invoked.
+  _prefetch_stop_source.request_stop();
   _dispatcher->request_stop();
   _dispatcher->wait_for_all();
   _scan_op_order.clear();
   _providers_by_op.clear();
+  // Providers (whose run_batch holds slot pointers) have been destroyed
+  // by the line above and the sequencer has drained on
+  // wait_for_all(), so it's safe to tear down the manager and the
+  // slots it owns.
+  _prefetch_manager.reset();
   _dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads);
 }

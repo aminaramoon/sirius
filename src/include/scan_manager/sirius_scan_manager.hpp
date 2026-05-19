@@ -32,6 +32,7 @@ class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -50,6 +51,10 @@ class prefetching_cache;
 namespace sirius::op::scan {
 class sirius_gpu_parquet_scan_operator;
 }  // namespace sirius::op::scan
+
+namespace sirius::scan_manager {
+class pipeline_ordered_prefetching_manager;
+}  // namespace sirius::scan_manager
 
 namespace sirius::planner {
 class query;
@@ -266,6 +271,17 @@ class sirius_scan_manager {
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+
+  /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
+  /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached
+  /// parquet scan (allocated by @ref create_provider_for when it builds
+  /// a parquet_split_provider).  The sequencer task is enqueued on the
+  /// per-query @c _dispatcher and drains the slots in insertion order.
+  std::unique_ptr<pipeline_ordered_prefetching_manager> _prefetch_manager;
+  /// Stop source threaded into the sequencer task so @ref reset() can
+  /// signal it to bail mid-pipeline.  Rebuilt per query alongside
+  /// @c _prefetch_manager.
+  std::stop_source _prefetch_stop_source;
 };
 
 }  // namespace sirius::scan_manager
