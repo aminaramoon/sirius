@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "io/metadata_store.hpp"
 #include "io/types.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -139,6 +140,14 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// gating condition.
   [[nodiscard]] bool uses_prefetching_cache() const noexcept { return _prefetching_enabled; }
 
+  /// Per-file metadata cache that lives independently of the prefetching
+  /// cache.  Always available — callers that have parsed file metadata
+  /// (e.g. a parquet footer) park it here so a later scan of the same
+  /// path can skip the parse without depending on whether the
+  /// prefetching machinery has been wired up.
+  [[nodiscard]] metadata_store& metadata() noexcept { return _metadata_store; }
+  [[nodiscard]] metadata_store const& metadata() const noexcept { return _metadata_store; }
+
   // -- Read API ---------------------------------------------------------------
 
   virtual size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst);
@@ -199,6 +208,9 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// cache; false when the cache is attached purely for metadata
   /// (kvikio fallback) or when no cache is attached at all.
   bool _prefetching_enabled{false};
+
+  /// Independent of the prefetching machinery — exposed via @c metadata().
+  metadata_store _metadata_store;
 };
 
 }  // namespace sirius::io

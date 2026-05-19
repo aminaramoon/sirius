@@ -19,7 +19,6 @@
 #include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "io/io_context.hpp"
 #include "io/kvikio/kvikio_context.hpp"
-#include "io/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
@@ -258,10 +257,8 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     std::size_t footer_byte_len = 0;
     std::unique_ptr<op::scan::hybrid_scan_reader> reader_ptr;
 
-    if (_io_ctx->cache() != nullptr) {
-      if (auto cached = _io_ctx->cache()->get_metadata(*file_io_object)) {
-        cached_parquet_metadata = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached));
-      }
+    if (auto cached = _io_ctx->metadata().get_metadata(*file_io_object)) {
+      cached_parquet_metadata = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached));
     }
 
     if (cached_parquet_metadata) {
@@ -385,10 +382,10 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
 
     // Stash freshly-parsed metadata so a subsequent scan of this file can
-    // skip the footer fetch.  Independent of any prefetch work that
-    // fadvise schedules below.
-    if (!cached_parquet_metadata && _io_ctx->cache() != nullptr) {
-      _io_ctx->cache()->register_metadata(
+    // skip the footer fetch.  Lives on the ioctx, independent of any
+    // prefetch work that fadvise schedules below.
+    if (!cached_parquet_metadata) {
+      _io_ctx->metadata().register_metadata(
         *file_io_object,
         std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
           std::make_shared<parquet_metadata>(file_metadata, footer_byte_len)));
