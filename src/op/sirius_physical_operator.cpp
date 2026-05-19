@@ -284,7 +284,9 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 
   if (unfinished_barrier != _ports_list.end()) {
     auto* producer = &((*unfinished_barrier)->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
+                              producer,
+                              tasks_for_barrier((*unfinished_barrier)->type)};
   }
 
   // if no unfinished barriers, then is this operator ready to create a task?
@@ -294,7 +296,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
                (p->type == MemoryBarrierType::FULL && p->repo->total_size() > 0 &&
                 p->src_pipeline && p->src_pipeline->is_pipeline_finished());
       })) {
-    return task_creation_hint{TaskCreationHint::READY, this};
+    return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
   }
 
   // if not scan from dependent pipelines
@@ -306,7 +308,9 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 
   if (unfinished_pipeline != _ports_list.end()) {
     auto* producer = &((*unfinished_pipeline)->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
+                              producer,
+                              tasks_for_barrier((*unfinished_pipeline)->type)};
   }
 
   // nothing to do

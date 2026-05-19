@@ -51,9 +51,27 @@ enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
 enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
 
 struct task_creation_hint {
+  static constexpr std::size_t ALL_TASKS                      = std::numeric_limits<size_t>::max();
+  static constexpr std::size_t PARTIAL_BARRIER_DEFAULT_TASKS  = 4;
+  static constexpr std::size_t PIPELINE_BARRIER_DEFAULT_TASKS = 1;
+
   TaskCreationHint hint{TaskCreationHint::WAITING_FOR_INPUT_DATA};
   sirius_physical_operator* producer{nullptr};
+  std::size_t upto_n_task_requested{ALL_TASKS};
 };
+
+/// Number of upstream tasks that need to be created for an operator to make forward progress on a
+/// port with the given barrier type. Used by get_next_task_hint() to populate
+/// task_creation_hint::upto_n_task_requested when returning WAITING_FOR_INPUT_DATA.
+constexpr std::size_t tasks_for_barrier(MemoryBarrierType type) noexcept
+{
+  switch (type) {
+    case MemoryBarrierType::FULL: return task_creation_hint::ALL_TASKS;
+    case MemoryBarrierType::PARTIAL: return task_creation_hint::PARTIAL_BARRIER_DEFAULT_TASKS;
+    case MemoryBarrierType::PIPELINE: return task_creation_hint::PIPELINE_BARRIER_DEFAULT_TASKS;
+  }
+  return task_creation_hint::ALL_TASKS;
+}
 
 /**
  * @brief Tag identifying the concrete operator_data subclass.
