@@ -18,6 +18,7 @@
 
 #include "helper/logical_type.hpp"
 #include "op/scan/scan_plan.hpp"
+#include "scan_manager/pipeline_ordered_prefetching_manager.hpp"
 #include "scan_manager/split_provider.hpp"
 #include "sirius_config.hpp"
 
@@ -99,9 +100,17 @@ class parquet_split_provider : public split_provider {
     /// Identity of the scan operator this provider is feeding.  Only used
     /// to label the fadvise INFO logs so the engine trace shows which
     /// operator each prefetch advisory belongs to.
-    std::string op_name      = {},
-    std::size_t op_id        = 0,
-    std::size_t pipeline_id  = 0);
+    std::string op_name     = {},
+    std::size_t op_id       = 0,
+    std::size_t pipeline_id = 0,
+    /// Optional opportunistic-prefetch sequencer slot.  When non-null,
+    /// the provider pushes (master_datasource, file_ranges) entries here
+    /// instead of calling @c fadvise(opportunistic) directly, and closes
+    /// the slot (null-datasource sentinel) once all batches of the
+    /// metadata scan finish.  The
+    /// @c pipeline_ordered_prefetching_manager's sequencer task drains
+    /// the slot and issues the fadvise calls in pipeline order.
+    pipeline_ordered_prefetching_manager::pipeline_slot* prefetch_slot = nullptr);
 
   ~parquet_split_provider() override;
 
@@ -158,6 +167,17 @@ class parquet_split_provider : public split_provider {
   /// Atomically incremented to claim the next batch index. Lets multiple
   /// workers process distinct batches in parallel with no mutex.
   std::atomic<std::size_t> _next_batch_idx{0};
+
+  /// Opportunistic-prefetch slot owned by the
+  /// @c pipeline_ordered_prefetching_manager.  Null when the provider is
+  /// constructed without a sequencer (e.g. cached-split provider path, or
+  /// when fadvise is not enabled).
+  pipeline_ordered_prefetching_manager::pipeline_slot* _prefetch_slot{nullptr};
+  /// Counts down as run_batch() completes.  When it reaches zero, the
+  /// provider pushes a closure sentinel to @c _prefetch_slot so the
+  /// sequencer can move on to the next pipeline.  Initialised to the
+  /// total number of file batches in the constructor.
+  std::atomic<std::size_t> _batches_remaining{0};
 };
 
 }  // namespace sirius::scan_manager

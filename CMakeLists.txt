@@ -260,6 +260,7 @@ set(EXTENSION_SOURCES
     src/scan_manager/cached_split_provider.cpp
     src/pin_table.cpp
     src/scan_manager/parquet_split_provider.cpp
+    src/scan_manager/pipeline_ordered_prefetching_manager.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
     src/scan_manager/split_provider.cpp

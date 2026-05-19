@@ -114,16 +114,15 @@ sirius_scan_manager::sirius_scan_manager(
                             static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
     auto const max_slabs =
       static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-    _buffer_pool = std::make_unique<sirius::io::buffer_pool>(
-      *host_mr, max_slabs, /*initial_slabs=*/max_slabs);
+    _buffer_pool =
+      std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs, /*initial_slabs=*/max_slabs);
   }
 
   // Pass the pool (or nullptr) and budget into the cache.  The cache
   // self-determines armed-ness from those + the io_ctx capability.  We
   // pass budget=0 when the user has disabled prefetching, so the cache
   // stays metadata-only even on a vector-host-read-capable backend.
-  size_t const budget =
-    _config.enable_prefetch_cache ? _config.prefetch_inflight_budget_chunks : 0;
+  size_t const budget = _config.enable_prefetch_cache ? _config.prefetch_inflight_budget_chunks : 0;
   _cache = std::make_unique<sirius::io::prefetching_cache>(_buffer_pool.get(), _io_ctx, budget);
   _io_ctx->attach_cache(_cache.get());
 

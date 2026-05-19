@@ -109,12 +109,11 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_i
   if (auto* scan_data = dynamic_cast<parquet_scan_data*>(data.get())) {
     auto const pipeline = get_pipeline();
     auto const pid      = pipeline ? pipeline->get_pipeline_id() : std::size_t{0};
-    SIRIUS_LOG_INFO(
-      "[fadvise immediate] op='{}' op_id={} pipeline_id={} slices={}",
-      get_name(),
-      get_operator_id(),
-      pid,
-      scan_data->rg_slices.size());
+    SIRIUS_LOG_INFO("[fadvise immediate] op='{}' op_id={} pipeline_id={} slices={}",
+                    get_name(),
+                    get_operator_id(),
+                    pid,
+                    scan_data->rg_slices.size());
     for (auto& slice : scan_data->rg_slices) {
       if (slice.datasource) {
         slice.datasource->fadvise(sirius::io::prefetching_mode::immediate, slice.ranges);

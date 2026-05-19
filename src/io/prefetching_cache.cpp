@@ -181,8 +181,7 @@ pinned_view::pinned_view(std::shared_ptr<cache_entry> entry, cudaStream_t stream
 
 pinned_view::~pinned_view() { unpin(); }
 
-pinned_view::pinned_view(pinned_view&& o) noexcept
-  : _entry(std::move(o._entry)), _stream(o._stream)
+pinned_view::pinned_view(pinned_view&& o) noexcept : _entry(std::move(o._entry)), _stream(o._stream)
 {
   o._entry.reset();
 }
@@ -368,8 +367,7 @@ bool compute_armed(buffer_pool* pool,
                    std::shared_ptr<sirius_ioctx> const& io_ctx,
                    size_t budget) noexcept
 {
-  return pool != nullptr && io_ctx != nullptr && io_ctx->supports_vector_host_read() &&
-         budget > 0;
+  return pool != nullptr && io_ctx != nullptr && io_ctx->supports_vector_host_read() && budget > 0;
 }
 }  // namespace
 
@@ -379,8 +377,7 @@ prefetching_cache::prefetching_cache(buffer_pool* pool,
   : _pool(pool),
     _io_ctx(std::move(io_ctx)),
     _armed(compute_armed(pool, _io_ctx, inflight_budget_chunks)),
-    _inflight_budget(_armed ? std::make_unique<admission_control>(inflight_budget_chunks)
-                            : nullptr)
+    _inflight_budget(_armed ? std::make_unique<admission_control>(inflight_budget_chunks) : nullptr)
 {
   // Threads only run when the cache is armed.  When unarmed the cache is
   // effectively a metadata-only store: register_metadata / get_metadata /
@@ -633,7 +630,7 @@ prefetching_handle prefetching_cache::insert(
   // n_pending+=1 saturating).  The new stamp is snapshotted on the
   // eviction-queue wrapper so the evictor can later detect requests
   // overtaken by newer activity on the same file.
-  uint64_t const new_stamp = file.demand.register_request();
+  uint64_t const new_stamp  = file.demand.register_request();
   file_demand* const demand = &file.demand;
 
   file_lk.unlock();
@@ -831,11 +828,10 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
 
     if (!have_request) continue;  // spurious wake
 
-    size_t const needed = chunk_req.n_chunks_needed;
-    size_t reclaimed    = 0;
-    size_t empty_cycles = 0;
-    size_t const queue_size_hint =
-      std::max<size_t>(_eviction_queue.size_approx(), 1);
+    size_t const needed          = chunk_req.n_chunks_needed;
+    size_t reclaimed             = 0;
+    size_t empty_cycles          = 0;
+    size_t const queue_size_hint = std::max<size_t>(_eviction_queue.size_approx(), 1);
 
     while (reclaimed < needed) {
       if (stop.stop_requested()) break;
@@ -915,8 +911,8 @@ void prefetching_cache::worker_loop(std::stop_token stop)
   // only run when _armed (which already implies pool != nullptr and
   // _io_ctx supports vector host read), so no per-iteration null checks
   // or snapshots are needed.
-  buffer_pool* const pool      = _pool;
-  sirius_ioctx* const io_ctx   = _io_ctx.get();
+  buffer_pool* const pool    = _pool;
+  sirius_ioctx* const io_ctx = _io_ctx.get();
 
   while (!stop.stop_requested()) {
     // Dequeue.  Park on _work_seq when the queue is empty; the dtor
@@ -1128,10 +1124,9 @@ void prefetching_cache::worker_loop(std::stop_token stop)
       // Slice this sub-batch's entries into their own vector — each
       // lambda owns its subset so the per-entry mark_cached/mark_load_failed
       // in the callback below operates only on its sub-batch's entries.
-      std::vector<std::shared_ptr<cache_entry>> sb_batch(batch.begin() +
-                                                           static_cast<std::ptrdiff_t>(sb_start),
-                                                         batch.begin() +
-                                                           static_cast<std::ptrdiff_t>(sb_end));
+      std::vector<std::shared_ptr<cache_entry>> sb_batch(
+        batch.begin() + static_cast<std::ptrdiff_t>(sb_start),
+        batch.begin() + static_cast<std::ptrdiff_t>(sb_end));
 
       io_ctx->host_read_ranges_async_io(
         obj_ref,
@@ -1139,9 +1134,9 @@ void prefetching_cache::worker_loop(std::stop_token stop)
         sb_dsts,
         [pool,
          batch  = std::move(sb_batch),
-         slot   = slot_holder,    // shared across sub-batches
-         io_obj = item.io_obj,    // copy, not move — used by later sub-batches
-         key    = item.file_key]  // copy, not move
+         slot   = slot_holder,  // shared across sub-batches
+         io_obj = item.io_obj,  // copy, not move — used by later sub-batches
+         key    = item.file_key]   // copy, not move
         (size_t /*bytes*/, std::exception_ptr ep) {
           if (ep) {
             try {

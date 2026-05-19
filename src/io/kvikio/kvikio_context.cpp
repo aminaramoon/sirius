@@ -65,10 +65,7 @@ bool kvikio_context::supports(std::string_view /*path*/) const
 
 // -- Public read API ---------------------------------------------------------
 
-size_t kvikio_context::host_read(sirius_io_object& obj,
-                                 size_t offset,
-                                 size_t size,
-                                 uint8_t* dst)
+size_t kvikio_context::host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst)
 {
   return as_kvikio(obj).datasource().host_read(offset, size, dst);
 }
@@ -81,20 +78,14 @@ std::future<size_t> kvikio_context::host_read_async(sirius_io_object& obj,
   return as_kvikio(obj).datasource().host_read_async(offset, size, dst);
 }
 
-size_t kvikio_context::device_read(sirius_io_object& obj,
-                                   size_t offset,
-                                   size_t size,
-                                   uint8_t* dst,
-                                   rmm::cuda_stream_view stream)
+size_t kvikio_context::device_read(
+  sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
   return as_kvikio(obj).datasource().device_read(offset, size, dst, stream);
 }
 
-std::future<size_t> kvikio_context::device_read_async(sirius_io_object& obj,
-                                                      size_t offset,
-                                                      size_t size,
-                                                      uint8_t* dst,
-                                                      rmm::cuda_stream_view stream)
+std::future<size_t> kvikio_context::device_read_async(
+  sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
   return as_kvikio(obj).datasource().device_read_async(offset, size, dst, stream);
 }

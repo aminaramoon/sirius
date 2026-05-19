@@ -138,9 +138,9 @@ class parquet_scan_data : public op::operator_data {
                     std::shared_ptr<duckdb::Expression> filter_expression,
                     std::shared_ptr<scan_plan const> plan,
                     std::vector<std::string> partition_values,
-                    std::string op_name      = {},
-                    std::size_t op_id        = 0,
-                    std::size_t pipeline_id  = 0)
+                    std::string op_name     = {},
+                    std::size_t op_id       = 0,
+                    std::size_t pipeline_id = 0)
     : rg_slices(std::move(rg_slices)),
       reader_options(std::move(reader_options)),
       filter_expression(std::move(filter_expression)),
@@ -186,12 +186,11 @@ class parquet_scan_data : public op::operator_data {
     // disposable is always honored regardless of the backend's preferred
     // mode; on backends with no pending work (e.g. kvikio fallback) it's
     // a cheap no-op because the stored handle is empty.
-    SIRIUS_LOG_INFO(
-      "[fadvise disposable] op='{}' op_id={} pipeline_id={} slices={}",
-      op_name,
-      op_id,
-      pipeline_id,
-      rg_slices.size());
+    SIRIUS_LOG_INFO("[fadvise disposable] op='{}' op_id={} pipeline_id={} slices={}",
+                    op_name,
+                    op_id,
+                    pipeline_id,
+                    rg_slices.size());
     for (auto& slice : rg_slices) {
       if (slice.datasource) {
         slice.datasource->fadvise(sirius::io::prefetching_mode::disposable, {});

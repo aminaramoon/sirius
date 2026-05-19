@@ -73,7 +73,8 @@ parquet_split_provider::parquet_split_provider(
   std::shared_ptr<sirius::io::sirius_ioctx> io_ctx,
   std::string op_name,
   std::size_t op_id,
-  std::size_t pipeline_id)
+  std::size_t pipeline_id,
+  pipeline_ordered_prefetching_manager::pipeline_slot* prefetch_slot)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
@@ -84,7 +85,8 @@ parquet_split_provider::parquet_split_provider(
     _io_ctx(io_ctx ? std::move(io_ctx) : std::make_shared<sirius::io::kvikio_context>()),
     _op_name(std::move(op_name)),
     _op_id(op_id),
-    _pipeline_id(pipeline_id)
+    _pipeline_id(pipeline_id),
+    _prefetch_slot(prefetch_slot)
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /
@@ -124,6 +126,14 @@ parquet_split_provider::parquet_split_provider(
                             _file_paths.begin() + static_cast<std::ptrdiff_t>(end));
     _batches.push_back(std::move(batch));
   }
+  // Seed the closure countdown so the last run_batch to finish (whichever
+  // worker that is) can push the sentinel onto the sequencer slot.  When
+  // there is no slot wired up, the counter is harmlessly decremented but
+  // no sentinel is ever pushed.
+  _batches_remaining.store(_batches.size(), std::memory_order_relaxed);
+  // Edge case: a provider over an empty file list still needs to close
+  // its slot so the sequencer can advance past it.
+  if (_prefetch_slot != nullptr && _batches.empty()) { _prefetch_slot->close(); }
 }
 
 parquet_split_provider::~parquet_split_provider() = default;
@@ -384,21 +394,38 @@ void parquet_split_provider::run_batch(file_batch const& batch,
           std::make_shared<parquet_metadata>(file_metadata, footer_byte_len)));
     }
 
-    // Speculative prewarm.  Honored only when the io_ctx's preferred
-    // prefetching_mode is opportunistic (e.g. slow IO backends that want
-    // lots of lead time); otherwise this is a no-op and the per-slice
-    // immediate fadvise below carries the work.  Either way the cache
+    // Speculative prewarm.  When a sequencer slot is wired up, hand the
+    // (datasource, ranges) pair off to the
+    // pipeline_ordered_prefetching_manager so opportunistic fadvise calls
+    // get serialised in pipeline-id order across pipelines.  Without a
+    // slot — direct test sites, cached-split fast path — fall back to an
+    // immediate fadvise so behavior is unchanged.  Either way the cache
     // discards the handle since the provider has no per-file cancel
-    // point — slice-level disposable is what cancels in-flight work.
+    // point: slice-level disposable cancels in-flight work.
     if (!file_ranges.empty()) {
-      SIRIUS_LOG_INFO(
-        "[fadvise opportunistic] op='{}' op_id={} pipeline_id={} file='{}' ranges={}",
-        _op_name,
-        _op_id,
-        _pipeline_id,
-        file_path,
-        file_ranges.size());
-      file_datasource->fadvise(sirius::io::prefetching_mode::opportunistic, file_ranges);
+      if (_prefetch_slot != nullptr) {
+        // Copy the ranges into the sequencer entry — file_ranges is also
+        // attached to each emitted row_group_slice below for the
+        // per-slice immediate/disposable fadvise calls, so we can't move
+        // out of it here.
+        SIRIUS_LOG_INFO(
+          "[fadvise opportunistic enqueue] op='{}' op_id={} pipeline_id={} file='{}' ranges={}",
+          _op_name,
+          _op_id,
+          _pipeline_id,
+          file_path,
+          file_ranges.size());
+        _prefetch_slot->push({file_datasource, file_ranges});
+      } else {
+        SIRIUS_LOG_INFO(
+          "[fadvise opportunistic] op='{}' op_id={} pipeline_id={} file='{}' ranges={}",
+          _op_name,
+          _op_id,
+          _pipeline_id,
+          file_path,
+          file_ranges.size());
+        file_datasource->fadvise(sirius::io::prefetching_mode::opportunistic, file_ranges);
+      }
     }
 
     std::vector<cudf::size_type> cur_rgs;
@@ -476,6 +503,15 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     seal_current_file();
   }
   flush();
+
+  // Last batch to finish closes the sequencer slot so the manager's
+  // sequencer task can advance to the next pipeline.  Use the batch
+  // counter for this — next_split_provider only counts claims, not
+  // completions, and several workers can run batches concurrently.
+  if (_prefetch_slot != nullptr) {
+    auto const prev = _batches_remaining.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev == 1) { _prefetch_slot->close(); }
+  }
 }
 
 }  // namespace sirius::scan_manager
