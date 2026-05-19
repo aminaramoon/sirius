@@ -75,7 +75,8 @@ void sirius_gpu_parquet_scan_operator::set_split_connector(
 //===----------------------------------------------------------------------===//
 // Scheduling interface
 //===----------------------------------------------------------------------===//
-std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_task_hint()
+std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_task_hint(
+  std::optional<std::size_t> downstream_request)
 {
   if (_split_connector->is_closed()) { return std::nullopt; }
   // Returns READY even when the split queue is empty but not yet closed. The dispatched worker
@@ -90,7 +91,10 @@ std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_tas
   // close the operator's split_connector (e.g. via sirius_scan_manager::close_all_connectors());
   // otherwise the parked worker hangs forever and bounded_pool::wait_all deadlocks. Normal
   // completion is fine — the split_provider closes the connector when it has no more splits.
-  return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
+  // Sources have no upstream; if a downstream operator has communicated how many tasks it needs
+  // we cap at that — otherwise default to ALL_TASKS (preserves self-perpetuating scan behavior).
+  std::size_t cap = downstream_request.value_or(task_creation_hint::ALL_TASKS);
+  return task_creation_hint{TaskCreationHint::READY, this, cap};
 }
 
 bool sirius_gpu_parquet_scan_operator::all_ports_empty() { return _split_connector->is_closed(); }

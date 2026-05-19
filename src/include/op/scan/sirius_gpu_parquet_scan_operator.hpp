@@ -78,7 +78,8 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
    * @return nullopt once the bound split_connector is closed and drained;
    *         READY pointing at this operator otherwise.
    */
-  std::optional<task_creation_hint> get_next_task_hint() override;
+  std::optional<task_creation_hint> get_next_task_hint(
+    std::optional<std::size_t> downstream_request = std::nullopt) override;
 
   /**
    * @return true once the bound split_connector is closed and drained.

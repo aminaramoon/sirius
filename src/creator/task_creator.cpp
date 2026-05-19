@@ -144,7 +144,8 @@ void task_creator::reset(bool keep_parquet_metadata)
   _execution_context.reset();
 }
 
-next_task_target task_creator::get_operator_for_next_task(op::sirius_physical_operator* node)
+next_task_target task_creator::get_operator_for_next_task(
+  op::sirius_physical_operator* node, std::optional<std::size_t> downstream_request)
 {
   if (node == nullptr) { return {}; }
 
@@ -158,14 +159,13 @@ next_task_target task_creator::get_operator_for_next_task(op::sirius_physical_op
       return {};
     }
   }
-  auto hint = node->get_next_task_hint();
+  auto hint = node->get_next_task_hint(downstream_request);
 
   if (hint.has_value() && hint.value().hint == op::TaskCreationHint::READY) {
     if (hint.value().producer == nullptr) {
       throw std::runtime_error(
         "During get_operator_for_next_task Producer is nullptr for operator " + node->get_name());
     }
-    // WSM TODO: how do we handle other ports that are not default?
     return {hint.value().producer, hint.value().upto_n_task_requested};
   } else if (hint.has_value() &&
              hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
@@ -182,7 +182,9 @@ next_task_target task_creator::get_operator_for_next_task(op::sirius_physical_op
         return {};
       }
     }
-    return get_operator_for_next_task(producer);
+    // Forward the current operator's request upward. Each upstream operator's combine rule
+    // decides whether to promote its local default based on this value and its own relation.
+    return get_operator_for_next_task(producer, hint.value().upto_n_task_requested);
   }
   return {};
 }

@@ -69,8 +69,12 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
   }
 }
 
-std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
+std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint(
+  std::optional<std::size_t> /* downstream_request */)
 {
+  // Concat is FAN_IN: combine_upstream_request ignores downstream requests for this relation, so
+  // we intentionally don't forward it. The local barrier semantics (PARTIAL vs concat-all)
+  // already encode the right upstream demand.
   std::lock_guard<std::mutex> lg(lock);
 
   if (ports.size() != 1) {

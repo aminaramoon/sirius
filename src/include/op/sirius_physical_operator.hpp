@@ -89,6 +89,31 @@ constexpr std::size_t tasks_for_barrier(MemoryBarrierType type) noexcept
   return task_creation_hint::ALL_TASKS;
 }
 
+/// Combine an operator's local barrier-derived task request with a downstream-supplied request.
+///
+/// `local_default` is what the operator would request from upstream based purely on its own input
+/// port barrier (typically tasks_for_barrier(port_type)). `downstream_request`, when set, is the
+/// number of tasks the operator immediately downstream needs from THIS operator. The combined
+/// value is what THIS operator should ask its upstream for.
+///
+/// The combination rule depends on the operator's structural relation between upstream and
+/// downstream task counts (see TaskCountRelation):
+///   - PASSTHROUGH: N downstream tasks need N upstream tasks; promote upward when downstream wants
+///     more than the local default.
+///   - FAN_IN / FAN_OUT / BARRIER: the local default already encodes the right shape; ignore the
+///     downstream request. FAN_IN local defaults are usually large (PARTIAL/ALL); FAN_OUT local
+///     defaults are sized for the operator itself and don't propagate; BARRIER decouples counts.
+constexpr std::size_t combine_upstream_request(
+  std::size_t local_default,
+  TaskCountRelation relation,
+  std::optional<std::size_t> downstream_request) noexcept
+{
+  if (!downstream_request.has_value() || relation != TaskCountRelation::PASSTHROUGH) {
+    return local_default;
+  }
+  return std::max(local_default, *downstream_request);
+}
+
 /**
  * @brief Tag identifying the concrete operator_data subclass.
  *
@@ -506,8 +531,15 @@ class sirius_physical_operator {
   //! Get the next ports after sink
   const std::vector<sirius_physical_operator::next_port_info>& get_next_ports_after_sink() const;
 
-  //! Get the next task hint
-  virtual std::optional<task_creation_hint> get_next_task_hint();
+  //! Get the next task hint.
+  //!
+  //! \param downstream_request  When set, the number of tasks the immediately downstream operator
+  //! needs from THIS operator. Allows the propagation walk in task_creator to promote a small
+  //! local PIPELINE/PARTIAL default into a larger value when an even-further-downstream FULL
+  //! barrier requires more upstream work. Operators that fan-in or fan-out (concat, partition)
+  //! ignore the request — see TaskCountRelation and combine_upstream_request().
+  virtual std::optional<task_creation_hint> get_next_task_hint(
+    std::optional<std::size_t> downstream_request = std::nullopt);
 
   //! Structural relation between this operator's upstream task count and the count it produces
   //! for downstream. Defaults to PASSTHROUGH (1-in/1-out pipelineable). See TaskCountRelation for

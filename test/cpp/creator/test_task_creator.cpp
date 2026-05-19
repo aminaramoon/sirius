@@ -78,11 +78,12 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
   /**
    * @brief Override to return configured hint when in custom mode.
    */
-  std::optional<task_creation_hint> get_next_task_hint() override
+  std::optional<task_creation_hint> get_next_task_hint(
+    std::optional<std::size_t> downstream_request = std::nullopt) override
   {
     if (_use_custom_hint) { return _custom_hint; }
     // Fall back to parent implementation
-    return sirius_physical_operator::get_next_task_hint();
+    return sirius_physical_operator::get_next_task_hint(downstream_request);
   }
 
  private:

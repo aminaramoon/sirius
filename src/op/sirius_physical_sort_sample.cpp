@@ -50,11 +50,13 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
 {
 }
 
-std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hint()
+std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hint(
+  std::optional<std::size_t> downstream_request)
 {
-  // If boundaries already computed, use default behavior (process batches as they arrive)
+  // If boundaries already computed, sort_sample is a pure PASSTHROUGH — forward to the base impl
+  // which combines our PASSTHROUGH relation with downstream_request.
   if (_boundary_state.load(std::memory_order_acquire) == 2) {
-    return sirius_physical_operator::get_next_task_hint();
+    return sirius_physical_operator::get_next_task_hint(downstream_request);
   }
 
   // Need to wait for N batches before computing boundaries
@@ -73,12 +75,14 @@ std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hin
 
   if (p->src_pipeline && !upstream_finished) {
     // We specifically need at least `num_sample_batches` upstream batches before we can compute
-    // boundaries — request that many upstream tasks instead of falling back to the port's barrier
-    // default (which would be 1 for PIPELINE).
-    auto* producer = &(p->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
-                              producer,
-                              static_cast<std::size_t>(num_sample_batches)};
+    // boundaries. After that point sort_sample is PASSTHROUGH, so any larger downstream request
+    // must also be satisfied — request the larger of the two.
+    auto* producer            = &(p->src_pipeline->get_operators()[0].get());
+    std::size_t local_default = static_cast<std::size_t>(num_sample_batches);
+    return task_creation_hint{
+      TaskCreationHint::WAITING_FOR_INPUT_DATA,
+      producer,
+      combine_upstream_request(local_default, TaskCountRelation::PASSTHROUGH, downstream_request)};
   }
 
   return std::nullopt;
