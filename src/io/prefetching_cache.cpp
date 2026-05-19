@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <memory>
 #include <stdexcept>
 
@@ -890,12 +891,16 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
     auto const free     = _pool->free_count();
     auto const consumed = (cap >= free) ? (cap - free) : 0;
 
-    auto const start_lim = static_cast<size_t>(_pressure_evict_start_ratio * cap);
+    // Round-to-nearest rather than truncate: a plain static_cast would
+    // shave the threshold by ~half a chunk on small pools (e.g.
+    // cap=7, ratio=0.85 → trunc=5 vs. round=6), so the trigger would
+    // fire one chunk earlier than the documented percentage.
+    auto const start_lim = static_cast<size_t>(std::llround(_pressure_evict_start_ratio * cap));
     if (consumed <= start_lim) return;
 
     // Target the stop-threshold (consumed_target = stop_ratio * cap),
     // i.e. free enough chunks so consumed drops below stop_lim.
-    auto const stop_lim = static_cast<size_t>(_pressure_evict_stop_ratio * cap);
+    auto const stop_lim = static_cast<size_t>(std::llround(_pressure_evict_stop_ratio * cap));
     size_t const target = (consumed > stop_lim) ? (consumed - stop_lim) : 0;
     if (target == 0) return;
 
