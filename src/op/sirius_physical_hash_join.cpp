@@ -410,30 +410,38 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
     auto probe_size = probe_port->repo->total_size();
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::NOT_BUILT) {
       if (build_size > 0 && probe_size > 0) {
+        // Only a single build task fires here — it consumes one batch from each side and
+        // transitions the state machine. Subsequent probe tasks happen after BUILT.
         _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULING;
-        return task_creation_hint{TaskCreationHint::READY, this};
+        return task_creation_hint{TaskCreationHint::READY, this, 1};
       } else if (build_size == 0) {
-        // No build batch available yet, hint to wait for build input data.
+        // No build batch available yet, hint to wait for build input data. The build port is the
+        // gating side; honor its barrier type when asking upstream for work.
         auto* producer = &build_port->src_pipeline->get_operators()[0].get();
-        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+        return task_creation_hint{
+          TaskCreationHint::WAITING_FOR_INPUT_DATA, producer, tasks_for_barrier(build_port->type)};
       } else {
         // Build batch is available but no probe batch yet, hint to wait for probe input data.
         auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
-        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+        return task_creation_hint{
+          TaskCreationHint::WAITING_FOR_INPUT_DATA, producer, tasks_for_barrier(probe_port->type)};
       }
     } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULING ||
                _hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
-      // Hash table is currently being built, hint to wait for it to be ready.
+      // Hash table is currently being built; we can't fire probe tasks yet. Asking the upstream
+      // for zero tasks lets task_creator skip creating speculative probe tasks during this window;
+      // the join will be re-scheduled when the build completes.
       auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer, 0};
     } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
       // Hash table is built, we can process probe only batches.
       if (ports["default"]->repo->total_size() > 0) {
-        return task_creation_hint{TaskCreationHint::READY, this};
+        return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
       } else {
         // No probe batch available yet, hint to wait for probe input data.
         auto* producer = &ports["default"]->src_pipeline->get_operators()[0].get();
-        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+        return task_creation_hint{
+          TaskCreationHint::WAITING_FOR_INPUT_DATA, producer, tasks_for_barrier(probe_port->type)};
       }
     } else {
       // If we are here, then this operator is actually complete.

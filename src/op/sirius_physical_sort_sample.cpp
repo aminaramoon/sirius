@@ -68,12 +68,17 @@ std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hin
   bool has_enough        = p->repo->size() >= static_cast<size_t>(num_sample_batches);
 
   if (has_enough || (upstream_finished && p->repo->size() > 0)) {
-    return task_creation_hint{TaskCreationHint::READY, this};
+    return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
   }
 
   if (p->src_pipeline && !upstream_finished) {
+    // We specifically need at least `num_sample_batches` upstream batches before we can compute
+    // boundaries — request that many upstream tasks instead of falling back to the port's barrier
+    // default (which would be 1 for PIPELINE).
     auto* producer = &(p->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
+                              producer,
+                              static_cast<std::size_t>(num_sample_batches)};
   }
 
   return std::nullopt;

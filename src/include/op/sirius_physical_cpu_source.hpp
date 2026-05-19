@@ -49,7 +49,8 @@ class sirius_physical_cpu_source : public sirius_physical_operator {
     // after the task runs, leaving a window where a second task can be created.
     bool expected = false;
     if (!task_scheduled.compare_exchange_strong(expected, true)) { return std::nullopt; }
-    return task_creation_hint{TaskCreationHint::READY, this};
+    // CPU source is single-shot: exactly one task drains the collection.
+    return task_creation_hint{TaskCreationHint::READY, this, 1};
   }
 
   bool is_source() const override { return true; }

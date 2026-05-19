@@ -83,13 +83,14 @@ std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_tas
   // or closes the connector. This trades one parked worker per active scan for not needing a
   // scheduler-visible wake-up signal from the scan_manager — the task_creator schedules the scan
   // op once and the worker self-perpetuates inside task_creator's "loop until all_ports_empty"
-  // branch (see task_creator::manager_loop default else-branch).
+  // branch (see task_creator::manager_loop default else-branch). The ALL_TASKS request preserves
+  // that self-perpetuating behavior.
   //
   // Lifecycle requirement: any error/drain path that joins task_creator's worker pool MUST first
   // close the operator's split_connector (e.g. via sirius_scan_manager::close_all_connectors());
   // otherwise the parked worker hangs forever and bounded_pool::wait_all deadlocks. Normal
   // completion is fine — the split_provider closes the connector when it has no more splits.
-  return task_creation_hint{TaskCreationHint::READY, this};
+  return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
 }
 
 bool sirius_gpu_parquet_scan_operator::all_ports_empty() { return _split_connector->is_closed(); }

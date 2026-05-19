@@ -52,7 +52,7 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
   std::optional<task_creation_hint> get_next_task_hint() override
   {
     if (exhausted.load()) { return std::nullopt; }
-    return task_creation_hint{TaskCreationHint::READY, this};
+    return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
   }
 
   //! The table function

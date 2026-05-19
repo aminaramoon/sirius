@@ -272,10 +272,13 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
     }
     auto port_ptr = ports.begin()->second;
     if (port_ptr->repo->total_size() > 0) {
-      return task_creation_hint{TaskCreationHint::READY, this};
+      return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
     } else if (port_ptr->src_pipeline && !port_ptr->src_pipeline->is_pipeline_finished()) {
+      // In pipelineable-probe mode partition can make progress one batch at a time; honor the
+      // port's barrier type so PIPELINE ports ask for 1, PARTIAL for 4, etc.
       auto* producer = &(port_ptr->src_pipeline->get_operators()[0].get());
-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+      return task_creation_hint{
+        TaskCreationHint::WAITING_FOR_INPUT_DATA, producer, tasks_for_barrier(port_ptr->type)};
     } else {
       return std::nullopt;
     }
