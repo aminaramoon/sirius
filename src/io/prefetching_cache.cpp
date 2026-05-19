@@ -318,47 +318,48 @@ std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t o
 // prefetching_cache — construction / destruction
 // ===========================================================================
 
-prefetching_cache::prefetching_cache(cucascade::memory::fixed_size_host_memory_resource& mr,
-                                     uint32_t max_slabs,
-                                     uint32_t initial_slabs)
-  : _pool_mr(&mr),
-    _pool_max_slabs(max_slabs),
-    _pool_initial_slabs(std::min(initial_slabs, max_slabs))
+namespace {
+// armed iff every dependency the prefetch machinery needs is present.
+bool compute_armed(buffer_pool* pool,
+                   std::shared_ptr<sirius_ioctx> const& io_ctx,
+                   size_t budget) noexcept
 {
-  // Separators point past the (empty) list initially; every bucket is empty.
-  _lru_buckets.fill(_lru_list.end());
-  // Threads start dormant — _active is false until reset(non-null) flips it.
-  // Both still run so they can be re-armed cheaply without thread churn
-  // between queries.
-  _evictor_thread = std::jthread([this](std::stop_token st) { evictor_loop(std::move(st)); });
-  _worker_thread  = std::jthread([this](std::stop_token st) { worker_loop(std::move(st)); });
+  return pool != nullptr && io_ctx != nullptr && io_ctx->supports_vector_host_read() &&
+         budget > 0;
 }
+}  // namespace
 
-prefetching_cache::prefetching_cache()
+prefetching_cache::prefetching_cache(buffer_pool* pool,
+                                     std::shared_ptr<sirius_ioctx> io_ctx,
+                                     size_t inflight_budget_chunks)
+  : _pool(pool),
+    _io_ctx(std::move(io_ctx)),
+    _armed(compute_armed(pool, _io_ctx, inflight_budget_chunks)),
+    _inflight_budget(_armed ? std::make_unique<admission_control>(inflight_budget_chunks)
+                            : nullptr)
 {
-  // Metadata-only cache: no pool config, no mr.  reset(non-null) on this
-  // cache will set _active=true but leave _pool null, so the worker's
-  // pool-null check (in worker_loop) bails on every dequeued item.
-  // register_metadata / get_metadata still work because they only touch
-  // the file_entry map.
   _lru_buckets.fill(_lru_list.end());
-  _evictor_thread = std::jthread([this](std::stop_token st) { evictor_loop(std::move(st)); });
-  _worker_thread  = std::jthread([this](std::stop_token st) { worker_loop(std::move(st)); });
+  // Threads only run when the cache is armed.  When unarmed the cache is
+  // effectively a metadata-only store: register_metadata / get_metadata /
+  // read still work but nobody is consuming the work queue, and insert()
+  // short-circuits before enqueuing anything anyway.
+  if (_armed) {
+    _evictor_thread = std::jthread([this](std::stop_token st) { evictor_loop(std::move(st)); });
+    _worker_thread  = std::jthread([this](std::stop_token st) { worker_loop(std::move(st)); });
+  }
 }
 
 prefetching_cache::~prefetching_cache()
 {
-  // Flip _active first so any worker mid-iteration observes the
-  // shutdown when it hits the pre-dispatch gate and rolls back instead
-  // of dispatching new IO.  This must happen before request_stop so an
-  // already-spinning worker doesn't fire a final dispatch between us
-  // requesting stop and us draining in-flight.
-  {
-    std::unique_lock lk(_ctrl_mtx);
-    _active = false;
-    _ctrl_cv.notify_all();
+  if (!_armed) {
+    // Nothing to drain — no threads, no in-flight IO.  The file_cache map
+    // and LRU list will be destroyed by member destruction.
+    return;
   }
 
+  // Stop the threads.  Stop-token requests + waitpoint wakeups (work_seq,
+  // request_sem) unblock both loops; each one rechecks the token at every
+  // wait point and exits promptly.
   _worker_thread.request_stop();
   _evictor_thread.request_stop();
   _work_seq.fetch_add(1, std::memory_order_release);
@@ -367,58 +368,11 @@ prefetching_cache::~prefetching_cache()
 
   // Wake readers waiting on entries that were loading when shutdown began.
   // Outstanding backend requests may still resolve via their request_context
-  // safety net, but waiters should not depend on that happening.
+  // safety net, but waiters shouldn't depend on that happening.
   abort_pending_entries();
 
-  // Join explicitly so all cache-owned queues and counters outlive the worker
-  // and evictor loops. std::jthread would join during member destruction, but
-  // doing it here lets us abort any entries that raced into loading just before
-  // the worker observed stop.
-  if (_worker_thread.joinable()) { _worker_thread.join(); }
-  if (_evictor_thread.joinable()) { _evictor_thread.join(); }
-
-  // Wait for every IO the worker dispatched (before observing stop) to
-  // complete and release its admission_control slot.  Each IO callback
-  // captures raw pointers into @c _pool and @c _inflight_budget; if we
-  // returned now those members would be destroyed underneath any
-  // still-pending callback.  The reactor — owned by the io_ctx, declared
-  // before this cache in @c sirius_scan_manager so it outlives us — is
-  // still alive here and will either complete the IO normally or surface
-  // it via @c request_context's safety-net handler on reactor shutdown;
-  // either path releases the slot, so this wait is bounded by the
-  // reactor making progress.
-  //
-  // Wrapped in try/catch because a destructor must be noexcept; a
-  // throwing condvar (e.g. system_error) shouldn't propagate out and a
-  // hang here is preferable to a UAF after the dtor returns.
-  if (_inflight_budget) {
-    try {
-      _inflight_budget->wait_for_idle();
-    } catch (...) {
-      // Best-effort drain; no useful recovery in a dtor.
-    }
-  }
-
-  abort_pending_entries();
-}
-
-void prefetching_cache::prefetch_using(std::shared_ptr<sirius_ioctx> io_ctx,
-                                       size_t inflight_budget_chunks)
-{
-  // ----- Phase 1: take the cache offline ---------------------------------
-  // Flip _active to false so:
-  //   - insert() stops scheduling prefetch work (it still records metadata)
-  //   - the worker, when it loops back, parks on _ctrl_cv
-  // After flipping, drain the work queue ourselves so anything the worker
-  // hasn't picked up yet doesn't sit around with a stale io_ctx attached.
-  {
-    std::unique_lock lk(_ctrl_mtx);
-    _active = false;
-    _ctrl_cv.notify_all();
-  }
-  _work_seq.fetch_add(1, std::memory_order_release);
-  _work_seq.notify_all();
-
+  // Drain whatever the worker / evictor left behind so the loops don't
+  // block forever waiting on the queues we'll never re-fill.
   work_item drained;
   while (_work_queue.try_dequeue(drained)) {
     for (auto& entry : drained.entries) {
@@ -426,67 +380,36 @@ void prefetching_cache::prefetch_using(std::shared_ptr<sirius_ioctx> io_ctx,
     }
   }
 
-  // ----- Phase 2: wait for in-flight backend IO --------------------------
-  // The worker may have dispatched host_read_ranges_async_io but the
-  // completion callback hasn't fired yet.  Those callbacks touch the pool
-  // and cache entries via the admission_control::slot captured in their
-  // closure; draining the admission_control's outstanding slots therefore
-  // proves no callback is mid-flight.  If we're transitioning null → null
-  // there's no budget to drain.
-  if (_inflight_budget) { _inflight_budget->wait_for_idle(); }
-
-  // ----- Phase 3: drain the eviction side --------------------------------
-  // Candidates are weak refs; just empty the queue.  Pending chunk
-  // requests would otherwise have the evictor block on backpressure for
-  // entries that are about to be wiped — fulfil them with an exception so
-  // any worker still parked in fut.get() unblocks.
-  eviction_candidate cand;
-  while (_candidate_queue.try_dequeue(cand)) {}
-
   eviction_request ereq;
   while (_request_queue.try_dequeue(ereq)) {
     ereq.promise.set_exception(
-      std::make_exception_ptr(std::runtime_error("eviction aborted — cache reset")));
+      std::make_exception_ptr(std::runtime_error("eviction aborted — cache shutting down")));
   }
 
-  // The LRU list holds raw cache_entry* pointers into the file_cache map;
-  // drop it before the entries themselves go away.
-  _lru_list.clear();
-  _lru_buckets.fill(_lru_list.end());
-  _last_seen_age = 0;
+  // Join.  After joins, no new IO will be dispatched, but the reactor
+  // (held alive by _io_ctx) may still be processing IOs we submitted
+  // earlier; their completion callbacks hold a slot in _inflight_budget.
+  if (_worker_thread.joinable()) { _worker_thread.join(); }
+  if (_evictor_thread.joinable()) { _evictor_thread.join(); }
 
-  // ----- Phase 4: drop all file entries ----------------------------------
-  // After waiting for in-flight IO, no callback references a cache_entry
-  // anymore — clearing the map releases every shared_ptr we own.
-  {
-    std::unique_lock map_lk(_map_mtx);
-    _file_cache.clear();
+  // Wait for every in-flight IO callback to release its admission slot.
+  // Each callback captures the raw _pool pointer; the owner of the pool
+  // (scan_manager) won't tear it down until this cache returns from its
+  // dtor, so callbacks observing the pool here are safe.  The shared_ptr
+  // capture on _io_ctx in the same callbacks keeps the reactor alive
+  // too, so the IO either completes normally or surfaces via the
+  // request_context safety net at reactor shutdown — both paths release
+  // the slot.
+  //
+  // Wrapped in try/catch: a destructor must be noexcept and a hanging
+  // wait is preferable to a UAF.
+  try {
+    _inflight_budget->wait_for_idle();
+  } catch (...) {
+    // Best-effort drain.
   }
 
-  // ----- Phase 5: pool + budget lifecycle + re-arm -----------------------
-  std::unique_lock lk(_ctrl_mtx);
-  _io_ctx = io_ctx.get();
-  if (_io_ctx != nullptr) {
-    if (_pool) {
-      _pool->reclaim_all();
-    } else if (_pool_mr != nullptr) {
-      _pool = std::make_unique<buffer_pool>(*_pool_mr, _pool_max_slabs, _pool_initial_slabs);
-    }
-    // Rebuild the admission_control with the caller-supplied budget.  No
-    // outstanding slots survive across reset (Phase 2 drained them), so
-    // dropping the old instance is safe.
-    _inflight_budget = std::make_unique<admission_control>(inflight_budget_chunks);
-    _active          = true;
-    _ctrl_cv.notify_all();
-    _work_seq.fetch_add(1, std::memory_order_release);
-    _work_seq.notify_all();
-  } else {
-    // Detached: hand the slabs back to the upstream cucascade resource and
-    // release the admission_control.
-    _pool.reset();
-    _inflight_budget.reset();
-    // _active stays false until a future reset(non-null) re-arms us.
-  }
+  abort_pending_entries();
 }
 
 void prefetching_cache::enqueue_work(work_item item)
@@ -603,21 +526,6 @@ prefetching_handle prefetching_cache::insert(
   auto const& key = obj.raw_file_cache_id();
   auto file_size  = obj.size();
 
-  // Snapshot the lifecycle once.  Either piece going missing (no pool /
-  // no ioctx) puts insert() into the "metadata only" path the user asked
-  // for: still record the file entry + metadata so subsequent reads can
-  // observe it, but skip building per-range cache_entries that would need
-  // the pool's chunk_bytes and the ioctx's compute_physical_range.
-  buffer_pool* pool    = nullptr;
-  sirius_ioctx* io_ctx = nullptr;
-  bool active          = false;
-  {
-    std::unique_lock lk(_ctrl_mtx);
-    pool   = _pool.get();
-    io_ctx = _io_ctx;
-    active = _active;
-  }
-
   std::unique_lock map_lk(_map_mtx);
   auto [it, inserted] = _file_cache.try_emplace(key, nullptr);
   if (inserted) it->second = std::make_unique<file_entry>();
@@ -632,11 +540,10 @@ prefetching_handle prefetching_cache::insert(
   // separating that concern keeps insert() about ranges only, and lets
   // metadata be recorded by callers that have no prefetch work to schedule.
 
-  if (!active || pool == nullptr || io_ctx == nullptr) {
-    // Dormant cache: the file_entry is recorded; per-range prefetching
-    // needs the pool and ioctx and waits for the next reset.  Return an
-    // empty handle so the caller's `if (handle)` check skips the
-    // "store on the datasource" path.
+  if (!_armed) {
+    // Unarmed cache: record the file_entry so subsequent reads can find
+    // metadata, but skip the per-range cache_entries — there's no pool
+    // to allocate chunks from and no worker to dispatch IO.
     return {};
   }
 
@@ -679,8 +586,8 @@ prefetching_handle prefetching_cache::insert(
       merged.push_back(std::move(existing));
       ++ex_it;
     } else {
-      auto physical = io_ctx->compute_physical_range(logical, file_size);
-      auto e        = std::make_shared<cache_entry>(logical, physical, pool->chunk_bytes());
+      auto physical = _io_ctx->compute_physical_range(logical, file_size);
+      auto e        = std::make_shared<cache_entry>(logical, physical, _pool->chunk_bytes());
       e->n_total_request.fetch_add(1, std::memory_order_relaxed);
       e->n_request.store(1, std::memory_order_relaxed);
       e->request_ts.store(tick, std::memory_order_release);
@@ -993,6 +900,7 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
     // the cache ages mid-wait — that's the signal that this request's epoch
     // is stale and the caller is moving on.
     while (reclaimed < needed) {
+      if (stop.stop_requested()) break;  // bail before another expensive walk
       drain_candidates_into_lru();
       catch_up_age();
 
@@ -1002,6 +910,7 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
       auto it           = _lru_list.begin();
       size_t cur_bucket = 0;
       while (it != _lru_list.end() && reclaimed < needed) {
+        if (stop.stop_requested()) break;  // abort the walk on shutdown
         while (cur_bucket < N_LRU_BUCKETS && it == _lru_buckets[cur_bucket])
           ++cur_bucket;
         if (cur_bucket >= N_LRU_BUCKETS) break;
@@ -1080,56 +989,30 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     _work_seq.notify_one();
   });
 
-  while (!stop.stop_requested()) {
-    // ---- Lifecycle gate ----------------------------------------------------
-    // The cache may be dormant (no io_ctx attached yet, or temporarily
-    // detached by reset()).  Park on _ctrl_cv until reset() arms us again
-    // rather than spinning on the work queue.
-    {
-      std::unique_lock lk(_ctrl_mtx);
-      _ctrl_cv.wait(lk, [&] { return _active || stop.stop_requested(); });
-    }
-    if (stop.stop_requested()) break;
+  // _pool and _io_ctx are const members baked at construction.  Threads
+  // only run when _armed (which already implies pool != nullptr and
+  // _io_ctx supports vector host read), so no per-iteration null checks
+  // or snapshots are needed.
+  buffer_pool* const pool      = _pool;
+  sirius_ioctx* const io_ctx   = _io_ctx.get();
 
+  while (!stop.stop_requested()) {
+    // Dequeue.  Park on _work_seq when the queue is empty; the dtor
+    // bumps _work_seq + notify_all (and the stop_callback above re-bumps
+    // it) so a stopped worker observes the token here and exits.
     work_item item;
     if (!_work_queue.try_dequeue(item)) {
       auto seq = _work_seq.load(std::memory_order_acquire);
+      if (stop.stop_requested()) break;
       if (!_work_queue.try_dequeue(item)) {
         _work_seq.wait(seq, std::memory_order_relaxed);
         continue;
       }
     }
-
-    // Hold _ctrl_mtx for the ENTIRE iteration body — snapshot + Phase
-    // 1-5 + dispatch.  Rationale: the worker takes raw pointers to
-    // @c _pool and @c _io_ctx and walks across long-running operations
-    // (Phase 2's eviction wait, Phase 3's admission_control acquire).
-    // Without the lock held, prefetch_using() could observe an empty
-    // admission_control (active_slots == 0 because we haven't reached
-    // Phase 3 yet), return from wait_for_idle, drop _pool and
-    // _inflight_budget, and leave us using dangling pointers.
-    //
-    // The mutex window is bounded by other threads making progress:
-    //   - The evictor doesn't take _ctrl_mtx, so eviction waits don't
-    //     deadlock against this hold.
-    //   - admission_control has its own mutex, so admission waits don't
-    //     deadlock either.
-    //   - prefetch_using just waits for the lock — that's the desired
-    //     behaviour: it blocks until our iteration completes (or until
-    //     we bail at the gate below), after which the lock is free.
-    std::unique_lock ctrl_lk(_ctrl_mtx);
-
-    if (!_active) {
+    if (stop.stop_requested()) {
       for (auto& e : item.entries)
         if (e) e->state.try_cancel_queued();
-      continue;
-    }
-    buffer_pool* pool    = _pool.get();
-    sirius_ioctx* io_ctx = _io_ctx;
-    if (pool == nullptr || io_ctx == nullptr) {
-      for (auto& e : item.entries)
-        if (e) e->state.try_cancel_queued();
-      continue;
+      break;
     }
 
     // ---- Cancellation gate -------------------------------------------------
@@ -1173,6 +1056,15 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     auto got                = pool->allocate_bulk(upper_bound_chunks, ptrs);
     bool eviction_requested = false;
     if (got < upper_bound_chunks) {
+      // Check stop before enqueueing: the evictor's exit drain runs only
+      // for requests already in the queue when it stops.  An enqueue that
+      // races past that drain would never be resolved and we'd hang here.
+      if (stop.stop_requested()) {
+        pool->deallocate_bulk(ptrs);
+        for (auto& e : item.entries)
+          if (e) e->state.try_cancel_queued();
+        break;
+      }
       size_t shortfall = upper_bound_chunks - got;
       eviction_request req;
       req.n_chunks_needed = shortfall;
@@ -1188,6 +1080,16 @@ void prefetching_cache::worker_loop(std::stop_token stop)
         continue;
       }
 
+      // After the wait — re-check stop.  If the evictor resolved us
+      // mid-shutdown, drop the work cleanly instead of pushing IO into
+      // a tearing-down system.
+      if (stop.stop_requested()) {
+        pool->deallocate_bulk(ptrs);
+        for (auto& e : item.entries)
+          if (e) e->state.try_cancel_queued();
+        break;
+      }
+
       auto extra = pool->allocate_bulk(shortfall, ptrs);
       if (extra < shortfall) {
         pool->deallocate_bulk(ptrs);
@@ -1196,17 +1098,13 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     }
 
     // ---- Phase 3: reserve the inflight budget for the upper bound ----------
-    // We may end up using less than upper_bound (if entries race in Phase 4),
-    // but admission_control::slot is a fixed reservation — we hold the full
-    // amount until IO completes.  This is a conservative over-reservation;
-    // any excess chunks are returned to the pool immediately in Phase 4.
-    // _active==true (checked above under _ctrl_mtx) guarantees the budget
-    // unique_ptr is live; reset() can't drop it without first waiting for
-    // wait_for_idle, which only returns after this work item's callback
-    // (and every other outstanding callback) has released its slot.
+    // admission_control::acquire takes the stop_token; a disengaged slot
+    // means we were interrupted mid-wait.  Return chunks and exit.
     auto budget_slot = _inflight_budget->acquire(upper_bound_chunks, stop);
     if (!budget_slot) {
       pool->deallocate_bulk(ptrs);
+      for (auto& e : item.entries)
+        if (e) e->state.try_cancel_queued();
       break;
     }
 

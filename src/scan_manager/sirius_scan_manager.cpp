@@ -105,37 +105,29 @@ sirius_scan_manager::sirius_scan_manager(
       "[sirius_scan_manager] sirius_datasource disabled — using kvikio_context fallback");
   }
 
-  // The cache is built unconditionally: it doubles as the metadata
-  // store, and metadata caching is useful even when prefetching is off
-  // (e.g. parquet footer reuse across scans, kvikio fallback path).
-  // When host_mr is available we configure the buffer pool too so a
-  // later prefetch arm doesn't have to switch cache instances; when
-  // it's not we get a metadata-only cache that fadvise inserts on
-  // naturally short-circuit.
+  // The scan_manager owns the buffer pool and the cache.  The cache
+  // takes both as construction-time dependencies and is single-life: it
+  // arms itself iff (pool != nullptr && io_ctx->supports_vector_host_read()
+  // && budget > 0); otherwise it's a metadata-only store.
   if (host_mr != nullptr) {
     auto const slab_bytes = host_mr->get_block_size() *
                             static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
     auto const max_slabs =
       static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-    _cache = std::make_unique<sirius::io::prefetching_cache>(
+    _buffer_pool = std::make_unique<sirius::io::buffer_pool>(
       *host_mr, max_slabs, /*initial_slabs=*/max_slabs);
-  } else {
-    _cache = std::make_unique<sirius::io::prefetching_cache>();
   }
+
+  // Pass the pool (or nullptr) and budget into the cache.  The cache
+  // self-determines armed-ness from those + the io_ctx capability.  We
+  // pass budget=0 when the user has disabled prefetching, so the cache
+  // stays metadata-only even on a vector-host-read-capable backend.
+  size_t const budget =
+    _config.enable_prefetch_cache ? _config.prefetch_inflight_budget_chunks : 0;
+  _cache = std::make_unique<sirius::io::prefetching_cache>(_buffer_pool.get(), _io_ctx, budget);
   _io_ctx->attach_cache(_cache.get());
 
-  // Arming (= allocating the pool, registering this io_ctx for IO
-  // dispatch, starting the worker) is conditional on both the user's
-  // intent and the backend's capability.  When either gate is closed
-  // the cache stays metadata-only; fadvise inserts and reads
-  // gracefully no-op against an unarmed cache.
-  if (_config.enable_prefetch_cache && _io_ctx->supports_vector_host_read()) {
-    if (host_mr == nullptr) {
-      throw std::runtime_error(
-        "[sirius_scan_manager] prefetch cache requested on a vector-host-read "
-        "backend but no host fixed_size_host_memory_resource was provided");
-    }
-    _cache->prefetch_using(_io_ctx, _config.prefetch_inflight_budget_chunks);
+  if (_cache->is_armed()) {
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] prefetch cache armed (inflight_chunks={})",
                      _config.prefetch_inflight_budget_chunks);
   } else {
@@ -146,13 +138,15 @@ sirius_scan_manager::sirius_scan_manager(
 sirius_scan_manager::~sirius_scan_manager()
 {
   if (_cache) { SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _cache->summary()); }
-  // Detach the cache from the ioctx before either is torn down so the
-  // ioctx doesn't observe a half-destroyed cache via @c host_read.  The
-  // cache's destructor will then drain its worker and queues; afterwards
-  // the ioctx and its reactors can be destroyed safely.
+  // Detach the cache from the ioctx before tearing down so the ioctx
+  // doesn't observe a half-destroyed cache via @c host_read.  The
+  // cache's destructor drains its worker, queues, and in-flight IO
+  // (via admission_control::wait_for_idle) before returning.
   if (_io_ctx) { _io_ctx->attach_cache(nullptr); }
-  if (_cache) { _cache->reset(); }
   _cache.reset();
+  // Pool destructs next (after _cache); by this point no callback or
+  // worker iteration still holds a raw pointer into it.
+  _buffer_pool.reset();
   stop();
 }
 

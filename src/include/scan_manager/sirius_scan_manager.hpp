@@ -250,12 +250,17 @@ class sirius_scan_manager {
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
-  /// Optional prefetching_cache, owned by the scan_manager.  Declared
-  /// after @c _io_ctx so destruction happens cache-first — the cache's
-  /// dtor drains its worker (which only touches the ioctx through the
-  /// pointer wired via @c attach_cache) before the ioctx itself goes
-  /// away.  Constructed only when both gates open: prefetch enabled in
-  /// config AND backend reports @c supports_vector_host_read.
+  /// Buffer pool owned by the scan_manager (not the cache).  Constructed
+  /// when a HOST-tier @c fixed_size_host_memory_resource is available;
+  /// null otherwise.  Declared between @c _io_ctx and @c _cache so the
+  /// destruction order is cache → pool → io_ctx: the cache's dtor
+  /// drains in-flight IO before pool destruction returns slabs to the
+  /// upstream resource.
+  std::unique_ptr<sirius::io::buffer_pool> _buffer_pool;
+  /// Cache wraps the pool (if any) and the io_ctx.  The cache is "armed"
+  /// for prefetching iff pool != nullptr AND ioctx supports vector host
+  /// read AND budget > 0; otherwise it's a metadata-only store with no
+  /// background threads.
   std::unique_ptr<sirius::io::prefetching_cache> _cache;
   std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
