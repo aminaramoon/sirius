@@ -156,7 +156,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 
   // Advance the cache age so the evictor can score this query's inserts
   // against entries left over from prior queries.
-  if (_io_ctx && _io_ctx->cache()) { _io_ctx->cache()->refresh_cache(); }
+  // refresh_cache() removed — the cache no longer has a query-epoch
+  // notion.  Per-file aging in the eviction queue handles staleness
+  // without scan_manager involvement.
 
   SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={}",
                    query.get_pipelines().size());

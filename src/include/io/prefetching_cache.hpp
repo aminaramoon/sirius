@@ -26,10 +26,8 @@
 #include <concurrentqueue.h>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
-#include <array>
 #include <atomic>
 #include <future>
-#include <list>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -43,6 +41,62 @@
 namespace sirius::io {
 
 class sirius_ioctx;
+
+// ---------------------------------------------------------------------------
+// file_demand — per-file packed (stamp:48 | n_pending:16) atomic
+// ---------------------------------------------------------------------------
+//
+// The prefetching cache tracks "how many active prefetch_handles are
+// outstanding for this file" (n_pending) and "how many prefetch requests
+// have ever been registered for this file" (stamp).  Both live in a
+// single 64-bit atomic so insert() can bump both with one CAS.
+//
+// Lifecycle:
+//   - insert()                        → register_request()    (stamp+=1, n+=1)
+//   - prefetching_handle dtor         → unregister_request()  (clamped n−=1)
+//   - evictor pop of a live wrapper   → unregister_request()  (aging)
+//
+// The evictor reads load() to decide whether a queued prefetch_request
+// is still wanted (n_pending > 0) and whether it's been overtaken by
+// newer activity (stamp_now > stamp_at_insert + STALE_THRESHOLD).
+
+class file_demand {
+ public:
+  /// Snapshot view returned by @c load.
+  struct view {
+    uint64_t stamp;
+    uint16_t n_pending;
+  };
+
+  /// Bump stamp+=1 and n_pending+=1 (saturating at the 16-bit max).
+  /// Returns the new stamp so the caller can snapshot it on the
+  /// corresponding prefetch_request wrapper.
+  uint64_t register_request() noexcept;
+
+  /// Clamped CAS-decrement of n_pending.  No-op when n_pending is
+  /// already 0.  Used by both handle dtor (consumer-done signal) and
+  /// the evictor (aging signal).
+  void unregister_request() noexcept;
+
+  /// Atomically read both fields.
+  [[nodiscard]] view load(std::memory_order ord = std::memory_order_acquire) const noexcept;
+
+ private:
+  static constexpr uint64_t N_BITS      = 16;
+  static constexpr uint64_t N_MASK      = (1ULL << N_BITS) - 1;
+  static constexpr uint64_t STAMP_SHIFT = N_BITS;
+
+  static constexpr uint64_t pack(uint64_t stamp, uint16_t n) noexcept
+  {
+    return (stamp << STAMP_SHIFT) | n;
+  }
+  static constexpr view unpack(uint64_t v) noexcept
+  {
+    return {v >> STAMP_SHIFT, static_cast<uint16_t>(v & N_MASK)};
+  }
+
+  std::atomic<uint64_t> _packed{0};
+};
 
 // ---------------------------------------------------------------------------
 // buffer_pool — growable pool of pinned chunks
@@ -352,31 +406,6 @@ struct alignas(64) cache_entry {
   /// Packed state + pin_count.  All state transitions go through this.
   entry_state state;
 
-  /// Cumulative number of insert() calls that included this range.
-  /// Monotonically increasing — never decremented.  Used for historical
-  /// demand signals (LRU bucket scoring etc.).
-  std::atomic<int64_t> n_total_request{0};
-
-  /// Epoch-scoped outstanding-read counter.  Bumped per insert that lands
-  /// in the current cache_age epoch (reset to 1 on epoch change).
-  /// Decremented on every read terminal (hit or miss).  The worker skips
-  /// a work_item entry when n_request &lt;= 0 — all expected readers have
-  /// already resolved, so prefetch would be wasted.
-  std::atomic<int> n_request{0};
-
-  /// _cache_age at the most recent insert of this range.
-  std::atomic<uint64_t> request_ts{0};
-
-  /// _cache_age at the most recent successful read (pinned_view
-  /// construction).  0 by default — never-consumed entries have
-  /// consumption_ts < request_ts.
-  std::atomic<uint64_t> consumption_ts{0};
-
-  /// Set to true while this entry sits in the evictor's LRU list, cleared
-  /// when the evictor pops it out (eviction or otherwise).  Only mutated
-  /// by the evictor thread, so no synchronisation is required.
-  bool in_lru{false};
-
   cache_entry(cudf::io::text::byte_range_info logical,
               cudf::io::text::byte_range_info physical,
               size_t chunk_bytes)
@@ -386,33 +415,11 @@ struct alignas(64) cache_entry {
 
   cache_entry(cache_entry const&)            = delete;
   cache_entry& operator=(cache_entry const&) = delete;
-
-  /// True iff this entry is safe to evict under the current cache age:
-  /// either it has been read at or after its most recent insert (consumed),
-  /// or its most recent request was made in an earlier epoch (stale — the
-  /// caller has already moved on and no longer needs this range).
-  [[nodiscard]] bool is_consumed_or_stale(uint64_t cache_age) const noexcept
-  {
-    auto req  = request_ts.load(std::memory_order_acquire);
-    auto cons = consumption_ts.load(std::memory_order_acquire);
-    return cons >= req || req < cache_age;
-  }
 };
 
 // ---------------------------------------------------------------------------
-// eviction queue messages
+// eviction request
 // ---------------------------------------------------------------------------
-//
-// The evictor reads from two separate queues:
-//   - candidate queue: hints posted by unpin() when an entry becomes
-//     evictable.  Silent (no wake) — candidates are drained on a periodic
-//     poll or whenever the evictor wakes for a request.
-//   - request queue: backpressure from the worker asking for free chunks.
-//     Each push signals the evictor's semaphore.
-
-struct eviction_candidate {
-  std::weak_ptr<cache_entry> entry;
-};
 
 struct eviction_request {
   /// Promise resolves when the evictor has freed at least @c n_chunks_needed
@@ -443,9 +450,7 @@ class pinned_view {
   /// the caller submitted earlier has finished consuming the chunks.  When
   /// null, the read is released synchronously on destruction (host-only
   /// reads have no async work to wait on).
-  pinned_view(std::shared_ptr<cache_entry> entry,
-              duckdb_moodycamel::ConcurrentQueue<eviction_candidate>& candidate_queue,
-              cudaStream_t stream);
+  pinned_view(std::shared_ptr<cache_entry> entry, cudaStream_t stream);
   ~pinned_view();
 
   pinned_view(pinned_view&& o) noexcept;
@@ -482,7 +487,6 @@ class pinned_view {
   void unpin();
 
   std::shared_ptr<cache_entry> _entry;
-  duckdb_moodycamel::ConcurrentQueue<eviction_candidate>* _candidate_queue{nullptr};
   cudaStream_t _stream{nullptr};
 };
 
@@ -510,8 +514,32 @@ class prefetching_handle {
  public:
   prefetching_handle() = default;
 
+  ~prefetching_handle() { release(); }
+
+  prefetching_handle(prefetching_handle const&)            = delete;
+  prefetching_handle& operator=(prefetching_handle const&) = delete;
+
+  prefetching_handle(prefetching_handle&& o) noexcept
+    : _alive(std::move(o._alive)), _demand(o._demand)
+  {
+    o._demand = nullptr;
+  }
+
+  prefetching_handle& operator=(prefetching_handle&& o) noexcept
+  {
+    if (this != &o) {
+      release();
+      _alive    = std::move(o._alive);
+      _demand   = o._demand;
+      o._demand = nullptr;
+    }
+    return *this;
+  }
+
   /// Mark the prefetch as no longer wanted.  Idempotent; safe on an empty
-  /// handle.  Thread-safe with respect to the worker's check.
+  /// handle.  Thread-safe with respect to the worker's check.  Note: this
+  /// only flips the alive flag — the per-file n_request counter is
+  /// decremented on destruction (or move-out), not on cancel.
   void cancel() noexcept
   {
     if (_alive) _alive->store(false, std::memory_order_release);
@@ -523,14 +551,25 @@ class prefetching_handle {
 
  private:
   friend class prefetching_cache;
-  explicit prefetching_handle(std::shared_ptr<std::atomic<bool>> alive) noexcept
-    : _alive(std::move(alive))
+  prefetching_handle(std::shared_ptr<std::atomic<bool>> alive, file_demand* demand) noexcept
+    : _alive(std::move(alive)), _demand(demand)
   {
   }
 
-  /// Shared with the corresponding @c work_item.  true == still wanted;
-  /// false == cancelled, worker should drop.
+  /// Drops this handle's contribution to the file's @c file_demand
+  /// counter via @c unregister_request (clamped).  Idempotent: clears
+  /// @c _demand after the call so repeat release()s (move-out, then
+  /// dtor) are no-ops.
+  void release() noexcept;
+
+  /// Shared with the corresponding @c work_item / @c prefetch_request.
+  /// true == still wanted; false == cancelled, worker / evictor should drop.
   std::shared_ptr<std::atomic<bool>> _alive;
+
+  /// Non-owning pointer into the source @c file_entry's @c file_demand.
+  /// The cache keeps file_entries alive for its lifetime; handles never
+  /// outlive the cache, so this raw pointer is stable.
+  file_demand* _demand{nullptr};
 };
 
 // ---------------------------------------------------------------------------
@@ -609,10 +648,6 @@ class prefetching_cache {
   [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
     const sirius_io_object& obj) const;
 
-  /// Increment _cache_age by 1.  The evictor uses
-  /// (n_total_read_request - _cache_age) to score entries into buckets.
-  void refresh_cache();
-
   /// One-line human-readable state: hit / partial-miss / full-miss counts,
   /// pool utilisation, and pending chunks.
   [[nodiscard]] std::string summary() const;
@@ -662,7 +697,17 @@ class prefetching_cache {
     size_t file_size{0};
     std::shared_ptr<sirius_io_object_metadata> metadata;
     std::vector<std::shared_ptr<cache_entry>> entries;  ///< Sorted by offset.
+
+    /// Per-file demand counter + insert stamp.  See @c file_demand for
+    /// the lifecycle (insert registers, handle dtor unregisters,
+    /// evictor unregisters as an aging tick).
+    file_demand demand;
   };
+
+  /// Per-file "this wrapper has been overtaken by K newer inserts on the
+  /// same file" cutoff.  Bigger means slower aging by staleness; the
+  /// demand counter aging still drives eviction in the steady state.
+  static constexpr uint64_t REQUEST_STALE_THRESHOLD = 8;
 
   // ---- helpers --------------------------------------------------------------
 
@@ -674,31 +719,6 @@ class prefetching_cache {
   /// Release all chunks held by an entry back to the pool.
   void release_chunks(cache_entry& entry);
 
-  // ---- LRU helpers (evictor-thread only; no locking) ----------------------
-
-  /// Bucket an entry would land in given the current age:
-  ///   clamp(4 + n_total_request - age, 0, N_LRU_BUCKETS-1)
-  static int lru_bucket_for(cache_entry const& entry, int64_t age) noexcept;
-
-  /// Insert @p entry at the tail of bucket @p bucket in @c _lru_list,
-  /// patching separators so that buckets below @p bucket don't claim
-  /// the newly inserted element.  Returns the new list iterator.
-  std::list<cache_entry*>::iterator lru_insert(cache_entry* entry, int bucket);
-
-  /// Erase the element at @p it from @c _lru_list, fixing any separator
-  /// that pointed at @p it.  Returns the iterator following @p it.
-  std::list<cache_entry*>::iterator lru_erase(std::list<cache_entry*>::iterator it);
-
-  /// Shift bucket separators one notch: bucket @c i absorbs bucket @c i+1,
-  /// and the topmost real separator drops to the very last element so
-  /// bucket 4 shrinks to a single entry.  Safe to call repeatedly.
-  void age_lru_buckets();
-
-  /// Pull pending candidates off @c _candidate_queue and file each into
-  /// its intended LRU bucket.  Entries already in @c _lru_list (in_lru
-  /// == true) are skipped.
-  void drain_candidates_into_lru();
-
   /// Binary search for an entry whose logical range fully covers
   /// [offset, offset+size).  Returns nullptr on miss.  Updates
   /// _partial_miss_count / _full_miss_count based on the classification.
@@ -706,6 +726,28 @@ class prefetching_cache {
   std::shared_ptr<cache_entry> find_entry(const std::vector<std::shared_ptr<cache_entry>>& entries,
                                           size_t offset,
                                           size_t size);
+
+  // ---- prefetch_request: per-insert wrapper carried in _eviction_queue ----
+  //
+  // One per insert() call.  Bundles the entries the request produced
+  // plus the metadata the evictor uses for FIFO + per-file aging:
+  //   - @c file_request_state: non-owning pointer to the source
+  //     @c file_entry's packed (stamp:48 | n:16) atomic.  The cache
+  //     keeps file_entries alive for its lifetime; wrappers never
+  //     outlive the cache, so this raw pointer is safe.
+  //   - @c stamp_at_insert: snapshot of the file's stamp at insert
+  //     time.  The evictor compares against the file's current stamp
+  //     to detect requests that have been overtaken by newer activity
+  //     on the same file (per-file generation staleness).
+  //   - @c alive: shared with the corresponding @c work_item and the
+  //     caller-side @c prefetching_handle.  Flipped to false by
+  //     @c handle::cancel() (= fadvise(disposable)).
+  struct prefetch_request {
+    std::vector<std::shared_ptr<cache_entry>> entries;
+    file_demand* demand{nullptr};
+    uint64_t stamp_at_insert{0};
+    std::shared_ptr<std::atomic<bool>> alive;
+  };
 
   // ---- members (destruction order matters: worker joined first) -------------
 
@@ -722,15 +764,6 @@ class prefetching_cache {
   /// admission_control are all only meaningful when this is true.
   bool const _armed;
 
-  /// Monotonic age counter.  Advanced only by refresh_cache() — caller
-  /// pulses it to age the cache (non-refreshed entries drift toward bucket 0).
-  /// request_ts and consumption_ts on cache_entry snapshot this value.
-  // Starts at 1 (not 0) so the default cache_entry::consumption_ts (0) is
-  // strictly less than any real cache_age.  Lets the worker distinguish
-  // "reader never touched" (cons == 0) from "reader resolved in this epoch"
-  // (cons == _cache_age).
-  std::atomic<int64_t> _cache_age{1};
-
   // Observability counters (updated on every read() / read_ranges() entry).
   std::atomic<uint64_t> _hit_count{0};
   std::atomic<uint64_t> _partial_miss_count{0};
@@ -738,10 +771,6 @@ class prefetching_cache {
 
   // Hits that had to wait on a loading entry (subset of _hit_count).
   std::atomic<uint64_t> _hit_after_wait{0};
-
-  // Worker skipped an entry because the reader already resolved it in this
-  // epoch (consumption_ts == _cache_age on a not-yet-cached entry).
-  std::atomic<uint64_t> _worker_skipped_reader_resolved{0};
 
   // Cumulative evictions since construction: entries whose chunks were
   // released back to the pool (+ total chunks freed).
@@ -751,10 +780,13 @@ class prefetching_cache {
   mutable std::shared_mutex _map_mtx;
   std::unordered_map<std::string, std::unique_ptr<file_entry>> _file_cache;
 
-  /// Evictor inputs.  Candidate pushes are silent; request pushes bump the
-  /// semaphore.  Evictor polls with a timeout to still drain candidates
-  /// when no requests arrive.
-  duckdb_moodycamel::ConcurrentQueue<eviction_candidate> _candidate_queue;
+  /// FIFO of @c prefetch_request wrappers.  Each insert() enqueues one
+  /// wrapper here; the evictor pops, ages (or evicts), and rotates back
+  /// to the tail.  See @c evictor_loop for the policy.
+  duckdb_moodycamel::ConcurrentQueue<prefetch_request> _eviction_queue;
+
+  /// Chunk-request backpressure channel: worker enqueues here when the
+  /// pool is short, evictor wakes via the semaphore.
   duckdb_moodycamel::ConcurrentQueue<eviction_request> _request_queue;
   std::counting_semaphore<> _request_sem{0};
   static constexpr auto EVICTOR_POLL_INTERVAL = std::chrono::milliseconds(50);
@@ -765,23 +797,6 @@ class prefetching_cache {
   /// when @c _armed (with the budget passed to the ctor) and null
   /// otherwise.  Const after construction; the cache is single-life.
   std::unique_ptr<admission_control> const _inflight_budget;
-
-  // ---- LRU-with-buckets eviction list (evictor-thread only) ---------------
-  //
-  // The evictor drains the candidate queue into @c _lru_list, bucketing
-  // entries by freshness: @c _lru_buckets[i] is the iterator one-past-the-
-  // end of bucket @c i (so bucket @c i covers [bucket[i-1], bucket[i]), with
-  // bucket 0 starting at @c _lru_list.begin()).  @c _lru_buckets[4] is kept
-  // equal to @c _lru_list.end().
-  //
-  // Only the evictor thread touches these fields, so no locking is needed.
-  static constexpr size_t N_LRU_BUCKETS = 5;
-  std::list<cache_entry*> _lru_list;
-  std::array<std::list<cache_entry*>::iterator, N_LRU_BUCKETS> _lru_buckets;
-  /// Last @c _cache_age seen by the evictor.  When the live age has
-  /// advanced past this, the evictor shifts bucket separators to age the
-  /// LRU before the next eviction pass.
-  int64_t _last_seen_age{0};
 
   duckdb_moodycamel::ConcurrentQueue<work_item> _work_queue;
   std::atomic<uint64_t> _work_seq{0};

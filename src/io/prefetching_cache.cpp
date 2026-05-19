@@ -171,10 +171,8 @@ void CUDART_CB release_read_host_callback(cudaStream_t /*stream*/,
 
 }  // namespace
 
-pinned_view::pinned_view(std::shared_ptr<cache_entry> entry,
-                         duckdb_moodycamel::ConcurrentQueue<eviction_candidate>& candidate_queue,
-                         cudaStream_t stream)
-  : _entry(nullptr), _candidate_queue(&candidate_queue), _stream(stream)
+pinned_view::pinned_view(std::shared_ptr<cache_entry> entry, cudaStream_t stream)
+  : _entry(nullptr), _stream(stream)
 {
   if (!entry) return;
   if (!entry->state.try_acquire_read()) return;
@@ -184,7 +182,7 @@ pinned_view::pinned_view(std::shared_ptr<cache_entry> entry,
 pinned_view::~pinned_view() { unpin(); }
 
 pinned_view::pinned_view(pinned_view&& o) noexcept
-  : _entry(std::move(o._entry)), _candidate_queue(o._candidate_queue), _stream(o._stream)
+  : _entry(std::move(o._entry)), _stream(o._stream)
 {
   o._entry.reset();
 }
@@ -195,8 +193,7 @@ pinned_view& pinned_view::operator=(pinned_view&& o) noexcept
     unpin();
     _entry = std::move(o._entry);
     o._entry.reset();
-    _candidate_queue = o._candidate_queue;
-    _stream          = o._stream;
+    _stream = o._stream;
   }
   return *this;
 }
@@ -205,13 +202,10 @@ void pinned_view::unpin()
 {
   if (!_entry) return;
 
-  // Always enqueue an eviction candidate — the evictor's state.get_state()
-  // gate skips entries still in_use, so a candidate whose deferred
-  // release_read is still pending on a stream callback simply isn't evicted
-  // until the callback runs.  Silent post: no semaphore release.  The
-  // evictor drains candidates on its next poll tick (EVICTOR_POLL_INTERVAL)
-  // or whenever a chunk request wakes it — whichever comes first.
-  _candidate_queue->enqueue({std::weak_ptr<cache_entry>(_entry)});
+  // The wrapper this entry came from is already in the eviction queue
+  // (pushed at insert time).  We just need to release the read pin so
+  // the entry transitions back from in_use to cached and becomes
+  // evictable.  No candidate-queue push.
 
   if (_stream == nullptr) {
     // Synchronous path (host reads): no async ops outstanding, release now.
@@ -315,6 +309,56 @@ std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t o
 }
 
 // ===========================================================================
+// file_demand
+// ===========================================================================
+
+uint64_t file_demand::register_request() noexcept
+{
+  uint64_t cur = _packed.load(std::memory_order_relaxed);
+  while (true) {
+    auto v          = unpack(cur);
+    auto next_stamp = v.stamp + 1;
+    auto next_n =
+      static_cast<uint16_t>(std::min<uint32_t>(static_cast<uint32_t>(v.n_pending) + 1, N_MASK));
+    auto next = pack(next_stamp, next_n);
+    if (_packed.compare_exchange_weak(
+          cur, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+      return next_stamp;
+    }
+  }
+}
+
+void file_demand::unregister_request() noexcept
+{
+  uint64_t cur = _packed.load(std::memory_order_relaxed);
+  while (true) {
+    auto v = unpack(cur);
+    if (v.n_pending == 0) return;  // clamped no-op
+    auto next = pack(v.stamp, static_cast<uint16_t>(v.n_pending - 1));
+    if (_packed.compare_exchange_weak(
+          cur, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+      return;
+    }
+  }
+}
+
+file_demand::view file_demand::load(std::memory_order ord) const noexcept
+{
+  return unpack(_packed.load(ord));
+}
+
+// ===========================================================================
+// prefetching_handle::release
+// ===========================================================================
+
+void prefetching_handle::release() noexcept
+{
+  if (_demand == nullptr) return;
+  _demand->unregister_request();
+  _demand = nullptr;
+}
+
+// ===========================================================================
 // prefetching_cache — construction / destruction
 // ===========================================================================
 
@@ -338,7 +382,6 @@ prefetching_cache::prefetching_cache(buffer_pool* pool,
     _inflight_budget(_armed ? std::make_unique<admission_control>(inflight_budget_chunks)
                             : nullptr)
 {
-  _lru_buckets.fill(_lru_list.end());
   // Threads only run when the cache is armed.  When unarmed the cache is
   // effectively a metadata-only store: register_metadata / get_metadata /
   // read still work but nobody is consuming the work queue, and insert()
@@ -547,11 +590,6 @@ prefetching_handle prefetching_cache::insert(
     return {};
   }
 
-  // _cache_age only advances via refresh_cache().  Sample it here so every
-  // range stamped in this call shares the same request_ts — they belong to
-  // the same epoch.
-  auto tick = _cache_age.load(std::memory_order_relaxed);
-
   // Every range in the insert becomes a prefetch request, regardless of the
   // entry's current state.  The worker decides at dispatch time whether the
   // entry actually needs loading (via state check in try_start_loading).
@@ -573,24 +611,14 @@ prefetching_handle prefetching_cache::insert(
       ++ex_it;
     }
     if (ex_it != ex_end && (*ex_it)->logical_range.offset() == off) {
-      auto& existing = *ex_it;
-      existing->n_total_request.fetch_add(1, std::memory_order_relaxed);
-      // n_request: same epoch → bump; different epoch → reset to 1.
-      auto prev_ts = existing->request_ts.load(std::memory_order_acquire);
-      if (prev_ts == tick)
-        existing->n_request.fetch_add(1, std::memory_order_relaxed);
-      else
-        existing->n_request.store(1, std::memory_order_relaxed);
-      existing->request_ts.store(tick, std::memory_order_release);
-      new_entries.push_back(existing);
-      merged.push_back(std::move(existing));
+      // Coalesce: reuse the existing entry.  Per-entry demand counters
+      // are gone (we now count demand per-file via request_state).
+      new_entries.push_back(*ex_it);
+      merged.push_back(std::move(*ex_it));
       ++ex_it;
     } else {
       auto physical = _io_ctx->compute_physical_range(logical, file_size);
       auto e        = std::make_shared<cache_entry>(logical, physical, _pool->chunk_bytes());
-      e->n_total_request.fetch_add(1, std::memory_order_relaxed);
-      e->n_request.store(1, std::memory_order_relaxed);
-      e->request_ts.store(tick, std::memory_order_release);
       new_entries.push_back(e);
       merged.push_back(std::move(e));
     }
@@ -601,21 +629,37 @@ prefetching_handle prefetching_cache::insert(
 
   file.entries = std::move(merged);
 
+  // Register this request with the file's demand counter (stamp+=1,
+  // n_pending+=1 saturating).  The new stamp is snapshotted on the
+  // eviction-queue wrapper so the evictor can later detect requests
+  // overtaken by newer activity on the same file.
+  uint64_t const new_stamp = file.demand.register_request();
+  file_demand* const demand = &file.demand;
+
   file_lk.unlock();
+
+  // Shared flag.  cancel() flips it; the worker checks it on dequeue and
+  // before dispatch; the evictor checks it on pop to short-circuit aging
+  // on cancelled requests.
+  auto alive = std::make_shared<std::atomic<bool>>(true);
 
   if (new_entries.empty()) {
     // Every range coalesced with an existing entry and no fresh prefetch
-    // was scheduled — nothing for the worker to do, so no handle to hand
-    // out.
-    return {};
+    // was scheduled — nothing for the worker to do, but we still hand
+    // back a handle so the caller's per-file demand counter decrements
+    // when the request is done.
+    return prefetching_handle{std::move(alive), demand};
   }
 
-  // The cache and the caller share this flag.  Worker reads it on dequeue
-  // and again right before dispatch; the caller flips it via
-  // prefetching_handle::cancel when the consumer no longer wants the data.
-  auto alive = std::make_shared<std::atomic<bool>>(true);
+  // Enqueue the eviction-queue wrapper BEFORE the work_item.  The wrapper
+  // sits in the queue from now until evicted (whether or not IO ever
+  // dispatches), so cancellation by handle drop doesn't need a separate
+  // enqueue path: the evictor pops, sees n_pending==0 (after handle
+  // dtor) or !alive, and drops the entries.
+  _eviction_queue.enqueue(prefetch_request{new_entries, demand, new_stamp, alive});
+
   enqueue_work(prefetch_req{key, std::move(obj_sp), std::move(new_entries), alive});
-  return prefetching_handle{std::move(alive)};
+  return prefetching_handle{std::move(alive), demand};
 }
 
 // ===========================================================================
@@ -644,20 +688,17 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
   if (!entry) return {};
 
   // Dispatch on state:
-  //   cached / in_use  → pin immediately (stamps consumption_ts).
-  //   loading          → wait for the worker to resolve the load, then retry.
+  //   cached / in_use → pin immediately.
+  //   loading         → wait for the worker to resolve the load, then retry.
   //   queued / evicting / empty → return empty (caller falls back).
   bool waited_on_loading = false;
   while (true) {
     auto st = entry->state.get_state();
     if (st == entry_state::cached || st == entry_state::in_use) {
-      pinned_view view{entry, _candidate_queue, stream};
+      pinned_view view{entry, stream};
       if (view) {
         _hit_count.fetch_add(1, std::memory_order_relaxed);
         if (waited_on_loading) _hit_after_wait.fetch_add(1, std::memory_order_relaxed);
-        entry->consumption_ts.store(_cache_age.load(std::memory_order_relaxed),
-                                    std::memory_order_release);
-        entry->n_request.fetch_sub(1, std::memory_order_relaxed);
         return view;
       }
       // try_acquire_read lost a race; re-observe the state.
@@ -676,7 +717,6 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
       continue;
     }
     _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
-    entry->n_request.fetch_sub(1, std::memory_order_relaxed);
     return {};
   }
 }
@@ -695,30 +735,12 @@ std::shared_ptr<sirius_io_object_metadata> prefetching_cache::get_metadata(
   return file.metadata;
 }
 
-void prefetching_cache::refresh_cache()
-{
-  _cache_age.fetch_add(1, std::memory_order_relaxed);
-
-  // Drain any pending prefetch work.  The entries in each drained item were
-  // queued for a previous epoch; cancel them (queued → empty) so future
-  // inserts can re-queue them fresh.
-  work_item item;
-  while (_work_queue.try_dequeue(item)) {
-    for (auto& entry : item.entries) {
-      entry->state.try_cancel_queued();
-    }
-  }
-
-  spdlog::info("cache being refreshed: closing — {}", summary());
-}
-
 std::string prefetching_cache::summary() const
 {
   auto hits            = _hit_count.load(std::memory_order_relaxed);
   auto hits_after_wait = _hit_after_wait.load(std::memory_order_relaxed);
   auto partial         = _partial_miss_count.load(std::memory_order_relaxed);
   auto full            = _full_miss_count.load(std::memory_order_relaxed);
-  auto worker_skip     = _worker_skipped_reader_resolved.load(std::memory_order_relaxed);
   auto evicted_entries = _evicted_entries.load(std::memory_order_relaxed);
   auto evicted_chunks  = _evicted_chunks.load(std::memory_order_relaxed);
   auto total           = hits + partial + full;
@@ -726,12 +748,9 @@ std::string prefetching_cache::summary() const
     return total > 0 ? (100.0 * static_cast<double>(n) / static_cast<double>(total)) : 0.0;
   };
   auto s = fmt::format(
-    "prefetching_cache: age={} {} reads ({} hit {:.1f}% [of which {} waited "
-    "on loading], {} partial-miss {:.1f}%, {} full-miss {:.1f}%); worker "
-    "skipped "
-    "(reader-resolved) {}; evicted {} entries / {} chunks; pool {}/{} "
-    "chunks free",
-    _cache_age.load(std::memory_order_relaxed),
+    "prefetching_cache: {} reads ({} hit {:.1f}% [of which {} waited on "
+    "loading], {} partial-miss {:.1f}%, {} full-miss {:.1f}%); evicted "
+    "{} entries / {} chunks; pool {}/{} chunks free",
     total,
     hits,
     pct(hits),
@@ -740,7 +759,6 @@ std::string prefetching_cache::summary() const
     pct(partial),
     full,
     pct(full),
-    worker_skip,
     evicted_entries,
     evicted_chunks,
     _pool ? _pool->free_count() : 0U,
@@ -750,227 +768,131 @@ std::string prefetching_cache::summary() const
 }
 
 // ===========================================================================
-// LRU helpers (evictor-thread only)
-// ===========================================================================
-
-int prefetching_cache::lru_bucket_for(cache_entry const& entry, int64_t age) noexcept
-{
-  int64_t n   = entry.n_total_request.load(std::memory_order_relaxed);
-  int64_t idx = static_cast<int64_t>(N_LRU_BUCKETS - 1) + n - age;
-  if (idx < 0) return 0;
-  if (idx > static_cast<int64_t>(N_LRU_BUCKETS - 1)) return static_cast<int>(N_LRU_BUCKETS - 1);
-  return static_cast<int>(idx);
-}
-
-std::list<cache_entry*>::iterator prefetching_cache::lru_insert(cache_entry* entry, int bucket)
-{
-  // Insert just before the separator that ends this bucket — the new
-  // element becomes the bucket's new tail.
-  auto new_it = _lru_list.insert(_lru_buckets[bucket], entry);
-  // Any lower separator that used to coincide with the insertion point
-  // now sits *after* the new element.  If we don't patch them, the new
-  // element would appear to belong to a lower bucket.
-  auto boundary = _lru_buckets[bucket];
-  for (int i = bucket - 1; i >= 0; --i) {
-    if (_lru_buckets[i] == boundary)
-      _lru_buckets[i] = new_it;
-    else
-      break;
-  }
-  return new_it;
-}
-
-std::list<cache_entry*>::iterator prefetching_cache::lru_erase(std::list<cache_entry*>::iterator it)
-{
-  auto next = std::next(it);
-  for (auto& sep : _lru_buckets) {
-    if (sep == it) sep = next;
-  }
-  return _lru_list.erase(it);
-}
-
-void prefetching_cache::age_lru_buckets()
-{
-  if (_lru_list.empty()) return;
-  // Shift left: bucket i absorbs what used to be bucket i+1.
-  for (size_t i = 0; i + 1 < N_LRU_BUCKETS; ++i)
-    _lru_buckets[i] = _lru_buckets[i + 1];
-  // _lru_buckets[N-1] stays at end() by invariant.  Pull the last real
-  // separator back so bucket N-2 ends at the very last element, i.e.
-  // bucket N-1 contains exactly one entry (the newest).
-  auto last                       = std::prev(_lru_list.end());
-  _lru_buckets[N_LRU_BUCKETS - 2] = last;
-  // Clamp any earlier separator that still points at end() — without this,
-  // separators would be non-monotonic (end() > last).
-  for (int i = static_cast<int>(N_LRU_BUCKETS) - 3; i >= 0; --i) {
-    if (_lru_buckets[i] == _lru_list.end())
-      _lru_buckets[i] = last;
-    else
-      break;
-  }
-}
-
-void prefetching_cache::drain_candidates_into_lru()
-{
-  int64_t age = _cache_age.load(std::memory_order_relaxed);
-  eviction_candidate cand;
-  while (_candidate_queue.try_dequeue(cand)) {
-    auto sp = cand.entry.lock();
-    if (!sp) continue;
-    auto* raw = sp.get();
-    if (raw->in_lru) continue;  // already filed
-    int bucket = lru_bucket_for(*raw, age);
-    lru_insert(raw, bucket);
-    raw->in_lru = true;
-  }
-}
-
-// ===========================================================================
-// evictor_loop
+// evictor_loop — FIFO with per-file aging
 // ===========================================================================
 
 void prefetching_cache::evictor_loop(std::stop_token stop)
 {
   std::stop_callback stop_cb(stop, [this] { _request_sem.release(); });
 
-  // Free one cached entry's chunks back to the pool.  Returns the number
-  // of chunks freed, or 0 if the entry isn't eligible right now.  Caller
-  // removes the entry from the LRU on non-zero return.
-  //
-  // The state-machine gate (state == cached, pin_count == 0) is the only
-  // in-use check needed: pinned_view::unpin defers release_read via a host
-  // callback on the reader's stream, so an entry stays in_use until any
-  // cudaMemcpyAsync the reader submitted has completed.
-  auto try_evict_raw = [this](cache_entry* entry, int64_t age) -> size_t {
-    if (entry->state.get_state() != entry_state::cached) return 0;
-    if (!entry->is_consumed_or_stale(static_cast<uint64_t>(age))) return 0;
-    if (!entry->state.try_start_evicting()) return 0;
-    size_t n = entry->chunks.size();
-    // The pool can only be torn down after reset() has waited for the
-    // worker and in-flight IO to drain, so any cached entry still in the
-    // LRU points into a live pool — but assert for safety in case a future
-    // refactor races the evictor against pool teardown.
-    if (_pool) { _pool->deallocate_bulk(entry->chunks); }
-    entry->state.mark_evicted();
+  // Try to evict one entry's chunks back to the pool.  Returns the
+  // number of chunks freed (0 if not evictable right now — pinned
+  // reader, still loading, or already evicted from a prior wrapper that
+  // referenced the same entry).
+  auto try_evict_entry = [this](cache_entry& entry) -> size_t {
+    if (entry.state.get_state() != entry_state::cached) return 0;
+    if (!entry.state.try_start_evicting()) return 0;
+    size_t n = entry.chunks.size();
+    if (_pool) { _pool->deallocate_bulk(entry.chunks); }
+    entry.state.mark_evicted();
     _evicted_entries.fetch_add(1, std::memory_order_relaxed);
     _evicted_chunks.fetch_add(n, std::memory_order_relaxed);
     return n;
   };
 
-  // Catch the evictor up with the live cache age by shifting bucket
-  // separators.  After N_LRU_BUCKETS shifts the LRU is saturated, so
-  // further aging is a no-op.
-  auto catch_up_age = [this]() {
-    int64_t age   = _cache_age.load(std::memory_order_relaxed);
-    int64_t delta = age - _last_seen_age;
-    if (delta <= 0) return;
-    auto shifts = std::min<int64_t>(delta, static_cast<int64_t>(N_LRU_BUCKETS));
-    for (int64_t i = 0; i < shifts; ++i)
-      age_lru_buckets();
-    _last_seen_age = age;
+  // Walk a wrapper's entries, evicting what we can.  Returns
+  //   .freed: total chunks reclaimed
+  //   .leftover: entries that weren't evictable (pinned / still loading)
+  // The leftover vector becomes the wrapper's new contents on push-back.
+  struct walk_result {
+    size_t freed{0};
+    std::vector<std::shared_ptr<cache_entry>> leftover;
+  };
+  auto walk_and_evict = [&](prefetch_request& req) -> walk_result {
+    walk_result r;
+    r.leftover.reserve(req.entries.size());
+    for (auto& e : req.entries) {
+      if (!e) continue;
+      size_t freed = try_evict_entry(*e);
+      if (freed > 0) {
+        r.freed += freed;
+      } else if (e->state.get_state() == entry_state::cached) {
+        // Cached but pin_count > 0 — reader still holds it.  Keep for
+        // the next pop.
+        r.leftover.push_back(std::move(e));
+      }
+      // States empty / evicting / load_failed / loading: drop from
+      // leftover.  Either already gone, or worker still owns them; the
+      // worker / callback will release chunks back to the pool itself.
+    }
+    return r;
   };
 
   while (!stop.stop_requested()) {
-    // Step 1: if a backpressure request is already waiting, service it now.
-    eviction_request req;
-    bool have_request = _request_queue.try_dequeue(req);
+    eviction_request chunk_req;
+    bool have_request = _request_queue.try_dequeue(chunk_req);
 
     if (!have_request) {
-      // Step 2: wait for either a new request or the poll timeout.
       bool signalled = _request_sem.try_acquire_for(EVICTOR_POLL_INTERVAL);
       if (stop.stop_requested()) break;
-      if (signalled) {
-        have_request = _request_queue.try_dequeue(req);
-      } else {
-        // Idle tick: pull fresh candidates into the LRU and age buckets
-        // so the list is organised when a request eventually lands.
-        drain_candidates_into_lru();
-        catch_up_age();
-        continue;
-      }
+      if (!signalled) continue;
+      have_request = _request_queue.try_dequeue(chunk_req);
     }
 
     if (!have_request) continue;  // spurious wake
 
-    size_t needed            = req.n_chunks_needed;
-    size_t reclaimed         = 0;
-    bool cache_aged_mid_wait = false;
+    size_t const needed = chunk_req.n_chunks_needed;
+    size_t reclaimed    = 0;
+    size_t empty_cycles = 0;
+    size_t const queue_size_hint =
+      std::max<size_t>(_eviction_queue.size_approx(), 1);
 
-    // Keep trying to satisfy the request.  Only give up (set_exception) when
-    // the cache ages mid-wait — that's the signal that this request's epoch
-    // is stale and the caller is moving on.
     while (reclaimed < needed) {
-      if (stop.stop_requested()) break;  // bail before another expensive walk
-      drain_candidates_into_lru();
-      catch_up_age();
-
-      int64_t age = _cache_age.load(std::memory_order_relaxed);
-
-      // --- One eviction walk -----------------------------------------------
-      auto it           = _lru_list.begin();
-      size_t cur_bucket = 0;
-      while (it != _lru_list.end() && reclaimed < needed) {
-        if (stop.stop_requested()) break;  // abort the walk on shutdown
-        while (cur_bucket < N_LRU_BUCKETS && it == _lru_buckets[cur_bucket])
-          ++cur_bucket;
-        if (cur_bucket >= N_LRU_BUCKETS) break;
-
-        cache_entry* entry = *it;
-
-        if (!entry->is_consumed_or_stale(static_cast<uint64_t>(age))) {
-          ++it;
-          continue;
-        }
-
-        int intended = lru_bucket_for(*entry, age);
-        if (intended <= static_cast<int>(cur_bucket)) {
-          size_t freed = try_evict_raw(entry, age);
-          if (freed > 0) {
-            entry->in_lru = false;
-            it            = lru_erase(it);
-            reclaimed += freed;
-          } else {
-            ++it;
-          }
-        } else {
-          it = lru_erase(it);
-          lru_insert(entry, intended);
-        }
-      }
-
-      if (reclaimed >= needed) break;
-
-      // Couldn't satisfy yet.  Wait 50ms to let more candidates arrive (and
-      // to observe any refresh_cache that happens during the wait).  If the
-      // cache ages during the wait, the request is stale — bail.
-      int64_t age_before_wait = age;
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
       if (stop.stop_requested()) break;
 
-      int64_t age_after_wait = _cache_age.load(std::memory_order_relaxed);
-      if (age_after_wait != age_before_wait) {
-        cache_aged_mid_wait = true;
-        break;
+      prefetch_request wrapper;
+      if (!_eviction_queue.try_dequeue(wrapper)) {
+        // Queue empty: wait briefly for new inserts to land.  If we
+        // keep finding it empty across multiple back-off ticks, bail
+        // and let the worker observe the failure.
+        std::this_thread::sleep_for(EVICTOR_POLL_INTERVAL);
+        if (stop.stop_requested()) break;
+        if (++empty_cycles > 4) break;
+        continue;
       }
-      // Else: loop and try again.
+      empty_cycles = 0;
+
+      auto const v         = wrapper.demand->load();
+      bool const cancelled = !wrapper.alive->load(std::memory_order_acquire);
+      bool const stale     = v.stamp > wrapper.stamp_at_insert + REQUEST_STALE_THRESHOLD;
+      bool const exhausted = (v.n_pending == 0);
+
+      if (cancelled || stale || exhausted) {
+        // Evict whatever is evictable.  Push back the leftovers — pinned
+        // entries — so we retry once readers release.  If nothing's
+        // left, drop the wrapper entirely.
+        auto r = walk_and_evict(wrapper);
+        reclaimed += r.freed;
+        if (!r.leftover.empty()) {
+          wrapper.entries = std::move(r.leftover);
+          _eviction_queue.enqueue(std::move(wrapper));
+        }
+      } else {
+        // Live request with positive demand and recent stamp: age it by
+        // one (clamped) and push the wrapper back to the tail.
+        wrapper.demand->unregister_request();
+        _eviction_queue.enqueue(std::move(wrapper));
+
+        // If we've cycled through the whole queue without evicting,
+        // pause briefly so the worker can release pins and the queue
+        // can drain.
+        if (reclaimed == 0 && ++empty_cycles > queue_size_hint) {
+          std::this_thread::sleep_for(EVICTOR_POLL_INTERVAL);
+          if (stop.stop_requested()) break;
+          empty_cycles = 0;
+        }
+      }
     }
 
     if (reclaimed >= needed) {
-      req.promise.set_value();
-    } else if (cache_aged_mid_wait) {
-      req.promise.set_exception(
-        std::make_exception_ptr(std::runtime_error("eviction aborted — cache aged during wait")));
+      chunk_req.promise.set_value();
     } else {
-      // stop_requested mid-wait — fulfil with exception so the worker
-      // unblocks cleanly during shutdown.
-      req.promise.set_exception(
-        std::make_exception_ptr(std::runtime_error("eviction aborted — cache shutting down")));
+      chunk_req.promise.set_exception(std::make_exception_ptr(
+        std::runtime_error("eviction aborted — couldn't satisfy chunk request")));
     }
   }
 
-  // A worker may be blocked in fut.get() after enqueueing a request while the
-  // stop token is already set. Drain anything the loop did not pick up and
-  // resolve it with an exception so the worker can exit.
+  // Drain any pending chunk requests on shutdown so workers in fut.get() unblock.
   eviction_request req;
   while (_request_queue.try_dequeue(req)) {
     req.promise.set_exception(
@@ -1036,8 +958,7 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     auto const chunk_bytes    = pool->chunk_bytes();
     for (size_t i = 0; i < item.entries.size(); ++i) {
       auto const& e = item.entries[i];
-      if (e->n_request.load(std::memory_order_acquire) <= 0) continue;
-      auto st = e->state.get_state();
+      auto st       = e->state.get_state();
       if (st != entry_state::empty && st != entry_state::queued) continue;
       auto phys_size      = static_cast<size_t>(e->physical_range.size());
       auto n              = (phys_size + chunk_bytes - 1) / chunk_bytes;
@@ -1127,11 +1048,6 @@ void prefetching_cache::worker_loop(std::stop_token stop)
         ptr_idx += n;
       };
 
-      if (e->n_request.load(std::memory_order_acquire) <= 0) {
-        _worker_skipped_reader_resolved.fetch_add(1, std::memory_order_relaxed);
-        return_chunks();
-        continue;
-      }
       if (!e->state.try_start_loading()) {
         return_chunks();
         continue;
