@@ -119,37 +119,36 @@ sirius_scan_manager::sirius_scan_manager(
       std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs, /*initial_slabs=*/max_slabs);
   }
 
-  // Pass the pool (or nullptr) and budget into the cache.  The cache
-  // self-determines armed-ness from those + the io_ctx capability.  We
-  // pass budget=0 when the user has disabled prefetching, so the cache
-  // stays metadata-only even on a vector-host-read-capable backend.
+  // Build the prefetching cache on the ioctx.  Budget=0 keeps the
+  // cache unarmed (no background threads); we pass that whenever the
+  // user has disabled prefetching so the construction is always
+  // unconditional and there's no "is the cache present" branch to
+  // worry about in callers.
   size_t const budget = _config.enable_prefetch_cache ? _config.prefetch_inflight_budget_chunks : 0;
-  _cache = std::make_unique<sirius::io::prefetching_cache>(_buffer_pool.get(), _io_ctx, budget);
-  _io_ctx->attach_cache(_cache.get());
+  _io_ctx->initialize_cache(_buffer_pool.get(), budget);
 
-  if (_cache->is_armed()) {
+  if (_io_ctx->cache() && _io_ctx->cache()->is_armed()) {
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] prefetch cache armed (inflight_chunks={})",
                      _config.prefetch_inflight_budget_chunks);
   } else {
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager] cache present but unarmed (metadata-only path)");
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] prefetch cache unarmed");
   }
 }
 
 sirius_scan_manager::~sirius_scan_manager()
 {
-  if (_cache) { SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _cache->summary()); }
+  if (_io_ctx && _io_ctx->cache()) {
+    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
+  }
   // Drain the dispatcher (and the worker pool) first so no in-flight
   // metadata-scan / sequencer task can still be reaching into the
   // cache via _io_ctx when we tear it down below.
   stop();
-  // Detach the cache from the ioctx before tearing down so the ioctx
-  // doesn't observe a half-destroyed cache via @c host_read.  The
-  // cache's destructor drains its worker, queues, and in-flight IO
-  // (via admission_control::wait_for_idle) before returning.
-  if (_io_ctx) { _io_ctx->attach_cache(nullptr); }
-  _cache.reset();
-  // Pool destructs next (after _cache); by this point no callback or
-  // worker iteration still holds a raw pointer into it.
+  // Tear down the cache before releasing the buffer_pool — the cache's
+  // worker holds a raw _pool pointer, and its destructor drains
+  // in-flight IO before returning, so the pool stays alive long
+  // enough for callbacks to release their chunks safely.
+  if (_io_ctx) { _io_ctx->shutdown_cache(); }
   _buffer_pool.reset();
 }
 
@@ -349,7 +348,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   // sequencer overhead.  Null slot keeps the provider on the legacy
   // direct-fadvise path (also a no-op when the cache is unarmed).
   pipeline_ordered_prefetching_manager::pipeline_slot* prefetch_slot = nullptr;
-  if (_prefetch_manager && _cache && _cache->is_armed()) {
+  if (_prefetch_manager && _io_ctx && _io_ctx->cache() && _io_ctx->cache()->is_armed()) {
     prefetch_slot = _prefetch_manager->add_pipeline_slot(pipeline_id);
   }
   return std::make_unique<parquet_split_provider>(

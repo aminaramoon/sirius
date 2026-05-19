@@ -114,26 +114,38 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// characteristics.
   [[nodiscard]] virtual prefetching_mode preferred_prefetching_mode() const = 0;
 
-  /// Wire up a non-owning prefetching_cache.  The caller owns the cache
-  /// and must guarantee it outlives this ioctx.  Pass nullptr to detach.
+  /// Build the prefetching cache.  One-shot — calling twice is a no-op
+  /// after the first successful build.  The cache holds a raw
+  /// back-pointer to this ioctx and stays alive until @ref
+  /// shutdown_cache is called (or this ioctx is destroyed).  @p pool
+  /// is non-owning; the caller (typically @c scan_manager) guarantees
+  /// it outlives the cache.
   ///
-  /// Whether @c host_read / @c device_read actually consult the cache is
-  /// gated on @c uses_prefetching_cache(): a cache is only consulted
-  /// when this backend can serve the vector host reads the cache
-  /// dispatches (so the kvikio fallback never hits the cache even when
-  /// one is attached).
-  void attach_cache(prefetching_cache* cache) noexcept
-  {
-    _cache               = cache;
-    _prefetching_enabled = (cache != nullptr) && supports_vector_host_read();
-  }
+  /// The cache constructs itself in an "armed" or "unarmed" state
+  /// depending on @p pool and @c supports_vector_host_read(); the
+  /// ioctx is unaware of that distinction — it simply forwards lookups
+  /// through @c cache().
+  void initialize_cache(buffer_pool* pool,
+                        size_t inflight_budget_chunks,
+                        double pressure_evict_start_ratio = 0.85,
+                        double pressure_evict_stop_ratio  = 0.60);
 
-  [[nodiscard]] prefetching_cache* cache() noexcept { return _cache; }
+  /// Tear down the cache (drains background workers and any in-flight
+  /// IO via @c admission_control).  Idempotent.  The owner (scan
+  /// manager) calls this BEFORE releasing the @c buffer_pool the cache
+  /// was constructed with — otherwise workers may issue final IO
+  /// against a destroyed pool.
+  void shutdown_cache() noexcept;
+
+  [[nodiscard]] prefetching_cache* cache() noexcept { return _cache.get(); }
 
   /// True iff @c host_read / @c device_read should consult the cache
-  /// before falling through to the backend.  See @c attach_cache for the
-  /// gating condition.
-  [[nodiscard]] bool uses_prefetching_cache() const noexcept { return _prefetching_enabled; }
+  /// before falling through to the backend.  Computed live so it tracks
+  /// @ref initialize_cache / @ref shutdown_cache transitions.
+  [[nodiscard]] bool uses_prefetching_cache() const noexcept
+  {
+    return _cache != nullptr && supports_vector_host_read();
+  }
 
   /// Per-file metadata cache that lives independently of the prefetching
   /// cache.  Always available — callers that have parsed file metadata
@@ -193,16 +205,11 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
                                          io_completion_handler handler) = 0;
 
  protected:
-  /// Non-owning pointer wired up by @c attach_cache.  Lifetime is the
-  /// caller's responsibility (typically a scan_manager that outlives any
-  /// ioctx using its cache).
-  prefetching_cache* _cache{nullptr};
-
-  /// Derived from @c _cache and @c supports_vector_host_read at
-  /// @c attach_cache time.  True when reads should route through the
-  /// cache; false when the cache is attached purely for metadata
-  /// (kvikio fallback) or when no cache is attached at all.
-  bool _prefetching_enabled{false};
+  /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed
+  /// by @ref shutdown_cache (or the ioctx destructor as a safety net,
+  /// though callers are expected to drive the lifecycle explicitly so
+  /// reactors stay alive while workers drain).
+  std::unique_ptr<prefetching_cache> _cache;
 
   /// Independent of the prefetching machinery — exposed via @c metadata().
   metadata_store _metadata_store;

@@ -612,9 +612,9 @@ class prefetching_cache {
   /// Ownership:
   ///   - @p pool is non-owning; the caller (typically @c scan_manager)
   ///     guarantees it outlives this cache.
-  ///   - @p io_ctx is held as a @c shared_ptr — the cache keeps the ioctx
-  ///     alive past its own destruction so in-flight callbacks captured
-  ///     against the ioctx complete safely.
+  ///   - @p io_ctx is the back-pointer to the owning ioctx; held as a
+  ///     raw pointer because the ioctx now owns this cache, so it is
+  ///     guaranteed to outlive it.
   /// @param pressure_evict_start_ratio  Pool-consumption ratio
   ///   (consumed_chunks / max_chunks) at which the evictor's idle-poll
   ///   path starts proactively evicting, even when no eviction_request
@@ -627,7 +627,7 @@ class prefetching_cache {
   ///   ratio drops below this value (default 0.60), so the start
   ///   threshold isn't re-triggered every tick.
   prefetching_cache(buffer_pool* pool,
-                    std::shared_ptr<sirius_ioctx> io_ctx,
+                    sirius_ioctx* io_ctx,
                     size_t inflight_budget_chunks,
                     double pressure_evict_start_ratio = 0.85,
                     double pressure_evict_stop_ratio  = 0.60);
@@ -755,9 +755,10 @@ class prefetching_cache {
   /// guarantees the pool outlives this cache.  Null on the unarmed path.
   buffer_pool* const _pool;
 
-  /// IO context, held by shared_ptr so it outlives this cache by at least
-  /// as long as any in-flight callback we dispatched still references it.
-  std::shared_ptr<sirius_ioctx> const _io_ctx;
+  /// IO context back-pointer.  The ioctx owns this cache, so the
+  /// pointer is guaranteed valid for the cache's full lifetime; no
+  /// shared_ptr required.
+  sirius_ioctx* const _io_ctx;
 
   /// True when the prefetch machinery is wired up: pool + supporting ioctx +
   /// non-zero budget.  Const after construction; threads, queues, and the

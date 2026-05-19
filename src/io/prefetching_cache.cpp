@@ -364,21 +364,19 @@ void prefetching_handle::release() noexcept
 
 namespace {
 // armed iff every dependency the prefetch machinery needs is present.
-bool compute_armed(buffer_pool* pool,
-                   std::shared_ptr<sirius_ioctx> const& io_ctx,
-                   size_t budget) noexcept
+bool compute_armed(buffer_pool* pool, sirius_ioctx const* io_ctx, size_t budget) noexcept
 {
   return pool != nullptr && io_ctx != nullptr && io_ctx->supports_vector_host_read() && budget > 0;
 }
 }  // namespace
 
 prefetching_cache::prefetching_cache(buffer_pool* pool,
-                                     std::shared_ptr<sirius_ioctx> io_ctx,
+                                     sirius_ioctx* io_ctx,
                                      size_t inflight_budget_chunks,
                                      double pressure_evict_start_ratio,
                                      double pressure_evict_stop_ratio)
   : _pool(pool),
-    _io_ctx(std::move(io_ctx)),
+    _io_ctx(io_ctx),
     _armed(compute_armed(pool, _io_ctx, inflight_budget_chunks)),
     _pressure_evict_start_ratio(pressure_evict_start_ratio),
     _pressure_evict_stop_ratio(pressure_evict_stop_ratio),
@@ -431,19 +429,20 @@ prefetching_cache::~prefetching_cache()
   }
 
   // Join.  After joins, no new IO will be dispatched, but the reactor
-  // (held alive by _io_ctx) may still be processing IOs we submitted
-  // earlier; their completion callbacks hold a slot in _inflight_budget.
+  // (owned by the ioctx that owns this cache) may still be processing
+  // IOs we submitted earlier; their completion callbacks hold a slot
+  // in _inflight_budget.
   if (_worker_thread.joinable()) { _worker_thread.join(); }
   if (_evictor_thread.joinable()) { _evictor_thread.join(); }
 
   // Wait for every in-flight IO callback to release its admission slot.
   // Each callback captures the raw _pool pointer; the owner of the pool
-  // (scan_manager) won't tear it down until this cache returns from its
-  // dtor, so callbacks observing the pool here are safe.  The shared_ptr
-  // capture on _io_ctx in the same callbacks keeps the reactor alive
-  // too, so the IO either completes normally or surfaces via the
-  // request_context safety net at reactor shutdown — both paths release
-  // the slot.
+  // (scan_manager) is required to keep the pool alive until @c
+  // sirius_ioctx::shutdown_cache returns — which only happens after
+  // this destructor runs — so callbacks observing the pool here are
+  // safe.  The owning ioctx is similarly required to stay alive while
+  // this destructor is in progress (the scan_manager holds a
+  // @c shared_ptr<sirius_ioctx> across @c shutdown_cache).
   //
   // Wrapped in try/catch: a destructor must be noexcept and a hanging
   // wait is preferable to a UAF.
@@ -921,7 +920,7 @@ void prefetching_cache::worker_loop(std::stop_token stop)
   // _io_ctx supports vector host read), so no per-iteration null checks
   // or snapshots are needed.
   buffer_pool* const pool    = _pool;
-  sirius_ioctx* const io_ctx = _io_ctx.get();
+  sirius_ioctx* const io_ctx = _io_ctx;
 
   while (!stop.stop_requested()) {
     // Dequeue.  Park on _work_seq when the queue is empty; the dtor

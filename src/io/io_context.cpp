@@ -35,8 +35,31 @@
 
 namespace sirius::io {
 
-sirius_ioctx::sirius_ioctx()  = default;
-sirius_ioctx::~sirius_ioctx() = default;
+sirius_ioctx::sirius_ioctx() = default;
+sirius_ioctx::~sirius_ioctx()
+{
+  // Defensive: drain the cache if the owner forgot to call
+  // shutdown_cache().  Derived classes' reactor teardown has already
+  // run at this point, so any IO the cache's workers issue here will
+  // surface via the per-request safety net rather than complete
+  // normally — but we still prefer a clean drain over leaving rogue
+  // threads attached to dangling reactors.
+  shutdown_cache();
+}
+
+void sirius_ioctx::initialize_cache(buffer_pool* pool,
+                                    size_t inflight_budget_chunks,
+                                    double pressure_evict_start_ratio,
+                                    double pressure_evict_stop_ratio)
+{
+  // One-shot.  Repeated calls are silent no-ops so callers can be
+  // robust to multiple wiring sites.
+  if (_cache) return;
+  _cache = std::make_unique<prefetching_cache>(
+    pool, this, inflight_budget_chunks, pressure_evict_start_ratio, pressure_evict_stop_ratio);
+}
+
+void sirius_ioctx::shutdown_cache() noexcept { _cache.reset(); }
 
 namespace {
 
@@ -159,11 +182,11 @@ std::future<size_t> copy_pinned_slices_to_device(
 
 size_t sirius_ioctx::host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst)
 {
-  // _prefetching_enabled, not _cache: a cache may be attached purely
-  // for metadata (kvikio fallback path) without supporting the vector
-  // host reads the prefetcher needs.  Consulting cache->read on those
-  // backends costs a map lookup that will never hit.
-  if (_prefetching_enabled) {
+  // uses_prefetching_cache() gates the lookup on both "a cache exists"
+  // and "this backend can serve the vector host reads the prefetcher
+  // needs" — backends like the kvikio fallback never carry a cache for
+  // reads, so the map lookup is skipped entirely.
+  if (uses_prefetching_cache()) {
     if (auto view = _cache->read(obj, offset, size); view) {
       auto slices   = view.slice(offset, size);
       size_t copied = 0;
@@ -182,7 +205,7 @@ std::future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
                                                   size_t size,
                                                   uint8_t* dst)
 {
-  if (_prefetching_enabled) {
+  if (uses_prefetching_cache()) {
     if (auto view = _cache->read(obj, offset, size); view) {
       auto slices = view.slice(offset, size);
       try {
@@ -214,7 +237,7 @@ std::future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
 size_t sirius_ioctx::device_read(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
-  if (_prefetching_enabled) {
+  if (uses_prefetching_cache()) {
     if (auto view = _cache->read(obj, offset, size); view) {
       auto slices = view.slice(offset, size);
       auto copied = copy_pinned_slices_to_device(slices, dst, stream);
@@ -227,7 +250,7 @@ size_t sirius_ioctx::device_read(
 std::future<size_t> sirius_ioctx::device_read_async(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
-  if (_prefetching_enabled) {
+  if (uses_prefetching_cache()) {
     if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
       auto slices = view.slice(offset, size);
       try {

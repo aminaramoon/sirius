@@ -44,7 +44,6 @@ class memory_reservation_manager;
 namespace sirius::io {
 class sirius_ioctx;
 class buffer_pool;
-class prefetching_cache;
 }  // namespace sirius::io
 
 namespace sirius::op::scan {
@@ -256,16 +255,10 @@ class sirius_scan_manager {
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
   /// Buffer pool owned by the scan_manager (not the cache).  Constructed
   /// when a HOST-tier @c fixed_size_host_memory_resource is available;
-  /// null otherwise.  Declared between @c _io_ctx and @c _cache so the
-  /// destruction order is cache → pool → io_ctx: the cache's dtor
-  /// drains in-flight IO before pool destruction returns slabs to the
-  /// upstream resource.
+  /// null otherwise.  The cache (owned by @c _io_ctx) holds the pool
+  /// by raw pointer, so the destructor MUST call
+  /// @c _io_ctx->shutdown_cache() before resetting this pool.
   std::unique_ptr<sirius::io::buffer_pool> _buffer_pool;
-  /// Cache wraps the pool (if any) and the io_ctx.  The cache is "armed"
-  /// for prefetching iff pool != nullptr AND ioctx supports vector host
-  /// read AND budget > 0; otherwise it's a metadata-only store with no
-  /// background threads.
-  std::unique_ptr<sirius::io::prefetching_cache> _cache;
   std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _scan_op_order;

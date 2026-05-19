@@ -107,9 +107,10 @@ class kvikio_context final : public sirius_ioctx {
   // -- Public read API (override the base virtuals directly) ----------------
   //
   // Each forwards to the cudf datasource held on the io_object.  The cache
-  // pointer wired via @c attach_cache is intentionally NOT consulted here:
-  // kvikio_context reports @c supports_vector_host_read == false, so the
-  // scan_manager won't ever attach a cache to a kvikio_context anyway.
+  // (if @c initialize_cache was ever called on this ioctx) is intentionally
+  // NOT consulted here: kvikio_context reports
+  // @c supports_vector_host_read == false, so @c uses_prefetching_cache()
+  // is also false on the base class read path.
 
   size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
 
