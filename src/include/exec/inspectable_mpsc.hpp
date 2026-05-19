@@ -23,6 +23,9 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 namespace sirius::exec {
 
@@ -33,6 +36,28 @@ namespace sirius::exec {
 /// Note: push() / emplace() always append to the back; pop_if() / mutable_pop_if() honor their
 /// own `front_to_back` argument and ignore this ordering.
 enum class queue_ordering { FIFO, LIFO };
+
+/// ADL-discoverable string conversion so yaml_reader can parse queue_ordering values.
+inline bool string_to_enum(std::string_view sv, queue_ordering& out)
+{
+  static const std::unordered_map<std::string_view, queue_ordering> map = {
+    {"fifo", queue_ordering::FIFO},
+    {"lifo", queue_ordering::LIFO},
+  };
+  auto it = map.find(sv);
+  if (it == map.end()) { return false; }
+  out = it->second;
+  return true;
+}
+
+inline bool enum_to_string(queue_ordering ordering, std::string& s)
+{
+  switch (ordering) {
+    case queue_ordering::FIFO: s = "fifo"; return true;
+    case queue_ordering::LIFO: s = "lifo"; return true;
+  }
+  return false;
+}
 
 template <typename T>
 class inspectable_mpsc {
