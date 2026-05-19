@@ -138,6 +138,10 @@ sirius_scan_manager::sirius_scan_manager(
 sirius_scan_manager::~sirius_scan_manager()
 {
   if (_cache) { SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _cache->summary()); }
+  // Drain the dispatcher (and the worker pool) first so no in-flight
+  // metadata-scan / sequencer task can still be reaching into the
+  // cache via _io_ctx when we tear it down below.
+  stop();
   // Detach the cache from the ioctx before tearing down so the ioctx
   // doesn't observe a half-destroyed cache via @c host_read.  The
   // cache's destructor drains its worker, queues, and in-flight IO
@@ -147,7 +151,6 @@ sirius_scan_manager::~sirius_scan_manager()
   // Pool destructs next (after _cache); by this point no callback or
   // worker iteration still holds a raw pointer into it.
   _buffer_pool.reset();
-  stop();
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
@@ -166,10 +169,10 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   // Build a fresh sequencer for this query.  Slots are added by
   // create_provider_for() whenever it chooses the parquet path; the
   // cached path skips slot allocation since there's no IO to prefetch.
-  // A fresh stop_source goes with it — once stop is requested it stays
-  // requested, so we can't reuse the previous query's source.
-  _prefetch_manager     = std::make_unique<pipeline_ordered_prefetching_manager>();
-  _prefetch_stop_source = std::stop_source{};
+  // The sequencer task piggy-backs on the dispatcher's injected
+  // stop_token, so reset()/request_stop on the dispatcher tears it
+  // down without a side-channel stop_source.
+  _prefetch_manager = std::make_unique<pipeline_ordered_prefetching_manager>();
 
   for (auto const& pipeline : query.get_pipelines()) {
     if (!pipeline) { continue; }
@@ -201,7 +204,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   // the task captures the full slot list in insertion order.  Safe to
   // skip when no slots were added (purely-cached query) — the manager
   // is fine with zero slots.
-  _prefetch_manager->register_ranges(_prefetch_stop_source.get_token(), *_dispatcher);
+  _prefetch_manager->register_ranges(*_dispatcher);
 
   start_metadata_processing();
 }
@@ -392,19 +395,16 @@ void sirius_scan_manager::start_metadata_processing()
 
 void sirius_scan_manager::reset()
 {
-  // Signal the sequencer first so it bails before we drain the
-  // dispatcher; its poll loop wakes within @c SEQUENCER_POLL_INTERVAL.
-  // request_stop on a default-constructed source is a no-op, so this is
-  // safe to call when prepare_for_query was never invoked.
-  _prefetch_stop_source.request_stop();
+  // Dispatcher::request_stop fires its internal stop_token, which the
+  // sequencer task polls every SEQUENCER_POLL_INTERVAL ms — so it bails
+  // mid-pipeline without a side-channel stop_source.
   _dispatcher->request_stop();
   _dispatcher->wait_for_all();
   _scan_op_order.clear();
   _providers_by_op.clear();
-  // Providers (whose run_batch holds slot pointers) have been destroyed
-  // by the line above and the sequencer has drained on
-  // wait_for_all(), so it's safe to tear down the manager and the
-  // slots it owns.
+  // Providers (whose run_batch holds slot pointers) and the sequencer
+  // task have both finished by now, so it's safe to tear down the
+  // manager and the slots it owns.
   _prefetch_manager.reset();
   _dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads);

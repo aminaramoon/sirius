@@ -32,7 +32,6 @@ class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
 #include <memory>
-#include <stop_token>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -276,12 +275,10 @@ class sirius_scan_manager {
   /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached
   /// parquet scan (allocated by @ref create_provider_for when it builds
   /// a parquet_split_provider).  The sequencer task is enqueued on the
-  /// per-query @c _dispatcher and drains the slots in insertion order.
+  /// per-query @c _dispatcher, which injects its own stop_token; the
+  /// dispatcher's @c request_stop() in @ref reset() therefore tears the
+  /// sequencer down without an extra side-channel.
   std::unique_ptr<pipeline_ordered_prefetching_manager> _prefetch_manager;
-  /// Stop source threaded into the sequencer task so @ref reset() can
-  /// signal it to bail mid-pipeline.  Rebuilt per query alongside
-  /// @c _prefetch_manager.
-  std::stop_source _prefetch_stop_source;
 };
 
 }  // namespace sirius::scan_manager

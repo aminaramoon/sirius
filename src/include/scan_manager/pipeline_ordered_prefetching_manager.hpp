@@ -100,14 +100,15 @@ class pipeline_ordered_prefetching_manager {
   pipeline_slot* add_pipeline_slot(std::size_t pipeline_id);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
-  /// expose @c enqueue(callable) — typically a @c scoped_dispatcher or
-  /// any thread-pool-like type with that surface.  Call once after all
-  /// slots have been added (the task captures the slot list by
-  /// reference; adding slots after this call has undefined ordering).
+  /// expose @c enqueue(callable) and inject a @c std::stop_token when
+  /// the callable asks for one (e.g. @c scoped_dispatcher).  Call once
+  /// after all slots have been added — the task captures the slot list
+  /// by reference, so adding slots after this call has undefined
+  /// ordering with respect to the sequencer walk.
   template <class Dispatcher>
-  void register_ranges(std::stop_token stop, Dispatcher& dispatcher)
+  void register_ranges(Dispatcher& dispatcher)
   {
-    dispatcher.enqueue([this, stop = std::move(stop)]() { run_sequencer(stop); });
+    dispatcher.enqueue([this](std::stop_token const& stop) { run_sequencer(stop); });
   }
 
  private:
