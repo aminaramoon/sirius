@@ -26,6 +26,7 @@
 #include <cucascade/cuda/event.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -38,13 +39,12 @@ namespace sirius::io {
 sirius_ioctx::sirius_ioctx() = default;
 sirius_ioctx::~sirius_ioctx()
 {
-  // Defensive: drain the cache if the owner forgot to call
-  // shutdown_cache().  Derived classes' reactor teardown has already
-  // run at this point, so any IO the cache's workers issue here will
-  // surface via the per-request safety net rather than complete
-  // normally — but we still prefer a clean drain over leaving rogue
-  // threads attached to dangling reactors.
-  shutdown_cache();
+  // Derived destructors are required to call @c pre_destroy() as
+  // their first statement, which drains the cache while reactors are
+  // still alive.  By the time we get here, _cache must be empty;
+  // anything else is a contract violation that would race the
+  // cache's worker against partially-destroyed derived state.
+  assert(!_cache && "derived ioctx forgot to call pre_destroy() in its destructor");
 }
 
 void sirius_ioctx::initialize_cache(buffer_pool* pool,

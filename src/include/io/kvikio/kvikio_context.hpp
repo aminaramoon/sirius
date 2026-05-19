@@ -85,8 +85,14 @@ class kvikio_io_object final : public sirius_io_object {
  */
 class kvikio_context final : public sirius_ioctx {
  public:
-  kvikio_context()           = default;
-  ~kvikio_context() override = default;
+  kvikio_context() = default;
+  ~kvikio_context() override
+  {
+    // See sirius_ioctx::pre_destroy — drains the cache (if any) while
+    // this derived part of the object is still alive.  No reactors to
+    // tear down for kvikio_context, but the contract still applies.
+    this->pre_destroy();
+  }
 
   void shutdown() override {}
 

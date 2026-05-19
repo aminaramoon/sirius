@@ -128,10 +128,11 @@ class templated_ioctx : public sirius_ioctx {
 
   ~templated_ioctx() override
   {
-    // The owner is required to have called @c shutdown_cache() on the
-    // base class before this destructor runs, so the cache's workers
-    // are already drained and won't dispatch any new IO against the
-    // reactors we tear down below.
+    // pre_destroy() drains the cache (if any) so its workers stop
+    // issuing IO BEFORE we tear down the reactors below.  Must be the
+    // first statement in every derived dtor — see sirius_ioctx for
+    // the full contract.
+    this->pre_destroy();
     shutdown();
   }
 

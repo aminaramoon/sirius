@@ -137,6 +137,18 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// against a destroyed pool.
   void shutdown_cache() noexcept;
 
+  /// Every concrete derived class MUST call this as the very first
+  /// statement in its destructor.  It drains the cache (so its workers
+  /// stop issuing IO) while the derived object's reactors / handles
+  /// are still alive.  Without this, the cache's defensive shutdown
+  /// in @c ~sirius_ioctx would run AFTER the derived part of the
+  /// object has been destroyed, and worker callbacks would reach
+  /// already-destroyed reactors.
+  ///
+  /// Idempotent — calling @c shutdown_cache directly before this is
+  /// fine.  Cheap when no cache was ever initialised.
+  void pre_destroy() noexcept { shutdown_cache(); }
+
   [[nodiscard]] prefetching_cache* cache() noexcept { return _cache.get(); }
 
   /// True iff @c host_read / @c device_read should consult the cache
