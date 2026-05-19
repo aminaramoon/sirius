@@ -16,7 +16,6 @@
 
 #include "creator/task_creator.hpp"
 
-#include "cucascade/memory/common.hpp"
 #include "log/logging.hpp"
 #include "op/scan/cpu_source_task.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
@@ -34,7 +33,6 @@
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 
-#include <limits>
 #include <optional>
 
 namespace sirius::creator {
