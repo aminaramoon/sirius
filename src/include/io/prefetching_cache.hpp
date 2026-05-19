@@ -164,6 +164,11 @@ class buffer_pool {
   {
     return _total_chunks.load(std::memory_order_relaxed);
   }
+  /// Hard cap on chunks the pool can grow to (i.e. @c max_slabs ×
+  /// CHUNKS_PER_SLAB).  Stable for the pool's lifetime.  Used by the
+  /// prefetching_cache evictor to score pool pressure against the
+  /// configured ceiling rather than the (lazily-grown) current size.
+  [[nodiscard]] uint32_t max_chunks() const noexcept { return _max_slabs * CHUNKS_PER_SLAB; }
 
  private:
   /// Pull one slab worth of blocks from the upstream resource and append
@@ -609,9 +614,22 @@ class prefetching_cache {
   ///   - @p io_ctx is held as a @c shared_ptr — the cache keeps the ioctx
   ///     alive past its own destruction so in-flight callbacks captured
   ///     against the ioctx complete safely.
+  /// @param pressure_evict_start_ratio  Pool-consumption ratio
+  ///   (consumed_chunks / max_chunks) at which the evictor's idle-poll
+  ///   path starts proactively evicting, even when no eviction_request
+  ///   is in flight.  Defaults to 0.85 — when 85% of the pool is in
+  ///   use, the evictor starts reclaiming chunks ahead of the next
+  ///   spike rather than making every prefetch wait its turn behind
+  ///   an on-demand eviction.
+  /// @param pressure_evict_stop_ratio   Lower hysteresis bound.  Once
+  ///   the proactive path triggers, it keeps reclaiming until the
+  ///   ratio drops below this value (default 0.60), so the start
+  ///   threshold isn't re-triggered every tick.
   prefetching_cache(buffer_pool* pool,
                     std::shared_ptr<sirius_ioctx> io_ctx,
-                    size_t inflight_budget_chunks);
+                    size_t inflight_budget_chunks,
+                    double pressure_evict_start_ratio = 0.85,
+                    double pressure_evict_stop_ratio  = 0.60);
   ~prefetching_cache();
 
   prefetching_cache(prefetching_cache const&)            = delete;
@@ -763,6 +781,12 @@ class prefetching_cache {
   /// non-zero budget.  Const after construction; threads, queues, and the
   /// admission_control are all only meaningful when this is true.
   bool const _armed;
+
+  /// Hysteresis bounds for the evictor's proactive (idle-tick)
+  /// pressure-relief path.  Both expressed as a fraction of
+  /// @c buffer_pool::max_chunks().  See the ctor for semantics.
+  double const _pressure_evict_start_ratio;
+  double const _pressure_evict_stop_ratio;
 
   // Observability counters (updated on every read() / read_ranges() entry).
   std::atomic<uint64_t> _hit_count{0};

@@ -373,10 +373,14 @@ bool compute_armed(buffer_pool* pool,
 
 prefetching_cache::prefetching_cache(buffer_pool* pool,
                                      std::shared_ptr<sirius_ioctx> io_ctx,
-                                     size_t inflight_budget_chunks)
+                                     size_t inflight_budget_chunks,
+                                     double pressure_evict_start_ratio,
+                                     double pressure_evict_stop_ratio)
   : _pool(pool),
     _io_ctx(std::move(io_ctx)),
     _armed(compute_armed(pool, _io_ctx, inflight_budget_chunks)),
+    _pressure_evict_start_ratio(pressure_evict_start_ratio),
+    _pressure_evict_stop_ratio(pressure_evict_stop_ratio),
     _inflight_budget(_armed ? std::make_unique<admission_control>(inflight_budget_chunks) : nullptr)
 {
   // Threads only run when the cache is armed.  When unarmed the cache is
@@ -815,20 +819,11 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
     return r;
   };
 
-  while (!stop.stop_requested()) {
-    eviction_request chunk_req;
-    bool have_request = _request_queue.try_dequeue(chunk_req);
-
-    if (!have_request) {
-      bool signalled = _request_sem.try_acquire_for(EVICTOR_POLL_INTERVAL);
-      if (stop.stop_requested()) break;
-      if (!signalled) continue;
-      have_request = _request_queue.try_dequeue(chunk_req);
-    }
-
-    if (!have_request) continue;  // spurious wake
-
-    size_t const needed          = chunk_req.n_chunks_needed;
+  // Inner eviction driver: walk the FIFO until at least @p needed chunks
+  // have been reclaimed (or the queue stays empty / stop fires).  Shared
+  // by the request path (where the result resolves a promise) and the
+  // proactive-pressure path (where the result is informational only).
+  auto evict_chunks = [&](size_t needed) -> size_t {
     size_t reclaimed             = 0;
     size_t empty_cycles          = 0;
     size_t const queue_size_hint = std::max<size_t>(_eviction_queue.size_approx(), 1);
@@ -840,7 +835,8 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
       if (!_eviction_queue.try_dequeue(wrapper)) {
         // Queue empty: wait briefly for new inserts to land.  If we
         // keep finding it empty across multiple back-off ticks, bail
-        // and let the worker observe the failure.
+        // and let the caller decide what to do (fail the request, or
+        // sleep through the next proactive tick).
         std::this_thread::sleep_for(EVICTOR_POLL_INTERVAL);
         if (stop.stop_requested()) break;
         if (++empty_cycles > 4) break;
@@ -879,6 +875,59 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
         }
       }
     }
+
+    return reclaimed;
+  };
+
+  // Proactive pressure-relief path: on idle ticks, look at pool
+  // utilisation and reclaim ahead of demand so the next prefetch isn't
+  // blocked behind a synchronous eviction.  Hysteresis between the
+  // start and stop ratios keeps us from oscillating on every tick.
+  auto proactive_evict_if_pressured = [&] {
+    if (_pool == nullptr) return;
+    auto const cap = _pool->max_chunks();
+    if (cap == 0) return;
+    auto const free     = _pool->free_count();
+    auto const consumed = (cap >= free) ? (cap - free) : 0;
+
+    auto const start_lim = static_cast<size_t>(_pressure_evict_start_ratio * cap);
+    if (consumed <= start_lim) return;
+
+    // Target the stop-threshold (consumed_target = stop_ratio * cap),
+    // i.e. free enough chunks so consumed drops below stop_lim.
+    auto const stop_lim = static_cast<size_t>(_pressure_evict_stop_ratio * cap);
+    size_t const target = (consumed > stop_lim) ? (consumed - stop_lim) : 0;
+    if (target == 0) return;
+
+    auto const reclaimed = evict_chunks(target);
+    spdlog::debug("prefetching_cache: proactive evict cap={} consumed={} target={} reclaimed={}",
+                  cap,
+                  consumed,
+                  target,
+                  reclaimed);
+  };
+
+  while (!stop.stop_requested()) {
+    eviction_request chunk_req;
+    bool have_request = _request_queue.try_dequeue(chunk_req);
+
+    if (!have_request) {
+      bool signalled = _request_sem.try_acquire_for(EVICTOR_POLL_INTERVAL);
+      if (stop.stop_requested()) break;
+      if (!signalled) {
+        // Idle tick: no on-demand request waiting.  Use the time to
+        // reclaim chunks proactively if pool pressure is above the
+        // start threshold.
+        proactive_evict_if_pressured();
+        continue;
+      }
+      have_request = _request_queue.try_dequeue(chunk_req);
+    }
+
+    if (!have_request) continue;  // spurious wake
+
+    size_t const needed    = chunk_req.n_chunks_needed;
+    size_t const reclaimed = evict_chunks(needed);
 
     if (reclaimed >= needed) {
       chunk_req.promise.set_value();
