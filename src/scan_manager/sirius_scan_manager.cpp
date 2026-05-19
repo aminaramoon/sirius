@@ -162,8 +162,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   // notion.  Per-file aging in the eviction queue handles staleness
   // without scan_manager involvement.
 
-  SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={}",
-                   query.get_pipelines().size());
+  SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] scan_operators={}",
+                   query.get_scan_operators().size());
 
   // Build a fresh sequencer for this query.  Slots are added by
   // create_provider_for() whenever it chooses the parquet path; the
@@ -173,13 +173,10 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   // down without a side-channel stop_source.
   _prefetch_manager = std::make_unique<pipeline_ordered_prefetching_manager>();
 
-  for (auto const& pipeline : query.get_pipelines()) {
-    if (!pipeline) { continue; }
-    auto source = pipeline->get_source();
-    if (!source) { continue; }
-    if (source->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) { continue; }
+  for (auto const& scan_op : query.get_scan_operators()) {
+    if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) { continue; }
 
-    auto* op = &source->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
+    auto* op = &scan_op->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
 
     auto provider = create_provider_for(op);

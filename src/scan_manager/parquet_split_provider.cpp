@@ -413,15 +413,6 @@ void parquet_split_provider::run_batch(file_batch const& batch,
           file_path,
           file_ranges.size());
         _prefetch_slot->push({file_datasource, file_ranges});
-      } else {
-        SIRIUS_LOG_INFO(
-          "[fadvise opportunistic] op='{}' op_id={} pipeline_id={} file='{}' ranges={}",
-          _op_name,
-          _op_id,
-          _pipeline_id,
-          file_path,
-          file_ranges.size());
-        file_datasource->fadvise(sirius::io::prefetching_mode::opportunistic, file_ranges);
       }
     }
 
