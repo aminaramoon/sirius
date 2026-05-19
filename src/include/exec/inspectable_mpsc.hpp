@@ -26,6 +26,14 @@
 #include <utility>
 namespace sirius::exec {
 
+/// Pop order for inspectable_mpsc::pop() / try_pop().
+///   FIFO: first-in-first-out (default; preserves legacy queue behavior).
+///   LIFO: last-in-first-out (newest item is popped first; useful as a depth-first scheduler
+///         hint so freshly produced tasks are processed before older queued ones).
+/// Note: push() / emplace() always append to the back; pop_if() / mutable_pop_if() honor their
+/// own `front_to_back` argument and ignore this ordering.
+enum class queue_ordering { FIFO, LIFO };
+
 template <typename T>
 class inspectable_mpsc {
  private:
@@ -33,9 +41,11 @@ class inspectable_mpsc {
   mutable std::mutex _mutex;
   std::condition_variable _cv;
   bool _active{true};
+  queue_ordering _ordering{queue_ordering::FIFO};
 
  public:
-  inspectable_mpsc()  = default;
+  inspectable_mpsc() = default;
+  explicit inspectable_mpsc(queue_ordering ordering) : _ordering(ordering) {}
   ~inspectable_mpsc() = default;
 
   inspectable_mpsc(const inspectable_mpsc&)            = delete;
@@ -78,29 +88,28 @@ class inspectable_mpsc {
    *
    * If the queue is interrupted but still has items, those items are returned
    * before nullptr (drain remaining). Uses condition_variable::wait for true
-   * blocking -- no polling.
+   * blocking -- no polling. The end of the deque popped from depends on the
+   * configured queue_ordering (front for FIFO, back for LIFO).
    */
   std::unique_ptr<T> pop()
   {
     std::unique_lock<std::mutex> lock(_mutex);
     _cv.wait(lock, [this] { return !_queue.empty() || !_active; });
     if (_queue.empty()) { return nullptr; }
-    auto item = std::move(_queue.front());
-    _queue.pop_front();
-    return item;
+    return pop_one_unlocked();
   }
 
   /**
    * \brief Attempts to pop without blocking.
    * \return Returns nullptr if the queue is empty.
+   *
+   * Honors the configured queue_ordering (front for FIFO, back for LIFO).
    */
   std::unique_ptr<T> try_pop()
   {
     std::unique_lock<std::mutex> lock(_mutex);
     if (_queue.empty()) { return nullptr; }
-    auto item = std::move(_queue.front());
-    _queue.pop_front();
-    return item;
+    return pop_one_unlocked();
   }
 
   /**
@@ -138,6 +147,9 @@ class inspectable_mpsc {
     }
     _cv.notify_all();
   }
+
+  /// Returns the configured pop ordering. Not lock-guarded — the value is fixed at construction.
+  [[nodiscard]] queue_ordering get_ordering() const noexcept { return _ordering; }
 
   /**
    * \brief Returns true if the queue is active (not interrupted).
@@ -231,6 +243,21 @@ class inspectable_mpsc {
       }
     }
     return nullptr;
+  }
+
+ private:
+  /// Pop a single element from the end of the deque selected by _ordering. Caller must hold
+  /// _mutex and ensure the queue is non-empty.
+  std::unique_ptr<T> pop_one_unlocked()
+  {
+    if (_ordering == queue_ordering::LIFO) {
+      auto item = std::move(_queue.back());
+      _queue.pop_back();
+      return item;
+    }
+    auto item = std::move(_queue.front());
+    _queue.pop_front();
+    return item;
   }
 };
 }  // namespace sirius::exec
