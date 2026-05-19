@@ -384,10 +384,9 @@ prefetching_cache::prefetching_cache(buffer_pool* pool,
     _pressure_evict_stop_ratio(pressure_evict_stop_ratio),
     _inflight_budget(_armed ? std::make_unique<admission_control>(inflight_budget_chunks) : nullptr)
 {
-  // Threads only run when the cache is armed.  When unarmed the cache is
-  // effectively a metadata-only store: register_metadata / get_metadata /
-  // read still work but nobody is consuming the work queue, and insert()
-  // short-circuits before enqueuing anything anyway.
+  // Threads only run when the cache is armed.  When unarmed nobody
+  // consumes the work queue, and insert() short-circuits before
+  // enqueuing anything anyway; read() simply misses on every lookup.
   if (_armed) {
     _evictor_thread = std::jthread([this](std::stop_token st) { evictor_loop(std::move(st)); });
     _worker_thread  = std::jthread([this](std::stop_token st) { worker_loop(std::move(st)); });
@@ -526,33 +525,6 @@ std::shared_ptr<cache_entry> prefetching_cache::find_entry(
 }
 
 // ===========================================================================
-// register_metadata
-// ===========================================================================
-
-void prefetching_cache::register_metadata(sirius_io_object& obj,
-                                          std::shared_ptr<sirius_io_object_metadata> metadata)
-{
-  // Match insert's contract: caller must own @p obj through a shared_ptr.
-  auto obj_sp     = obj.shared_from_this();
-  auto const& key = obj.raw_file_cache_id();
-  auto file_size  = obj.size();
-
-  std::unique_lock map_lk(_map_mtx);
-  auto [it, inserted] = _file_cache.try_emplace(key, nullptr);
-  if (inserted) it->second = std::make_unique<file_entry>();
-  auto& file = *it->second;
-
-  std::unique_lock file_lk(file.mtx);
-  map_lk.unlock();
-
-  file.io_obj    = std::move(obj_sp);
-  file.file_size = file_size;
-  // Symmetric with insert(): a null @p metadata leaves any existing
-  // metadata in place rather than clobbering it.
-  if (metadata) { file.metadata = std::move(metadata); }
-}
-
-// ===========================================================================
 // insert
 // ===========================================================================
 
@@ -581,9 +553,6 @@ prefetching_handle prefetching_cache::insert(
 
   file.io_obj    = obj_sp;
   file.file_size = file_size;
-  // Metadata is set via register_metadata() and is left untouched here —
-  // separating that concern keeps insert() about ranges only, and lets
-  // metadata be recorded by callers that have no prefetch work to schedule.
 
   if (!_armed) {
     // Unarmed cache: record the file_entry so subsequent reads can find
@@ -721,20 +690,6 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
     _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
     return {};
   }
-}
-
-std::shared_ptr<sirius_io_object_metadata> prefetching_cache::get_metadata(
-  const sirius_io_object& obj) const
-{
-  auto const& key = obj.raw_file_cache_id();
-
-  std::shared_lock map_lk(_map_mtx);
-  auto it = _file_cache.find(key);
-  if (it == _file_cache.end()) { return nullptr; }
-  auto& file = *it->second;
-
-  std::shared_lock file_lk(file.mtx);
-  return file.metadata;
 }
 
 std::string prefetching_cache::summary() const

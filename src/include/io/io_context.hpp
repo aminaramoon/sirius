@@ -117,16 +117,11 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// Wire up a non-owning prefetching_cache.  The caller owns the cache
   /// and must guarantee it outlives this ioctx.  Pass nullptr to detach.
   ///
-  /// @c cache() always returns the attached pointer so callers can hit
-  /// @c register_metadata / @c get_metadata regardless of prefetching
-  /// capability — the metadata store works on dormant caches too.
-  ///
   /// Whether @c host_read / @c device_read actually consult the cache is
-  /// a separate question, gated on @c uses_prefetching_cache().  The
-  /// flag is set here based on the backend's capability:
-  /// (cache != nullptr) && supports_vector_host_read() — backends that
-  /// can't serve vector host reads (e.g. kvikio_context) never use the
-  /// cache for read lookups even when a cache is attached for metadata.
+  /// gated on @c uses_prefetching_cache(): a cache is only consulted
+  /// when this backend can serve the vector host reads the cache
+  /// dispatches (so the kvikio fallback never hits the cache even when
+  /// one is attached).
   void attach_cache(prefetching_cache* cache) noexcept
   {
     _cache               = cache;

@@ -604,9 +604,10 @@ class prefetching_cache {
   ///     @c supports_vector_host_read() (the backend can serve the
   ///     batched IO the prefetcher dispatches), and
   ///   - @p inflight_budget_chunks > 0.
-  /// Otherwise the cache is unarmed: no threads start, @c insert returns
-  /// an empty handle, but @c register_metadata / @c get_metadata still
-  /// work (the file_entry map is independent of the prefetch machinery).
+  /// Otherwise the cache is unarmed: no threads start and @c insert
+  /// returns an empty handle.  Per-file metadata caching is handled by
+  /// the @c metadata_store owned by the ioctx and is independent of
+  /// this class.
   ///
   /// Ownership:
   ///   - @p pool is non-owning; the caller (typically @c scan_manager)
@@ -636,15 +637,8 @@ class prefetching_cache {
   prefetching_cache& operator=(prefetching_cache const&) = delete;
 
   /// @return whether prefetch dispatch is wired up (pool + supporting
-  /// ioctx + non-zero budget).  Metadata-only callers can ignore.
+  /// ioctx + non-zero budget).
   [[nodiscard]] bool is_armed() const noexcept { return _armed; }
-
-  /// Record (or overwrite) the metadata for @p obj's cache key without
-  /// registering any ranges or scheduling prefetch.  Used by callers that
-  /// have parsed file metadata before the cache is armed, or that want to
-  /// stash metadata for a file they will never prefetch.
-  void register_metadata(sirius_io_object& obj,
-                         std::shared_ptr<sirius_io_object_metadata> metadata);
 
   /// Non-blocking read of a single range.
   /// Returns an empty pinned_view if the range is not cached or the cached
@@ -656,15 +650,6 @@ class prefetching_cache {
                                  size_t offset,
                                  size_t size,
                                  cudaStream_t stream = nullptr);
-
-  /// Look up the metadata that a previous insert() stored for @p obj.
-  /// Returns nullptr if no entry exists for the object's cache key or no
-  /// metadata was supplied on insert.  Callers that want to skip re-parsing
-  /// a parquet footer (or other backend-specific metadata) check this
-  /// before doing the parse and then call insert() with a freshly-built
-  /// metadata object on a miss.
-  [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
-    const sirius_io_object& obj) const;
 
   /// One-line human-readable state: hit / partial-miss / full-miss counts,
   /// pool utilisation, and pending chunks.
@@ -680,8 +665,6 @@ class prefetching_cache {
   /// @c shared_from_this() so the underlying file handles stay open
   /// until all pending prefetch work for this file has completed.
   /// @p obj must already be owned by a @c std::shared_ptr.
-  ///
-  /// Metadata is a separate concern — see @c register_metadata.
   ///
   /// Returns an empty handle when the cache is dormant or no new prefetch
   /// work was scheduled; the file_entry is still recorded either way.
@@ -713,7 +696,6 @@ class prefetching_cache {
     /// entries for it — outliving the caller's datasource if necessary.
     std::shared_ptr<sirius_io_object> io_obj;
     size_t file_size{0};
-    std::shared_ptr<sirius_io_object_metadata> metadata;
     std::vector<std::shared_ptr<cache_entry>> entries;  ///< Sorted by offset.
 
     /// Per-file demand counter + insert stamp.  See @c file_demand for
