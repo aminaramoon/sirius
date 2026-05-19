@@ -71,6 +71,13 @@ struct task_creation_request {
   op::sirius_physical_operator* node;
 };
 
+/// Result of walking the get_next_task_hint chain to find the next operator to schedule.
+/// Carries both the producer to schedule and the requested cap on tasks to create.
+struct next_task_target {
+  op::sirius_physical_operator* node{nullptr};
+  std::size_t upto_n_task_requested{op::task_creation_hint::ALL_TASKS};
+};
+
 class task_creator {
  public:
   /**
@@ -160,7 +167,7 @@ class task_creator {
    * @return The operator node that should be scheduled next, or nullptr if no task should be
    * scheduled.
    */
-  op::sirius_physical_operator* get_operator_for_next_task(op::sirius_physical_operator* node);
+  next_task_target get_operator_for_next_task(op::sirius_physical_operator* node);
 
   /**
    * @brief Manager loop to consume task creation requests and dispatch to the thread pool.

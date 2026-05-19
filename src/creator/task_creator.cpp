@@ -144,18 +144,18 @@ void task_creator::reset(bool keep_parquet_metadata)
   _execution_context.reset();
 }
 
-op::sirius_physical_operator* task_creator::get_operator_for_next_task(
-  op::sirius_physical_operator* node)
+next_task_target task_creator::get_operator_for_next_task(op::sirius_physical_operator* node)
 {
-  if (node == nullptr) { return nullptr; }
+  if (node == nullptr) { return {}; }
 
   if (node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
     size_t operator_id             = node->get_operator_id();
     auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
     if (parquet_task_global_state->has_more_partitions()) {
-      return node;
+      // Iceberg has its own self-throttling partition loop; ALL keeps prior behavior.
+      return {node, op::task_creation_hint::ALL_TASKS};
     } else {
-      return nullptr;
+      return {};
     }
   }
   auto hint = node->get_next_task_hint();
@@ -166,22 +166,25 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
         "During get_operator_for_next_task Producer is nullptr for operator " + node->get_name());
     }
     // WSM TODO: how do we handle other ports that are not default?
-    return hint.value().producer;
+    return {hint.value().producer, hint.value().upto_n_task_requested};
   } else if (hint.has_value() &&
              hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
     auto* producer = hint.value().producer;
+    // A request of zero tasks means "don't create anything for me right now"
+    // (e.g. hash_join while the table is being built). Don't recurse upstream.
+    if (hint.value().upto_n_task_requested == 0) { return {}; }
     // DuckDB scan tasks create their own continuations internally, so the
     // task creator should never schedule additional scans from downstream.
     // (Parquet scans are fine — they use partition indices that self-limit.)
     if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
       auto& global_state = _scan_operator_global_state_map.at(producer->get_operator_id());
       if (global_state->is_source_drained() || !global_state->can_create_more_tasks()) {
-        return nullptr;
+        return {};
       }
     }
     return get_operator_for_next_task(producer);
   }
-  return nullptr;
+  return {};
 }
 
 void task_creator::stop()
@@ -236,12 +239,15 @@ void task_creator::manager_loop()
     auto node = request->node;
     if (node == nullptr) { continue; }
 
-    node = get_operator_for_next_task(node);
+    auto target = get_operator_for_next_task(node);
+    node        = target.node;
 
     if (node == nullptr) { continue; }
 
+    std::size_t upto_n_task_requested = target.upto_n_task_requested;
+
     // Dispatch the task creation work to the pool
-    _bounded_pool->dispatch(std::move(slot), [this, node]() mutable {
+    _bounded_pool->dispatch(std::move(slot), [this, node, upto_n_task_requested]() mutable {
       try {
         // Get what we need to create the task
         auto pipeline = node->get_pipeline();
@@ -345,13 +351,11 @@ void task_creator::manager_loop()
           _task_scheduler->schedule(std::move(task));
 
         } else {
-          // Create all possible tasks until all ports are empty
-          // TODO(amin) : do this based on the operator hint
-          // auto is_gpu_parquet_scan = node->type ==
-          // op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN; std::size_t count =
-          // is_gpu_parquet_scan ? 1 : std::numeric_limits<std::size_t>::max(); need to exhaust
-          // input batches until all ports are empty
-          while (!node->all_ports_empty()) {
+          // Create tasks until either all ports are empty or we hit the cap requested by the
+          // operator hint. upto_n_task_requested is the maximum number of tasks to create in this
+          // dispatch; ALL_TASKS means drain.
+          std::size_t tasks_created = 0;
+          while (tasks_created < upto_n_task_requested && !node->all_ports_empty()) {
             auto task_lock  = pipeline->get_task_creation_lock();
             auto input_data = node->get_next_task_input_data();
             auto* pipelineable_input =
@@ -373,6 +377,7 @@ void task_creator::manager_loop()
                                                             gpu_pipeline_task_global_state);
             task_lock.unlock();
             _task_scheduler->schedule(std::move(task));
+            ++tasks_created;
           }
         }
       } catch (const std::exception& e) {
