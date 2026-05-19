@@ -91,9 +91,9 @@ struct sirius_config {
 
   /// Pop ordering for the task_scheduler's pipeline-level task queue. See
   /// exec::queue_ordering for semantics. Defaults to FIFO (legacy behavior).
-  [[nodiscard]] exec::queue_ordering get_pipeline_task_queue_ordering() const noexcept
+  [[nodiscard]] exec::queue_ordering get_task_queue_ordering() const noexcept
   {
-    return _pipeline_task_queue_ordering;
+    return _task_queue_ordering;
   }
 
   [[nodiscard]] bool is_scan_caching_enabled() const noexcept
@@ -129,7 +129,7 @@ struct sirius_config {
   exec::downgrade_executor_config _downgrade_executor_config;
   op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
-  exec::queue_ordering _pipeline_task_queue_ordering{exec::queue_ordering::FIFO};
+  exec::queue_ordering _task_queue_ordering{exec::queue_ordering::FIFO};
 };
 
 }  // namespace sirius
