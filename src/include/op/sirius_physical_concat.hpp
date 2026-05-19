@@ -49,6 +49,12 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
+  //! Concat fans many upstream batches into one (or a small number of) output batches.
+  [[nodiscard]] TaskCountRelation upstream_to_downstream_relation() const override
+  {
+    return TaskCountRelation::FAN_IN;
+  }
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,

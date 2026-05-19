@@ -50,6 +50,22 @@ enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
 
 enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
 
+/// Structural relation between an operator's upstream task count and the count it produces for
+/// downstream. Used by task_creator's hint-propagation walk to decide whether a downstream
+/// operator's task-count request should be forwarded up the chain.
+///
+///   PASSTHROUGH: 1 upstream task -> 1 downstream task (filter, projection, scan).
+///                A downstream request of N requires N upstream tasks.
+///   FAN_IN:      many upstream tasks -> 1 downstream task (concat, ungrouped_agg sink,
+///                hash_join build). Upstream count typically >= downstream count; the operator's
+///                local barrier-derived default already encodes "many", so downstream requests are
+///                not promoted further.
+///   FAN_OUT:     1 upstream task -> many downstream tasks (partition). Upstream count typically
+///                <= downstream count; downstream requests are not promoted up.
+///   BARRIER:     upstream and downstream task counts are decoupled (e.g. the operator buffers
+///                everything before emitting). Downstream requests are ignored upward.
+enum class TaskCountRelation { PASSTHROUGH, FAN_IN, FAN_OUT, BARRIER };
+
 struct task_creation_hint {
   static constexpr std::size_t ALL_TASKS                      = std::numeric_limits<size_t>::max();
   static constexpr std::size_t PARTIAL_BARRIER_DEFAULT_TASKS  = 4;
@@ -492,6 +508,14 @@ class sirius_physical_operator {
 
   //! Get the next task hint
   virtual std::optional<task_creation_hint> get_next_task_hint();
+
+  //! Structural relation between this operator's upstream task count and the count it produces
+  //! for downstream. Defaults to PASSTHROUGH (1-in/1-out pipelineable). See TaskCountRelation for
+  //! the enum semantics.
+  [[nodiscard]] virtual TaskCountRelation upstream_to_downstream_relation() const
+  {
+    return TaskCountRelation::PASSTHROUGH;
+  }
 
   /// \brief check if there are more tasks to create
   /// \note not necessarily ready to create at the moment

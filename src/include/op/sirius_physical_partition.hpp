@@ -84,6 +84,12 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
+  //! Partition turns one input batch into N output partitions.
+  [[nodiscard]] TaskCountRelation upstream_to_downstream_relation() const override
+  {
+    return TaskCountRelation::FAN_OUT;
+  }
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   void set_num_partitions(int num_partitions);
