@@ -329,19 +329,23 @@ void uring_reactor::worker_loop()
       pending_host.push_back(std::move(hr));
   };
 
-  // Submit queued requests until the ring is full or pending is empty.
-  // SQE availability is checked first — this prevents calling acquire()
-  // when io_uring already holds all slots, which would deadlock since
-  // releasing those slots requires reap_cqes().  With the SQE check first,
-  // acquire() can only block when CUDA callbacks hold all slots; they release
-  // slots (and notify slot_pool) independently of the worker thread.
+  // Submit queued requests until the ring is full, the slot pool is exhausted,
+  // or pending is empty.  Uses try_acquire (non-blocking) so the worker never
+  // parks inside this lambda — pool-exhausted waiting happens in the main loop
+  // where the inflight count is visible and the correct park strategy can be
+  // chosen (reap CQEs if inflight > 0; slot_pool::acquire if inflight == 0).
   auto submit_pending = [&]() {
     int added = 0;
     while (!pending.empty() || !pending_host.empty()) {
-      io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-      if (!sqe) break;  // ring full — submit what we have and wait for CQEs
+      int si = _slot_pool.try_acquire();
+      if (si < 0) break;  // pool exhausted — let main loop decide how to wait
 
-      int si  = _slot_pool.acquire();  // blocks if pool is exhausted by CUDA callbacks
+      io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
+      if (!sqe) {
+        _slot_pool.release(si);
+        break;  // ring full — submit what we have and wait for CQEs
+      }
+
       auto& s = slots[si];
       if (!pending.empty()) {
         update_slot_device(pending.front(), s);
@@ -502,11 +506,12 @@ void uring_reactor::worker_loop()
   //
   // Park points:
   //  A) nothing to submit and no in-flight IO: wait on _wake_seq.
-  //     Covers truly idle (waiting for new work) and shutdown while CUDA
-  //     callbacks are still outstanding (_copying_count > 0).
-  //  B) in-flight IO: wait on io_uring_wait_cqe_timeout.
-  //     Pool exhaustion by CUDA callbacks is handled inside submit_pending
-  //     via slot_pool::acquire(), which parks until cuda_copy_cb fires.
+  //     Covers truly idle (new work) and shutdown draining CUDA callbacks.
+  //  B) in-flight IO: wait on io_uring_wait_cqe_timeout; reap releases slots.
+  //  C) inflight == 0 but pool exhausted (all slots in CUDA callbacks):
+  //     slot_pool::acquire() parks until cuda_copy_cb calls release().
+  //     Safe because inflight == 0 means no io_uring op holds a slot, so
+  //     acquire() cannot deadlock waiting for reap_cqes().
   // ---------------------------------------------------------------------------
   while (true) {
     if (!_stop.load(std::memory_order_acquire)) drain_queue();
@@ -542,6 +547,15 @@ void uring_reactor::worker_loop()
         break;
       }
       reap_cqes();
+      continue;
+    }
+
+    // Park C: inflight == 0, pending non-empty, pool exhausted by CUDA
+    // callbacks.  Acquire a slot to sleep until cuda_copy_cb fires, then
+    // release it immediately — submit_pending will claim it next iteration.
+    {
+      int si = _slot_pool.acquire();
+      _slot_pool.release(si);
     }
   }
 }
