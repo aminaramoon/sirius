@@ -231,6 +231,12 @@ struct device_read_req {
   /// deployments.  -1 means "don't switch" (single-GPU fast path).
   int device_id{-1};
   std::shared_ptr<request_context> ctx;
+  /// Optional caller-supplied pinned bounce buffer.  When non-null the
+  /// reactor reads the file into this buffer instead of allocating one of
+  /// its own managed bounce slots.  The buffer must be at least @c io_size
+  /// bytes, page-aligned (for O_DIRECT), and remain valid until the
+  /// completion handler fires (i.e. until @c ctx->chunk_done() is called).
+  uint8_t* bounce{nullptr};
 };
 
 /**

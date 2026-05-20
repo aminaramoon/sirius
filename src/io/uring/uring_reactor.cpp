@@ -115,6 +115,22 @@ void uring_reactor::cuda_copy_cb(cudaStream_t /*stream*/, cudaError_t status, vo
   arg->self->_wake_seq.notify_one();
 }
 
+// ---------------------------------------------------------------------------
+// byo_in_flight — state for one caller-supplied bounce-buffer device read
+// ---------------------------------------------------------------------------
+//
+// Heap-allocated by the worker when it dequeues a device_read_req whose
+// bounce field is non-null.  Lives until the io_uring read completes (and
+// any short-read retries finish).  Unlike managed-slot reads there is no
+// CUDA callback: cudaMemcpyAsync is fire-and-forget on the caller's stream
+// and chunk_done fires immediately after submission.  The caller's buffer
+// needs no recycling so no slot-like state machine is required.
+
+struct byo_in_flight {
+  device_read_req<int> req;
+  size_t bytes_read{0};
+};
+
 cudf::io::text::byte_range_info uring_reactor::align_to_physical(
   cudf::io::text::byte_range_info logical, size_t file_size)
 {
@@ -254,6 +270,11 @@ void uring_reactor::worker_loop()
                              std::string(strerror(-rc)));
 
   static constexpr uint64_t HOST_TAG = 1ULL << 63;
+  // BYO (caller-supplied bounce buffer) device reads are tagged with bit 62.
+  // Slot indices (0..NUM_CHUNKS-1) and heap pointers for HOST/BYO are
+  // distinguishable: slot indices never have bits 62/63 set, and Linux
+  // user-space heap pointers use at most 48 bits so bits 48-63 are zero.
+  static constexpr uint64_t BYO_TAG = 1ULL << 62;
 
   enum class slot_state : uint8_t { FREE, READING, COPYING };
   struct slot_info {
@@ -272,7 +293,7 @@ void uring_reactor::worker_loop()
     size_t bytes_read{0};
   };
   std::array<slot_info, NUM_CHUNKS> slots{};
-  std::deque<device_read_req_type> pending;
+  std::deque<device_read_req_type> pending;  // device reads (bounce==nullptr → slot, else BYO)
   std::deque<host_read_req_type> pending_host;
   int inflight = 0;
 
@@ -313,27 +334,40 @@ void uring_reactor::worker_loop()
   };
   auto submit_pending = [&]() {
     int added = 0;
-    // Device reads consume a bounce slot.
     while (!pending.empty()) {
-      int si = find_free();
-      if (si < 0) break;
+      auto& req         = pending.front();
       io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
       if (!sqe) break;
-      auto& req = pending.front();
-      // Bounce slots are pre-registered via io_uring_register_buffers, so
-      // submit through the fixed-buffer fast path — skips per-IO buffer
-      // pin/unmap overhead in the kernel.
-      io_uring_prep_read_fixed(sqe,
-                               req.handle,
-                               _bounce[si].buf,
-                               (unsigned)req.io_size,
-                               (unsigned long long)req.file_off,
-                               si);
-      io_uring_sqe_set_data64(sqe, (uint64_t)si);
-      slots[si].state      = slot_state::READING;
-      slots[si].bytes_read = 0;  // fresh request → reset retry accumulator
-      slots[si].req        = std::move(req);
-      pending.pop_front();
+      if (req.bounce != nullptr) {
+        // BYO: caller owns the bounce buffer — no managed slot needed.
+        // Use prep_read (not read_fixed): BYO buffers are not in the
+        // pre-registered iovec table.
+        auto* byo = new byo_in_flight{std::move(req)};
+        pending.pop_front();
+        io_uring_prep_read(sqe,
+                           byo->req.handle,
+                           byo->req.bounce,
+                           (unsigned)byo->req.io_size,
+                           (unsigned long long)byo->req.file_off);
+        io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(byo) | BYO_TAG);
+      } else {
+        // Managed-slot: consume a pre-registered bounce slot.
+        // Bounce slots are registered via io_uring_register_buffers, so use
+        // the fixed-buffer fast path — skips per-IO pin/unmap in the kernel.
+        int si = find_free();
+        if (si < 0) break;
+        io_uring_prep_read_fixed(sqe,
+                                 req.handle,
+                                 _bounce[si].buf,
+                                 (unsigned)req.io_size,
+                                 (unsigned long long)req.file_off,
+                                 si);
+        io_uring_sqe_set_data64(sqe, (uint64_t)si);
+        slots[si].state      = slot_state::READING;
+        slots[si].bytes_read = 0;  // fresh request → reset retry accumulator
+        slots[si].req        = std::move(req);
+        pending.pop_front();
+      }
       ++inflight;
       ++added;
     }
@@ -364,6 +398,8 @@ void uring_reactor::worker_loop()
 
       if (data & HOST_TAG) {
         // Host read completion.
+        // NOTE: HOST_TAG (bit 63) is checked first; BYO_TAG (bit 62) next.
+        // Slot indices (0..NUM_CHUNKS-1) have neither bit set.
         auto* hf = reinterpret_cast<host_in_flight*>(data & ~HOST_TAG);
         if (res < 0) {
           hf->req.ctx->chunk_failed(std::make_exception_ptr(
@@ -406,8 +442,80 @@ void uring_reactor::worker_loop()
         }
         hf->req.ctx->chunk_done();
         delete hf;
+      } else if (data & BYO_TAG) {
+        // BYO device read completion: caller supplied the bounce buffer.
+        auto* byo = reinterpret_cast<byo_in_flight*>(data & ~BYO_TAG);
+        if (res < 0) {
+          byo->req.ctx->chunk_failed(std::make_exception_ptr(
+            std::runtime_error("reactor BYO read: " + std::string(strerror(-res)))));
+          delete byo;
+          continue;
+        }
+        size_t rd = static_cast<size_t>(res);
+        byo->bytes_read += rd;
+        bool const fully_read = byo->bytes_read >= byo->req.io_size;
+        bool const eof        = (rd == 0);
+        if (!fully_read && !eof) {
+          io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
+          if (sqe) {
+            io_uring_prep_read(sqe,
+                               byo->req.handle,
+                               byo->req.bounce + byo->bytes_read,
+                               (unsigned)(byo->req.io_size - byo->bytes_read),
+                               (__u64)(byo->req.file_off + byo->bytes_read));
+            io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(byo) | BYO_TAG);
+            ++inflight;
+            need_resubmit = true;
+            spdlog::warn(
+              "uring_reactor: BYO short read, retrying tail. fd={} file_off={} "
+              "io_size={} bytes_read={} this_rd={}",
+              byo->req.handle,
+              byo->req.file_off,
+              byo->req.io_size,
+              byo->bytes_read,
+              rd);
+            continue;
+          }
+          spdlog::warn("uring_reactor: SQE exhausted on BYO short-read retry");
+        }
+        // BYO: no slot to recycle, so fire-and-forget the H2D copy and
+        // resolve the context immediately.  Async CUDA errors poison the
+        // caller's stream; they will observe them on the next stream sync.
+        size_t actual = byo->bytes_read > byo->req.data_off
+                          ? std::min(byo->req.data_size, byo->bytes_read - byo->req.data_off)
+                          : 0;
+        if (actual > 0 && !byo->req.ctx->failed.load(std::memory_order_relaxed)) {
+          if (byo->req.device_id >= 0) cudaSetDevice(byo->req.device_id);
+          cudaError_t cpy_err = cudaMemcpyAsync(byo->req.dst,
+                                                byo->req.bounce + byo->req.data_off,
+                                                actual,
+                                                cudaMemcpyHostToDevice,
+                                                byo->req.stream);
+          if (cpy_err != cudaSuccess) {
+            cudaGetLastError();
+            byo->req.ctx->chunk_failed(std::make_exception_ptr(
+              std::runtime_error(std::string("uring_reactor: BYO cudaMemcpyAsync failed: ") +
+                                 cudaGetErrorString(cpy_err))));
+            delete byo;
+            continue;
+          }
+        } else if (actual == 0) {
+          spdlog::warn(
+            "uring_reactor: BYO chunk completed with no H2D after retry. "
+            "fd={} file_off={} io_size={} data_off={} data_size={} bytes_read={} "
+            "ctx_failed={}",
+            byo->req.handle,
+            byo->req.file_off,
+            byo->req.io_size,
+            byo->req.data_off,
+            byo->req.data_size,
+            byo->bytes_read,
+            byo->req.ctx->failed.load(std::memory_order_relaxed));
+        }
+        byo->req.ctx->chunk_done();
+        delete byo;
       } else {
-        // Device read completion.
+        // Managed-slot device read completion.
         int si      = static_cast<int>(data);
         auto& sinfo = slots[si];
         auto& req   = sinfo.req;
