@@ -281,8 +281,12 @@ void uring_reactor::worker_loop()
     std::shared_ptr<request_context> ctx;
   };
   std::array<io_slot, NUM_CHUNKS> slots{};
+  // registered_bounce_buf is invariant per slot — set once here, never
+  // touched by update_slot_* again.
+  for (size_t i = 0; i < NUM_CHUNKS; ++i)
+    slots[i].registered_bounce_buf = _bounce[i].buf;
 
-  auto update_slot_device = [](device_read_req_type const& req, io_slot& s, void* bounce_buf) {
+  auto update_slot_device = [](device_read_req_type const& req, io_slot& s) {
     s.fd              = req.handle;
     s.io_offset       = req.file_off;
     s.io_size         = req.io_size;
@@ -293,31 +297,23 @@ void uring_reactor::worker_loop()
     s.device_id       = req.device_id;
     s.ctx             = req.ctx;
     s.bytes_read      = 0;
-    if (req.bounce != nullptr) {
-      s.user_host_buf         = req.bounce;
-      s.registered_bounce_buf = nullptr;
-      s.is_registered         = false;
-    } else {
-      s.user_host_buf         = nullptr;
-      s.registered_bounce_buf = bounce_buf;
-      s.is_registered         = true;
-    }
+    s.user_host_buf   = req.bounce;           // nullptr for managed, BYO buffer otherwise
+    s.is_registered   = (req.bounce == nullptr);
   };
 
   auto update_slot_host = [](host_read_req_type const& req, io_slot& s) {
-    s.fd                    = req.handle;
-    s.io_offset             = req.offset;
-    s.io_size               = req.size;
-    s.user_offset           = 0;
-    s.user_size             = req.size;
-    s.destination_buf       = nullptr;
-    s.user_host_buf         = req.dst;
-    s.registered_bounce_buf = nullptr;
-    s.is_registered         = false;
-    s.stream                = nullptr;
-    s.device_id             = -1;
-    s.ctx                   = req.ctx;
-    s.bytes_read            = 0;
+    s.fd              = req.handle;
+    s.io_offset       = req.offset;
+    s.io_size         = req.size;
+    s.user_offset     = 0;
+    s.user_size       = req.size;
+    s.destination_buf = nullptr;
+    s.user_host_buf   = req.dst;
+    s.is_registered   = false;
+    s.stream          = nullptr;
+    s.device_id       = -1;
+    s.ctx             = req.ctx;
+    s.bytes_read      = 0;
   };
 
   std::deque<device_read_req_type> pending;
@@ -349,7 +345,7 @@ void uring_reactor::worker_loop()
 
       auto& s = slots[si];
       if (!pending.empty()) {
-        update_slot_device(pending.front(), s, _bounce[si].buf);
+        update_slot_device(pending.front(), s);
         pending.pop_front();
       } else {
         update_slot_host(pending_host.front(), s);
