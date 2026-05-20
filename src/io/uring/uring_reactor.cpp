@@ -27,7 +27,6 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
-#include <ranges>
 #include <stdexcept>
 
 namespace sirius::io {
@@ -77,7 +76,7 @@ uring_reactor::uring_reactor(cucascade::memory::fixed_size_host_memory_resource&
   }
   for (int i = 0; i < static_cast<int>(NUM_CHUNKS); ++i) {
     _bounce[i].buf = blocks[i];
-    _cb_args[i]    = {this, i};
+    _cb_args[i]    = {this, i, nullptr};
   }
 
   _worker = std::thread([this] { worker_loop(); });
@@ -103,33 +102,18 @@ void uring_reactor::shutdown()
 void uring_reactor::cuda_copy_cb(cudaStream_t /*stream*/, cudaError_t status, void* p) noexcept
 {
   auto* arg = static_cast<cb_arg*>(p);
-  // Write status BEFORE the release-store on cuda_done so a reader that
-  // observes cuda_done == true via acquire also observes this status.
-  arg->self->_bounce[arg->slot].cuda_status = status;
-  arg->self->_bounce[arg->slot].cuda_done.store(true, std::memory_order_release);
-  // Bump the unified wake atomic — the same one queue enqueues and
-  // interrupt() bump.  The reactor's single park point on _wake_seq wakes
-  // on any event, so a stalled CUDA callback no longer blocks the reactor
-  // from observing new host reads or shutdown.
+  if (status != cudaSuccess) {
+    arg->ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+      std::string("uring_reactor: H2D copy failed: ") + cudaGetErrorString(status))));
+  } else {
+    arg->ctx->chunk_done();
+  }
+  arg->ctx.reset();
+  arg->self->_copying_count.fetch_sub(1, std::memory_order_release);
+  arg->self->_slot_pool.release(arg->slot);
   arg->self->_wake_seq.fetch_add(1, std::memory_order_release);
   arg->self->_wake_seq.notify_one();
 }
-
-// ---------------------------------------------------------------------------
-// byo_in_flight — state for one caller-supplied bounce-buffer device read
-// ---------------------------------------------------------------------------
-//
-// Heap-allocated by the worker when it dequeues a device_read_req whose
-// bounce field is non-null.  Lives until the io_uring read completes (and
-// any short-read retries finish).  Unlike managed-slot reads there is no
-// CUDA callback: cudaMemcpyAsync is fire-and-forget on the caller's stream
-// and chunk_done fires immediately after submission.  The caller's buffer
-// needs no recycling so no slot-like state machine is required.
-
-struct byo_in_flight {
-  device_read_req<int> req;
-  size_t bytes_read{0};
-};
 
 cudf::io::text::byte_range_info uring_reactor::align_to_physical(
   cudf::io::text::byte_range_info logical, size_t file_size)
@@ -239,10 +223,7 @@ void uring_reactor::worker_loop()
 #if defined(IORING_SETUP_SINGLE_ISSUER) && defined(IORING_SETUP_DEFER_TASKRUN)
     auto r                   = std::make_unique<io_uring>();
     struct io_uring_params p = {0};
-    // Disable kernel locks (assuming 1 thread per ring)
     p.flags |= IORING_SETUP_SINGLE_ISSUER;
-
-    // Keep completions on the current CPU, avoid cache thrashing
     p.flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN;
     int rc = io_uring_queue_init_params(_ring_entries, r.get(), &p);
     if (rc == 0) {
@@ -262,68 +243,30 @@ void uring_reactor::worker_loop()
     return unique_ring{r2.release()};
   }();
 
-  std::array<iovec, NUM_CHUNKS> iovecs{};
-  for (size_t i = 0; i < NUM_CHUNKS; ++i)
-    iovecs[i] = {_bounce[i].buf, _bounce_slot_size};
-  if (int rc = io_uring_register_buffers(ring.get(), iovecs.data(), NUM_CHUNKS); rc < 0)
-    throw std::runtime_error("uring_device_reactor: io_uring_register_buffers: " +
-                             std::string(strerror(-rc)));
-
-  static constexpr uint64_t HOST_TAG = 1ULL << 63;
-  // BYO (caller-supplied bounce buffer) device reads are tagged with bit 62.
-  // Slot indices (0..NUM_CHUNKS-1) and heap pointers for HOST/BYO are
-  // distinguishable: slot indices never have bits 62/63 set, and Linux
-  // user-space heap pointers use at most 48 bits so bits 48-63 are zero.
-  static constexpr uint64_t BYO_TAG = 1ULL << 62;
-
-  enum class slot_state : uint8_t { FREE, READING, COPYING };
+  // ---------------------------------------------------------------------------
+  // Per-slot state — covers all three request kinds (host, BYO device,
+  // managed device).  The slot pool is the single source of truth for
+  // free/in-use status; slots[] is a parallel array of per-slot payloads.
+  //
+  // host        : read goes directly into host_req.dst; slot released on CQE.
+  // device_byo  : read into dev_req.bounce (caller-supplied); fire H2D async
+  //               + chunk_done(); release slot immediately.
+  // device_managed: read into _bounce[si].buf; fire H2D async + register
+  //               cuda_copy_cb; callback calls chunk_done() + releases slot.
+  // ---------------------------------------------------------------------------
+  enum class slot_kind : uint8_t { host, device_byo, device_managed };
   struct slot_info {
-    slot_state state{slot_state::FREE};
-    device_read_req_type req{};
-    // Cumulative bytes read for the current request across short-read retries.
-    // Reset to 0 on slot acquisition; on each completion we add `cqe->res` and
-    // either re-submit the remainder or proceed to the H2D path.
-    size_t bytes_read{0};
-  };
-  // Heap-allocated wrapper for in-flight host reads. Mirrors the device
-  // slot's bytes_read tracking so we can retry short reads at the same
-  // user_data identity across multiple SQE submissions.
-  struct host_in_flight {
-    host_read_req_type req;
+    slot_kind kind{slot_kind::host};
+    device_read_req_type dev_req{};
+    host_read_req_type host_req{};
     size_t bytes_read{0};
   };
   std::array<slot_info, NUM_CHUNKS> slots{};
-  std::deque<device_read_req_type> pending;  // device reads (bounce==nullptr → slot, else BYO)
+
+  std::deque<device_read_req_type> pending;
   std::deque<host_read_req_type> pending_host;
   int inflight = 0;
 
-  auto find_free = [&]() -> int {
-    auto it = std::ranges::find_if(slots, [](auto& s) { return s.state == slot_state::FREE; });
-    return it != slots.end() ? static_cast<int>(it - slots.begin()) : -1;
-  };
-  auto has_active = [&]() {
-    return inflight > 0 || !pending.empty() || !pending_host.empty() ||
-           std::ranges::any_of(slots, [](auto& s) { return s.state == slot_state::COPYING; });
-  };
-  auto poll_cuda = [&]() {
-    for (auto i : std::views::iota(size_t{0}, NUM_CHUNKS)) {
-      if (slots[i].state == slot_state::COPYING &&
-          _bounce[i].cuda_done.load(std::memory_order_acquire)) {
-        // cuda_copy_cb stored the stream's status at callback time, before
-        // the release-store on cuda_done.  Read it directly — this is the
-        // state of the stream when our copy finished, not the current state
-        // (which may also include later work the consumer queued).
-        cudaError_t err = _bounce[i].cuda_status;
-        if (err != cudaSuccess) {
-          slots[i].req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
-            std::string("uring_reactor: H2D copy failed: ") + cudaGetErrorString(err))));
-        } else {
-          slots[i].req.ctx->chunk_done();
-        }
-        slots[i] = slot_info{};
-      }
-    }
-  };
   auto drain_queue = [&]() {
     device_read_req_type r;
     while (_queue.try_dequeue(r))
@@ -332,313 +275,251 @@ void uring_reactor::worker_loop()
     while (_host_queue.try_dequeue(hr))
       pending_host.push_back(std::move(hr));
   };
+
+  // Submit as many queued requests as possible — up to the available ring
+  // SQEs and slot_pool capacity (both bounded by NUM_CHUNKS).
   auto submit_pending = [&]() {
     int added = 0;
-    while (!pending.empty()) {
-      auto& req         = pending.front();
+    while (!pending.empty() || !pending_host.empty()) {
+      int si = _slot_pool.try_acquire();
+      if (si < 0) break;  // pool exhausted — wait for completions
+
       io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-      if (!sqe) break;
-      if (req.bounce != nullptr) {
-        // BYO: caller owns the bounce buffer — no managed slot needed.
-        // Use prep_read (not read_fixed): BYO buffers are not in the
-        // pre-registered iovec table.
-        auto* byo = new byo_in_flight{std::move(req)};
-        pending.pop_front();
-        io_uring_prep_read(sqe,
-                           byo->req.handle,
-                           byo->req.bounce,
-                           (unsigned)byo->req.io_size,
-                           (unsigned long long)byo->req.file_off);
-        io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(byo) | BYO_TAG);
-      } else {
-        // Managed-slot: consume a pre-registered bounce slot.
-        // Bounce slots are registered via io_uring_register_buffers, so use
-        // the fixed-buffer fast path — skips per-IO pin/unmap in the kernel.
-        int si = find_free();
-        if (si < 0) break;
-        io_uring_prep_read_fixed(sqe,
-                                 req.handle,
-                                 _bounce[si].buf,
-                                 (unsigned)req.io_size,
-                                 (unsigned long long)req.file_off,
-                                 si);
-        io_uring_sqe_set_data64(sqe, (uint64_t)si);
-        slots[si].state      = slot_state::READING;
-        slots[si].bytes_read = 0;  // fresh request → reset retry accumulator
-        slots[si].req        = std::move(req);
-        pending.pop_front();
+      if (!sqe) {
+        _slot_pool.release(si);
+        break;  // ring full — submit what we have and wait for CQEs
       }
-      ++inflight;
-      ++added;
-    }
-    // Host reads: heap-allocate a host_in_flight wrapper so we can carry
-    // cumulative bytes across short-read retries via the same user_data tag.
-    while (!pending_host.empty()) {
-      io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-      if (!sqe) break;
-      auto* hf = new host_in_flight{std::move(pending_host.front()), 0};
-      pending_host.pop_front();
-      io_uring_prep_read(
-        sqe, hf->req.handle, hf->req.dst, (unsigned)hf->req.size, (__u64)hf->req.offset);
-      io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(hf) | HOST_TAG);
+
+      slots[si].bytes_read = 0;
+
+      if (!pending.empty()) {
+        auto req = std::move(pending.front());
+        pending.pop_front();
+        slots[si].dev_req = std::move(req);
+
+        if (slots[si].dev_req.bounce != nullptr) {
+          slots[si].kind = slot_kind::device_byo;
+          io_uring_prep_read(sqe,
+                             slots[si].dev_req.handle,
+                             slots[si].dev_req.bounce,
+                             static_cast<unsigned>(slots[si].dev_req.io_size),
+                             static_cast<unsigned long long>(slots[si].dev_req.file_off));
+        } else {
+          slots[si].kind = slot_kind::device_managed;
+          io_uring_prep_read(sqe,
+                             slots[si].dev_req.handle,
+                             _bounce[si].buf,
+                             static_cast<unsigned>(slots[si].dev_req.io_size),
+                             static_cast<unsigned long long>(slots[si].dev_req.file_off));
+        }
+      } else {
+        auto req = std::move(pending_host.front());
+        pending_host.pop_front();
+        slots[si].kind     = slot_kind::host;
+        slots[si].host_req = std::move(req);
+        io_uring_prep_read(sqe,
+                           slots[si].host_req.handle,
+                           slots[si].host_req.dst,
+                           static_cast<unsigned>(slots[si].host_req.size),
+                           static_cast<__u64>(slots[si].host_req.offset));
+      }
+
+      io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(si));
       ++inflight;
       ++added;
     }
     if (added > 0) io_uring_submit(ring.get());
   };
+
   auto reap_cqes = [&]() {
     io_uring_cqe* cqes[NUM_CHUNKS];
     unsigned n         = io_uring_peek_batch_cqe(ring.get(), cqes, NUM_CHUNKS);
-    bool need_resubmit = false;  // any retry SQE prepared in this pass?
+    bool need_resubmit = false;
     for (auto* cqe : std::span{cqes, n}) {
-      uint64_t data = io_uring_cqe_get_data64(cqe);
-      int res       = cqe->res;
+      int si  = static_cast<int>(io_uring_cqe_get_data64(cqe));
+      int res = cqe->res;
       io_uring_cqe_seen(ring.get(), cqe);
       --inflight;
 
-      if (data & HOST_TAG) {
-        // Host read completion.
-        // NOTE: HOST_TAG (bit 63) is checked first; BYO_TAG (bit 62) next.
-        // Slot indices (0..NUM_CHUNKS-1) have neither bit set.
-        auto* hf = reinterpret_cast<host_in_flight*>(data & ~HOST_TAG);
-        if (res < 0) {
-          hf->req.ctx->chunk_failed(std::make_exception_ptr(
-            std::runtime_error("reactor host read: " + std::string(strerror(-res)))));
-          delete hf;
-          continue;
-        }
-        size_t rd = static_cast<size_t>(res);
-        hf->bytes_read += rd;
-        bool const fully_read = hf->bytes_read >= hf->req.size;
-        bool const eof        = (rd == 0);
-        if (!fully_read && !eof) {
-          // Short read mid-file: queue a follow-up SQE for the unread tail.
-          // We reuse the same host_in_flight identity so subsequent CQEs
-          // continue to accumulate bytes_read against this request.
-          io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-          if (sqe) {
+      auto& s = slots[si];
+
+      if (res < 0) {
+        auto e = std::make_exception_ptr(std::runtime_error(strerror(-res)));
+        if (s.kind == slot_kind::host)
+          s.host_req.ctx->chunk_failed(e);
+        else
+          s.dev_req.ctx->chunk_failed(e);
+        s = {};
+        _slot_pool.release(si);
+        continue;
+      }
+
+      size_t rd = static_cast<size_t>(res);
+      s.bytes_read += rd;
+
+      size_t const expected = (s.kind == slot_kind::host) ? s.host_req.size : s.dev_req.io_size;
+      bool const fully_read = s.bytes_read >= expected;
+      bool const eof        = (rd == 0);
+
+      if (!fully_read && !eof) {
+        io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
+        if (sqe) {
+          // Retry the unread tail into the same buffer at the next-byte offset.
+          if (s.kind == slot_kind::host) {
             io_uring_prep_read(sqe,
-                               hf->req.handle,
-                               hf->req.dst + hf->bytes_read,
-                               (unsigned)(hf->req.size - hf->bytes_read),
-                               (__u64)(hf->req.offset + hf->bytes_read));
-            io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(hf) | HOST_TAG);
-            ++inflight;
-            need_resubmit = true;
+                               s.host_req.handle,
+                               s.host_req.dst + s.bytes_read,
+                               static_cast<unsigned>(s.host_req.size - s.bytes_read),
+                               static_cast<__u64>(s.host_req.offset + s.bytes_read));
             spdlog::warn(
-              "uring_reactor: host short read, retrying tail. fd={} offset={} size={} "
+              "uring_reactor: host short read, retrying. fd={} offset={} size={} "
               "bytes_read={} this_rd={}",
-              hf->req.handle,
-              hf->req.offset,
-              hf->req.size,
-              hf->bytes_read,
+              s.host_req.handle,
+              s.host_req.offset,
+              s.host_req.size,
+              s.bytes_read,
               rd);
-            continue;
-          }
-          // SQE exhaustion is unexpected (we have _ring_entries SQEs and
-          // never more than NUM_CHUNKS in flight); fall through and complete
-          // with whatever we have rather than spin.
-          spdlog::warn("uring_reactor: SQE exhausted on host short-read retry");
-        }
-        hf->req.ctx->chunk_done();
-        delete hf;
-      } else if (data & BYO_TAG) {
-        // BYO device read completion: caller supplied the bounce buffer.
-        auto* byo = reinterpret_cast<byo_in_flight*>(data & ~BYO_TAG);
-        if (res < 0) {
-          byo->req.ctx->chunk_failed(std::make_exception_ptr(
-            std::runtime_error("reactor BYO read: " + std::string(strerror(-res)))));
-          delete byo;
-          continue;
-        }
-        size_t rd = static_cast<size_t>(res);
-        byo->bytes_read += rd;
-        bool const fully_read = byo->bytes_read >= byo->req.io_size;
-        bool const eof        = (rd == 0);
-        if (!fully_read && !eof) {
-          io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-          if (sqe) {
+          } else if (s.kind == slot_kind::device_byo) {
             io_uring_prep_read(sqe,
-                               byo->req.handle,
-                               byo->req.bounce + byo->bytes_read,
-                               (unsigned)(byo->req.io_size - byo->bytes_read),
-                               (__u64)(byo->req.file_off + byo->bytes_read));
-            io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(byo) | BYO_TAG);
-            ++inflight;
-            need_resubmit = true;
+                               s.dev_req.handle,
+                               s.dev_req.bounce + s.bytes_read,
+                               static_cast<unsigned>(s.dev_req.io_size - s.bytes_read),
+                               static_cast<__u64>(s.dev_req.file_off + s.bytes_read));
             spdlog::warn(
-              "uring_reactor: BYO short read, retrying tail. fd={} file_off={} "
-              "io_size={} bytes_read={} this_rd={}",
-              byo->req.handle,
-              byo->req.file_off,
-              byo->req.io_size,
-              byo->bytes_read,
+              "uring_reactor: BYO short read, retrying. fd={} file_off={} io_size={} "
+              "bytes_read={} this_rd={}",
+              s.dev_req.handle,
+              s.dev_req.file_off,
+              s.dev_req.io_size,
+              s.bytes_read,
               rd);
-            continue;
-          }
-          spdlog::warn("uring_reactor: SQE exhausted on BYO short-read retry");
-        }
-        // BYO: no slot to recycle, so fire-and-forget the H2D copy and
-        // resolve the context immediately.  Async CUDA errors poison the
-        // caller's stream; they will observe them on the next stream sync.
-        size_t actual = byo->bytes_read > byo->req.data_off
-                          ? std::min(byo->req.data_size, byo->bytes_read - byo->req.data_off)
-                          : 0;
-        if (actual > 0 && !byo->req.ctx->failed.load(std::memory_order_relaxed)) {
-          if (byo->req.device_id >= 0) cudaSetDevice(byo->req.device_id);
-          cudaError_t cpy_err = cudaMemcpyAsync(byo->req.dst,
-                                                byo->req.bounce + byo->req.data_off,
-                                                actual,
-                                                cudaMemcpyHostToDevice,
-                                                byo->req.stream);
-          if (cpy_err != cudaSuccess) {
-            cudaGetLastError();
-            byo->req.ctx->chunk_failed(std::make_exception_ptr(
-              std::runtime_error(std::string("uring_reactor: BYO cudaMemcpyAsync failed: ") +
-                                 cudaGetErrorString(cpy_err))));
-            delete byo;
-            continue;
-          }
-        } else if (actual == 0) {
-          spdlog::warn(
-            "uring_reactor: BYO chunk completed with no H2D after retry. "
-            "fd={} file_off={} io_size={} data_off={} data_size={} bytes_read={} "
-            "ctx_failed={}",
-            byo->req.handle,
-            byo->req.file_off,
-            byo->req.io_size,
-            byo->req.data_off,
-            byo->req.data_size,
-            byo->bytes_read,
-            byo->req.ctx->failed.load(std::memory_order_relaxed));
-        }
-        byo->req.ctx->chunk_done();
-        delete byo;
-      } else {
-        // Managed-slot device read completion.
-        int si      = static_cast<int>(data);
-        auto& sinfo = slots[si];
-        auto& req   = sinfo.req;
-        if (res < 0) {
-          req.ctx->chunk_failed(std::make_exception_ptr(
-            std::runtime_error("reactor read: " + std::string(strerror(-res)))));
-          sinfo = slot_info{};
-          continue;
-        }
-        size_t rd = static_cast<size_t>(res);
-        sinfo.bytes_read += rd;
-        bool const fully_read = sinfo.bytes_read >= req.io_size;
-        bool const eof        = (rd == 0);
-        if (!fully_read && !eof) {
-          // Short read mid-file: queue a follow-up SQE for the unread tail
-          // into the same bounce slot at the next-byte offset. The slot
-          // stays in READING; once we get the full io_size (or EOF), we
-          // proceed to the H2D path below using sinfo.bytes_read.
-          io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-          if (sqe) {
-            io_uring_prep_read_fixed(sqe,
-                                     req.handle,
-                                     (uint8_t*)_bounce[si].buf + sinfo.bytes_read,
-                                     (unsigned)(req.io_size - sinfo.bytes_read),
-                                     (__u64)(req.file_off + sinfo.bytes_read),
-                                     si);
-            io_uring_sqe_set_data64(sqe, (uint64_t)si);
-            ++inflight;
-            need_resubmit = true;
+          } else {
+            io_uring_prep_read(sqe,
+                               s.dev_req.handle,
+                               static_cast<uint8_t*>(_bounce[si].buf) + s.bytes_read,
+                               static_cast<unsigned>(s.dev_req.io_size - s.bytes_read),
+                               static_cast<__u64>(s.dev_req.file_off + s.bytes_read));
             spdlog::warn(
-              "uring_reactor: device short read, retrying tail. slot={} file_off={} "
-              "io_size={} bytes_read={} this_rd={}",
+              "uring_reactor: device short read, retrying. slot={} file_off={} io_size={} "
+              "bytes_read={} this_rd={}",
               si,
-              req.file_off,
-              req.io_size,
-              sinfo.bytes_read,
+              s.dev_req.file_off,
+              s.dev_req.io_size,
+              s.bytes_read,
               rd);
-            continue;
           }
-          spdlog::warn("uring_reactor: SQE exhausted on device short-read retry");
+          io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(si));
+          ++inflight;
+          need_resubmit = true;
+          continue;  // slot still in use
         }
-        // Fully read or true EOF: compute user-visible bytes from the
-        // accumulated bytes_read, not just this CQE's `rd`.
-        size_t actual = sinfo.bytes_read > req.data_off
-                          ? std::min(req.data_size, sinfo.bytes_read - req.data_off)
-                          : 0;
-        if (actual > 0 && !req.ctx->failed.load(std::memory_order_relaxed)) {
-          _bounce[si].cuda_done.store(false, std::memory_order_relaxed);
-          _bounce[si].cuda_status = cudaSuccess;
-          if (req.device_id >= 0) cudaSetDevice(req.device_id);
-          cudaError_t cpy_err = cudaMemcpyAsync(req.dst,
-                                                (uint8_t*)_bounce[si].buf + req.data_off,
-                                                actual,
-                                                cudaMemcpyHostToDevice,
-                                                req.stream);
-          if (cpy_err != cudaSuccess) {
-            // Synchronous failure (e.g., invalid pointer / context).  Drain
-            // the sticky error so unrelated runtime calls don't observe it,
-            // fail the slot, and skip the callback registration — there's
-            // no stream work to attach a callback to.
-            cudaGetLastError();
-            req.ctx->chunk_failed(std::make_exception_ptr(
-              std::runtime_error(std::string("uring_reactor: cudaMemcpyAsync failed: ") +
-                                 cudaGetErrorString(cpy_err))));
-            sinfo = slot_info{};
-            continue;
-          }
-          // cudaStreamAddCallback (deprecated but used deliberately): unlike
-          // cudaLaunchHostFunc, the callback fires even if the stream is in
-          // an error state — guaranteeing we never strand the slot in
-          // COPYING waiting for a callback that won't come.
-          cudaStreamAddCallback(req.stream, cuda_copy_cb, &_cb_args[si], 0);
-          sinfo.state = slot_state::COPYING;
-        } else {
-          // After retry-to-completion this only fires when the file truly
-          // ends inside the alignment prefix (actual == 0) or when another
-          // chunk of the same request already failed. The handler still
-          // resolves with total_bytes, so anything in `req.dst` past what
-          // we could read is left untouched — log so it surfaces.
+        spdlog::warn("uring_reactor: SQE exhausted on short-read retry, slot={}", si);
+        // Fall through and complete with whatever was read.
+      }
+
+      // --- Complete the request ------------------------------------------
+
+      if (s.kind == slot_kind::host) {
+        s.host_req.ctx->chunk_done();
+        s = {};
+        _slot_pool.release(si);
+        continue;
+      }
+
+      // Device read (BYO or managed): compute user-visible bytes from the
+      // accumulated bytes_read after all retries.
+      auto& req = s.dev_req;
+      size_t actual =
+        s.bytes_read > req.data_off ? std::min(req.data_size, s.bytes_read - req.data_off) : 0;
+
+      void* src_buf = (s.kind == slot_kind::device_byo)
+                        ? static_cast<void*>(req.bounce + req.data_off)
+                        : static_cast<void*>(static_cast<uint8_t*>(_bounce[si].buf) + req.data_off);
+
+      if (actual == 0 || req.ctx->failed.load(std::memory_order_relaxed)) {
+        if (actual == 0)
           spdlog::warn(
-            "uring_reactor: chunk completed with no H2D after retry. "
-            "slot={} file_off={} io_size={} data_off={} data_size={} bytes_read={} actual={} "
-            "ctx_failed={}",
+            "uring_reactor: chunk completed with no H2D. slot={} file_off={} io_size={} "
+            "data_off={} data_size={} bytes_read={} ctx_failed={}",
             si,
             req.file_off,
             req.io_size,
             req.data_off,
             req.data_size,
-            sinfo.bytes_read,
-            actual,
+            s.bytes_read,
             req.ctx->failed.load(std::memory_order_relaxed));
-          req.ctx->chunk_done();
-          sinfo = slot_info{};
-        }
+        req.ctx->chunk_done();
+        s = {};
+        _slot_pool.release(si);
+        continue;
+      }
+
+      if (req.device_id >= 0) cudaSetDevice(req.device_id);
+      cudaError_t cpy_err =
+        cudaMemcpyAsync(req.dst, src_buf, actual, cudaMemcpyHostToDevice, req.stream);
+      if (cpy_err != cudaSuccess) {
+        cudaGetLastError();
+        req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+          std::string("uring_reactor: cudaMemcpyAsync failed: ") + cudaGetErrorString(cpy_err))));
+        s = {};
+        _slot_pool.release(si);
+        continue;
+      }
+
+      if (s.kind == slot_kind::device_byo) {
+        // Fire-and-forget: the caller owns the bounce buffer and the stream.
+        // chunk_done fires immediately so the request_context can complete
+        // once all chunks are done.  CUDA errors poison the caller's stream
+        // and will surface on the next stream-sync.
+        req.ctx->chunk_done();
+        s = {};
+        _slot_pool.release(si);
+      } else {
+        // Managed slot: the callback owns the slot until the H2D copy
+        // completes.  Stash the ctx in cb_arg so the callback can resolve it,
+        // then register — cudaStreamAddCallback fires even if the stream is
+        // already in an error state.
+        _cb_args[si].ctx = req.ctx;
+        s                = {};
+        _copying_count.fetch_add(1, std::memory_order_relaxed);
+        cudaStreamAddCallback(req.stream, cuda_copy_cb, &_cb_args[si], 0);
+        // Slot released in cuda_copy_cb; do NOT call _slot_pool.release here.
       }
     }
     if (need_resubmit) io_uring_submit(ring.get());
   };
 
-  // Single park atomic: _wake_seq is bumped by every event source —
-  // queue enqueues, interrupt(), and cuda_copy_cb.  CQE delivery is the
-  // only exception: those are signalled by the kernel directly, so we
-  // wait on io_uring_wait_cqe_timeout when (and only when) there is
-  // in-flight IO that can produce one.
-  auto any_copying = [&]() {
-    return std::ranges::any_of(slots, [](auto& s) { return s.state == slot_state::COPYING; });
-  };
-
+  // ---------------------------------------------------------------------------
+  // Main loop
+  //
+  // Park points:
+  //  A) truly idle (nothing queued, no in-flight IO, no pending CUDA copies):
+  //     wait on _wake_seq — bumped by enqueue_bulk / interrupt / cuda_copy_cb.
+  //  B) pending items but pool exhausted (all slots in CUDA callback):
+  //     wait on _wake_seq — cuda_copy_cb bumps it when a slot is released.
+  //  C) in-flight IO: wait on io_uring_wait_cqe_timeout.
+  // ---------------------------------------------------------------------------
   while (true) {
     drain_queue();
-    poll_cuda();  // retire COPYING slots whose callback has fired
 
-    if (_stop.load(std::memory_order_acquire)) break;
+    if (_stop.load(std::memory_order_acquire)) {
+      // Drain any remaining CUDA callbacks before destroying reactor members.
+      while (_copying_count.load(std::memory_order_acquire) > 0) {
+        uint64_t seq = _wake_seq.load(std::memory_order_acquire);
+        if (_copying_count.load(std::memory_order_acquire) == 0) break;
+        _wake_seq.wait(seq, std::memory_order_relaxed);
+      }
+      break;
+    }
 
-    bool work_to_submit = !pending.empty() || !pending_host.empty();
+    bool const have_work = !pending.empty() || !pending_host.empty();
 
-    if (!work_to_submit && inflight == 0 && !any_copying()) {
-      // Fully idle.  Park on _wake_seq with the standard race-guard:
-      // load the seq, re-drain, and only park if still idle.
+    if (!have_work && inflight == 0 && _copying_count.load(std::memory_order_acquire) == 0) {
+      // Park A: truly idle.
       uint64_t seq = _wake_seq.load(std::memory_order_acquire);
       drain_queue();
-      poll_cuda();
-      if (pending.empty() && pending_host.empty() && inflight == 0 && !any_copying() &&
+      if (pending.empty() && pending_host.empty() && inflight == 0 &&
+          _copying_count.load(std::memory_order_acquire) == 0 &&
           !_stop.load(std::memory_order_acquire)) {
         _wake_seq.wait(seq, std::memory_order_relaxed);
       }
@@ -649,10 +530,10 @@ void uring_reactor::worker_loop()
 
     if (inflight > 0) {
       io_uring_cqe* tmp = nullptr;
-      // Bounded wait so the top-of-loop _stop check is reachable even
-      // when no CQE arrives.  SINGLE_ISSUER means we can't post a NOP
-      // SQE from interrupt() to unblock a plain wait_cqe; the timeout
-      // bounds shutdown latency to SHUTDOWN_POLL_MS instead.
+      // Bounded wait so the top-of-loop _stop check is reachable even when
+      // no CQE arrives.  SINGLE_ISSUER means we can't post a NOP SQE from
+      // interrupt() to unblock a plain wait_cqe; the timeout bounds shutdown
+      // latency to SHUTDOWN_POLL_MS.
       static constexpr long SHUTDOWN_POLL_MS = 100;
       __kernel_timespec ts{};
       ts.tv_sec  = SHUTDOWN_POLL_MS / 1000;
@@ -663,19 +544,18 @@ void uring_reactor::worker_loop()
         break;
       }
       reap_cqes();
-      continue;  // loop top: drain_queue + poll_cuda handle any state change
+      continue;
     }
 
-    // Here: nothing to submit, no in-flight IO, but has_active is true
-    // because of COPYING slots.  Park on _wake_seq until cuda_copy_cb
-    // (or new queue work / interrupt) bumps it.
+    // Park B: have pending work but pool is exhausted (all slots held by CUDA
+    // callbacks).  Wait for a callback to release a slot and bump _wake_seq.
     uint64_t seq = _wake_seq.load(std::memory_order_acquire);
-    poll_cuda();  // race-guard: a callback may have fired since the top
     drain_queue();
-    if (!pending.empty() || !pending_host.empty() || !any_copying() ||
-        _stop.load(std::memory_order_acquire))
-      continue;
-    _wake_seq.wait(seq, std::memory_order_relaxed);
+    if (!pending.empty() || !pending_host.empty()) {
+      if (!_slot_pool.any_free() && !_stop.load(std::memory_order_acquire)) {
+        _wake_seq.wait(seq, std::memory_order_relaxed);
+      }
+    }
   }
 }
 
