@@ -255,24 +255,70 @@ void uring_reactor::worker_loop()
                              std::string(strerror(-rc)));
 
   // ---------------------------------------------------------------------------
-  // Per-slot state — covers all three request kinds (host, BYO device,
-  // managed device).  The slot pool is the single source of truth for
-  // free/in-use status; slots[] is a parallel array of per-slot payloads.
+  // io_slot — flat per-slot state extracted from the incoming request.
   //
-  // host        : read goes directly into host_req.dst; slot released on CQE.
-  // device_byo  : read into dev_req.bounce (caller-supplied); fire H2D async
-  //               + chunk_done(); release slot immediately.
-  // device_managed: read into _bounce[si].buf; fire H2D async + register
-  //               cuda_copy_cb; callback calls chunk_done() + releases slot.
+  // Exactly one of registered_bounce_buf / user_host_buf is non-null:
+  //   registered_bounce_buf  non-null → managed device read (prep_read_fixed)
+  //   user_host_buf          non-null → host read or BYO device read (prep_read)
+  //
+  // destination_buf encodes the output kind:
+  //   nullptr  → host read (data lands in user_host_buf; no H2D copy needed)
+  //   non-null → device read (H2D copy required after disk IO completes)
   // ---------------------------------------------------------------------------
-  enum class slot_kind : uint8_t { host, device_byo, device_managed };
-  struct slot_info {
-    slot_kind kind{slot_kind::host};
-    device_read_req_type dev_req{};
-    host_read_req_type host_req{};
+  struct io_slot {
+    int fd{-1};
+    void* registered_bounce_buf{nullptr};
+    void* user_host_buf{nullptr};
+    size_t io_offset{0};
+    size_t io_size{0};
+    size_t user_offset{0};
+    size_t user_size{0};
+    void* destination_buf{nullptr};
+    bool is_registered{false};
+    cudaStream_t stream{nullptr};
+    int device_id{-1};
     size_t bytes_read{0};
+    std::shared_ptr<request_context> ctx;
   };
-  std::array<slot_info, NUM_CHUNKS> slots{};
+  std::array<io_slot, NUM_CHUNKS> slots{};
+
+  auto update_slot_device = [](device_read_req_type const& req, io_slot& s, void* bounce_buf) {
+    s.fd              = req.handle;
+    s.io_offset       = req.file_off;
+    s.io_size         = req.io_size;
+    s.user_offset     = req.data_off;
+    s.user_size       = req.data_size;
+    s.destination_buf = req.dst;
+    s.stream          = req.stream;
+    s.device_id       = req.device_id;
+    s.ctx             = req.ctx;
+    s.bytes_read      = 0;
+    if (req.bounce != nullptr) {
+      s.user_host_buf         = req.bounce;
+      s.registered_bounce_buf = nullptr;
+      s.is_registered         = false;
+    } else {
+      s.user_host_buf         = nullptr;
+      s.registered_bounce_buf = bounce_buf;
+      s.is_registered         = true;
+    }
+  };
+
+  auto update_slot_host = [](host_read_req_type const& req, io_slot& s) {
+    s.fd                    = req.handle;
+    s.io_offset             = req.offset;
+    s.io_size               = req.size;
+    s.user_offset           = 0;
+    s.user_size             = req.size;
+    s.destination_buf       = nullptr;
+    s.user_host_buf         = req.dst;
+    s.registered_bounce_buf = nullptr;
+    s.is_registered         = false;
+    s.stream                = nullptr;
+    s.device_id             = -1;
+    s.ctx                   = req.ctx;
+    s.bytes_read            = 0;
+  };
 
   std::deque<device_read_req_type> pending;
   std::deque<host_read_req_type> pending_host;
@@ -301,39 +347,28 @@ void uring_reactor::worker_loop()
         break;  // ring full — submit what we have and wait for CQEs
       }
 
-      slots[si].bytes_read = 0;
-
+      auto& s = slots[si];
       if (!pending.empty()) {
-        auto req = std::move(pending.front());
+        update_slot_device(pending.front(), s, _bounce[si].buf);
         pending.pop_front();
-        slots[si].dev_req = std::move(req);
-
-        if (slots[si].dev_req.bounce != nullptr) {
-          slots[si].kind = slot_kind::device_byo;
-          io_uring_prep_read(sqe,
-                             slots[si].dev_req.handle,
-                             slots[si].dev_req.bounce,
-                             static_cast<unsigned>(slots[si].dev_req.io_size),
-                             static_cast<unsigned long long>(slots[si].dev_req.file_off));
-        } else {
-          slots[si].kind = slot_kind::device_managed;
-          io_uring_prep_read_fixed(sqe,
-                                   slots[si].dev_req.handle,
-                                   _bounce[si].buf,
-                                   static_cast<unsigned>(slots[si].dev_req.io_size),
-                                   static_cast<unsigned long long>(slots[si].dev_req.file_off),
-                                   si);
-        }
       } else {
-        auto req = std::move(pending_host.front());
+        update_slot_host(pending_host.front(), s);
         pending_host.pop_front();
-        slots[si].kind     = slot_kind::host;
-        slots[si].host_req = std::move(req);
+      }
+
+      if (s.is_registered) {
+        io_uring_prep_read_fixed(sqe,
+                                 s.fd,
+                                 s.registered_bounce_buf,
+                                 static_cast<unsigned>(s.io_size),
+                                 static_cast<unsigned long long>(s.io_offset),
+                                 si);
+      } else {
         io_uring_prep_read(sqe,
-                           slots[si].host_req.handle,
-                           slots[si].host_req.dst,
-                           static_cast<unsigned>(slots[si].host_req.size),
-                           static_cast<__u64>(slots[si].host_req.offset));
+                           s.fd,
+                           s.user_host_buf,
+                           static_cast<unsigned>(s.io_size),
+                           static_cast<__u64>(s.io_offset));
       }
 
       io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(si));
@@ -344,10 +379,10 @@ void uring_reactor::worker_loop()
   };
 
   auto reap_cqes = [&]() {
-    io_uring_cqe* cqes[NUM_CHUNKS];
-    unsigned n         = io_uring_peek_batch_cqe(ring.get(), cqes, NUM_CHUNKS);
+    std::array<io_uring_cqe*, NUM_CHUNKS> cqes{};
+    unsigned n         = io_uring_peek_batch_cqe(ring.get(), cqes.data(), NUM_CHUNKS);
     bool need_resubmit = false;
-    for (auto* cqe : std::span{cqes, n}) {
+    for (auto* cqe : std::span{cqes.data(), n}) {
       int si  = static_cast<int>(io_uring_cqe_get_data64(cqe));
       int res = cqe->res;
       io_uring_cqe_seen(ring.get(), cqe);
@@ -356,147 +391,118 @@ void uring_reactor::worker_loop()
       auto& s = slots[si];
 
       if (res < 0) {
-        auto e = std::make_exception_ptr(std::runtime_error(strerror(-res)));
-        if (s.kind == slot_kind::host)
-          s.host_req.ctx->chunk_failed(e);
-        else
-          s.dev_req.ctx->chunk_failed(e);
+        s.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(strerror(-res))));
         s = {};
         _slot_pool.release(si);
         continue;
       }
 
-      size_t rd = static_cast<size_t>(res);
-      s.bytes_read += rd;
-
-      size_t const expected = (s.kind == slot_kind::host) ? s.host_req.size : s.dev_req.io_size;
-      bool const fully_read = s.bytes_read >= expected;
-      bool const eof        = (rd == 0);
+      s.bytes_read += static_cast<size_t>(res);
+      bool const fully_read = s.bytes_read >= s.io_size;
+      bool const eof        = (res == 0);
 
       if (!fully_read && !eof) {
         io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
         if (sqe) {
-          // Retry the unread tail into the same buffer at the next-byte offset.
-          if (s.kind == slot_kind::host) {
-            io_uring_prep_read(sqe,
-                               s.host_req.handle,
-                               s.host_req.dst + s.bytes_read,
-                               static_cast<unsigned>(s.host_req.size - s.bytes_read),
-                               static_cast<__u64>(s.host_req.offset + s.bytes_read));
-            spdlog::warn(
-              "uring_reactor: host short read, retrying. fd={} offset={} size={} "
-              "bytes_read={} this_rd={}",
-              s.host_req.handle,
-              s.host_req.offset,
-              s.host_req.size,
-              s.bytes_read,
-              rd);
-          } else if (s.kind == slot_kind::device_byo) {
-            io_uring_prep_read(sqe,
-                               s.dev_req.handle,
-                               s.dev_req.bounce + s.bytes_read,
-                               static_cast<unsigned>(s.dev_req.io_size - s.bytes_read),
-                               static_cast<__u64>(s.dev_req.file_off + s.bytes_read));
-            spdlog::warn(
-              "uring_reactor: BYO short read, retrying. fd={} file_off={} io_size={} "
-              "bytes_read={} this_rd={}",
-              s.dev_req.handle,
-              s.dev_req.file_off,
-              s.dev_req.io_size,
-              s.bytes_read,
-              rd);
-          } else {
+          size_t remaining   = s.io_size - s.bytes_read;
+          auto next_file_off = static_cast<unsigned long long>(s.io_offset + s.bytes_read);
+          if (s.is_registered) {
             io_uring_prep_read_fixed(sqe,
-                                     s.dev_req.handle,
-                                     static_cast<uint8_t*>(_bounce[si].buf) + s.bytes_read,
-                                     static_cast<unsigned>(s.dev_req.io_size - s.bytes_read),
-                                     static_cast<__u64>(s.dev_req.file_off + s.bytes_read),
+                                     s.fd,
+                                     static_cast<uint8_t*>(s.registered_bounce_buf) + s.bytes_read,
+                                     static_cast<unsigned>(remaining),
+                                     next_file_off,
                                      si);
-            spdlog::warn(
-              "uring_reactor: device short read, retrying. slot={} file_off={} io_size={} "
-              "bytes_read={} this_rd={}",
-              si,
-              s.dev_req.file_off,
-              s.dev_req.io_size,
-              s.bytes_read,
-              rd);
+          } else {
+            io_uring_prep_read(sqe,
+                               s.fd,
+                               static_cast<uint8_t*>(s.user_host_buf) + s.bytes_read,
+                               static_cast<unsigned>(remaining),
+                               static_cast<__u64>(next_file_off));
           }
           io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(si));
           ++inflight;
           need_resubmit = true;
-          continue;  // slot still in use
+          spdlog::warn(
+            "uring_reactor: short read, retrying. slot={} fd={} io_offset={} "
+            "io_size={} bytes_read={} this_rd={}",
+            si,
+            s.fd,
+            s.io_offset,
+            s.io_size,
+            s.bytes_read,
+            res);
+          continue;
         }
         spdlog::warn("uring_reactor: SQE exhausted on short-read retry, slot={}", si);
         // Fall through and complete with whatever was read.
       }
 
-      // --- Complete the request ------------------------------------------
+      // --- Complete the request -----------------------------------------
 
-      if (s.kind == slot_kind::host) {
-        s.host_req.ctx->chunk_done();
+      if (s.destination_buf == nullptr) {
+        // Host read: data already landed in user_host_buf.
+        s.ctx->chunk_done();
         s = {};
         _slot_pool.release(si);
         continue;
       }
 
-      // Device read (BYO or managed): compute user-visible bytes from the
-      // accumulated bytes_read after all retries.
-      auto& req = s.dev_req;
+      // Device read: compute how many bytes to H2D-copy into destination_buf.
       size_t actual =
-        s.bytes_read > req.data_off ? std::min(req.data_size, s.bytes_read - req.data_off) : 0;
+        s.bytes_read > s.user_offset ? std::min(s.user_size, s.bytes_read - s.user_offset) : 0;
+      void* src_buf = s.is_registered
+                        ? static_cast<uint8_t*>(s.registered_bounce_buf) + s.user_offset
+                        : static_cast<uint8_t*>(s.user_host_buf) + s.user_offset;
 
-      void* src_buf = (s.kind == slot_kind::device_byo)
-                        ? static_cast<void*>(req.bounce + req.data_off)
-                        : static_cast<void*>(static_cast<uint8_t*>(_bounce[si].buf) + req.data_off);
-
-      if (actual == 0 || req.ctx->failed.load(std::memory_order_relaxed)) {
+      if (actual == 0 || s.ctx->failed.load(std::memory_order_relaxed)) {
         if (actual == 0)
           spdlog::warn(
-            "uring_reactor: chunk completed with no H2D. slot={} file_off={} io_size={} "
-            "data_off={} data_size={} bytes_read={} ctx_failed={}",
+            "uring_reactor: chunk completed with no H2D. slot={} fd={} "
+            "io_offset={} io_size={} user_offset={} user_size={} "
+            "bytes_read={} ctx_failed={}",
             si,
-            req.file_off,
-            req.io_size,
-            req.data_off,
-            req.data_size,
+            s.fd,
+            s.io_offset,
+            s.io_size,
+            s.user_offset,
+            s.user_size,
             s.bytes_read,
-            req.ctx->failed.load(std::memory_order_relaxed));
-        req.ctx->chunk_done();
+            s.ctx->failed.load(std::memory_order_relaxed));
+        s.ctx->chunk_done();
         s = {};
         _slot_pool.release(si);
         continue;
       }
 
-      if (req.device_id >= 0) cudaSetDevice(req.device_id);
+      if (s.device_id >= 0) cudaSetDevice(s.device_id);
       cudaError_t cpy_err =
-        cudaMemcpyAsync(req.dst, src_buf, actual, cudaMemcpyHostToDevice, req.stream);
+        cudaMemcpyAsync(s.destination_buf, src_buf, actual, cudaMemcpyHostToDevice, s.stream);
       if (cpy_err != cudaSuccess) {
         cudaGetLastError();
-        req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+        s.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
           std::string("uring_reactor: cudaMemcpyAsync failed: ") + cudaGetErrorString(cpy_err))));
         s = {};
         _slot_pool.release(si);
         continue;
       }
 
-      if (s.kind == slot_kind::device_byo) {
-        // Fire-and-forget: the caller owns the bounce buffer and the stream.
-        // chunk_done fires immediately so the request_context can complete
-        // once all chunks are done.  CUDA errors poison the caller's stream
-        // and will surface on the next stream-sync.
-        req.ctx->chunk_done();
+      if (!s.is_registered) {
+        // BYO: caller owns the bounce buffer; fire-and-forget.
+        // CUDA errors poison the stream and surface on the next stream-sync.
+        s.ctx->chunk_done();
         s = {};
         _slot_pool.release(si);
       } else {
-        // Managed slot: the callback owns the slot until the H2D copy
-        // completes.  Stash the ctx in cb_arg so the callback can resolve it,
-        // then register — cudaStreamAddCallback fires even if the stream is
-        // already in an error state.
-        _cb_args[si].ctx = req.ctx;
+        // Managed: stash ctx in cb_arg, clear slot, register callback.
+        // cudaStreamAddCallback fires even if the stream is in an error
+        // state — chunk_done/chunk_failed always fires.
+        _cb_args[si].ctx = std::move(s.ctx);
+        auto stream      = s.stream;
         s                = {};
         _copying_count.fetch_add(1, std::memory_order_relaxed);
-        cudaStreamAddCallback(req.stream, cuda_copy_cb, &_cb_args[si], 0);
-        // Slot released in cuda_copy_cb; do NOT call _slot_pool.release here.
+        cudaStreamAddCallback(stream, cuda_copy_cb, &_cb_args[si], 0);
+        // Slot released in cuda_copy_cb.
       }
     }
     if (need_resubmit) io_uring_submit(ring.get());
