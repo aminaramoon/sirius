@@ -17,10 +17,10 @@
 // Unified MPSC request queue for uring_reactor.
 //
 // Wraps two moodycamel ConcurrentQueues (device and host requests) behind a
-// single interface: drain(), empty(), notify(), and wait().  Producers call
-// the try_enqueue_* methods, which bump the sequence counter on success; the
-// worker thread calls drain() to pull items into its local pending deques,
-// and wait() / notify() for parking.
+// single interface: try_dequeue_*, empty(), notify(), and wait().  Producers
+// call the try_enqueue_* methods, which bump the sequence counter on success;
+// the worker thread dequeues directly via try_dequeue_* and uses wait() /
+// notify() for parking.
 
 #pragma once
 
@@ -30,7 +30,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <deque>
 
 namespace sirius::io {
 
@@ -67,13 +66,8 @@ class io_request_queue {
 
   // --- Consumer API -------------------------------------------------------
 
-  void drain(std::deque<device_req>& dev, std::deque<host_req>& host)
-  {
-    device_req dr;
-    while (_device.try_dequeue(dr)) dev.push_back(std::move(dr));
-    host_req hr;
-    while (_host.try_dequeue(hr)) host.push_back(std::move(hr));
-  }
+  bool try_dequeue_device(device_req& out) { return _device.try_dequeue(out); }
+  bool try_dequeue_host(host_req& out) { return _host.try_dequeue(out); }
 
   [[nodiscard]] bool empty() const noexcept
   {
@@ -101,8 +95,8 @@ class io_request_queue {
 
  private:
   duckdb_moodycamel::ConcurrentQueue<device_req> _device;
-  duckdb_moodycamel::ConcurrentQueue<host_req>   _host;
-  std::atomic<uint64_t>                           _seq{0};
+  duckdb_moodycamel::ConcurrentQueue<host_req> _host;
+  std::atomic<uint64_t> _seq{0};
 };
 
 }  // namespace sirius::io

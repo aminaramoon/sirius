@@ -24,8 +24,8 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
-#include <deque>
 #include <filesystem>
 #include <stdexcept>
 
@@ -65,7 +65,12 @@ size_t uring_reactor::size(int fd)
 
 uring_reactor::uring_reactor(cucascade::memory::fixed_size_host_memory_resource& mr,
                              unsigned ring_entries)
-  : _bounce_slot_size(mr.get_block_size()), _ring_entries(ring_entries)
+  : _bounce_slot_size(mr.get_block_size()),
+    // Ring is sized to 2 × NUM_CHUNKS so the worst-case short-read storm
+    // (every in-flight op completes short in one reap pass) can be re-queued
+    // without ever exhausting SQEs.  `ring_entries` is taken as a *minimum*;
+    // callers asking for a larger ring get what they asked for.
+    _ring_entries(std::max<unsigned>(ring_entries, 2u * NUM_CHUNKS))
 {
   _bounce_storage = mr.allocate_multiple_blocks(NUM_CHUNKS * _bounce_slot_size);
   auto blocks     = _bounce_storage->get_blocks();
@@ -212,7 +217,8 @@ void uring_reactor::worker_loop()
     p.flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN;
     int rc = io_uring_queue_init_params(_ring_entries, r.get(), &p);
     if (rc == 0) {
-      spdlog::debug("uring_device_reactor: ring using SINGLE_ISSUER|DEFER_TASKRUN");
+      spdlog::debug("uring_device_reactor: ring using SINGLE_ISSUER|DEFER_TASKRUN, entries={}",
+                    _ring_entries);
       return unique_ring{r.release()};
     }
     spdlog::debug(
@@ -224,7 +230,7 @@ void uring_reactor::worker_loop()
     int rc2 = io_uring_queue_init(_ring_entries, r2.get(), 0);
     if (rc2 < 0)
       throw std::runtime_error("uring_reactor: ring init: " + std::string(strerror(-rc2)));
-    spdlog::debug("uring_reactor: ring using plain flags");
+    spdlog::debug("uring_reactor: ring using plain flags, entries={}", _ring_entries);
     return unique_ring{r2.release()};
   }();
 
@@ -242,18 +248,23 @@ void uring_reactor::worker_loop()
   // ---------------------------------------------------------------------------
   // io_slot — flat per-slot state extracted from the incoming request.
   //
-  // Exactly one of registered_bounce_buf / user_host_buf is non-null:
-  //   registered_bounce_buf  non-null → managed device read (prep_read_fixed)
-  //   user_host_buf          non-null → host read or BYO device read (prep_read)
+  // io_buffer is the buffer io_uring reads into. It comes from one of two
+  // sources, distinguished by is_registered:
+  //   is_registered == true  → io_buffer points into _bounce[slot] (managed
+  //                            device read); SQE uses prep_read_fixed with
+  //                            buf_index == slot.  Slot lifetime owns the
+  //                            bounce buffer.
+  //   is_registered == false → io_buffer is user-provided (host read dst, or
+  //                            BYO device bounce); SQE uses prep_read.  Slot
+  //                            lifetime does not own the buffer.
   //
   // destination_buf encodes the output kind:
-  //   nullptr  → host read (data lands in user_host_buf; no H2D copy needed)
-  //   non-null → device read (H2D copy required after disk IO completes)
+  //   nullptr  → host read (data already in io_buffer; no H2D copy needed)
+  //   non-null → device read (H2D copy from io_buffer + user_offset)
   // ---------------------------------------------------------------------------
   struct io_slot {
     int fd{-1};
-    void* registered_bounce_buf{nullptr};
-    void* user_host_buf{nullptr};
+    void* io_buffer{nullptr};
     size_t io_offset{0};
     size_t io_size{0};
     size_t user_offset{0};
@@ -266,12 +277,8 @@ void uring_reactor::worker_loop()
     std::shared_ptr<request_context> ctx;
   };
   std::array<io_slot, NUM_CHUNKS> slots{};
-  // registered_bounce_buf is invariant per slot — set once here, never
-  // touched by update_slot_* again.
-  for (size_t i = 0; i < NUM_CHUNKS; ++i)
-    slots[i].registered_bounce_buf = _bounce[i].buf;
 
-  auto update_slot_device = [](device_read_req_type const& req, io_slot& s) {
+  auto update_slot_device = [this](device_read_req_type const& req, int si, io_slot& s) {
     s.fd              = req.handle;
     s.io_offset       = req.file_off;
     s.io_size         = req.io_size;
@@ -282,8 +289,14 @@ void uring_reactor::worker_loop()
     s.device_id       = req.device_id;
     s.ctx             = req.ctx;
     s.bytes_read      = 0;
-    s.user_host_buf   = req.bounce;  // nullptr for managed, BYO buffer otherwise
-    s.is_registered   = (req.bounce == nullptr);
+    // Managed: use the slot's registered bounce buffer.
+    // BYO: caller-provided bounce buffer.
+    s.is_registered = (req.bounce == nullptr);
+    s.io_buffer     = s.is_registered ? _bounce[si].buf : req.bounce;
+    // Defense against upstream contract violations: io_size must fit in the
+    // registered slab. Chunks are 1 MiB and slab is sized for that — this
+    // should never trip.
+    assert(!s.is_registered || s.io_size <= _bounce_slot_size);
   };
 
   auto update_slot_host = [](host_read_req_type const& req, io_slot& s) {
@@ -293,7 +306,7 @@ void uring_reactor::worker_loop()
     s.user_offset     = 0;
     s.user_size       = req.size;
     s.destination_buf = nullptr;
-    s.user_host_buf   = req.dst;
+    s.io_buffer       = req.dst;
     s.is_registered   = false;
     s.stream          = nullptr;
     s.device_id       = -1;
@@ -301,49 +314,47 @@ void uring_reactor::worker_loop()
     s.bytes_read      = 0;
   };
 
-  std::deque<device_read_req_type> pending;
-  std::deque<host_read_req_type> pending_host;
   int inflight = 0;
 
-  auto drain_queue = [&]() { _request_queue.drain(pending, pending_host); };
-
-  // Submit queued requests until the ring is full, the slot pool is exhausted,
-  // or pending is empty.  Uses try_acquire (non-blocking) so the worker never
-  // parks inside this lambda — pool-exhausted waiting happens in the main loop
-  // where the inflight count is visible and the correct park strategy can be
-  // chosen (reap CQEs if inflight > 0; slot_pool::acquire if inflight == 0).
+  // Dequeue directly from _request_queue into io_uring — no intermediate buffer.
+  // Acquires slot and SQE first (both non-blocking); if the queue turns out to
+  // be empty, releases them and exits.  Pool-exhausted and ring-full cases are
+  // handled by the main loop (Park B / Park C).
   auto submit_pending = [&]() {
     int added = 0;
-    while (!pending.empty() || !pending_host.empty()) {
+    while (true) {
       int si = _slot_pool.try_acquire();
-      if (si < 0) break;  // pool exhausted — let main loop decide how to wait
+      if (si < 0) break;  // pool exhausted
 
       io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
       if (!sqe) {
         _slot_pool.release(si);
-        break;  // ring full — submit what we have and wait for CQEs
+        break;  // ring full
       }
 
       auto& s = slots[si];
-      if (!pending.empty()) {
-        update_slot_device(pending.front(), s);
-        pending.pop_front();
+      device_read_req_type dr;
+      host_read_req_type hr;
+      if (_request_queue.try_dequeue_device(dr)) {
+        update_slot_device(dr, si, s);
+      } else if (_request_queue.try_dequeue_host(hr)) {
+        update_slot_host(hr, s);
       } else {
-        update_slot_host(pending_host.front(), s);
-        pending_host.pop_front();
+        _slot_pool.release(si);
+        break;  // queue empty
       }
 
       if (s.is_registered) {
         io_uring_prep_read_fixed(sqe,
                                  s.fd,
-                                 s.registered_bounce_buf,
+                                 s.io_buffer,
                                  static_cast<unsigned>(s.io_size),
                                  static_cast<unsigned long long>(s.io_offset),
                                  si);
       } else {
         io_uring_prep_read(sqe,
                            s.fd,
-                           s.user_host_buf,
+                           s.io_buffer,
                            static_cast<unsigned>(s.io_size),
                            static_cast<__u64>(s.io_offset));
       }
@@ -352,15 +363,67 @@ void uring_reactor::worker_loop()
       ++inflight;
       ++added;
     }
-    if (added > 0) io_uring_submit(ring.get());
+    if (added > 0) {
+      int rc = io_uring_submit(ring.get());
+      if (rc < 0) {
+        // Fatal: SQEs are queued in the ring but the kernel won't consume
+        // them. inflight has already been incremented for each, so without
+        // intervention we'd deadlock waiting for completions that can never
+        // arrive. There's no clean recovery here — log loudly and abort the
+        // worker. Any in-flight ops are abandoned; pending ctxs in the queue
+        // are left untouched (callers will time out on their own waits, or
+        // shutdown will drain them).
+        spdlog::critical(
+          "uring_reactor: io_uring_submit failed in submit_pending: {} "
+          "(added={}, inflight={})",
+          strerror(-rc),
+          added,
+          inflight);
+        throw std::runtime_error("uring_reactor: io_uring_submit failed: " +
+                                 std::string(strerror(-rc)));
+      }
+      if (rc < added) {
+        // Partial submit. Extremely rare on a non-IOPOLL/non-SQPOLL ring on
+        // modern kernels, but flag it loudly. The un-submitted SQEs are
+        // still in the SQ ring and will be picked up by the next submit()
+        // call (e.g. from the next reap pass or submit_pending invocation).
+        // inflight accounting is still consistent because we never decrement
+        // until a CQE arrives.
+        spdlog::warn("uring_reactor: short submit in submit_pending: {}/{}", rc, added);
+      }
+    }
   };
 
   auto reap_cqes = [&]() {
     std::array<io_uring_cqe*, NUM_CHUNKS> cqes{};
     unsigned n         = io_uring_peek_batch_cqe(ring.get(), cqes.data(), NUM_CHUNKS);
     bool need_resubmit = false;
+
+    // Helper: get an SQE, draining pending retries to the kernel if the ring
+    // appears full. With _ring_entries >= 2 * NUM_CHUNKS this is provably
+    // sufficient — at most NUM_CHUNKS retries can be queued in one reap pass
+    // and a submit() between them frees every slot in the ring.
+    auto get_sqe_with_drain = [&]() -> io_uring_sqe* {
+      io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
+      if (sqe) return sqe;
+      if (need_resubmit) {
+        int rc = io_uring_submit(ring.get());
+        if (rc < 0) {
+          spdlog::critical("uring_reactor: io_uring_submit failed in reap_cqes drain: {}",
+                           strerror(-rc));
+          throw std::runtime_error(
+            "uring_reactor: io_uring_submit failed during short-read drain: " +
+            std::string(strerror(-rc)));
+        }
+        need_resubmit = false;
+      }
+      return io_uring_get_sqe(ring.get());
+    };
+
     for (auto* cqe : std::span{cqes.data(), n}) {
-      int si  = static_cast<int>(io_uring_cqe_get_data64(cqe));
+      uint64_t raw = io_uring_cqe_get_data64(cqe);
+      assert(raw < NUM_CHUNKS);
+      int si  = static_cast<int>(raw);
       int res = cqe->res;
       io_uring_cqe_seen(ring.get(), cqe);
       --inflight;
@@ -378,46 +441,60 @@ void uring_reactor::worker_loop()
       bool const eof        = (res == 0);
 
       if (!fully_read && !eof) {
-        io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-        if (sqe) {
-          size_t remaining   = s.io_size - s.bytes_read;
-          auto next_file_off = static_cast<unsigned long long>(s.io_offset + s.bytes_read);
-          if (s.is_registered) {
-            io_uring_prep_read_fixed(sqe,
-                                     s.fd,
-                                     static_cast<uint8_t*>(s.registered_bounce_buf) + s.bytes_read,
-                                     static_cast<unsigned>(remaining),
-                                     next_file_off,
-                                     si);
-          } else {
-            io_uring_prep_read(sqe,
-                               s.fd,
-                               static_cast<uint8_t*>(s.user_host_buf) + s.bytes_read,
-                               static_cast<unsigned>(remaining),
-                               static_cast<__u64>(next_file_off));
-          }
-          io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(si));
-          ++inflight;
-          need_resubmit = true;
-          spdlog::warn(
-            "uring_reactor: short read, retrying. slot={} fd={} io_offset={} "
-            "io_size={} bytes_read={} this_rd={}",
+        io_uring_sqe* sqe = get_sqe_with_drain();
+        if (!sqe) {
+          // Provably unreachable given _ring_entries >= 2 * NUM_CHUNKS: at
+          // worst the SQ ring held NUM_CHUNKS retries from this pass, and
+          // get_sqe_with_drain() just flushed all of them. If this fires the
+          // sizing invariant has been violated; fail loud rather than deliver
+          // a truncated chunk to the caller.
+          spdlog::critical(
+            "uring_reactor: SQE exhausted on short-read retry after drain. "
+            "slot={} bytes_read={}/{}",
             si,
-            s.fd,
-            s.io_offset,
-            s.io_size,
             s.bytes_read,
-            res);
+            s.io_size);
+          s.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+            "uring_reactor: SQE exhausted on short-read retry — ring sizing invariant violated")));
+          _slot_pool.release(si);
           continue;
         }
-        spdlog::warn("uring_reactor: SQE exhausted on short-read retry, slot={}", si);
-        // Fall through and complete with whatever was read.
+
+        size_t remaining   = s.io_size - s.bytes_read;
+        auto next_file_off = static_cast<unsigned long long>(s.io_offset + s.bytes_read);
+        if (s.is_registered) {
+          io_uring_prep_read_fixed(sqe,
+                                   s.fd,
+                                   static_cast<uint8_t*>(s.io_buffer) + s.bytes_read,
+                                   static_cast<unsigned>(remaining),
+                                   next_file_off,
+                                   si);
+        } else {
+          io_uring_prep_read(sqe,
+                             s.fd,
+                             static_cast<uint8_t*>(s.io_buffer) + s.bytes_read,
+                             static_cast<unsigned>(remaining),
+                             static_cast<__u64>(next_file_off));
+        }
+        io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(si));
+        ++inflight;
+        need_resubmit = true;
+        spdlog::warn(
+          "uring_reactor: short read, retrying. slot={} fd={} io_offset={} "
+          "io_size={} bytes_read={} this_rd={}",
+          si,
+          s.fd,
+          s.io_offset,
+          s.io_size,
+          s.bytes_read,
+          res);
+        continue;
       }
 
       // --- Complete the request -----------------------------------------
 
       if (s.destination_buf == nullptr) {
-        // Host read: data already landed in user_host_buf.
+        // Host read: data already landed in io_buffer (== user dst).
         s.ctx->chunk_done();
         _slot_pool.release(si);
         continue;
@@ -426,9 +503,7 @@ void uring_reactor::worker_loop()
       // Device read: compute how many bytes to H2D-copy into destination_buf.
       size_t actual =
         s.bytes_read > s.user_offset ? std::min(s.user_size, s.bytes_read - s.user_offset) : 0;
-      void* src_buf = s.is_registered
-                        ? static_cast<uint8_t*>(s.registered_bounce_buf) + s.user_offset
-                        : static_cast<uint8_t*>(s.user_host_buf) + s.user_offset;
+      void* src_buf = static_cast<uint8_t*>(s.io_buffer) + s.user_offset;
 
       if (actual == 0 || s.ctx->failed.load(std::memory_order_relaxed)) {
         if (actual == 0)
@@ -469,6 +544,8 @@ void uring_reactor::worker_loop()
         // Managed: stash ctx in cb_arg, register callback.
         // cudaStreamAddCallback fires even if the stream is in an error
         // state — chunk_done/chunk_failed always fires.
+        // is_registered drives release: the callback is responsible for
+        // recycling the bounce buffer (via _slot_pool.release).
         _cb_args[si].ctx = std::move(s.ctx);
         auto stream      = s.stream;
         _copying_count.fetch_add(1, std::memory_order_relaxed);
@@ -476,33 +553,40 @@ void uring_reactor::worker_loop()
         // Slot released in cuda_copy_cb.
       }
     }
-    if (need_resubmit) io_uring_submit(ring.get());
+    if (need_resubmit) {
+      int rc = io_uring_submit(ring.get());
+      if (rc < 0) {
+        spdlog::critical("uring_reactor: io_uring_submit failed after reap retries: {}",
+                         strerror(-rc));
+        throw std::runtime_error("uring_reactor: io_uring_submit failed after reap retries: " +
+                                 std::string(strerror(-rc)));
+      }
+    }
   };
 
   // ---------------------------------------------------------------------------
   // Main loop
   //
   // Park points:
-  //  A) nothing to submit and no in-flight IO: wait on _wake_seq.
+  //  A) queue empty and no in-flight IO: wait on _request_queue seq counter.
   //     Covers truly idle (new work) and shutdown draining CUDA callbacks.
   //  B) in-flight IO: wait on io_uring_wait_cqe_timeout; reap releases slots.
   //  C) inflight == 0 but pool exhausted (all slots in CUDA callbacks):
   //     slot_pool::acquire() parks until cuda_copy_cb calls release().
-  //     Safe because inflight == 0 means no io_uring op holds a slot, so
-  //     acquire() cannot deadlock waiting for reap_cqes().
+  //     Safe: inflight == 0 guarantees no io_uring op holds a slot.
   // ---------------------------------------------------------------------------
   while (true) {
-    if (!_stop.load(std::memory_order_acquire)) drain_queue();
-
-    if (_stop.load(std::memory_order_acquire) && pending.empty() && pending_host.empty() &&
-        inflight == 0 && _copying_count.load(std::memory_order_acquire) == 0)
+    if (_stop.load(std::memory_order_acquire) && _request_queue.empty() && inflight == 0 &&
+        _copying_count.load(std::memory_order_acquire) == 0)
       break;
 
-    // Park A: nothing to submit and no io_uring work in flight.
-    if (pending.empty() && pending_host.empty() && inflight == 0) {
+    // Park A: nothing queued and no io_uring work in flight.
+    // Single-check is sufficient: inflight is only mutated by this worker, so
+    // we don't need a recheck for it; the seq snapshot taken before wait()
+    // closes the race against producers enqueuing new work.
+    if (_request_queue.empty() && inflight == 0) {
       uint64_t seq = _request_queue.current_seq();
-      if (!_stop.load(std::memory_order_acquire)) drain_queue();
-      if (pending.empty() && pending_host.empty() && inflight == 0) _request_queue.wait(seq);
+      if (_request_queue.empty()) _request_queue.wait(seq);
       continue;
     }
 
@@ -527,10 +611,15 @@ void uring_reactor::worker_loop()
       continue;
     }
 
-    // Park C: inflight == 0, pending non-empty, pool exhausted by CUDA
-    // callbacks.  Acquire a slot to sleep until cuda_copy_cb fires, then
-    // release it immediately — submit_pending will claim it next iteration.
-    {
+    // Park C: inflight == 0, queue non-empty, pool exhausted by CUDA callbacks.
+    // Acquire a slot to sleep until cuda_copy_cb fires, then release it —
+    // submit_pending will claim it on the next iteration.
+    //
+    // Shutdown intentionally does not bypass this park: in-flight ops (here,
+    // CUDA callbacks holding slots) are never abandoned. The worker waits
+    // for at least one callback to fire before re-checking _stop at the top
+    // of the loop.
+    if (!_slot_pool.any_free()) {
       int si = _slot_pool.acquire();
       _slot_pool.release(si);
     }
