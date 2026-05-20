@@ -18,11 +18,11 @@
 
 #include "io/io_context.hpp"
 #include "io/types.hpp"
+#include "io/uring/io_request_queue.hpp"
 #include "io/uring/slot_pool.hpp"
 
 #include <cuda_runtime.h>
 
-#include <concurrentqueue.h>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <liburing.h>
 
@@ -260,11 +260,9 @@ class uring_reactor {
   // callback never fires against a destroyed reactor.
   std::atomic<int> _copying_count{0};
   unsigned _ring_entries;
-  std::atomic<uint64_t> _wake_seq{0};
   std::atomic<bool> _stop{false};
   std::thread _worker;
-  duckdb_moodycamel::ConcurrentQueue<device_read_req_type> _queue;
-  duckdb_moodycamel::ConcurrentQueue<host_read_req_type> _host_queue;
+  io_request_queue<native_handle_type> _request_queue;
 };
 
 }  // namespace sirius::io

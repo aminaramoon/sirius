@@ -84,11 +84,7 @@ uring_reactor::uring_reactor(cucascade::memory::fixed_size_host_memory_resource&
 
 uring_reactor::~uring_reactor() { shutdown(); }
 
-void uring_reactor::interrupt()
-{
-  _wake_seq.fetch_add(1, std::memory_order_release);
-  _wake_seq.notify_one();
-}
+void uring_reactor::interrupt() { _request_queue.notify(); }
 
 void uring_reactor::shutdown()
 {
@@ -111,8 +107,7 @@ void uring_reactor::cuda_copy_cb(cudaStream_t /*stream*/, cudaError_t status, vo
   arg->ctx.reset();
   arg->self->_copying_count.fetch_sub(1, std::memory_order_release);
   arg->self->_slot_pool.release(arg->slot);
-  arg->self->_wake_seq.fetch_add(1, std::memory_order_release);
-  arg->self->_wake_seq.notify_one();
+  arg->self->_request_queue.notify();
 }
 
 cudf::io::text::byte_range_info uring_reactor::align_to_physical(
@@ -147,16 +142,13 @@ void uring_reactor::enqueue_bulk(std::span<device_read_req_type> batch)
   for (auto& r : batch)
     ctxs.push_back(r.ctx);
 
-  if (!_queue.enqueue_bulk(std::make_move_iterator(batch.begin()), batch.size())) {
+  if (!_request_queue.try_enqueue_device_bulk(std::make_move_iterator(batch.begin()),
+                                              batch.size())) {
     auto e = std::make_exception_ptr(
       std::runtime_error("uring_reactor::enqueue_bulk: queue enqueue failed"));
     for (auto& ctx : ctxs)
       ctx->chunk_failed(e);
-    return;
   }
-
-  _wake_seq.fetch_add(1, std::memory_order_release);
-  _wake_seq.notify_one();
 }
 
 size_t uring_reactor::host_read(int fd, size_t offset, size_t size, uint8_t* dst)
@@ -184,13 +176,10 @@ void uring_reactor::host_read_async(host_read_req_type req)
   // Hold the ctx separately so we can drain pending via chunk_failed if the
   // enqueue itself fails (otherwise req.ctx may be moved-from and lost).
   auto ctx = req.ctx;
-  if (!_host_queue.enqueue(std::move(req))) {
+  if (!_request_queue.try_enqueue_host(std::move(req))) {
     ctx->chunk_failed(std::make_exception_ptr(
       std::runtime_error("uring_reactor::host_read_async: queue enqueue failed")));
-    return;
   }
-  _wake_seq.fetch_add(1, std::memory_order_release);
-  _wake_seq.notify_one();
 }
 
 void uring_reactor::host_enqueue_bulk(std::span<host_read_req_type> batch)
@@ -205,16 +194,12 @@ void uring_reactor::host_enqueue_bulk(std::span<host_read_req_type> batch)
   for (auto& r : batch)
     ctxs.push_back(r.ctx);
 
-  if (!_host_queue.enqueue_bulk(std::make_move_iterator(batch.begin()), batch.size())) {
+  if (!_request_queue.try_enqueue_host_bulk(std::make_move_iterator(batch.begin()), batch.size())) {
     auto e = std::make_exception_ptr(
       std::runtime_error("uring_reactor::host_enqueue_bulk: queue enqueue failed"));
     for (auto& ctx : ctxs)
       ctx->chunk_failed(e);
-    return;
   }
-
-  _wake_seq.fetch_add(1, std::memory_order_release);
-  _wake_seq.notify_one();
 }
 
 void uring_reactor::worker_loop()
@@ -320,14 +305,7 @@ void uring_reactor::worker_loop()
   std::deque<host_read_req_type> pending_host;
   int inflight = 0;
 
-  auto drain_queue = [&]() {
-    device_read_req_type r;
-    while (_queue.try_dequeue(r))
-      pending.push_back(std::move(r));
-    host_read_req_type hr;
-    while (_host_queue.try_dequeue(hr))
-      pending_host.push_back(std::move(hr));
-  };
+  auto drain_queue = [&]() { _request_queue.drain(pending, pending_host); };
 
   // Submit queued requests until the ring is full, the slot pool is exhausted,
   // or pending is empty.  Uses try_acquire (non-blocking) so the worker never
@@ -522,10 +500,9 @@ void uring_reactor::worker_loop()
 
     // Park A: nothing to submit and no io_uring work in flight.
     if (pending.empty() && pending_host.empty() && inflight == 0) {
-      uint64_t seq = _wake_seq.load(std::memory_order_acquire);
+      uint64_t seq = _request_queue.current_seq();
       if (!_stop.load(std::memory_order_acquire)) drain_queue();
-      if (pending.empty() && pending_host.empty() && inflight == 0)
-        _wake_seq.wait(seq, std::memory_order_relaxed);
+      if (pending.empty() && pending_host.empty() && inflight == 0) _request_queue.wait(seq);
       continue;
     }
 
