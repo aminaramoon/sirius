@@ -329,20 +329,19 @@ void uring_reactor::worker_loop()
       pending_host.push_back(std::move(hr));
   };
 
-  // Submit as many queued requests as possible — up to the available ring
-  // SQEs and slot_pool capacity (both bounded by NUM_CHUNKS).
+  // Submit queued requests until the ring is full or pending is empty.
+  // SQE availability is checked first — this prevents calling acquire()
+  // when io_uring already holds all slots, which would deadlock since
+  // releasing those slots requires reap_cqes().  With the SQE check first,
+  // acquire() can only block when CUDA callbacks hold all slots; they release
+  // slots (and notify slot_pool) independently of the worker thread.
   auto submit_pending = [&]() {
     int added = 0;
     while (!pending.empty() || !pending_host.empty()) {
-      int si = _slot_pool.try_acquire();
-      if (si < 0) break;  // pool exhausted — wait for completions
-
       io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-      if (!sqe) {
-        _slot_pool.release(si);
-        break;  // ring full — submit what we have and wait for CQEs
-      }
+      if (!sqe) break;  // ring full — submit what we have and wait for CQEs
 
+      int si  = _slot_pool.acquire();  // blocks if pool is exhausted by CUDA callbacks
       auto& s = slots[si];
       if (!pending.empty()) {
         update_slot_device(pending.front(), s);
@@ -502,36 +501,26 @@ void uring_reactor::worker_loop()
   // Main loop
   //
   // Park points:
-  //  A) truly idle (nothing queued, no in-flight IO, no pending CUDA copies):
-  //     wait on _wake_seq — bumped by enqueue_bulk / interrupt / cuda_copy_cb.
-  //  B) pending items but pool exhausted (all slots in CUDA callback):
-  //     wait on _wake_seq — cuda_copy_cb bumps it when a slot is released.
-  //  C) in-flight IO: wait on io_uring_wait_cqe_timeout.
+  //  A) nothing to submit and no in-flight IO: wait on _wake_seq.
+  //     Covers truly idle (waiting for new work) and shutdown while CUDA
+  //     callbacks are still outstanding (_copying_count > 0).
+  //  B) in-flight IO: wait on io_uring_wait_cqe_timeout.
+  //     Pool exhaustion by CUDA callbacks is handled inside submit_pending
+  //     via slot_pool::acquire(), which parks until cuda_copy_cb fires.
   // ---------------------------------------------------------------------------
   while (true) {
-    drain_queue();
+    if (!_stop.load(std::memory_order_acquire)) drain_queue();
 
-    if (_stop.load(std::memory_order_acquire)) {
-      // Drain any remaining CUDA callbacks before destroying reactor members.
-      while (_copying_count.load(std::memory_order_acquire) > 0) {
-        uint64_t seq = _wake_seq.load(std::memory_order_acquire);
-        if (_copying_count.load(std::memory_order_acquire) == 0) break;
-        _wake_seq.wait(seq, std::memory_order_relaxed);
-      }
+    if (_stop.load(std::memory_order_acquire) && pending.empty() && pending_host.empty() &&
+        inflight == 0 && _copying_count.load(std::memory_order_acquire) == 0)
       break;
-    }
 
-    bool const have_work = !pending.empty() || !pending_host.empty();
-
-    if (!have_work && inflight == 0 && _copying_count.load(std::memory_order_acquire) == 0) {
-      // Park A: truly idle.
+    // Park A: nothing to submit and no io_uring work in flight.
+    if (pending.empty() && pending_host.empty() && inflight == 0) {
       uint64_t seq = _wake_seq.load(std::memory_order_acquire);
-      drain_queue();
-      if (pending.empty() && pending_host.empty() && inflight == 0 &&
-          _copying_count.load(std::memory_order_acquire) == 0 &&
-          !_stop.load(std::memory_order_acquire)) {
+      if (!_stop.load(std::memory_order_acquire)) drain_queue();
+      if (pending.empty() && pending_host.empty() && inflight == 0)
         _wake_seq.wait(seq, std::memory_order_relaxed);
-      }
       continue;
     }
 
@@ -553,17 +542,6 @@ void uring_reactor::worker_loop()
         break;
       }
       reap_cqes();
-      continue;
-    }
-
-    // Park B: have pending work but pool is exhausted (all slots held by CUDA
-    // callbacks).  Wait for a callback to release a slot and bump _wake_seq.
-    uint64_t seq = _wake_seq.load(std::memory_order_acquire);
-    drain_queue();
-    if (!pending.empty() || !pending_host.empty()) {
-      if (!_slot_pool.any_free() && !_stop.load(std::memory_order_acquire)) {
-        _wake_seq.wait(seq, std::memory_order_relaxed);
-      }
     }
   }
 }
