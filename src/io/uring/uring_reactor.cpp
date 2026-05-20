@@ -243,6 +243,17 @@ void uring_reactor::worker_loop()
     return unique_ring{r2.release()};
   }();
 
+  // Register the managed bounce buffers with io_uring so device_managed reads
+  // can use prep_read_fixed — the kernel keeps the pages pinned across all
+  // IOs on this ring, avoiding per-IO pin/unmap overhead.  Host and BYO reads
+  // use plain prep_read since those buffers are not in this table.
+  std::array<iovec, NUM_CHUNKS> iovecs{};
+  for (size_t i = 0; i < NUM_CHUNKS; ++i)
+    iovecs[i] = {_bounce[i].buf, _bounce_slot_size};
+  if (int rc = io_uring_register_buffers(ring.get(), iovecs.data(), NUM_CHUNKS); rc < 0)
+    throw std::runtime_error("uring_reactor: io_uring_register_buffers: " +
+                             std::string(strerror(-rc)));
+
   // ---------------------------------------------------------------------------
   // Per-slot state — covers all three request kinds (host, BYO device,
   // managed device).  The slot pool is the single source of truth for
@@ -306,11 +317,12 @@ void uring_reactor::worker_loop()
                              static_cast<unsigned long long>(slots[si].dev_req.file_off));
         } else {
           slots[si].kind = slot_kind::device_managed;
-          io_uring_prep_read(sqe,
-                             slots[si].dev_req.handle,
-                             _bounce[si].buf,
-                             static_cast<unsigned>(slots[si].dev_req.io_size),
-                             static_cast<unsigned long long>(slots[si].dev_req.file_off));
+          io_uring_prep_read_fixed(sqe,
+                                   slots[si].dev_req.handle,
+                                   _bounce[si].buf,
+                                   static_cast<unsigned>(slots[si].dev_req.io_size),
+                                   static_cast<unsigned long long>(slots[si].dev_req.file_off),
+                                   si);
         }
       } else {
         auto req = std::move(pending_host.front());
@@ -394,11 +406,12 @@ void uring_reactor::worker_loop()
               s.bytes_read,
               rd);
           } else {
-            io_uring_prep_read(sqe,
-                               s.dev_req.handle,
-                               static_cast<uint8_t*>(_bounce[si].buf) + s.bytes_read,
-                               static_cast<unsigned>(s.dev_req.io_size - s.bytes_read),
-                               static_cast<__u64>(s.dev_req.file_off + s.bytes_read));
+            io_uring_prep_read_fixed(sqe,
+                                     s.dev_req.handle,
+                                     static_cast<uint8_t*>(_bounce[si].buf) + s.bytes_read,
+                                     static_cast<unsigned>(s.dev_req.io_size - s.bytes_read),
+                                     static_cast<__u64>(s.dev_req.file_off + s.bytes_read),
+                                     si);
             spdlog::warn(
               "uring_reactor: device short read, retrying. slot={} file_off={} io_size={} "
               "bytes_read={} this_rd={}",
