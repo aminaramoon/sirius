@@ -40,10 +40,9 @@ template <std::size_t N>
 class slot_pool {
   static_assert(N >= 1, "slot_pool needs at least one slot");
 
-  using word_t                              = std::uint64_t;
+  using word_t                               = std::uint64_t;
   static constexpr std::size_t bits_per_word = 64;
-  static constexpr std::size_t num_words =
-    (N + bits_per_word - 1) / bits_per_word;
+  static constexpr std::size_t num_words     = (N + bits_per_word - 1) / bits_per_word;
 
   // Mask of valid bits within word w.  All but possibly the last word are
   // fully populated; the tail word masks off bits beyond N.
@@ -112,9 +111,9 @@ class slot_pool {
   void release(int idx) noexcept
   {
     assert(idx >= 0 && static_cast<std::size_t>(idx) < N);
-    const std::size_t w   = static_cast<std::size_t>(idx) / bits_per_word;
-    const std::size_t b   = static_cast<std::size_t>(idx) % bits_per_word;
-    const word_t bit      = word_t{1} << b;
+    const std::size_t w        = static_cast<std::size_t>(idx) / bits_per_word;
+    const std::size_t b        = static_cast<std::size_t>(idx) % bits_per_word;
+    const word_t bit           = word_t{1} << b;
     [[maybe_unused]] auto prev = _words[w].bits.fetch_or(bit, std::memory_order_release);
     assert((prev & bit) == 0 && "double-release of slot");
     _words[w].bits.notify_one();
@@ -125,8 +124,7 @@ class slot_pool {
   {
     std::size_t n = 0;
     for (std::size_t w = 0; w < num_words; ++w)
-      n += static_cast<std::size_t>(
-        std::popcount(_words[w].bits.load(std::memory_order_relaxed)));
+      n += static_cast<std::size_t>(std::popcount(_words[w].bits.load(std::memory_order_relaxed)));
     return n;
   }
 
