@@ -316,14 +316,6 @@ void uring_reactor::worker_loop()
     s.bytes_read      = 0;
   };
 
-  // Reset a slot to its idle state while preserving the registered_bounce_buf
-  // invariant — that pointer is set once at init and must never be cleared.
-  auto clear_slot = [](io_slot& s) {
-    void* bounce            = s.registered_bounce_buf;
-    s                       = {};
-    s.registered_bounce_buf = bounce;
-  };
-
   std::deque<device_read_req_type> pending;
   std::deque<host_read_req_type> pending_host;
   int inflight = 0;
@@ -396,7 +388,6 @@ void uring_reactor::worker_loop()
 
       if (res < 0) {
         s.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(strerror(-res))));
-        clear_slot(s);
         _slot_pool.release(si);
         continue;
       }
@@ -447,7 +438,6 @@ void uring_reactor::worker_loop()
       if (s.destination_buf == nullptr) {
         // Host read: data already landed in user_host_buf.
         s.ctx->chunk_done();
-        clear_slot(s);
         _slot_pool.release(si);
         continue;
       }
@@ -474,7 +464,6 @@ void uring_reactor::worker_loop()
             s.bytes_read,
             s.ctx->failed.load(std::memory_order_relaxed));
         s.ctx->chunk_done();
-        clear_slot(s);
         _slot_pool.release(si);
         continue;
       }
@@ -486,7 +475,6 @@ void uring_reactor::worker_loop()
         cudaGetLastError();
         s.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
           std::string("uring_reactor: cudaMemcpyAsync failed: ") + cudaGetErrorString(cpy_err))));
-        clear_slot(s);
         _slot_pool.release(si);
         continue;
       }
@@ -495,15 +483,13 @@ void uring_reactor::worker_loop()
         // BYO: caller owns the bounce buffer; fire-and-forget.
         // CUDA errors poison the stream and surface on the next stream-sync.
         s.ctx->chunk_done();
-        clear_slot(s);
         _slot_pool.release(si);
       } else {
-        // Managed: stash ctx in cb_arg, clear slot, register callback.
+        // Managed: stash ctx in cb_arg, register callback.
         // cudaStreamAddCallback fires even if the stream is in an error
         // state — chunk_done/chunk_failed always fires.
         _cb_args[si].ctx = std::move(s.ctx);
         auto stream      = s.stream;
-        clear_slot(s);
         _copying_count.fetch_add(1, std::memory_order_relaxed);
         cudaStreamAddCallback(stream, cuda_copy_cb, &_cb_args[si], 0);
         // Slot released in cuda_copy_cb.
