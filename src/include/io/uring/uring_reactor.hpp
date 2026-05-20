@@ -18,6 +18,7 @@
 
 #include "io/io_context.hpp"
 #include "io/types.hpp"
+#include "io/uring/slot_pool.hpp"
 
 #include <cuda_runtime.h>
 
@@ -92,21 +93,15 @@ using unique_ring = std::unique_ptr<io_uring, ring_deleter>;
 // ---- bounce_slot -----------------------------------------------------------
 
 /**
- * @brief One pinned-memory staging buffer with a completion flag.
+ * @brief One pinned-memory staging buffer.
  *
  * The buffer is a non-owning pointer into a block owned by the reactor's
  * @c fixed_size_host_memory_resource allocation — the resource frees the
- * memory when the reactor is destroyed.
+ * memory when the reactor is destroyed.  Used only by managed device reads;
+ * host and BYO device reads supply their own destination buffer.
  */
 struct bounce_slot {
   void* buf{nullptr};
-  std::atomic<bool> cuda_done{false};
-  // Status captured by cuda_copy_cb at callback time.  Written before the
-  // release-store on cuda_done, read after the acquire-load — so the
-  // happens-before chain piggybacks on cuda_done.  Lets poll_cuda use the
-  // stream's state when our copy finished, ignoring later unrelated work
-  // the consumer may have queued onto the same stream.
-  cudaError_t cuda_status{cudaSuccess};
 };
 
 // ---------------------------------------------------------------------------
@@ -233,14 +228,21 @@ class uring_reactor {
  private:
   void worker_loop();
 
+  // Payload passed to cudaStreamAddCallback for managed device reads.
+  // `ctx` is set on each dispatch and reset in the callback after use.
+  // The reactor waits for all pending callbacks before destroying members
+  // (guarded by `_copying_count`).
   struct cb_arg {
     uring_reactor* self;
     int slot;
+    std::shared_ptr<request_context> ctx;
   };
   // cudaStreamAddCallback signature (deprecated but used deliberately).
   // Unlike cudaLaunchHostFunc, the callback fires even when the stream is
-  // already in an error state — so we never strand a slot in COPYING
-  // waiting for a callback that wouldn't otherwise come.
+  // already in an error state — so we never strand a slot waiting for a
+  // callback that wouldn't otherwise come.  The callback calls chunk_done /
+  // chunk_failed on ctx, releases the slot back to _slot_pool, and wakes the
+  // worker.
   static void cuda_copy_cb(cudaStream_t stream, cudaError_t status, void* p) noexcept;
 
   // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
@@ -250,6 +252,13 @@ class uring_reactor {
   std::size_t _bounce_slot_size;
   std::array<bounce_slot, NUM_CHUNKS> _bounce;
   std::array<cb_arg, NUM_CHUNKS> _cb_args;
+  // Unified slot allocator shared by all request types (host, BYO device,
+  // managed device).  Slot index == io_uring user_data — no tag bits needed.
+  slot_pool<NUM_CHUNKS> _slot_pool;
+  // Tracks how many managed-device-read slots are held by a pending CUDA
+  // stream callback.  The worker drains this to zero before exiting so the
+  // callback never fires against a destroyed reactor.
+  std::atomic<int> _copying_count{0};
   unsigned _ring_entries;
   std::atomic<uint64_t> _wake_seq{0};
   std::atomic<bool> _stop{false};
