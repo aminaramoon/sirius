@@ -458,6 +458,13 @@ struct alignas(64) cache_entry {
   /// load-failed" (eviction churn).  Never cleared after set.
   std::atomic<bool> ever_allocated{false};
 
+  /// One-shot diagnostic flag: set when the entry first reaches the
+  /// `cached` state (IO completed successfully).  Combined with
+  /// ever_allocated, lets read()'s miss-classifier separate
+  /// "allocated-then-evicted" (ever_cached=true) from "allocated-then-
+  /// load-failed" (ever_cached=false).  Never cleared after set.
+  std::atomic<bool> ever_cached{false};
+
   cache_entry(cudf::io::text::byte_range_info logical,
               cudf::io::text::byte_range_info physical,
               size_t chunk_bytes)
