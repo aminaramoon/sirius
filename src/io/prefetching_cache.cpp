@@ -170,6 +170,28 @@ void CUDART_CB release_read_host_callback(cudaStream_t /*stream*/,
   args->entry->state.release_read();
 }
 
+// Recover from a failed cudaStreamAddCallback registration.  The callback
+// will never fire, so the caller hands us the raw args pointer it had
+// already `args.release()`'d and we do the callback's work inline:
+//   1. Drain the stream so any cudaMemcpyAsync the caller had already
+//      submitted against this entry's chunks completes (or fails fast)
+//      before we drop the pin — otherwise the evictor could recycle the
+//      chunks while the copy is still consuming them.
+//   2. Drop the pin via release_read so the entry is no longer
+//      non-evictable.  We do this even if the synchronize itself failed,
+//      preferring a user-visible CUDA fault on the failing stream over a
+//      permanent cache leak.
+// The cudaGetLastError calls clear sticky thread-local errors so they
+// don't surface on an unrelated CUDA call later in this thread.
+void release_args_inline_on_callback_failure(cudaStream_t stream,
+                                             release_callback_args* raw) noexcept
+{
+  cudaGetLastError();
+  std::unique_ptr<release_callback_args> reown(raw);
+  if (cudaStreamSynchronize(stream) != cudaSuccess) cudaGetLastError();
+  reown->entry->state.release_read();
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -186,12 +208,21 @@ void cached_host_buffer::mark_cached_with_stream(cudaStream_t stream) noexcept
 {
   if (!_entry) return;
   if (_entry->state.try_finish_loading_pinned()) {
-    auto args   = std::make_unique<release_callback_args>();
-    args->entry = std::move(_entry);
-    cudaStreamAddCallback(stream, &release_read_host_callback, args.release(), 0);
+    // Entry is ours in in_use(pin=1).  Hand it to a stream callback so
+    // the pin is released after the caller's H2D copy drains.
+    auto args       = std::make_unique<release_callback_args>();
+    args->entry     = std::move(_entry);
+    auto* raw       = args.release();
+    cudaError_t err = cudaStreamAddCallback(stream, &release_read_host_callback, raw, 0);
+    if (err != cudaSuccess) release_args_inline_on_callback_failure(stream, raw);
   } else {
-    // Shutdown raced us; abort path already moved entry to empty and the
-    // chunks (if any) are owned by abort_pending_entries — nothing to do.
+    // try_finish_loading_pinned failed — only possible because
+    // shutdown's abort_pending_entries flipped loading → empty.  abort
+    // does NOT free chunks on the loading-state transition (its
+    // contract is "the in-flight loader owns them") — and we ARE that
+    // loader.  Free them now before the last shared_ptr to the entry
+    // drops, or they leak in the slab until pool destruction.
+    if (_pool) _pool->deallocate_bulk(_entry->chunks);
     _entry = nullptr;
   }
 }
@@ -243,11 +274,13 @@ void pinned_view::unpin()
     // the entry transitions in_use → cached and becomes evictable.
     auto args   = std::make_unique<release_callback_args>();
     args->entry = std::move(_entry);
+    auto* raw   = args.release();
     // cudaStreamAddCallback (not cudaLaunchHostFunc): fires on error too,
     // so the release_read() is guaranteed even if the user's stream is
     // poisoned by an unrelated failure.  Otherwise a single stream error
     // would permanently leak this entry's pin and its pinned chunks.
-    cudaStreamAddCallback(_stream, &release_read_host_callback, args.release(), 0);
+    cudaError_t err = cudaStreamAddCallback(_stream, &release_read_host_callback, raw, 0);
+    if (err != cudaSuccess) release_args_inline_on_callback_failure(_stream, raw);
   }
 }
 
