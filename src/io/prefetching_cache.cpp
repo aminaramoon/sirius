@@ -348,14 +348,24 @@ file_demand::view file_demand::load(std::memory_order ord) const noexcept
 }
 
 // ===========================================================================
-// prefetching_handle::release
+// prefetching_handle — cancel / release
 // ===========================================================================
+
+void prefetching_handle::cancel() noexcept
+{
+  if (!_alive) return;
+  // Atomically flip alive to false exactly once. Exchange guarantees we only
+  // call notify_disposed() for the first caller when multiple threads race.
+  bool was_alive = _alive->exchange(false, std::memory_order_acq_rel);
+  if (was_alive && _cache) { _cache->notify_disposed(); }
+}
 
 void prefetching_handle::release() noexcept
 {
   if (_demand == nullptr) return;
   _demand->unregister_request();
   _demand = nullptr;
+  _cache  = nullptr;
 }
 
 // ===========================================================================
@@ -460,6 +470,15 @@ void prefetching_cache::enqueue_work(work_item item)
   _work_queue.enqueue(std::move(item));
   _work_seq.fetch_add(1, std::memory_order_release);
   _work_seq.notify_one();
+}
+
+void prefetching_cache::notify_disposed() noexcept
+{
+  // Wake the evictor so it can immediately reclaim any memory that was
+  // pre-allocated (queued/allocated state) for the cancelled request.
+  // The evictor checks the alive flag on every eviction queue pop and will
+  // free queued/allocated/cached entries for the cancelled wrapper.
+  _request_sem.release();
 }
 
 void prefetching_cache::release_chunks(cache_entry& entry)
@@ -623,7 +642,7 @@ prefetching_handle prefetching_cache::insert(
     // was scheduled — nothing for the worker to do, but we still hand
     // back a handle so the caller's per-file demand counter decrements
     // when the request is done.
-    return prefetching_handle{std::move(alive), demand};
+    return prefetching_handle{std::move(alive), demand, this};
   }
 
   // Enqueue the eviction-queue wrapper BEFORE the work_item.  The wrapper
@@ -634,7 +653,7 @@ prefetching_handle prefetching_cache::insert(
   _eviction_queue.enqueue(prefetch_request{new_entries, demand, new_stamp, alive});
 
   enqueue_work(prefetch_req{key, std::move(obj_sp), std::move(new_entries), alive});
-  return prefetching_handle{std::move(alive), demand};
+  return prefetching_handle{std::move(alive), demand, this};
 }
 
 // ===========================================================================
