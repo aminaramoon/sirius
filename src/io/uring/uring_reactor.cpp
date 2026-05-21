@@ -110,9 +110,21 @@ void uring_reactor::cuda_copy_cb(cudaStream_t /*stream*/, cudaError_t status, vo
     arg->ctx->chunk_done();
   }
   arg->ctx.reset();
-  arg->self->_copying_count.fetch_sub(1, std::memory_order_release);
-  arg->self->_slot_pool.release(arg->slot);
-  arg->self->_request_queue.notify();
+
+  // Capture self/slot BEFORE the _copying_count decrement.  The worker's
+  // shutdown-drain check observes _copying_count==0 + inflight==0 and breaks
+  // out of worker_loop; ~uring_reactor then destroys _slot_pool /
+  // _request_queue / _cb_args.  Any access to `arg->self` (or `arg->slot`,
+  // since arg itself lives inside _cb_args) after that decrement is a UAF.
+  // The fetch_sub must therefore be the LAST member access on the reactor;
+  // release is sufficient — it forbids reordering the slot_pool / queue
+  // stores below the decrement, which is the property we need to pair with
+  // the worker's acquire-load of _copying_count.
+  auto* self = arg->self;
+  int slot   = arg->slot;
+  self->_slot_pool.release(slot);
+  self->_request_queue.notify();
+  self->_copying_count.fetch_sub(1, std::memory_order_release);
 }
 
 cudf::io::text::byte_range_info uring_reactor::align_to_physical(
