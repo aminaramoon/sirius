@@ -437,22 +437,30 @@ prefetching_cache::~prefetching_cache()
     return;
   }
 
-  // Stop the threads.  Stop-token requests + waitpoint wakeups (work_seq,
-  // request_sem) unblock both loops; each one rechecks the token at every
-  // wait point and exits promptly.
+  // Flip the shutdown flag BEFORE request_stop on either thread.  This
+  // closes the deadlock window where the allocator was past its
+  // stop-check inside Phase 2's shortfall path: it now bails out at the
+  // _shutting_down check just before its enqueue.  The microsecond race
+  // (allocator past the flag check but pre-enqueue) is handled below by
+  // keeping the evictor alive across join(allocator) so the late-pushed
+  // eviction_request gets resolved instead of stranding fut.get().
+  _shutting_down.store(true, std::memory_order_release);
+
+  // Stop the ALLOCATOR first.  The evictor stays running so it can
+  // resolve any eviction_request the allocator pushed in its dying
+  // breath; its evict_chunks loop also observes _shutting_down and
+  // bails fast (returns 0 → promise.set_exception), so the allocator
+  // unblocks promptly.
   _allocator_thread.request_stop();
-  _evictor_thread.request_stop();
   _work_seq.fetch_add(1, std::memory_order_release);
   _work_seq.notify_all();
-  _request_sem.release();
 
   // Wake readers waiting on entries that were loading when shutdown began.
   // Outstanding backend requests may still resolve via their request_context
   // safety net, but waiters shouldn't depend on that happening.
   abort_pending_entries();
 
-  // Drain whatever the worker / evictor left behind so the loops don't
-  // block forever waiting on the queues we'll never re-fill.
+  // Drain pending work items.  The allocator won't dequeue these now.
   work_item drained;
   while (_work_queue.try_dequeue(drained)) {
     for (auto& entry : drained.entries) {
@@ -460,18 +468,31 @@ prefetching_cache::~prefetching_cache()
     }
   }
 
+  // Join allocator.  It exits because either it was idle (woken by the
+  // stop_callback + work_seq notify above) or it was in Phase 2's
+  // shortfall wait, in which case the still-running evictor resolves
+  // its eviction_request (set_exception via evict_chunks's
+  // _shutting_down bail).  No _request_sem.release() needed during this
+  // window: the evictor's main loop uses try_acquire_for(50ms) so it
+  // self-wakes and picks up the late-pushed request on the next poll.
+  if (_allocator_thread.joinable()) { _allocator_thread.join(); }
+
+  // Now stop the evictor.  No new eviction_requests can arrive (the
+  // allocator is gone).  The evictor's own exit-drain handles anything
+  // still in the request queue.
+  _evictor_thread.request_stop();
+  _request_sem.release();
+  if (_evictor_thread.joinable()) { _evictor_thread.join(); }
+
+  // Belt-and-suspenders drain.  The evictor's exit-drain should have
+  // resolved any pending requests; this catches anything that slipped
+  // through (e.g. a request enqueued after the evictor's drain ran but
+  // before it terminated — impossible by construction now, but cheap).
   eviction_request ereq;
   while (_request_queue.try_dequeue(ereq)) {
     ereq.promise.set_exception(
       std::make_exception_ptr(std::runtime_error("eviction aborted — cache shutting down")));
   }
-
-  // Join.  After joins, no new IO will be dispatched, but the reactor
-  // (owned by the ioctx that owns this cache) may still be processing
-  // IOs we submitted earlier; their completion callbacks hold a slot
-  // in _inflight_budget.
-  if (_allocator_thread.joinable()) { _allocator_thread.join(); }
-  if (_evictor_thread.joinable()) { _evictor_thread.join(); }
 
   // Stop the dispatch thread only after the allocator is fully joined, so
   // no more work_items can be pushed to _io_dispatch_queue.  The stop_callback
@@ -921,13 +942,22 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
     size_t empty_ticks           = 0;
     size_t const queue_size_hint = std::max<size_t>(_eviction_queue.size_approx(), 1);
 
+    // Compound stop predicate: stop_token (normal shutdown signal) OR
+    // _shutting_down (set by the dtor BEFORE request_stop so that we can
+    // bail before evict_chunks's natural termination conditions kick in
+    // — needed so the allocator's late-pushed eviction_request resolves
+    // promptly during shutdown and doesn't block join(allocator)).
+    auto should_stop = [&] {
+      return stop.stop_requested() || _shutting_down.load(std::memory_order_acquire);
+    };
+
     while (reclaimed < needed) {
-      if (stop.stop_requested()) break;
+      if (should_stop()) break;
 
       prefetch_request wrapper;
       if (!_eviction_queue.try_dequeue(wrapper)) {
         std::this_thread::sleep_for(EVICTOR_POLL_INTERVAL);
-        if (stop.stop_requested()) break;
+        if (should_stop()) break;
         if (++empty_ticks > 4) break;
         continue;
       }
@@ -950,7 +980,7 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
         _eviction_queue.enqueue(std::move(wrapper));
         if (reclaimed == 0 && ++empty_ticks > queue_size_hint) {
           std::this_thread::sleep_for(EVICTOR_POLL_INTERVAL);
-          if (stop.stop_requested()) break;
+          if (should_stop()) break;
           empty_ticks = 0;
         }
       }
@@ -1067,15 +1097,20 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
     ptrs.reserve(upper_bound_chunks);
     auto got = pool->allocate_bulk(upper_bound_chunks, ptrs);
     if (got < upper_bound_chunks) {
-      // Check stop before enqueueing: the evictor's exit drain runs only
-      // for requests already in the queue when it stops.  An enqueue that
-      // races past that drain would never be resolved and we'd hang here.
-      if (stop.stop_requested()) {
+      // Bail before enqueueing if shutdown started.  Without this, the
+      // allocator could push an eviction_request into a queue whose
+      // evictor has already exited, and fut.get() below would block
+      // forever, hanging the dtor's join(allocator).  Combined with the
+      // dtor reorder (allocator joined while evictor still alive) and
+      // the evictor's own _shutting_down check inside evict_chunks, this
+      // makes shutdown deadlock-free.
+      if (_shutting_down.load(std::memory_order_acquire) || stop.stop_requested()) {
         pool->deallocate_bulk(ptrs);
         for (auto& e : item.entries)
           if (e) e->state.try_cancel_queued();
         break;
       }
+
       size_t shortfall = upper_bound_chunks - got;
       eviction_request req;
       req.n_chunks_needed = shortfall;
