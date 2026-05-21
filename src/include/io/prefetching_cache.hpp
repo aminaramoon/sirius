@@ -347,15 +347,18 @@ class entry_state {
     }
   }
 
-  /// Block while state is @c allocated or @c loading.  Returns when the
-  /// state transitions to @c cached (success), @c empty (IO failed or
-  /// cancelled), or any other terminal state.
+  /// Block while state is @c loading.  Returns when the state transitions
+  /// to @c cached (success), @c empty (IO failed or cancelled), or any
+  /// other terminal state.  Does NOT wait on @c allocated — callers that
+  /// receive an @c allocated entry either steal it for a direct device read
+  /// (via @c cached_host_buffer) or treat it as a miss and fall through to
+  /// the backend.
   void wait_while_pending() noexcept
   {
     uint32_t cur = _packed.load(std::memory_order_acquire);
     while (true) {
       auto st = unpack_state(cur);
-      if (st != allocated && st != loading) break;
+      if (st != loading) break;
       _packed.wait(cur, std::memory_order_relaxed);
       cur = _packed.load(std::memory_order_acquire);
     }
@@ -847,10 +850,19 @@ class prefetching_cache {
   /// counters (see summary()).  @p stream, when non-null, defers the
   /// returned pinned_view's read release until the stream reaches the
   /// release point — see @c pinned_view's ctor for the full contract.
+  ///
+  /// @p out_buffer — when non-null and the entry is in the @c allocated
+  /// state, @c read() attempts to flip the entry to @c loading via a CAS
+  /// and, on success, constructs a @c cached_host_buffer that wraps the
+  /// entry's pre-allocated chunks.  The caller owns this buffer and must
+  /// pass it to @c sirius_ioctx::device_read_async_io_using() to issue
+  /// file → bounce → device IO.  If the CAS fails (evictor raced), or if
+  /// @p out_buffer is null, the entry is treated as a miss.
   [[nodiscard]] pinned_view read(const sirius_io_object& obj,
                                  size_t offset,
                                  size_t size,
-                                 cudaStream_t stream = nullptr);
+                                 cudaStream_t stream            = nullptr,
+                                 cached_host_buffer* out_buffer = nullptr);
 
   /// One-line human-readable state: hit / partial-miss / full-miss counts,
   /// pool utilisation, and pending chunks.

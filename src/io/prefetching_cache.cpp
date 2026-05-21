@@ -674,7 +674,8 @@ prefetching_handle prefetching_cache::insert(
 pinned_view prefetching_cache::read(const sirius_io_object& obj,
                                     size_t offset,
                                     size_t size,
-                                    cudaStream_t stream)
+                                    cudaStream_t stream,
+                                    cached_host_buffer* out_buffer)
 {
   auto const& key = obj.raw_file_cache_id();
 
@@ -693,9 +694,12 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
   if (!entry) return {};
 
   // Dispatch on state:
-  //   cached / in_use   → pin immediately.
-  //   allocated/loading → wait for the pipeline to resolve the load, then retry.
-  //   queued / evicting / empty → return empty (caller falls back).
+  //   cached / in_use → pin immediately.
+  //   allocated       → if out_buffer is non-null, try to steal the entry
+  //                     for a direct device read by flipping it to loading;
+  //                     otherwise treat as miss (io_dispatch_loop will load it).
+  //   loading         → wait for the load to complete, then retry.
+  //   queued / evicting / empty → miss (caller falls back).
   bool waited_on_load = false;
   while (true) {
     auto st = entry->state.get_state();
@@ -709,7 +713,14 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
       // try_acquire_read lost a race; re-observe the state.
       continue;
     }
-    if (st == entry_state::allocated || st == entry_state::loading) {
+    if (st == entry_state::allocated && out_buffer != nullptr) {
+      // Try to flip allocated → loading so we own the entry for device IO.
+      // On CAS failure the evictor raced us; treat as miss.
+      if (entry->state.try_start_loading()) { *out_buffer = cached_host_buffer{entry, _pool}; }
+      _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
+      return {};
+    }
+    if (st == entry_state::loading) {
       waited_on_load = true;
       // Release file_lk across the wait: the entry is pinned by our local
       // shared_ptr, and file.mtx no longer protects anything we touch while
