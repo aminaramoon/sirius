@@ -27,6 +27,8 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -749,7 +751,8 @@ class prefetching_cache {
 
   // ---- helpers --------------------------------------------------------------
 
-  void worker_loop(std::stop_token stop);
+  void allocator_loop(std::stop_token stop);
+  void io_dispatch_loop(std::stop_token stop);
   void evictor_loop(std::stop_token stop);
   void enqueue_work(work_item item);
   void abort_pending_entries() noexcept;
@@ -845,8 +848,15 @@ class prefetching_cache {
   duckdb_moodycamel::ConcurrentQueue<work_item> _work_queue;
   std::atomic<uint64_t> _work_seq{0};
 
+  /// Queue of allocated work items waiting for IO dispatch.  Produced by
+  /// allocator_loop after chunks are assigned; consumed by io_dispatch_loop.
+  std::deque<work_item> _io_dispatch_deque;
+  std::mutex _io_dispatch_mtx;
+  std::condition_variable _io_dispatch_cv;
+
   std::jthread _evictor_thread;
-  std::jthread _worker_thread;
+  std::jthread _allocator_thread;
+  std::jthread _io_dispatch_thread;
 };
 
 }  // namespace sirius::io
