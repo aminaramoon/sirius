@@ -172,6 +172,30 @@ void CUDART_CB release_read_host_callback(cudaStream_t /*stream*/,
 
 }  // namespace
 
+// ===========================================================================
+// cached_host_buffer::mark_cached_with_stream
+// ===========================================================================
+//
+// Out-of-line so the implementation can reuse the file-local
+// release_callback_args + release_read_host_callback machinery above.
+// Mirrors pinned_view's async release path: cudaStreamAddCallback (not
+// cudaLaunchHostFunc) so a poisoned stream still fires the callback and
+// releases the read pin.
+
+void cached_host_buffer::mark_cached_with_stream(cudaStream_t stream) noexcept
+{
+  if (!_entry) return;
+  if (_entry->state.try_finish_loading_pinned()) {
+    auto args   = std::make_unique<release_callback_args>();
+    args->entry = std::move(_entry);
+    cudaStreamAddCallback(stream, &release_read_host_callback, args.release(), 0);
+  } else {
+    // Shutdown raced us; abort path already moved entry to empty and the
+    // chunks (if any) are owned by abort_pending_entries — nothing to do.
+    _entry = nullptr;
+  }
+}
+
 pinned_view::pinned_view(std::shared_ptr<cache_entry> entry, cudaStream_t stream)
   : _entry(nullptr), _stream(stream)
 {

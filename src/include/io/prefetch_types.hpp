@@ -301,6 +301,23 @@ class entry_state {
     return ok;
   }
 
+  /// loading → in_use(pin_count = 1) using a single CAS.  Used by
+  /// @c cached_host_buffer to finish a direct-device read while keeping the
+  /// entry pinned across the caller's H2D copy: a subsequent stream callback
+  /// drops the pin (in_use → cached) once the stream completes.  Closes the
+  /// race window where the evictor could otherwise reclaim the entry's
+  /// pinned chunks before the H2D drains them.
+  ///
+  /// Returns false if shutdown or another completion path already moved the
+  /// entry out of loading.
+  bool try_finish_loading_pinned() noexcept
+  {
+    auto expected = pack(loading, 0);
+    bool ok = _packed.compare_exchange_strong(expected, pack(in_use, 1), std::memory_order_acq_rel);
+    if (ok) { _packed.notify_all(); }
+    return ok;
+  }
+
   /// loading → empty.  IO failed, chunks already freed by caller.
   /// Wakes any readers parked in @c wait_while_pending().
   void mark_load_failed() noexcept
@@ -660,12 +677,28 @@ class cached_host_buffer {
   /// racing @c try_abort_pending() (cache shutdown) that already moved
   /// the entry to @c empty is tolerated silently — the shutdown will have
   /// already woken all waiters.
+  ///
+  /// Prefer @c mark_cached_with_stream() when an async H2D copy is in flight
+  /// against the entry's chunks — otherwise the evictor can reclaim them
+  /// before the copy drains.
   void mark_cached() noexcept
   {
     if (!_entry) return;
     _entry->state.try_mark_cached();
     _entry = nullptr;
   }
+
+  /// Transition loading → in_use(1) atomically and defer the pin release via
+  /// a host callback enqueued on @p stream.  The entry stays non-evictable
+  /// (in_use) until the stream completes the H2D copy that was launched
+  /// against its chunks, at which point pin_count drops to zero and the
+  /// entry transitions back to cached.  Safe to call only once; clears the
+  /// internal entry pointer afterwards.
+  ///
+  /// Out-of-line because the implementation reuses the host-callback
+  /// machinery defined in @c prefetching_cache.cpp (same path as
+  /// @c pinned_view's async release).
+  void mark_cached_with_stream(cudaStream_t stream) noexcept;
 
   /// Transition the entry loading → empty; return chunks to the pool.
   /// Safe to call only once; clears the internal entry pointer afterwards.
