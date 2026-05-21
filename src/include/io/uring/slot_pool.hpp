@@ -23,7 +23,12 @@
 //   * Acquire = TZCNT + CAS on one 64-bit word — no linear scan over slots.
 //   * Release = single fetch_or (distinct bits never race, no CAS loop needed).
 //   * "Any free?" falls out of the same load the acquire path uses.
-//   * Blocking acquire parks via C++20 std::atomic::wait / notify_one.
+//   * Blocking acquire parks on a single shared release-generation counter
+//     (`_release_seq`), NOT on the per-word bits.  Per-word parking has a
+//     lost-wakeup hazard: a waiter blocked on word 0 is not woken by
+//     `notify_one()` on word 1, so releases on word 1 can leave the waiter
+//     stuck even though slots are free elsewhere.  The seq counter is bumped
+//     on every release, so any release wakes any waiter.
 
 #pragma once
 
@@ -87,22 +92,19 @@ class slot_pool {
   }
 
   // Blocks until a slot becomes available, then acquires it.
+  //
+  // Uses the seq-counter wait pattern: snapshot _release_seq before the
+  // final try_acquire so that any release racing between our last failed
+  // try_acquire and our wait() bumps the counter past our snapshot and
+  // makes wait() return immediately (no lost wakeup).  Any release from
+  // any word wakes any waiter — no cross-word lost-wakeup hazard.
   int acquire(unsigned hint = 0) noexcept
   {
     for (;;) {
-      const int idx = try_acquire(hint);
-      if (idx != no_slot) return idx;
-      // Park on the first empty-looking word.  If a release sneaks in
-      // between the load and wait(), wait() returns immediately — no lost
-      // wakeup.
-      const std::size_t start = (num_words == 1) ? 0 : (hint % num_words);
-      for (std::size_t i = 0; i < num_words; ++i) {
-        const std::size_t w = (start + i) % num_words;
-        if (_words[w].bits.load(std::memory_order_relaxed) == 0) {
-          _words[w].bits.wait(0, std::memory_order_relaxed);
-          break;
-        }
-      }
+      if (int idx = try_acquire(hint); idx != no_slot) return idx;
+      const uint64_t seq = _release_seq.load(std::memory_order_acquire);
+      if (int idx = try_acquire(hint); idx != no_slot) return idx;
+      _release_seq.wait(seq, std::memory_order_relaxed);
     }
   }
 
@@ -116,7 +118,14 @@ class slot_pool {
     const word_t bit           = word_t{1} << b;
     [[maybe_unused]] auto prev = _words[w].bits.fetch_or(bit, std::memory_order_release);
     assert((prev & bit) == 0 && "double-release of slot");
-    _words[w].bits.notify_one();
+    // Bump the shared release-generation counter and wake one waiter on
+    // it.  notify_one is sufficient even with multiple waiters: every
+    // waiter re-runs try_acquire on wake and the next release wakes the
+    // next waiter.  Bumping the counter unconditionally (even when no
+    // waiter is parked) is essentially free — notify_one on an empty
+    // wait list is a no-op fast path in glibc/libc++.
+    _release_seq.fetch_add(1, std::memory_order_release);
+    _release_seq.notify_one();
   }
 
   // Approximate (relaxed) count of free slots — suitable for heuristics only.
@@ -150,6 +159,11 @@ class slot_pool {
   }
 
   std::array<word_storage, num_words> _words{};
+
+  // Shared release-generation counter for the seq-wait pattern in
+  // acquire().  Kept on its own cache line so release()'s fetch_add
+  // doesn't false-share with the per-word CAS traffic.
+  alignas(64) std::atomic<uint64_t> _release_seq{0};
 };
 
 }  // namespace sirius::io
