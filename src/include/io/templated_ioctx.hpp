@@ -287,20 +287,25 @@ class templated_ioctx : public sirius_ioctx {
     }
 
     // shared_ptr makes the lambda copy-constructible (required by std::function);
-    // cached_host_buffer itself is move-only.
+    // cached_host_buffer itself is move-only.  Capture stream.value() so the
+    // success path can defer the read-pin release via cudaStreamAddCallback —
+    // this keeps the entry pinned across the H2D copy that the reactor
+    // launches against the entry's chunks, preventing the evictor from
+    // recycling pool buffers while the copy is still in flight.
     auto shared_buf = std::make_shared<cached_host_buffer>(std::move(buffer));
-    auto ctx =
-      request_context::create(reqs.size(),
-                              size,
-                              [buf = std::move(shared_buf), user_handler = std::move(handler)](
-                                size_t bytes, const std::exception_ptr& ep) mutable {
-                                if (ep) {
-                                  buf->mark_load_failed();
-                                } else {
-                                  buf->mark_cached();
-                                }
-                                if (user_handler) user_handler(bytes, ep);
-                              });
+    auto raw_stream = stream.value();
+    auto ctx        = request_context::create(
+      reqs.size(),
+      size,
+      [buf = std::move(shared_buf), user_handler = std::move(handler), raw_stream](
+        size_t bytes, const std::exception_ptr& ep) mutable {
+        if (ep) {
+          buf->mark_load_failed();
+        } else {
+          buf->mark_cached_with_stream(raw_stream);
+        }
+        if (user_handler) user_handler(bytes, ep);
+      });
 
     assert(ctx);  // n_chunks == reqs.size() > 0, so create() never returns null here
 
