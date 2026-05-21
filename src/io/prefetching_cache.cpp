@@ -394,6 +394,8 @@ prefetching_cache::prefetching_cache(buffer_pool* pool,
   if (_armed) {
     _evictor_thread   = std::jthread([this](std::stop_token st) { evictor_loop(std::move(st)); });
     _allocator_thread = std::jthread([this](std::stop_token st) { allocator_loop(std::move(st)); });
+    _io_dispatch_thread =
+      std::jthread([this](std::stop_token st) { io_dispatch_loop(std::move(st)); });
   }
 }
 
@@ -440,6 +442,13 @@ prefetching_cache::~prefetching_cache()
   // in _inflight_budget.
   if (_allocator_thread.joinable()) { _allocator_thread.join(); }
   if (_evictor_thread.joinable()) { _evictor_thread.join(); }
+
+  // Stop the dispatch thread only after the allocator is fully joined, so
+  // no more work_items can be pushed to _io_dispatch_queue.  The stop_callback
+  // registered in io_dispatch_loop fires notify_all on _io_dispatch_cv, which
+  // wakes the thread.  The thread then drains the queue and exits.
+  _io_dispatch_thread.request_stop();
+  if (_io_dispatch_thread.joinable()) { _io_dispatch_thread.join(); }
 
   // Wait for every in-flight IO callback to release its admission slot.
   // Each callback captures the raw _pool pointer; the owner of the pool
