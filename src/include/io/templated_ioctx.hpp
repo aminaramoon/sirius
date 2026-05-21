@@ -264,7 +264,7 @@ class templated_ioctx : public sirius_ioctx {
                                   uint8_t* dst,
                                   rmm::cuda_stream_view stream,
                                   cached_host_buffer buffer,
-                                  io_completion_handler handler)
+                                  io_completion_handler handler) override
   {
     auto& tobj = as_typed(obj);
 
@@ -281,19 +281,21 @@ class templated_ioctx : public sirius_ioctx {
       return;
     }
 
-    // Create the request_context AFTER prepare so we can move buffer into
-    // the lambda.  ctx is then patched onto every request before dispatch.
-    auto ctx = request_context::create(reqs.size(),
-                                       size,
-                                       [buf = std::move(buffer), user_handler = std::move(handler)](
-                                         size_t bytes, const std::exception_ptr& ep) mutable {
-                                         if (ep) {
-                                           buf.mark_load_failed();
-                                         } else {
-                                           buf.mark_cached();
-                                         }
-                                         if (user_handler) user_handler(bytes, ep);
-                                       });
+    // shared_ptr makes the lambda copy-constructible (required by std::function);
+    // cached_host_buffer itself is move-only.
+    auto shared_buf = std::make_shared<cached_host_buffer>(std::move(buffer));
+    auto ctx =
+      request_context::create(reqs.size(),
+                              size,
+                              [buf = std::move(shared_buf), user_handler = std::move(handler)](
+                                size_t bytes, const std::exception_ptr& ep) mutable {
+                                if (ep) {
+                                  buf->mark_load_failed();
+                                } else {
+                                  buf->mark_cached();
+                                }
+                                if (user_handler) user_handler(bytes, ep);
+                              });
 
     assert(ctx);  // n_chunks == reqs.size() > 0, so create() never returns null here
 

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "io/metadata_store.hpp"
+#include "io/prefetch_types.hpp"
 #include "io/types.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -30,7 +31,6 @@
 
 namespace sirius::io {
 
-class buffer_pool;
 class prefetching_cache;
 
 // ---------------------------------------------------------------------------
@@ -178,6 +178,20 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   virtual std::future<size_t> device_read_async(
     sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
+
+  /// Issue a device read reusing the pre-allocated bounce buffers in @p buffer.
+  /// @p buffer must be in the @c loading state (caller already stole it from
+  /// the prefetching cache via @c prefetching_cache::read()).  On completion
+  /// the handler fires and the entry transitions to @c cached or @c empty.
+  /// Default implementation throws; only meaningful for backends that support
+  /// vector host reads (i.e. when @c supports_vector_host_read() is true).
+  virtual void device_read_async_io_using(sirius_io_object& obj,
+                                          size_t offset,
+                                          size_t size,
+                                          uint8_t* dst,
+                                          rmm::cuda_stream_view stream,
+                                          cached_host_buffer buffer,
+                                          io_completion_handler handler);
 
   // -- Physical range alignment ------------------------------------------------
 

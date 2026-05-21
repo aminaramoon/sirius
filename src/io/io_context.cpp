@@ -57,6 +57,18 @@ void sirius_ioctx::initialize_cache(buffer_pool* pool, size_t inflight_budget_ch
 
 void sirius_ioctx::shutdown_cache() noexcept { _cache.reset(); }
 
+void sirius_ioctx::device_read_async_io_using(sirius_io_object&,
+                                              size_t,
+                                              size_t,
+                                              uint8_t*,
+                                              rmm::cuda_stream_view,
+                                              cached_host_buffer buffer,
+                                              io_completion_handler)
+{
+  throw std::runtime_error(
+    "sirius_ioctx: device_read_async_io_using not supported by this backend");
+}
+
 namespace {
 
 std::future<size_t> copy_pinned_slices_to_device(
