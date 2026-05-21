@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -277,7 +278,11 @@ class templated_ioctx : public sirius_ioctx {
 
     if (reqs.empty()) {
       buffer.mark_load_failed();
-      if (handler) handler(0, nullptr);
+      if (handler) {
+        handler(0,
+                std::make_exception_ptr(
+                  std::runtime_error("device_read_async_io_using: cache entry has no chunks")));
+      }
       return;
     }
 

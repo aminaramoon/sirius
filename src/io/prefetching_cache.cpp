@@ -110,7 +110,7 @@ size_t buffer_pool::allocate_bulk(size_t n, std::vector<std::byte*>& out)
   return got;
 }
 
-void buffer_pool::deallocate_bulk(std::vector<std::byte*>& out)
+void buffer_pool::deallocate_bulk(std::vector<std::byte*>& out) noexcept
 {
   if (out.empty()) return;
   std::unique_lock lk(_mtx);
