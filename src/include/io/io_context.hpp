@@ -125,10 +125,7 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// depending on @p pool and @c supports_vector_host_read(); the
   /// ioctx is unaware of that distinction — it simply forwards lookups
   /// through @c cache().
-  void initialize_cache(buffer_pool* pool,
-                        size_t inflight_budget_chunks,
-                        double pressure_evict_start_ratio = 0.85,
-                        double pressure_evict_stop_ratio  = 0.60);
+  void initialize_cache(buffer_pool* pool, size_t inflight_budget_chunks);
 
   /// Tear down the cache (drains background workers and any in-flight
   /// IO via @c admission_control).  Idempotent.  The owner (scan

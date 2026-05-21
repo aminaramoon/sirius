@@ -47,16 +47,12 @@ sirius_ioctx::~sirius_ioctx()
   assert(!_cache && "derived ioctx forgot to call pre_destroy() in its destructor");
 }
 
-void sirius_ioctx::initialize_cache(buffer_pool* pool,
-                                    size_t inflight_budget_chunks,
-                                    double pressure_evict_start_ratio,
-                                    double pressure_evict_stop_ratio)
+void sirius_ioctx::initialize_cache(buffer_pool* pool, size_t inflight_budget_chunks)
 {
   // One-shot.  Repeated calls are silent no-ops so callers can be
   // robust to multiple wiring sites.
   if (_cache) return;
-  _cache = std::make_unique<prefetching_cache>(
-    pool, this, inflight_budget_chunks, pressure_evict_start_ratio, pressure_evict_stop_ratio);
+  _cache = std::make_unique<prefetching_cache>(pool, this, inflight_budget_chunks);
 }
 
 void sirius_ioctx::shutdown_cache() noexcept { _cache.reset(); }
