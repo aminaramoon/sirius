@@ -1007,8 +1007,7 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
     // state (empty/cached/etc.) and take their normal paths.
     std::vector<std::byte*> ptrs;
     ptrs.reserve(upper_bound_chunks);
-    auto got                = pool->allocate_bulk(upper_bound_chunks, ptrs);
-    bool eviction_requested = false;
+    auto got = pool->allocate_bulk(upper_bound_chunks, ptrs);
     if (got < upper_bound_chunks) {
       // Check stop before enqueueing: the evictor's exit drain runs only
       // for requests already in the queue when it stops.  An enqueue that
@@ -1025,7 +1024,6 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
       auto fut            = req.promise.get_future();
       _request_queue.enqueue(std::move(req));
       _request_sem.release();
-      eviction_requested = true;
 
       try {
         fut.get();
