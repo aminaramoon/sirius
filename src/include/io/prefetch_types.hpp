@@ -131,7 +131,7 @@ class buffer_pool {
   /// exhausted and cannot grow).
   size_t allocate_bulk(size_t n, std::vector<std::byte*>& out);
 
-  void deallocate_bulk(std::vector<std::byte*>& out);
+  void deallocate_bulk(std::vector<std::byte*>& out) noexcept;
 
   /// Return a chunk to the pool.
   void deallocate(std::byte* p);
@@ -570,9 +570,9 @@ class cached_host_buffer {
   cached_host_buffer(cached_host_buffer const&)            = delete;
   cached_host_buffer& operator=(cached_host_buffer const&) = delete;
 
-  cached_host_buffer(cached_host_buffer&& o) noexcept
-    : _entry(std::move(o._entry)), _pool(o._pool)
+  cached_host_buffer(cached_host_buffer&& o) noexcept : _entry(std::move(o._entry)), _pool(o._pool)
   {
+    assert(!o._entry);  // shared_ptr move guarantees the source is null
     o._pool = nullptr;
   }
 
@@ -603,13 +603,12 @@ class cached_host_buffer {
   /// every request before dispatching, following the pattern in
   /// @c host_read_ranges_async_io in @c templated_ioctx.
   template <typename Handle>
-  [[nodiscard]] std::vector<device_read_req<Handle>> prepare_device_requests(
-    Handle handle,
-    size_t offset,
-    size_t size,
-    uint8_t* dst,
-    cudaStream_t stream,
-    int device_id) const
+  [[nodiscard]] std::vector<device_read_req<Handle>> prepare_device_requests(Handle handle,
+                                                                             size_t offset,
+                                                                             size_t size,
+                                                                             uint8_t* dst,
+                                                                             cudaStream_t stream,
+                                                                             int device_id) const
   {
     assert(_entry != nullptr);
     auto const phys_off    = static_cast<size_t>(_entry->physical_range.offset());
