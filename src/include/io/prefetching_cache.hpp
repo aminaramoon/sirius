@@ -528,6 +528,10 @@ class pinned_view {
   cudaStream_t _stream{nullptr};
 };
 
+// Forward declaration needed: prefetching_handle holds a back-pointer to the
+// cache so cancel() can signal the evictor directly.
+class prefetching_cache;
+
 // ---------------------------------------------------------------------------
 // prefetching_handle
 // ---------------------------------------------------------------------------
@@ -537,8 +541,12 @@ class pinned_view {
  *
  * The cache and the caller jointly hold a @c shared_ptr<atomic<bool>>.  The
  * caller flips the flag to false (via @c cancel) when the consumer no longer
- * needs the prefetched data; the cache's worker checks the flag before
+ * needs the prefetched data; the cache's pipeline checks the flag before
  * doing work on the corresponding @c work_item and skips when cancelled.
+ *
+ * When @c cancel is called the handle also signals the cache's evictor so
+ * it can immediately reclaim any memory that was already allocated for this
+ * request but has not yet been dispatched to IO.
  *
  * Lifetime:
  *   - The handle returned by @c insert outlives the @c work_item it
@@ -558,9 +566,10 @@ class prefetching_handle {
   prefetching_handle& operator=(prefetching_handle const&) = delete;
 
   prefetching_handle(prefetching_handle&& o) noexcept
-    : _alive(std::move(o._alive)), _demand(o._demand)
+    : _alive(std::move(o._alive)), _demand(o._demand), _cache(o._cache)
   {
     o._demand = nullptr;
+    o._cache  = nullptr;
   }
 
   prefetching_handle& operator=(prefetching_handle&& o) noexcept
@@ -569,19 +578,20 @@ class prefetching_handle {
       release();
       _alive    = std::move(o._alive);
       _demand   = o._demand;
+      _cache    = o._cache;
       o._demand = nullptr;
+      o._cache  = nullptr;
     }
     return *this;
   }
 
   /// Mark the prefetch as no longer wanted.  Idempotent; safe on an empty
-  /// handle.  Thread-safe with respect to the worker's check.  Note: this
-  /// only flips the alive flag — the per-file n_request counter is
-  /// decremented on destruction (or move-out), not on cancel.
-  void cancel() noexcept
-  {
-    if (_alive) _alive->store(false, std::memory_order_release);
-  }
+  /// handle.  Thread-safe with respect to the pipeline's cancellation checks.
+  /// Flips the alive flag and signals the cache's evictor so it can reclaim
+  /// any pre-allocated memory for this request immediately.
+  /// Note: the per-file n_request counter is decremented on destruction (or
+  /// move-out), not on cancel.
+  void cancel() noexcept;
 
   /// True iff this handle is bound to a real prefetch request (i.e. came
   /// from an @c insert that scheduled work).
@@ -589,8 +599,10 @@ class prefetching_handle {
 
  private:
   friend class prefetching_cache;
-  prefetching_handle(std::shared_ptr<std::atomic<bool>> alive, file_demand* demand) noexcept
-    : _alive(std::move(alive)), _demand(demand)
+  prefetching_handle(std::shared_ptr<std::atomic<bool>> alive,
+                     file_demand* demand,
+                     prefetching_cache* cache) noexcept
+    : _alive(std::move(alive)), _demand(demand), _cache(cache)
   {
   }
 
@@ -608,6 +620,11 @@ class prefetching_handle {
   /// The cache keeps file_entries alive for its lifetime; handles never
   /// outlive the cache, so this raw pointer is stable.
   file_demand* _demand{nullptr};
+
+  /// Non-owning back-pointer to the owning cache.  Used by @c cancel() to
+  /// signal the evictor.  The cache outlives all handles (handles are vended
+  /// by the cache and callers never retain them past cache destruction).
+  prefetching_cache* _cache{nullptr};
 };
 
 // ---------------------------------------------------------------------------
@@ -626,6 +643,9 @@ class prefetching_cache {
   // datasource keeps insert() out of the public API while still letting
   // fadvise dispatch through it.
   friend class sirius_datasource;
+  // prefetching_handle calls notify_disposed() on cancel — needs access to
+  // the private method.
+  friend class prefetching_handle;
 
  public:
   /// Construct the cache with all of its dependencies wired up at
@@ -748,6 +768,11 @@ class prefetching_cache {
   void evictor_loop(std::stop_token stop);
   void enqueue_work(work_item item);
   void abort_pending_entries() noexcept;
+
+  /// Called by @c prefetching_handle::cancel() when the caller signals it no
+  /// longer needs the prefetched data.  Wakes the evictor so it can
+  /// immediately reclaim any pre-allocated memory for the cancelled request.
+  void notify_disposed() noexcept;
 
   /// Release all chunks held by an entry back to the pool.
   void release_chunks(cache_entry& entry);
