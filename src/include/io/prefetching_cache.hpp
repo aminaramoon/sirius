@@ -530,6 +530,150 @@ class pinned_view {
   cudaStream_t _stream{nullptr};
 };
 
+// ---------------------------------------------------------------------------
+// cached_host_buffer — pre-allocated bounce buffers for device reads
+// ---------------------------------------------------------------------------
+//
+// Vended by @c prefetching_cache::read() when the caller passes a non-null
+// out-pointer and the target entry is in the @c allocated state.
+// @c read() flips the entry to @c loading and transfers ownership to this
+// object; the caller then passes it to
+// @c sirius_ioctx::device_read_async_io_using() to issue file → bounce →
+// device IO using the chunks that are already allocated.
+//
+// Lifecycle:
+//   constructed → prepare_device_requests() called → IO dispatched
+//       → mark_cached() on success  (loading → cached)
+//       → mark_load_failed() on failure  (loading → empty, chunks freed)
+//   If destroyed before either mark is called (e.g. IO never dispatched),
+//   the destructor calls mark_load_failed() as a safety net.
+//
+// Thread safety: a single owner thread; mark_cached/mark_load_failed are
+// called from the reactor completion callback (same logical sequence).
+
+class cached_host_buffer {
+ public:
+  cached_host_buffer() = default;
+
+  /// Construct from an entry that MUST already be in the @c loading state.
+  /// @p pool is used to reclaim chunks on failure; must outlive this object.
+  cached_host_buffer(std::shared_ptr<cache_entry> entry, buffer_pool* pool) noexcept
+    : _entry(std::move(entry)), _pool(pool)
+  {
+  }
+
+  ~cached_host_buffer()
+  {
+    if (_entry) mark_load_failed();
+  }
+
+  cached_host_buffer(cached_host_buffer const&)            = delete;
+  cached_host_buffer& operator=(cached_host_buffer const&) = delete;
+
+  cached_host_buffer(cached_host_buffer&& o) noexcept : _entry(std::move(o._entry)), _pool(o._pool)
+  {
+    o._pool = nullptr;
+  }
+
+  cached_host_buffer& operator=(cached_host_buffer&& o) noexcept
+  {
+    if (this != &o) {
+      if (_entry) mark_load_failed();
+      _entry  = std::move(o._entry);
+      _pool   = o._pool;
+      o._pool = nullptr;
+    }
+    return *this;
+  }
+
+  explicit operator bool() const noexcept { return _entry != nullptr; }
+
+  /// Build one @c device_read_req per chunk in the entry, covering the full
+  /// physical range.  Chunks overlapping the caller's logical
+  /// [offset, offset+size) are configured to H2D-copy into @p dst; padding
+  /// chunks at the edges carry @c data_size == 0 (IO-only, no copy).
+  ///
+  /// @p ctx must be pre-built by the caller with @c pending == chunks().size()
+  /// so each chunk's @c chunk_done() / @c chunk_failed() decrements to zero
+  /// exactly once — the caller's completion handler fires when the last chunk
+  /// resolves.
+  template <typename Handle>
+  [[nodiscard]] std::vector<device_read_req<Handle>> prepare_device_requests(
+    Handle handle,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    cudaStream_t stream,
+    int device_id,
+    std::shared_ptr<request_context> ctx) const
+  {
+    assert(_entry != nullptr);
+    auto const phys_off    = static_cast<size_t>(_entry->physical_range.offset());
+    auto const phys_size   = static_cast<size_t>(_entry->physical_range.size());
+    auto const chunk_bytes = _entry->chunk_bytes;
+    auto const n_chunks    = _entry->chunks.size();
+
+    std::vector<device_read_req<Handle>> reqs;
+    reqs.reserve(n_chunks);
+
+    size_t produced = 0;
+    for (size_t i = 0; i < n_chunks; ++i) {
+      auto const chunk_file_off = phys_off + i * chunk_bytes;
+      auto const chunk_io_size  = std::min(chunk_bytes, phys_size - i * chunk_bytes);
+      auto const chunk_file_end = chunk_file_off + chunk_io_size;
+
+      device_read_req<Handle> req;
+      req.handle    = handle;
+      req.file_off  = chunk_file_off;
+      req.io_size   = chunk_io_size;
+      req.bounce    = reinterpret_cast<uint8_t*>(_entry->chunks[i]);
+      req.stream    = stream;
+      req.device_id = device_id;
+      req.ctx       = ctx;
+
+      // Determine how much (if any) of this chunk falls within the user's
+      // logical request window and should be H2D-copied to dst.
+      auto const useful_start = std::max(chunk_file_off, offset);
+      auto const useful_end   = std::min(chunk_file_end, offset + size);
+      if (useful_start < useful_end) {
+        req.data_off  = useful_start - chunk_file_off;
+        req.data_size = useful_end - useful_start;
+        req.dst       = dst + produced;
+        produced += req.data_size;
+      }
+      // else: alignment-only chunk — bounce is filled, but data_size == 0
+      // so no H2D copy is issued for this chunk.
+
+      reqs.push_back(std::move(req));
+    }
+
+    return reqs;
+  }
+
+  /// Transition the entry loading → cached.  Wakes waiting readers.
+  /// Safe to call only once; clears the internal entry pointer afterwards.
+  void mark_cached() noexcept
+  {
+    if (!_entry) return;
+    _entry->state.try_mark_cached();
+    _entry = nullptr;
+  }
+
+  /// Transition the entry loading → empty; return chunks to the pool.
+  /// Safe to call only once; clears the internal entry pointer afterwards.
+  void mark_load_failed() noexcept
+  {
+    if (!_entry) return;
+    if (_pool) { _pool->deallocate_bulk(_entry->chunks); }
+    _entry->state.try_mark_load_failed();
+    _entry = nullptr;
+  }
+
+ private:
+  std::shared_ptr<cache_entry> _entry;
+  buffer_pool* _pool{nullptr};
+};
+
 // Forward declaration needed: prefetching_handle holds a back-pointer to the
 // cache so cancel() can signal the evictor directly.
 class prefetching_cache;
