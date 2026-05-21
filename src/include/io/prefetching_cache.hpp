@@ -557,9 +557,12 @@ class cached_host_buffer {
 
   /// Construct from an entry that MUST already be in the @c loading state.
   /// @p pool is used to reclaim chunks on failure; must outlive this object.
+  /// @p pool must not be null when @p entry is non-null — the pool is needed
+  /// to return the entry's chunks on failure.
   cached_host_buffer(std::shared_ptr<cache_entry> entry, buffer_pool* pool) noexcept
     : _entry(std::move(entry)), _pool(pool)
   {
+    assert(!_entry || _pool);  // non-null entry requires a pool to reclaim chunks
   }
 
   ~cached_host_buffer()
@@ -589,23 +592,25 @@ class cached_host_buffer {
   explicit operator bool() const noexcept { return _entry != nullptr; }
 
   /// Build one @c device_read_req per chunk in the entry, covering the full
-  /// physical range.  Chunks overlapping the caller's logical
-  /// [offset, offset+size) are configured to H2D-copy into @p dst; padding
-  /// chunks at the edges carry @c data_size == 0 (IO-only, no copy).
+  /// physical range.  Chunks overlapping [offset, offset+size) are configured
+  /// to H2D-copy into @p dst; alignment-padding chunks carry
+  /// @c data_size == 0 (IO-only, no copy).
   ///
-  /// @p ctx must be pre-built by the caller with @c pending == chunks().size()
-  /// so each chunk's @c chunk_done() / @c chunk_failed() decrements to zero
-  /// exactly once — the caller's completion handler fires when the last chunk
-  /// resolves.
+  /// @p offset and @p size are **file-absolute** byte positions (same coordinate
+  /// space as @c physical_range.offset()).  The caller is responsible for
+  /// translating any logical offset before calling.
+  ///
+  /// The returned requests have a null @c ctx field.  The caller must create
+  /// a @c request_context with @c pending == reqs.size() and patch it onto
+  /// every request before dispatching, following the pattern in
+  /// @c host_read_ranges_async_io in @c templated_ioctx.
   template <typename Handle>
-  [[nodiscard]] std::vector<device_read_req<Handle>> prepare_device_requests(
-    Handle handle,
-    size_t offset,
-    size_t size,
-    uint8_t* dst,
-    cudaStream_t stream,
-    int device_id,
-    std::shared_ptr<request_context> ctx) const
+  [[nodiscard]] std::vector<device_read_req<Handle>> prepare_device_requests(Handle handle,
+                                                                             size_t offset,
+                                                                             size_t size,
+                                                                             uint8_t* dst,
+                                                                             cudaStream_t stream,
+                                                                             int device_id) const
   {
     assert(_entry != nullptr);
     auto const phys_off    = static_cast<size_t>(_entry->physical_range.offset());
@@ -629,10 +634,10 @@ class cached_host_buffer {
       req.bounce    = reinterpret_cast<uint8_t*>(_entry->chunks[i]);
       req.stream    = stream;
       req.device_id = device_id;
-      req.ctx       = ctx;
+      // ctx is left null here; caller patches it after creating request_context.
 
       // Determine how much (if any) of this chunk falls within the user's
-      // logical request window and should be H2D-copied to dst.
+      // request window and should be H2D-copied to dst.
       auto const useful_start = std::max(chunk_file_off, offset);
       auto const useful_end   = std::min(chunk_file_end, offset + size);
       if (useful_start < useful_end) {
@@ -652,6 +657,11 @@ class cached_host_buffer {
 
   /// Transition the entry loading → cached.  Wakes waiting readers.
   /// Safe to call only once; clears the internal entry pointer afterwards.
+  ///
+  /// Uses the CAS variant rather than the unconditional store so that a
+  /// racing @c try_abort_pending() (cache shutdown) that already moved
+  /// the entry to @c empty is tolerated silently — the shutdown will have
+  /// already woken all waiters.
   void mark_cached() noexcept
   {
     if (!_entry) return;
