@@ -324,15 +324,24 @@ std::future<size_t> sirius_ioctx::device_read_async(
       return promise->get_future();
     }
   }
+  // Same try/catch shape as the allocated-steal path above: a synchronous
+  // throw from device_read_async_io (e.g. cudaGetDevice failure inside
+  // enqueue_device_read) must be delivered via the returned future, not
+  // propagated to the caller — otherwise the future has no setter and
+  // callers see broken_promise instead of the real error.
   auto promise = std::make_shared<std::promise<size_t>>();
-  device_read_async_io(
-    obj, offset, size, dst, stream, [promise](size_t bytes_transferred, std::exception_ptr ep) {
-      if (ep) {
-        promise->set_exception(std::move(ep));
-      } else {
-        promise->set_value(bytes_transferred);
-      }
-    });
+  try {
+    device_read_async_io(
+      obj, offset, size, dst, stream, [promise](size_t bytes_transferred, std::exception_ptr ep) {
+        if (ep) {
+          promise->set_exception(std::move(ep));
+        } else {
+          promise->set_value(bytes_transferred);
+        }
+      });
+  } catch (...) {
+    promise->set_exception(std::current_exception());
+  }
   return promise->get_future();
 }
 

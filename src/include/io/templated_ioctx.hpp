@@ -36,6 +36,28 @@
 
 namespace sirius::io {
 
+namespace detail {
+
+/// Wrap cudaGetDevice with an exception on failure.  Without the check a
+/// failure leaves the out-param at -1, the reactor's `if (device_id >= 0)
+/// cudaSetDevice` skips, and on multi-GPU the H2D copy lands on whichever
+/// device the reactor thread happens to have current — wrong-device data
+/// corruption or a downstream cudaMemcpyAsync error on a different code
+/// path.  Throwing here surfaces the original error at the dispatch site.
+[[nodiscard]] inline int current_cuda_device()
+{
+  int id          = -1;
+  cudaError_t err = cudaGetDevice(&id);
+  if (err != cudaSuccess) {
+    cudaGetLastError();
+    throw std::runtime_error(std::string("templated_ioctx: cudaGetDevice failed: ") +
+                             cudaGetErrorString(err));
+  }
+  return id;
+}
+
+}  // namespace detail
+
 // ---------------------------------------------------------------------------
 // Concept: io_object_c
 // ---------------------------------------------------------------------------
@@ -269,12 +291,14 @@ class templated_ioctx : public sirius_ioctx {
   {
     auto& tobj = as_typed(obj);
 
+    // Capture the caller's device before we move `buffer` into shared
+    // ownership: a throw here unwinds the stack with `buffer` still
+    // local, so its dtor's mark_load_failed deallocates the entry's
+    // chunks and resets state instead of stranding them.
+    int const device_id = detail::current_cuda_device();
+
     auto reqs = buffer.template prepare_device_requests<native_handle_type>(
-      tobj.device_handle(), offset, size, dst, stream.value(), [&] {
-        int id = -1;
-        cudaGetDevice(&id);
-        return id;
-      }());
+      tobj.device_handle(), offset, size, dst, stream.value(), device_id);
 
     if (reqs.empty()) {
       buffer.mark_load_failed();
@@ -431,14 +455,16 @@ class templated_ioctx : public sirius_ioctx {
 
     size_t n_chunks = (a_end - a_start + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
+    // Capture the caller's CUDA device BEFORE creating the request_context
+    // so that a failure throws cleanly without leaving a ctx whose
+    // destructor safety net would fire the handler with a less specific
+    // error.  In multi-GPU usage a single reactor thread serves streams
+    // bound to different devices, and silently defaulting to "don't
+    // switch" lands the H2D on the wrong device.
+    int const device_id = detail::current_cuda_device();
+
     auto ctx = request_context::create(n_chunks, size, std::move(handler));
     if (!ctx) return;
-
-    // Capture the caller's CUDA device so the reactor thread can switch
-    // to it before the H2D copy.  In multi-GPU usage a single reactor
-    // thread serves streams bound to different devices.
-    int device_id = -1;
-    cudaGetDevice(&device_id);
 
     // Build the chunks into one flat vector, then hand each reactor a
     // contiguous span slice.  Collapses N wake-notifies to at most M
