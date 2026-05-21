@@ -333,6 +333,16 @@ class prefetching_cache {
   /// admission_control are all only meaningful when this is true.
   bool const _armed;
 
+  /// Set true by the dtor BEFORE request_stop on any thread.  The allocator
+  /// checks this just before enqueueing an eviction_request, so during
+  /// shutdown the request queue stays empty.  The evictor checks it inside
+  /// evict_chunks so a late-pushed request (the microsecond race between
+  /// the allocator's flag check and its enqueue) resolves with a fast
+  /// set_exception instead of stalling shutdown by looping over live
+  /// wrappers.  The dtor must keep the evictor alive across join(allocator)
+  /// so this resolution actually happens.
+  std::atomic<bool> _shutting_down{false};
+
   // Observability counters (updated on every read() / read_ranges() entry).
   std::atomic<uint64_t> _hit_count{0};
   std::atomic<uint64_t> _partial_miss_count{0};
