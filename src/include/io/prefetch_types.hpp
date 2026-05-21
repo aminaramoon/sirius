@@ -197,32 +197,37 @@ class buffer_pool {
 //
 // State machine (two-stage prefetch pipeline):
 //
-//   try_start_queueing()   try_allocate()    try_start_loading()
-//   empty ───────────► queued ──────────► allocated ──────────► loading
-//     ▲                  │                   │                     │
-//     │                  │ try_cancel_       │ try_cancel_         │ try_mark_cached()
-//     │                  │ queued()          │ allocated()         ▼
-//     │                  ▼                   ▼              cached ◄────────────────
-//     │                empty              empty               ▲    │
-//     │                                                       │    │ try_start_evicting()
-//     │          release_read() (last reader)                 │    ▼
-//     │ mark_evicted() ◄─────────────────── in_use ◄──────── ─ evicting
+//   try_allocate()                  try_start_loading()
+//   empty ──────────────► allocated ──────────────────► loading
+//     ▲                       │                              │
+//     │                       │ try_cancel_allocated()       │ try_mark_cached()
+//     │                       ▼                              ▼
+//     │                     empty                       cached ◄────────────────
+//     │                                                   ▲    │
+//     │                                                   │    │ try_start_evicting()
+//     │          release_read() (last reader)             │    ▼
+//     │ mark_evicted() ◄─────────────────── in_use ◄──── evicting
 //     │                                  (pin_count ≥ 1)
 //     └── mark_load_failed() / try_mark_load_failed()  (loading → empty)
 //
-// Stage 1 (allocator_loop): queued → allocated  (chunks assigned)
+// Stage 1 (allocator_loop): empty → allocated  (chunks assigned via CAS)
 // Stage 2 (io_dispatch_loop): allocated → loading → cached/empty
+//
+// Note: there is no separate `queued` state.  insert() just appends a
+// work_item to _work_queue; the cache_entry stays in `empty` until the
+// allocator picks it up and atomically transitions empty → allocated.
+// The CAS is the exclusive claim — concurrent allocator passes / inserts
+// covering the same range see allocated and skip.
 
 class entry_state {
  public:
   enum value : uint8_t {
     empty     = 0,
-    queued    = 1,
+    allocated = 1,  ///< chunks assigned, IO not yet dispatched
     loading   = 2,
     cached    = 3,
     in_use    = 4,
     evicting  = 5,
-    allocated = 6,  ///< chunks assigned, IO not yet dispatched
   };
 
   entry_state() noexcept = default;
@@ -237,19 +242,14 @@ class entry_state {
     return unpack_pins(_packed.load(std::memory_order_acquire));
   }
 
-  /// empty → queued.  Returns false if not empty.
-  /// Called by insert() to claim responsibility for scheduling a load.
-  bool try_start_queueing() noexcept
-  {
-    auto expected = pack(empty, 0);
-    return _packed.compare_exchange_strong(expected, pack(queued, 0), std::memory_order_acq_rel);
-  }
-
-  /// queued → allocated.  Returns false if not queued.
-  /// Called by allocator_loop after chunks have been assigned to the entry.
+  /// empty → allocated.  Returns false if not empty.  Called by
+  /// allocator_loop's Phase 4 to atomically claim an entry and assign
+  /// chunks to it; the CAS is the exclusive claim, so concurrent
+  /// allocator passes / inserts covering the same range see the entry
+  /// in `allocated` (or later) and skip.
   bool try_allocate() noexcept
   {
-    auto expected = pack(queued, 0);
+    auto expected = pack(empty, 0);
     return _packed.compare_exchange_strong(expected, pack(allocated, 0), std::memory_order_acq_rel);
   }
 
@@ -272,15 +272,6 @@ class entry_state {
   {
     auto expected = pack(allocated, 0);
     return _packed.compare_exchange_strong(expected, pack(loading, 0), std::memory_order_acq_rel);
-  }
-
-  /// queued → empty.  Returns false if not queued.
-  /// Used by refresh_cache to drop stale pending prefetches and by the
-  /// worker's abort path to release orphaned entries.
-  bool try_cancel_queued() noexcept
-  {
-    auto expected = pack(queued, 0);
-    return _packed.compare_exchange_strong(expected, pack(empty, 0), std::memory_order_acq_rel);
   }
 
   /// loading → cached.  Caller must ensure state is loading.
@@ -336,8 +327,8 @@ class entry_state {
     return ok;
   }
 
-  /// (queued | allocated | loading) → empty.  Used during cache shutdown to
-  /// wake readers parked on a load that may never complete.
+  /// (allocated | loading) → empty.  Used during cache shutdown to wake
+  /// readers parked on a load that may never complete.
   ///
   /// Returns the state the entry was in before the transition, or @c empty
   /// if no transition happened (state was not in the handled set).  The
@@ -349,7 +340,7 @@ class entry_state {
     uint32_t cur = _packed.load(std::memory_order_acquire);
     while (true) {
       auto st = unpack_state(cur);
-      if (st != queued && st != allocated && st != loading) return empty;
+      if (st != allocated && st != loading) return empty;
       if (_packed.compare_exchange_weak(
             cur, pack(empty, 0), std::memory_order_acq_rel, std::memory_order_acquire)) {
         _packed.notify_all();
