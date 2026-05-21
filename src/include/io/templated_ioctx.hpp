@@ -241,6 +241,79 @@ class templated_ioctx : public sirius_ioctx {
     enqueue_device_read(as_typed(obj), offset, size, dst, stream.value(), std::move(handler));
   }
 
+  // -- Device read using pre-allocated bounce buffers -----------------------
+
+  /// Issue an async device read for the range [offset, offset+size) into
+  /// @p dst, reusing the pinned host chunks already allocated in
+  /// @p buffer.  @p buffer MUST be in the @c loading state (the caller
+  /// already flipped it from @c allocated via
+  /// @c prefetching_cache::read()).
+  ///
+  /// On IO completion the reactor fires @p handler.  The wrapped
+  /// completion callback also calls @p buffer.mark_cached() on success or
+  /// @p buffer.mark_load_failed() on failure, which transitions the entry
+  /// to its terminal state and wakes any parked readers.
+  ///
+  /// @p offset must be **file-absolute** (same coordinate space as the
+  /// entry's @c physical_range.offset()); see
+  /// @c cached_host_buffer::prepare_device_requests for the full contract.
+  void device_read_async_io_using(sirius_io_object& obj,
+                                  size_t offset,
+                                  size_t size,
+                                  uint8_t* dst,
+                                  rmm::cuda_stream_view stream,
+                                  cached_host_buffer buffer,
+                                  io_completion_handler handler)
+  {
+    auto& tobj = as_typed(obj);
+
+    auto reqs = buffer.template prepare_device_requests<native_handle_type>(
+      tobj.device_handle(), offset, size, dst, stream.value(), [&] {
+        int id = -1;
+        cudaGetDevice(&id);
+        return id;
+      }());
+
+    if (reqs.empty()) {
+      buffer.mark_load_failed();
+      if (handler) handler(0, nullptr);
+      return;
+    }
+
+    // Create the request_context AFTER prepare so we can move buffer into
+    // the lambda.  ctx is then patched onto every request before dispatch.
+    auto ctx = request_context::create(reqs.size(),
+                                       size,
+                                       [buf = std::move(buffer), user_handler = std::move(handler)](
+                                         size_t bytes, const std::exception_ptr& ep) mutable {
+                                         if (ep) {
+                                           buf.mark_load_failed();
+                                         } else {
+                                           buf.mark_cached();
+                                         }
+                                         if (user_handler) user_handler(bytes, ep);
+                                       });
+
+    if (!ctx) return;  // n_chunks > 0 so create() can't return null, but guard anyway
+
+    for (auto& r : reqs)
+      r.ctx = ctx;
+
+    auto const m = _reactors.size();
+    size_t start = _next.fetch_add(1, std::memory_order_relaxed) % m;
+    size_t base  = reqs.size() / m;
+    size_t rem   = reqs.size() % m;
+    size_t off   = 0;
+    for (size_t k = 0; k < m; ++k) {
+      size_t group_size = base + (k < rem ? 1 : 0);
+      if (group_size == 0) continue;
+      size_t reactor_idx = (start + k) % m;
+      _reactors[reactor_idx]->enqueue_bulk(
+        std::span<device_read_req_type>(reqs.data() + off, group_size));
+      off += group_size;
+    }
+  }
+
   // -- Batch host reads (generic: dispatch to reactor host_read_async) ------
 
   void host_read_ranges_async_io(sirius_io_object& obj,
