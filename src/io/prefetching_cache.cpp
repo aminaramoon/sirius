@@ -479,7 +479,12 @@ void prefetching_cache::abort_pending_entries() noexcept
       if (!file_ptr) { continue; }
       std::shared_lock file_lk(file_ptr->mtx);
       for (auto const& entry : file_ptr->entries) {
-        if (entry) { entry->state.try_abort_pending(); }
+        if (!entry) continue;
+        auto old_st = entry->state.try_abort_pending();
+        if (old_st == entry_state::allocated && _pool) {
+          _pool->deallocate_bulk(entry->chunks);
+          entry->chunks.clear();
+        }
       }
     }
   } catch (...) {
@@ -658,31 +663,31 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
   if (!entry) return {};
 
   // Dispatch on state:
-  //   cached / in_use → pin immediately.
-  //   loading         → wait for the worker to resolve the load, then retry.
+  //   cached / in_use   → pin immediately.
+  //   allocated/loading → wait for the pipeline to resolve the load, then retry.
   //   queued / evicting / empty → return empty (caller falls back).
-  bool waited_on_loading = false;
+  bool waited_on_load = false;
   while (true) {
     auto st = entry->state.get_state();
     if (st == entry_state::cached || st == entry_state::in_use) {
       pinned_view view{entry, stream};
       if (view) {
         _hit_count.fetch_add(1, std::memory_order_relaxed);
-        if (waited_on_loading) _hit_after_wait.fetch_add(1, std::memory_order_relaxed);
+        if (waited_on_load) _hit_after_wait.fetch_add(1, std::memory_order_relaxed);
         return view;
       }
       // try_acquire_read lost a race; re-observe the state.
       continue;
     }
-    if (st == entry_state::loading) {
-      waited_on_loading = true;
+    if (st == entry_state::allocated || st == entry_state::loading) {
+      waited_on_load = true;
       // Release file_lk across the wait: the entry is pinned by our local
       // shared_ptr, and file.mtx no longer protects anything we touch while
       // parked.  Holding it shared would stall every concurrent insert() on
       // this file (and, under writer-preference shared_mutex, every reader
       // queued behind that insert).
       file_lk.unlock();
-      entry->state.wait_while_loading();
+      entry->state.wait_while_pending();
       file_lk.lock();
       continue;
     }
