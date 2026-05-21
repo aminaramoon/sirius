@@ -326,12 +326,13 @@ void uring_reactor::worker_loop()
       int si = _slot_pool.try_acquire();
       if (si < 0) break;  // pool exhausted
 
-      io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-      if (!sqe) {
-        _slot_pool.release(si);
-        break;  // ring full
-      }
-
+      // Dequeue BEFORE acquiring the SQE: io_uring_get_sqe() advances the
+      // ring's sqe_tail and the next io_uring_submit() ships everything up
+      // to that tail.  If we got an SQE and then found the queue empty, the
+      // unprepared SQE would submit as garbage (zero-initialized → NOP with
+      // user_data=0 on the first wrap), producing a phantom CQE that
+      // reap_cqes would route into slots[0] — corrupting inflight, double-
+      // releasing the slot, and dereferencing a moved-from s.ctx.
       auto& s = slots[si];
       device_read_req_type dr;
       host_read_req_type hr;
@@ -342,6 +343,22 @@ void uring_reactor::worker_loop()
       } else {
         _slot_pool.release(si);
         break;  // queue empty
+      }
+
+      io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
+      if (!sqe) {
+        // Provably unreachable given _ring_entries >= 2 * NUM_CHUNKS: a free
+        // slot implies a free SQE.  If this fires the sizing invariant has
+        // been violated; we've already moved the request out of the queue
+        // (no push-back on moodycamel) so drain the ctx via chunk_failed.
+        spdlog::critical(
+          "uring_reactor: SQE exhausted in submit_pending after dequeue — "
+          "ring sizing invariant violated (slot={})",
+          si);
+        s.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+          "uring_reactor: SQE exhausted in submit_pending — ring sizing invariant violated")));
+        _slot_pool.release(si);
+        break;
       }
 
       if (s.is_registered) {
