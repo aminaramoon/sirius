@@ -567,6 +567,10 @@ void uring_reactor::worker_loop()
   // ---------------------------------------------------------------------------
   // Main loop
   //
+  // Shutdown: queued-but-not-yet-submitted requests are cancelled immediately
+  // via chunk_failed.  Already-submitted io_uring ops (inflight) and pending
+  // CUDA copies (_copying_count) are allowed to complete naturally.
+  //
   // Park points:
   //  A) queue empty and no in-flight IO: wait on _request_queue seq counter.
   //     Covers truly idle (new work) and shutdown draining CUDA callbacks.
@@ -575,15 +579,21 @@ void uring_reactor::worker_loop()
   //     slot_pool::acquire() parks until cuda_copy_cb calls release().
   //     Safe: inflight == 0 guarantees no io_uring op holds a slot.
   // ---------------------------------------------------------------------------
+  static constexpr long SHUTDOWN_POLL_MS = 100;
+  auto shutdown_err = std::make_exception_ptr(std::runtime_error("uring_reactor: shutting down"));
+
   while (true) {
-    if (_stop.load(std::memory_order_acquire) && _request_queue.empty() && inflight == 0 &&
-        _copying_count.load(std::memory_order_acquire) == 0)
-      break;
+    if (_stop.load(std::memory_order_acquire)) {
+      device_read_req_type dr;
+      while (_request_queue.try_dequeue_device(dr))
+        dr.ctx->chunk_failed(shutdown_err);
+      host_read_req_type hr;
+      while (_request_queue.try_dequeue_host(hr))
+        hr.ctx->chunk_failed(shutdown_err);
+      if (inflight == 0 && _copying_count.load(std::memory_order_acquire) == 0) break;
+    }
 
     // Park A: nothing queued and no io_uring work in flight.
-    // Single-check is sufficient: inflight is only mutated by this worker, so
-    // we don't need a recheck for it; the seq snapshot taken before wait()
-    // closes the race against producers enqueuing new work.
     if (_request_queue.empty() && inflight == 0) {
       uint64_t seq = _request_queue.current_seq();
       if (_request_queue.empty()) _request_queue.wait(seq);
@@ -598,7 +608,6 @@ void uring_reactor::worker_loop()
       // no CQE arrives.  SINGLE_ISSUER means we can't post a NOP SQE from
       // interrupt() to unblock a plain wait_cqe; the timeout bounds shutdown
       // latency to SHUTDOWN_POLL_MS.
-      static constexpr long SHUTDOWN_POLL_MS = 100;
       __kernel_timespec ts{};
       ts.tv_sec  = SHUTDOWN_POLL_MS / 1000;
       ts.tv_nsec = (SHUTDOWN_POLL_MS % 1000) * 1'000'000L;
@@ -614,11 +623,6 @@ void uring_reactor::worker_loop()
     // Park C: inflight == 0, queue non-empty, pool exhausted by CUDA callbacks.
     // Acquire a slot to sleep until cuda_copy_cb fires, then release it —
     // submit_pending will claim it on the next iteration.
-    //
-    // Shutdown intentionally does not bypass this park: in-flight ops (here,
-    // CUDA callbacks holding slots) are never abandoned. The worker waits
-    // for at least one callback to fire before re-checking _stop at the top
-    // of the loop.
     if (!_slot_pool.any_free()) {
       int si = _slot_pool.acquire();
       _slot_pool.release(si);
