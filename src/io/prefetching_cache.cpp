@@ -838,16 +838,36 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
       file_lk.lock();
       continue;
     }
-    // State is `empty` (entry was evicted between find_entry and now) or
-    // `evicting` (about to be).  Caller falls back to the backend.
-    _miss_state_other.fetch_add(1, std::memory_order_relaxed);
-    spdlog::debug(
-      "prefetching_cache: miss_state_other state={} off={} size={} entry_off={} entry_size={}",
-      static_cast<int>(st),
-      offset,
-      size,
-      static_cast<size_t>(entry->logical_range.offset()),
-      static_cast<size_t>(entry->logical_range.size()));
+    // State is `empty` or `evicting`.  Differentiate so we can tell
+    // "allocation falling behind reads" from "entry was loaded then
+    // evicted / load-failed" — both look like state == empty otherwise.
+    if (st == entry_state::evicting) {
+      _miss_state_evicting.fetch_add(1, std::memory_order_relaxed);
+      spdlog::debug(
+        "prefetching_cache: miss_state_evicting off={} size={} entry_off={} entry_size={}",
+        offset,
+        size,
+        static_cast<size_t>(entry->logical_range.offset()),
+        static_cast<size_t>(entry->logical_range.size()));
+    } else if (entry->ever_allocated.load(std::memory_order_acquire)) {
+      _miss_state_empty_post_drain.fetch_add(1, std::memory_order_relaxed);
+      spdlog::debug(
+        "prefetching_cache: miss_state_empty_post_drain off={} size={} entry_off={} "
+        "entry_size={}",
+        offset,
+        size,
+        static_cast<size_t>(entry->logical_range.offset()),
+        static_cast<size_t>(entry->logical_range.size()));
+    } else {
+      _miss_state_empty_never_allocated.fetch_add(1, std::memory_order_relaxed);
+      spdlog::debug(
+        "prefetching_cache: miss_state_empty_never_allocated off={} size={} entry_off={} "
+        "entry_size={}",
+        offset,
+        size,
+        static_cast<size_t>(entry->logical_range.offset()),
+        static_cast<size_t>(entry->logical_range.size()));
+    }
     return {};
   }
 }
@@ -860,19 +880,23 @@ std::string prefetching_cache::summary() const
   auto m_range          = _miss_range.load(std::memory_order_relaxed);
   auto m_alloc_no_steal = _miss_state_allocated_no_steal.load(std::memory_order_relaxed);
   auto m_steal_lost     = _miss_state_steal_cas_lost.load(std::memory_order_relaxed);
-  auto m_other          = _miss_state_other.load(std::memory_order_relaxed);
+  auto m_evicting       = _miss_state_evicting.load(std::memory_order_relaxed);
+  auto m_never_alloc    = _miss_state_empty_never_allocated.load(std::memory_order_relaxed);
+  auto m_post_drain     = _miss_state_empty_post_drain.load(std::memory_order_relaxed);
   auto full             = _full_miss_count.load(std::memory_order_relaxed);
   auto evicted_entries  = _evicted_entries.load(std::memory_order_relaxed);
   auto evicted_chunks   = _evicted_chunks.load(std::memory_order_relaxed);
-  auto partial          = m_range + m_alloc_no_steal + m_steal_lost + m_other;
-  auto total            = hits + steals + partial + full;
-  auto pct              = [&](uint64_t n) {
+  auto partial =
+    m_range + m_alloc_no_steal + m_steal_lost + m_evicting + m_never_alloc + m_post_drain;
+  auto total = hits + steals + partial + full;
+  auto pct   = [&](uint64_t n) {
     return total > 0 ? (100.0 * static_cast<double>(n) / static_cast<double>(total)) : 0.0;
   };
   auto s = fmt::format(
     "prefetching_cache: {} reads ({} hit {:.1f}% [of which {} waited on "
     "loading], {} allocated-steal {:.1f}%, {} partial-miss {:.1f}% "
-    "[range={} alloc-no-steal={} steal-cas-lost={} state-other={}], "
+    "[range={} alloc-no-steal={} steal-cas-lost={} evicting={} "
+    "empty-never-alloc={} empty-post-drain={}], "
     "{} full-miss {:.1f}%); evicted {} entries / {} chunks; pool {}/{} chunks free",
     total,
     hits,
@@ -885,7 +909,9 @@ std::string prefetching_cache::summary() const
     m_range,
     m_alloc_no_steal,
     m_steal_lost,
-    m_other,
+    m_evicting,
+    m_never_alloc,
+    m_post_drain,
     full,
     pct(full),
     evicted_entries,
@@ -1248,6 +1274,12 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
         return_chunks();
         continue;
       }
+      // Diagnostic: mark the entry as having reached `allocated` at
+      // least once.  Lets read() distinguish "never allocated yet"
+      // (allocation behind reads) from "allocated but evicted/load-
+      // failed" (eviction churn).  release ordering pairs with the
+      // acquire-load in read()'s miss-classifier.
+      e->ever_allocated.store(true, std::memory_order_release);
 
       spdlog::info("allocator_loop: allocated {} chunks for entry {} (file {}, offset {}, size {})",
                    n,

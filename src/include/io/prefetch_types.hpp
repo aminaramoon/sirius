@@ -451,6 +451,13 @@ struct alignas(64) cache_entry {
   /// Packed state + pin_count.  All state transitions go through this.
   entry_state state;
 
+  /// One-shot diagnostic flag: set by the allocator on the first
+  /// empty → allocated transition.  Lets read()'s miss-classifier
+  /// distinguish "entry was never allocated yet" (allocation falling
+  /// behind reads) from "entry was allocated but later evicted /
+  /// load-failed" (eviction churn).  Never cleared after set.
+  std::atomic<bool> ever_allocated{false};
+
   cache_entry(cudf::io::text::byte_range_info logical,
               cudf::io::text::byte_range_info physical,
               size_t chunk_bytes)
