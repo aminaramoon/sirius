@@ -1143,43 +1143,40 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
       continue;
     }
 
-    // ---- Phase 3: acquire inflight budget ----------------------------------
-    // Count chunks across all allocated entries.  Budget is released when the
-    // last sub-batch's completion callback drops the shared slot.
-    size_t total_chunks = 0;
-    for (auto const& e : item.entries) {
-      if (e) total_chunks += e->chunks.size();
-    }
-
-    auto budget_slot = _inflight_budget->acquire(total_chunks, stop);
-    if (!budget_slot) {
-      // Stop requested while waiting for budget.  Return all chunks.
-      for (auto& e : item.entries) {
-        if (!e) continue;
-        if (e->state.try_cancel_allocated()) {
-          if (pool) { pool->deallocate_bulk(e->chunks); }
-        }
-      }
-      break;
-    }
-
     // ---- allocated → loading + build batch ---------------------------------
-    // Entries that race (try_start_loading fails) have already been cancelled
-    // by the evictor; return their chunks and exclude them from IO dispatch.
+    // try_start_loading() (allocated → loading) establishes exclusive ownership
+    // of the entry's chunks via an acq_rel CAS.  Reading e->chunks BEFORE
+    // this CAS would race with the evictor's try_cancel_allocated() which
+    // clears the vector.  We therefore count chunks and build the batch in
+    // a single pass, reading chunks only after the CAS succeeds.
+    // Entries where try_start_loading fails were cancelled by the evictor,
+    // which already freed their chunks.
     std::vector<std::shared_ptr<cache_entry>> batch;
     batch.reserve(item.entries.size());
+    size_t total_chunks = 0;
     for (auto& e : item.entries) {
       if (!e) continue;
-      if (!e->state.try_start_loading()) {
-        // Entry was cancelled (evictor already freed chunks via try_cancel_allocated).
-        continue;
-      }
+      if (!e->state.try_start_loading()) continue;
+      total_chunks += e->chunks.size();  // safe: CAS above gives us sole ownership
       batch.push_back(e);
     }
 
     if (batch.empty()) {
-      // All entries cancelled between allocation and here.
+      // All entries cancelled; nothing to dispatch.
       continue;
+    }
+
+    // ---- Phase 3: acquire inflight budget ----------------------------------
+    // Budget is sized to the exact chunks we own (not all allocated entries,
+    // since some may have been cancelled between allocator_loop and here).
+    auto budget_slot = _inflight_budget->acquire(total_chunks, stop);
+    if (!budget_slot) {
+      // Stop requested while waiting for budget.  Return chunks and exit.
+      for (auto& e : batch) {
+        pool->deallocate_bulk(e->chunks);
+        e->state.try_mark_load_failed();
+      }
+      break;
     }
 
     // ---- Phase 5: dispatch IO in sub-batches -------------------------------
