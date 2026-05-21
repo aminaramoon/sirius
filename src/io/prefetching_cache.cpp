@@ -392,8 +392,8 @@ prefetching_cache::prefetching_cache(buffer_pool* pool,
   // consumes the work queue, and insert() short-circuits before
   // enqueuing anything anyway; read() simply misses on every lookup.
   if (_armed) {
-    _evictor_thread = std::jthread([this](std::stop_token st) { evictor_loop(std::move(st)); });
-    _worker_thread  = std::jthread([this](std::stop_token st) { worker_loop(std::move(st)); });
+    _evictor_thread   = std::jthread([this](std::stop_token st) { evictor_loop(std::move(st)); });
+    _allocator_thread = std::jthread([this](std::stop_token st) { allocator_loop(std::move(st)); });
   }
 }
 
@@ -408,7 +408,7 @@ prefetching_cache::~prefetching_cache()
   // Stop the threads.  Stop-token requests + waitpoint wakeups (work_seq,
   // request_sem) unblock both loops; each one rechecks the token at every
   // wait point and exits promptly.
-  _worker_thread.request_stop();
+  _allocator_thread.request_stop();
   _evictor_thread.request_stop();
   _work_seq.fetch_add(1, std::memory_order_release);
   _work_seq.notify_all();
@@ -438,7 +438,7 @@ prefetching_cache::~prefetching_cache()
   // (owned by the ioctx that owns this cache) may still be processing
   // IOs we submitted earlier; their completion callbacks hold a slot
   // in _inflight_budget.
-  if (_worker_thread.joinable()) { _worker_thread.join(); }
+  if (_allocator_thread.joinable()) { _allocator_thread.join(); }
   if (_evictor_thread.joinable()) { _evictor_thread.join(); }
 
   // Wait for every in-flight IO callback to release its admission slot.
@@ -936,10 +936,10 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
 }
 
 // ===========================================================================
-// worker_loop
+// allocator_loop
 // ===========================================================================
 
-void prefetching_cache::worker_loop(std::stop_token stop)
+void prefetching_cache::allocator_loop(std::stop_token stop)
 {
   std::stop_callback stop_cb(stop, [this] {
     _work_seq.fetch_add(1, std::memory_order_release);
