@@ -141,7 +141,7 @@ void uring_reactor::enqueue_bulk(std::span<device_read_req_type> batch)
   // may already be moved-from, so batch[i].ctx could be null.  The captured
   // shared_ptrs let us drain ctx->pending via chunk_failed so the
   // completion handler still fires instead of stranding readers in
-  // wait_while_loading().
+  // wait_while_pending().
   std::vector<std::shared_ptr<request_context>> ctxs;
   ctxs.reserve(batch.size());
   for (auto& r : batch)

@@ -199,24 +199,35 @@ class buffer_pool {
 // atomic uint32_t.  Every transition is a single CAS (or store), which
 // eliminates the TOCTOU race between checking state and modifying pin_count.
 //
-// State machine:
+// State machine (two-stage prefetch pipeline):
 //
-//         try_start_queueing()     try_start_loading()
-//   empty ─────────────────► queued ──────────────────► loading
-//     ▲                                                   │
-//     │ mark_evicted()                          mark_cached() │
-//     mark_load_failed() │                                                   │
-//     │ │   ┌───────────────────────────────────────────────▼             ▼
-//  evicting │                                          cached ◄────── empty
-//     ▲    │                                         ▲      │
-//     │    │ release_read                            │      │
-//     try_acquire_read() │    │ (last reader)                           │ ▼ │
-//     │                                         │  in_use (pin_count ≥ 1) │ │ │
-//     └────┘ try_start_evicting()  (only from cached, pin_count==0)
+//   try_start_queueing()   try_allocate()    try_start_loading()
+//   empty ───────────► queued ──────────► allocated ──────────► loading
+//     ▲                  │                   │                     │
+//     │                  │ try_cancel_       │ try_cancel_         │ try_mark_cached()
+//     │                  │ queued()          │ allocated()         ▼
+//     │                  ▼                   ▼              cached ◄────────────────
+//     │                empty              empty               ▲    │
+//     │                                                       │    │ try_start_evicting()
+//     │          release_read() (last reader)                 │    ▼
+//     │ mark_evicted() ◄─────────────────── in_use ◄──────── ─ evicting
+//     │                                  (pin_count ≥ 1)
+//     └── mark_load_failed() / try_mark_load_failed()  (loading → empty)
+//
+// Stage 1 (allocator_loop): queued → allocated  (chunks assigned)
+// Stage 2 (io_dispatch_loop): allocated → loading → cached/empty
 
 class entry_state {
  public:
-  enum value : uint8_t { empty = 0, queued = 1, loading = 2, cached = 3, in_use = 4, evicting = 5 };
+  enum value : uint8_t {
+    empty     = 0,
+    queued    = 1,
+    loading   = 2,
+    cached    = 3,
+    in_use    = 4,
+    evicting  = 5,
+    allocated = 6,  ///< chunks assigned, IO not yet dispatched
+  };
 
   entry_state() noexcept = default;
 
@@ -238,20 +249,33 @@ class entry_state {
     return _packed.compare_exchange_strong(expected, pack(queued, 0), std::memory_order_acq_rel);
   }
 
-  /// (empty | queued) → loading.  Returns false if the entry is already
-  /// loading / cached / in_use / evicting (no work to do).
-  /// Called by the worker when it picks up an entry in a work_item.
+  /// queued → allocated.  Returns false if not queued.
+  /// Called by allocator_loop after chunks have been assigned to the entry.
+  bool try_allocate() noexcept
+  {
+    auto expected = pack(queued, 0);
+    return _packed.compare_exchange_strong(expected, pack(allocated, 0), std::memory_order_acq_rel);
+  }
+
+  /// allocated → empty.  Returns false if not allocated.
+  /// Caller must return the entry's chunks to the pool before or after this
+  /// call (state=empty means the entry is invisible to new readers, so the
+  /// chunk vector is exclusively owned by the caller at that point).
+  /// Notifies any threads parked in wait_while_pending().
+  bool try_cancel_allocated() noexcept
+  {
+    auto expected = pack(allocated, 0);
+    bool ok = _packed.compare_exchange_strong(expected, pack(empty, 0), std::memory_order_acq_rel);
+    if (ok) { _packed.notify_all(); }
+    return ok;
+  }
+
+  /// allocated → loading.  Returns false if not in allocated state.
+  /// Called by io_dispatch_loop when it takes ownership of an entry for IO.
   bool try_start_loading() noexcept
   {
-    uint32_t cur = _packed.load(std::memory_order_acquire);
-    while (true) {
-      auto st = unpack_state(cur);
-      if (st != empty && st != queued) return false;
-      auto next = pack(loading, 0);
-      if (_packed.compare_exchange_weak(
-            cur, next, std::memory_order_acq_rel, std::memory_order_acquire))
-        return true;
-    }
+    auto expected = pack(allocated, 0);
+    return _packed.compare_exchange_strong(expected, pack(loading, 0), std::memory_order_acq_rel);
   }
 
   /// queued → empty.  Returns false if not queued.
@@ -264,7 +288,7 @@ class entry_state {
   }
 
   /// loading → cached.  Caller must ensure state is loading.
-  /// Wakes any readers parked in @c wait_while_loading().
+  /// Wakes any readers parked in @c wait_while_pending().
   void mark_cached() noexcept
   {
     _packed.store(pack(cached, 0), std::memory_order_release);
@@ -282,7 +306,7 @@ class entry_state {
   }
 
   /// loading → empty.  IO failed, chunks already freed by caller.
-  /// Wakes any readers parked in @c wait_while_loading().
+  /// Wakes any readers parked in @c wait_while_pending().
   void mark_load_failed() noexcept
   {
     _packed.store(pack(empty, 0), std::memory_order_release);
@@ -299,28 +323,37 @@ class entry_state {
     return ok;
   }
 
-  /// (queued | loading) → empty. Used during cache shutdown to wake readers
-  /// that are parked on a background load that may never complete.
-  bool try_abort_pending() noexcept
+  /// (queued | allocated | loading) → empty.  Used during cache shutdown to
+  /// wake readers parked on a load that may never complete.
+  ///
+  /// Returns the state the entry was in before the transition, or @c empty
+  /// if no transition happened (state was not in the handled set).  The
+  /// caller must check the return value: if it equals @c allocated, the
+  /// caller is responsible for returning the entry's chunks to the pool
+  /// (entry_state has no pool reference).
+  value try_abort_pending() noexcept
   {
     uint32_t cur = _packed.load(std::memory_order_acquire);
     while (true) {
       auto st = unpack_state(cur);
-      if (st != queued && st != loading) return false;
+      if (st != queued && st != allocated && st != loading) return empty;
       if (_packed.compare_exchange_weak(
             cur, pack(empty, 0), std::memory_order_acq_rel, std::memory_order_acquire)) {
         _packed.notify_all();
-        return true;
+        return st;
       }
     }
   }
 
-  /// Block while state == loading.  Returns when the state transitions
-  /// out of loading (either cached on success or empty on failure).
-  void wait_while_loading() noexcept
+  /// Block while state is @c allocated or @c loading.  Returns when the
+  /// state transitions to @c cached (success), @c empty (IO failed or
+  /// cancelled), or any other terminal state.
+  void wait_while_pending() noexcept
   {
     uint32_t cur = _packed.load(std::memory_order_acquire);
-    while (unpack_state(cur) == loading) {
+    while (true) {
+      auto st = unpack_state(cur);
+      if (st != allocated && st != loading) break;
       _packed.wait(cur, std::memory_order_relaxed);
       cur = _packed.load(std::memory_order_acquire);
     }
