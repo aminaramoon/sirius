@@ -373,10 +373,19 @@ class prefetching_cache {
   //   non-null but the try_start_loading CAS lost (evictor or another
   //   reader beat us).
   std::atomic<uint64_t> _miss_state_steal_cas_lost{0};
-  // _miss_state_other: find_entry covered, state was `empty` or `evicting`
-  //   (post-eviction or pre-allocation).  Entry was once in the cache but
-  //   isn't usable right now.
-  std::atomic<uint64_t> _miss_state_other{0};
+  // _miss_state_evicting: find_entry covered, state was `evicting` — the
+  //   evictor has the entry and is freeing its chunks now.  Definitive
+  //   eviction signal.
+  std::atomic<uint64_t> _miss_state_evicting{0};
+  // _miss_state_empty_never_allocated: find_entry covered, state was
+  //   `empty`, and the entry was NEVER allocated (allocator hasn't
+  //   reached it yet).  Indicates allocation is falling behind read
+  //   consumption.
+  std::atomic<uint64_t> _miss_state_empty_never_allocated{0};
+  // _miss_state_empty_post_drain: find_entry covered, state was `empty`,
+  //   and the entry HAS been allocated at some point in the past.
+  //   Indicates the entry was loaded and then evicted, or load failed.
+  std::atomic<uint64_t> _miss_state_empty_post_drain{0};
   // _full_miss_count: file not in cache map, or no entry overlaps the read
   //   range at all.
   std::atomic<uint64_t> _full_miss_count{0};
