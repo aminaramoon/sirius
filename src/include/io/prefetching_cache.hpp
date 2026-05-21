@@ -992,6 +992,11 @@ class prefetching_cache {
   // Hits that had to wait on a loading entry (subset of _hit_count).
   std::atomic<uint64_t> _hit_after_wait{0};
 
+  // Entries in the allocated state that read() successfully flipped to
+  // loading for a direct device read (caller received a cached_host_buffer).
+  // Distinct from _partial_miss_count: the caller did get the entry's chunks.
+  std::atomic<uint64_t> _allocated_steal_count{0};
+
   // Cumulative evictions since construction: entries whose chunks were
   // released back to the pool (+ total chunks freed).
   std::atomic<uint64_t> _evicted_entries{0};

@@ -715,9 +715,14 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
     }
     if (st == entry_state::allocated && out_buffer != nullptr) {
       // Try to flip allocated → loading so we own the entry for device IO.
-      // On CAS failure the evictor raced us; treat as miss.
-      if (entry->state.try_start_loading()) { *out_buffer = cached_host_buffer{entry, _pool}; }
-      _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
+      // On CAS failure the evictor raced us; out_buffer is left
+      // default-constructed (operator bool() == false) and we report a miss.
+      if (entry->state.try_start_loading()) {
+        *out_buffer = cached_host_buffer{entry, _pool};
+        _allocated_steal_count.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
+      }
       return {};
     }
     if (st == entry_state::loading) {
@@ -741,22 +746,25 @@ std::string prefetching_cache::summary() const
 {
   auto hits            = _hit_count.load(std::memory_order_relaxed);
   auto hits_after_wait = _hit_after_wait.load(std::memory_order_relaxed);
+  auto steals          = _allocated_steal_count.load(std::memory_order_relaxed);
   auto partial         = _partial_miss_count.load(std::memory_order_relaxed);
   auto full            = _full_miss_count.load(std::memory_order_relaxed);
   auto evicted_entries = _evicted_entries.load(std::memory_order_relaxed);
   auto evicted_chunks  = _evicted_chunks.load(std::memory_order_relaxed);
-  auto total           = hits + partial + full;
+  auto total           = hits + steals + partial + full;
   auto pct             = [&](uint64_t n) {
     return total > 0 ? (100.0 * static_cast<double>(n) / static_cast<double>(total)) : 0.0;
   };
   auto s = fmt::format(
     "prefetching_cache: {} reads ({} hit {:.1f}% [of which {} waited on "
-    "loading], {} partial-miss {:.1f}%, {} full-miss {:.1f}%); evicted "
-    "{} entries / {} chunks; pool {}/{} chunks free",
+    "loading], {} allocated-steal {:.1f}%, {} partial-miss {:.1f}%, "
+    "{} full-miss {:.1f}%); evicted {} entries / {} chunks; pool {}/{} chunks free",
     total,
     hits,
     pct(hits),
     hits_after_wait,
+    steals,
+    pct(steals),
     partial,
     pct(partial),
     full,
