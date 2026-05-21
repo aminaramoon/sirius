@@ -195,29 +195,38 @@ class buffer_pool {
 // atomic uint32_t.  Every transition is a single CAS (or store), which
 // eliminates the TOCTOU race between checking state and modifying pin_count.
 //
-// State machine (two-stage prefetch pipeline):
+// State machine:
 //
-//   try_allocate()                  try_start_loading()
-//   empty ──────────────► allocated ──────────────────► loading
-//     ▲                       │                              │
-//     │                       │ try_cancel_allocated()       │ try_mark_cached()
-//     │                       ▼                              ▼
-//     │                     empty                       cached ◄────────────────
-//     │                                                   ▲    │
-//     │                                                   │    │ try_start_evicting()
-//     │          release_read() (last reader)             │    ▼
-//     │ mark_evicted() ◄─────────────────── in_use ◄──── evicting
-//     │                                  (pin_count ≥ 1)
-//     └── mark_load_failed() / try_mark_load_failed()  (loading → empty)
+//   try_allocate()                       try_start_loading()
+//   empty ──────────────► allocated ◄─┬─────────────────► loading
+//     ▲                   │     ▲     │                       │
+//     │                   │     │     │                       │
+//     │ mark_evicted()    │     └─────┴─────────┐             │ try_mark_cached()
+//     │                   │       try_revert_   │             ▼
+//     │            try_start_     loading_to_   │       cached ◄────────────────
+//     │            evicting_     allocated()    │         ▲     │
+//     │            from_         (io failure /  │         │     │ try_start_evicting()
+//     │            allocated()   budget bail)   │         │     ▼
+//     │                   ▼                     │  release_read()  evicting
+//     └──────────────── evicting ◄──────────────┴────────┘  (last reader)
+//                            ▲
+//                            │
+//                       in_use(pin≥1)
+//                            ▲
+//                  try_acquire_read() / release_read()
 //
-// Stage 1 (allocator_loop): empty → allocated  (chunks assigned via CAS)
-// Stage 2 (io_dispatch_loop): allocated → loading → cached/empty
+// Allocator (allocator_loop): empty → allocated.
+// IO dispatch (io_dispatch_loop): allocated → loading on budget acquire.
+//   - On successful IO completion: loading → cached.
+//   - On IO failure / budget bail / mid-dispatch cancel: loading → allocated
+//     (chunks stay attached for a future read-driven retry).
+// Evictor: cached → evicting → empty (releases chunks).
+//          allocated → evicting → empty (releases chunks).
+// Readers: cached ↔ in_use(pin) via try_acquire_read / release_read.
 //
-// Note: there is no separate `queued` state.  insert() just appends a
-// work_item to _work_queue; the cache_entry stays in `empty` until the
-// allocator picks it up and atomically transitions empty → allocated.
-// The CAS is the exclusive claim — concurrent allocator passes / inserts
-// covering the same range see allocated and skip.
+// `loading` is the only state that doesn't have a direct path to `evicting` —
+// the in-flight IO owns the chunks and decides whether to revert
+// (loading → allocated) or commit (loading → cached).
 
 class entry_state {
  public:
@@ -253,15 +262,16 @@ class entry_state {
     return _packed.compare_exchange_strong(expected, pack(allocated, 0), std::memory_order_acq_rel);
   }
 
-  /// allocated → empty.  Returns false if not allocated.
-  /// Caller must return the entry's chunks to the pool before or after this
-  /// call (state=empty means the entry is invisible to new readers, so the
-  /// chunk vector is exclusively owned by the caller at that point).
-  /// Notifies any threads parked in wait_while_pending().
-  bool try_cancel_allocated() noexcept
+  /// allocated → evicting.  Returns false if not allocated.  Unified
+  /// with the cached → evicting path so all eviction goes through the
+  /// `evicting` state — callers free chunks and then call
+  /// mark_evicted() to land at `empty`.  Notifies any threads parked
+  /// in wait_while_pending().
+  bool try_start_evicting_from_allocated() noexcept
   {
     auto expected = pack(allocated, 0);
-    bool ok = _packed.compare_exchange_strong(expected, pack(empty, 0), std::memory_order_acq_rel);
+    bool ok =
+      _packed.compare_exchange_strong(expected, pack(evicting, 0), std::memory_order_acq_rel);
     if (ok) { _packed.notify_all(); }
     return ok;
   }
@@ -726,8 +736,15 @@ class cached_host_buffer {
   void mark_load_failed() noexcept
   {
     if (!_entry) return;
-    if (_pool) { _pool->deallocate_bulk(_entry->chunks); }
-    _entry->state.try_mark_load_failed();
+    // Revert loading → allocated so the entry's chunks stay attached
+    // for a future read-driven retry (mirrors io_dispatch_loop's
+    // failure path).  Only deallocate if the CAS lost — that means
+    // shutdown's abort_pending_entries moved the entry out of
+    // `loading`, and since abort doesn't free chunks for the
+    // loading-state transition, we own them here.
+    if (!_entry->state.try_revert_loading_to_allocated()) {
+      if (_pool) { _pool->deallocate_bulk(_entry->chunks); }
+    }
     _entry = nullptr;
   }
 

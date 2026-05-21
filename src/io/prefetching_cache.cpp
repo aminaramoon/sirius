@@ -985,9 +985,12 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
       auto st = e->state.get_state();
 
       if (st == entry_state::allocated) {
-        if (e->state.try_cancel_allocated()) {
+        // Unified eviction path: allocated → evicting → empty, same
+        // shape as the cached → evicting → empty transition below.
+        if (e->state.try_start_evicting_from_allocated()) {
           size_t n = e->chunks.size();
           if (_pool) { _pool->deallocate_bulk(e->chunks); }
+          e->state.mark_evicted();
           r.freed += n;
         }
         continue;
@@ -1349,12 +1352,15 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
                            [&] { return !_io_dispatch_queue.empty() || stop.stop_requested(); });
       if (stop.stop_requested()) {
         // Drain any remaining items so allocator_loop doesn't block.
+        // Use the unified allocated → evicting → empty path so all
+        // evictions land at `empty` via `evicting`.
         while (!_io_dispatch_queue.empty()) {
           auto& front = _io_dispatch_queue.front();
           for (auto& e : front.entries) {
             if (!e) continue;
-            if (e->state.try_cancel_allocated()) {
+            if (e->state.try_start_evicting_from_allocated()) {
               if (pool) { pool->deallocate_bulk(e->chunks); }
+              e->state.mark_evicted();
             }
           }
           _io_dispatch_queue.pop_front();
@@ -1484,7 +1490,7 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
             // (abort doesn't free chunks for the `loading` transition)
             // and must deallocate to avoid a leak.
             for (auto const& e : batch) {
-              if (!e->state.try_revert_loading_to_allocated()) { pool->deallocate_bulk(e->chunks); }
+              if (e->state.try_mark_load_failed()) { pool->deallocate_bulk(e->chunks); }
             }
           } else {
             for (auto const& e : batch) {
