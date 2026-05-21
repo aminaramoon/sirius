@@ -1094,4 +1094,167 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
   }
 }
 
+// ===========================================================================
+// io_dispatch_loop
+// ===========================================================================
+
+void prefetching_cache::io_dispatch_loop(std::stop_token stop)
+{
+  std::stop_callback stop_cb(stop, [this] { _io_dispatch_cv.notify_all(); });
+
+  buffer_pool* const pool    = _pool;
+  sirius_ioctx* const io_ctx = _io_ctx;
+
+  while (!stop.stop_requested()) {
+    // ---- Wait for work from allocator_loop ---------------------------------
+    work_item item;
+    {
+      std::unique_lock lk(_io_dispatch_mtx);
+      _io_dispatch_cv.wait(lk,
+                           [&] { return !_io_dispatch_queue.empty() || stop.stop_requested(); });
+      if (stop.stop_requested()) {
+        // Drain any remaining items so allocator_loop doesn't block.
+        while (!_io_dispatch_queue.empty()) {
+          auto& front = _io_dispatch_queue.front();
+          for (auto& e : front.entries) {
+            if (!e) continue;
+            if (e->state.try_cancel_allocated()) {
+              if (pool) { pool->deallocate_bulk(e->chunks); }
+            }
+          }
+          _io_dispatch_queue.pop_front();
+        }
+        break;
+      }
+      item = std::move(_io_dispatch_queue.front());
+      _io_dispatch_queue.pop_front();
+    }
+
+    // ---- Cancellation check ------------------------------------------------
+    // The handle may have been cancelled between allocator_loop's push and now.
+    // Return chunks for all allocated entries and skip.
+    if (!item.alive->load(std::memory_order_acquire)) {
+      for (auto& e : item.entries) {
+        if (!e) continue;
+        if (e->state.try_cancel_allocated()) {
+          if (pool) { pool->deallocate_bulk(e->chunks); }
+        }
+      }
+      continue;
+    }
+
+    // ---- Phase 3: acquire inflight budget ----------------------------------
+    // Count chunks across all allocated entries.  Budget is released when the
+    // last sub-batch's completion callback drops the shared slot.
+    size_t total_chunks = 0;
+    for (auto const& e : item.entries) {
+      if (e) total_chunks += e->chunks.size();
+    }
+
+    auto budget_slot = _inflight_budget->acquire(total_chunks, stop);
+    if (!budget_slot) {
+      // Stop requested while waiting for budget.  Return all chunks.
+      for (auto& e : item.entries) {
+        if (!e) continue;
+        if (e->state.try_cancel_allocated()) {
+          if (pool) { pool->deallocate_bulk(e->chunks); }
+        }
+      }
+      break;
+    }
+
+    // ---- allocated → loading + build batch ---------------------------------
+    // Entries that race (try_start_loading fails) have already been cancelled
+    // by the evictor; return their chunks and exclude them from IO dispatch.
+    std::vector<std::shared_ptr<cache_entry>> batch;
+    batch.reserve(item.entries.size());
+    for (auto& e : item.entries) {
+      if (!e) continue;
+      if (!e->state.try_start_loading()) {
+        // Entry was cancelled (evictor already freed chunks via try_cancel_allocated).
+        continue;
+      }
+      batch.push_back(e);
+    }
+
+    if (batch.empty()) {
+      // All entries cancelled between allocation and here.
+      continue;
+    }
+
+    // ---- Phase 5: dispatch IO in sub-batches -------------------------------
+    // SUBBATCH at 16 trades dispatch count for HOL latency: a 600-range
+    // request becomes ~38 sub-dispatches; first-byte latency for the
+    // head reader drops from max(600 IOs) to max(16 IOs).
+    constexpr size_t SUBBATCH = 16;
+
+    auto slot_holder = std::make_shared<admission_control::slot>(std::move(budget_slot));
+    auto& obj_ref    = *item.io_obj;
+
+    for (size_t sb_start = 0; sb_start < batch.size(); sb_start += SUBBATCH) {
+      // Cancellation re-check between sub-batches: a fadvise(disposable)
+      // that fires after we dispatched some sub-batches can still cancel
+      // the remaining ones.  Already-dispatched callbacks complete normally.
+      if (!item.alive->load(std::memory_order_acquire)) {
+        for (size_t i = sb_start; i < batch.size(); ++i) {
+          pool->deallocate_bulk(batch[i]->chunks);
+          batch[i]->state.try_mark_load_failed();
+        }
+        break;
+      }
+
+      size_t const sb_end = std::min(sb_start + SUBBATCH, batch.size());
+
+      std::vector<cudf::io::text::byte_range_info> sb_ranges;
+      std::vector<cudf::host_span<std::byte>> sb_dsts;
+      for (size_t i = sb_start; i < sb_end; ++i) {
+        auto const& e          = batch[i];
+        auto phys_off          = static_cast<size_t>(e->physical_range.offset());
+        auto phys_size         = static_cast<size_t>(e->physical_range.size());
+        auto const chunk_bytes = e->chunk_bytes;
+        for (size_t c = 0; c < e->chunks.size(); ++c) {
+          auto off = phys_off + c * chunk_bytes;
+          auto sz  = std::min(chunk_bytes, phys_size - c * chunk_bytes);
+          sb_ranges.emplace_back(static_cast<int64_t>(off), static_cast<int64_t>(sz));
+          sb_dsts.emplace_back(e->chunks[c], sz);
+        }
+      }
+
+      std::vector<std::shared_ptr<cache_entry>> sb_batch(
+        batch.begin() + static_cast<std::ptrdiff_t>(sb_start),
+        batch.begin() + static_cast<std::ptrdiff_t>(sb_end));
+
+      io_ctx->host_read_ranges_async_io(
+        obj_ref,
+        sb_ranges,
+        sb_dsts,
+        [pool,
+         batch  = std::move(sb_batch),
+         slot   = slot_holder,  // shared across sub-batches
+         io_obj = item.io_obj,  // copy, not move — used by later sub-batches
+         key    = item.file_key]   // copy, not move
+        (size_t /*bytes*/, std::exception_ptr ep) {
+          if (ep) {
+            try {
+              std::rethrow_exception(std::move(ep));
+            } catch (std::exception const& ex) {
+              spdlog::error("prefetching_cache: IO failed for {}: {}", key, ex.what());
+            }
+            for (auto const& e : batch) {
+              pool->deallocate_bulk(e->chunks);
+              e->state.try_mark_load_failed();
+            }
+          } else {
+            for (auto const& e : batch)
+              e->state.try_mark_cached();
+          }
+          // `slot` and `io_obj` destruct here — budget is returned to
+          // admission_control (which wakes any wait_for_idle waiter once
+          // the last slot drops), and the file handle is released only
+          // after the IO backend is done with it.
+        });
+    }
+  }
+}
+
 }  // namespace sirius::io
