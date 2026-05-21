@@ -1038,11 +1038,13 @@ void prefetching_cache::worker_loop(std::stop_token stop)
       break;
     }
 
-    // ---- Phase 4: per-entry try_start_loading + chunk assignment -----------
-    // This is the first and only place the state machine transitions into
-    // loading.  If the CAS loses (state raced past empty/queued), we return
-    // that entry's pre-allocated chunks to the pool — no state cleanup needed
-    // because we never touched the state.
+    // ---- Phase 4: queued → allocated → loading + chunk assignment ----------
+    // Two-step transition: first claim the entry (queued → allocated), assign
+    // chunks, then commit it to loading.  Chunks are assigned between the two
+    // CASes so that IO dispatch (Phase 5) always sees a fully-populated chunk
+    // vector.  If try_allocate fails the entry raced past queued; return the
+    // pre-allocated chunks.  If try_start_loading fails the entry was cancelled
+    // after allocation; return its already-assigned chunks too.
     std::vector<std::shared_ptr<cache_entry>> batch;
     batch.reserve(item.entries.size());
     size_t ptr_idx = 0;
@@ -1057,13 +1059,20 @@ void prefetching_cache::worker_loop(std::stop_token stop)
         ptr_idx += n;
       };
 
-      if (!e->state.try_start_loading()) {
+      if (!e->state.try_allocate()) {
         return_chunks();
         continue;
       }
 
+      // Chunks assigned while in allocated state — visible to IO dispatch.
       e->chunks.assign(ptrs.begin() + ptr_idx, ptrs.begin() + ptr_idx + n);
       ptr_idx += n;
+
+      if (!e->state.try_start_loading()) {
+        pool->deallocate_bulk(e->chunks);
+        e->chunks.clear();
+        continue;
+      }
       batch.push_back(e);
     }
 
