@@ -668,22 +668,7 @@ class prefetching_cache {
   ///   - @p io_ctx is the back-pointer to the owning ioctx; held as a
   ///     raw pointer because the ioctx now owns this cache, so it is
   ///     guaranteed to outlive it.
-  /// @param pressure_evict_start_ratio  Pool-consumption ratio
-  ///   (consumed_chunks / max_chunks) at which the evictor's idle-poll
-  ///   path starts proactively evicting, even when no eviction_request
-  ///   is in flight.  Defaults to 0.85 — when 85% of the pool is in
-  ///   use, the evictor starts reclaiming chunks ahead of the next
-  ///   spike rather than making every prefetch wait its turn behind
-  ///   an on-demand eviction.
-  /// @param pressure_evict_stop_ratio   Lower hysteresis bound.  Once
-  ///   the proactive path triggers, it keeps reclaiming until the
-  ///   ratio drops below this value (default 0.60), so the start
-  ///   threshold isn't re-triggered every tick.
-  prefetching_cache(buffer_pool* pool,
-                    sirius_ioctx* io_ctx,
-                    size_t inflight_budget_chunks,
-                    double pressure_evict_start_ratio = 0.85,
-                    double pressure_evict_stop_ratio  = 0.60);
+  prefetching_cache(buffer_pool* pool, sirius_ioctx* io_ctx, size_t inflight_budget_chunks);
   ~prefetching_cache();
 
   prefetching_cache(prefetching_cache const&)            = delete;
@@ -822,12 +807,6 @@ class prefetching_cache {
   /// non-zero budget.  Const after construction; threads, queues, and the
   /// admission_control are all only meaningful when this is true.
   bool const _armed;
-
-  /// Hysteresis bounds for the evictor's proactive (idle-tick)
-  /// pressure-relief path.  Both expressed as a fraction of
-  /// @c buffer_pool::max_chunks().  See the ctor for semantics.
-  double const _pressure_evict_start_ratio;
-  double const _pressure_evict_stop_ratio;
 
   // Observability counters (updated on every read() / read_ranges() entry).
   std::atomic<uint64_t> _hit_count{0};
