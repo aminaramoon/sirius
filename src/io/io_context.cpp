@@ -144,11 +144,14 @@ std::future<size_t> copy_pinned_slices_to_device(
                       return total_copied;
                     });
 #else
-  // Batch API available. It does not support legacy/null streams, so in that
-  // case redirect to cudaStreamPerThread. The caller's legacy stream is *not*
-  // ordered against the work in that case — the function's contract is that
-  // the copy is observed-complete only after future.get()/wait() syncs the
-  // event recorded on stream_to_use.
+  // Batch API available. It does not support legacy/null streams, so in
+  // that case redirect to cudaStreamPerThread.  Once the batch completes
+  // we insert a GPU-side cudaStreamWaitEvent edge from per-thread back
+  // to the legacy stream so any work the caller queues on the legacy
+  // stream after we return is correctly ordered behind our copy.
+  // Without that edge the legacy stream and per-thread stream are
+  // unordered and a caller reading `dst` on the legacy stream races
+  // with our batch.
   bool const stream_is_legacy = (stream.value() == nullptr) || (stream.value() == cudaStreamLegacy);
   cudaStream_t stream_to_use  = stream_is_legacy ? cudaStreamPerThread : stream.value();
 
@@ -176,10 +179,22 @@ std::future<size_t> copy_pinned_slices_to_device(
     dsts.data(), srcs.data(), sizes.data(), n_nonempty, &attrs, &attrs_idx, 1, stream_to_use);
 #endif
   if (err != cudaSuccess) {
+    cudaGetLastError();
     throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyBatchAsync failed at idx ") +
                              std::to_string(fail_idx) + ": " + cudaGetErrorString(err));
   }
   copy_done_event.record(stream_to_use);
+  if (stream_is_legacy) {
+    // Add a GPU-side sync edge from per-thread back to the caller's
+    // legacy stream so caller work submitted on the legacy stream after
+    // device_read returns observes our copy.  Host cost: O(10ns).
+    cudaError_t wait_err = cudaStreamWaitEvent(stream.value(), copy_done_event.get(), 0);
+    if (wait_err != cudaSuccess) {
+      cudaGetLastError();
+      throw std::runtime_error(std::string("sirius_ioctx: cudaStreamWaitEvent failed: ") +
+                               cudaGetErrorString(wait_err));
+    }
+  }
   return std::async(std::launch::deferred, [e = std::move(copy_done_event), copied]() mutable {
     e.synchronize();
     return copied;
