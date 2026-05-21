@@ -289,7 +289,7 @@ class prefetching_cache {
 
   /// Binary search for an entry whose logical range fully covers
   /// [offset, offset+size).  Returns nullptr on miss.  Updates
-  /// _partial_miss_count / _full_miss_count based on the classification.
+  /// _miss_range / _full_miss_count based on the classification.
   /// The caller updates _hit_count on successful pin.
   std::shared_ptr<cache_entry> find_entry(const std::vector<std::shared_ptr<cache_entry>>& entries,
                                           size_t offset,
@@ -343,18 +343,43 @@ class prefetching_cache {
   /// so this resolution actually happens.
   std::atomic<bool> _shutting_down{false};
 
-  // Observability counters (updated on every read() / read_ranges() entry).
+  // Observability counters (updated on every read() entry).
   std::atomic<uint64_t> _hit_count{0};
-  std::atomic<uint64_t> _partial_miss_count{0};
-  std::atomic<uint64_t> _full_miss_count{0};
-
   // Hits that had to wait on a loading entry (subset of _hit_count).
   std::atomic<uint64_t> _hit_after_wait{0};
 
   // Entries in the allocated state that read() successfully flipped to
   // loading for a direct device read (caller received a cached_host_buffer).
-  // Distinct from _partial_miss_count: the caller did get the entry's chunks.
+  // Distinct from the miss counts: the caller did get the entry's chunks.
   std::atomic<uint64_t> _allocated_steal_count{0};
+
+  // ---- Miss breakdown ------------------------------------------------------
+  // Total misses = _miss_range + _miss_state_allocated_no_steal +
+  //                _miss_state_steal_cas_lost + _miss_state_other +
+  //                _full_miss_count.
+  //
+  // _miss_range: find_entry() found an entry whose offset <= read_offset but
+  //   whose end < read_offset + read_size — i.e. range mismatch.  Indicates
+  //   the registered fadvise range doesn't fully cover what the caller
+  //   actually reads (e.g. cudf reads past the registered column-chunk data
+  //   extent, or a read spans two adjacent-but-not-coalesced entries).
+  std::atomic<uint64_t> _miss_range{0};
+  // _miss_state_allocated_no_steal: find_entry covered, state was
+  //   `allocated`, but the caller did not pass an out_buffer (host read) so
+  //   the steal path was skipped.  Read fell through to a miss instead of
+  //   waiting for the imminent load.
+  std::atomic<uint64_t> _miss_state_allocated_no_steal{0};
+  // _miss_state_steal_cas_lost: state was `allocated` and out_buffer was
+  //   non-null but the try_start_loading CAS lost (evictor or another
+  //   reader beat us).
+  std::atomic<uint64_t> _miss_state_steal_cas_lost{0};
+  // _miss_state_other: find_entry covered, state was `empty` or `evicting`
+  //   (post-eviction or pre-allocation).  Entry was once in the cache but
+  //   isn't usable right now.
+  std::atomic<uint64_t> _miss_state_other{0};
+  // _full_miss_count: file not in cache map, or no entry overlaps the read
+  //   range at all.
+  std::atomic<uint64_t> _full_miss_count{0};
 
   // Cumulative evictions since construction: entries whose chunks were
   // released back to the pool (+ total chunks freed).

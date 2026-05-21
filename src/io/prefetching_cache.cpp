@@ -630,7 +630,13 @@ std::shared_ptr<cache_entry> prefetching_cache::find_entry(
   }
   // Candidate overlaps but doesn't fully contain the requested tail.
   if (offset + size > entry_end) {
-    _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
+    _miss_range.fetch_add(1, std::memory_order_relaxed);
+    spdlog::debug(
+      "prefetching_cache: miss_range read_off={} read_size={} entry_off={} entry_size={}",
+      offset,
+      size,
+      static_cast<size_t>((*pos)->logical_range.offset()),
+      static_cast<size_t>((*pos)->logical_range.size()));
     return nullptr;
   }
   return *pos;
@@ -643,6 +649,7 @@ std::shared_ptr<cache_entry> prefetching_cache::find_entry(
 prefetching_handle prefetching_cache::insert(
   sirius_io_object& obj, const std::vector<cudf::io::text::byte_range_info>& ranges)
 {
+  spdlog::info("insert: obj={} ranges {}", obj.raw_file_cache_id(), ranges.size());
   assert(std::is_sorted(ranges.begin(),
                         ranges.end(),
                         [](auto const& a, auto const& b) { return a.offset() < b.offset(); }) &&
@@ -791,7 +798,23 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
       // try_acquire_read lost a race; re-observe the state.
       continue;
     }
-    if (st == entry_state::allocated && out_buffer != nullptr) {
+    if (st == entry_state::allocated) {
+      if (out_buffer == nullptr) {
+        // Host read: no out_buffer means we can't steal the entry.  Today
+        // we report a miss, but the load IS imminent (io_dispatch_loop's
+        // try_start_loading is one CAS away); ideally we'd wait through
+        // this transient state instead of forcing the caller to fall back
+        // to the backend.
+        _miss_state_allocated_no_steal.fetch_add(1, std::memory_order_relaxed);
+        spdlog::debug(
+          "prefetching_cache: miss_state_allocated_no_steal off={} size={} entry_off={} "
+          "entry_size={}",
+          offset,
+          size,
+          static_cast<size_t>(entry->logical_range.offset()),
+          static_cast<size_t>(entry->logical_range.size()));
+        return {};
+      }
       // Try to flip allocated → loading so we own the entry for device IO.
       // On CAS failure the evictor raced us; out_buffer is left
       // default-constructed (operator bool() == false) and we report a miss.
@@ -799,7 +822,7 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
         *out_buffer = cached_host_buffer{entry, _pool};
         _allocated_steal_count.fetch_add(1, std::memory_order_relaxed);
       } else {
-        _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
+        _miss_state_steal_cas_lost.fetch_add(1, std::memory_order_relaxed);
       }
       return {};
     }
@@ -815,27 +838,41 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
       file_lk.lock();
       continue;
     }
-    _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
+    // State is `empty` (entry was evicted between find_entry and now) or
+    // `evicting` (about to be).  Caller falls back to the backend.
+    _miss_state_other.fetch_add(1, std::memory_order_relaxed);
+    spdlog::debug(
+      "prefetching_cache: miss_state_other state={} off={} size={} entry_off={} entry_size={}",
+      static_cast<int>(st),
+      offset,
+      size,
+      static_cast<size_t>(entry->logical_range.offset()),
+      static_cast<size_t>(entry->logical_range.size()));
     return {};
   }
 }
 
 std::string prefetching_cache::summary() const
 {
-  auto hits            = _hit_count.load(std::memory_order_relaxed);
-  auto hits_after_wait = _hit_after_wait.load(std::memory_order_relaxed);
-  auto steals          = _allocated_steal_count.load(std::memory_order_relaxed);
-  auto partial         = _partial_miss_count.load(std::memory_order_relaxed);
-  auto full            = _full_miss_count.load(std::memory_order_relaxed);
-  auto evicted_entries = _evicted_entries.load(std::memory_order_relaxed);
-  auto evicted_chunks  = _evicted_chunks.load(std::memory_order_relaxed);
-  auto total           = hits + steals + partial + full;
-  auto pct             = [&](uint64_t n) {
+  auto hits             = _hit_count.load(std::memory_order_relaxed);
+  auto hits_after_wait  = _hit_after_wait.load(std::memory_order_relaxed);
+  auto steals           = _allocated_steal_count.load(std::memory_order_relaxed);
+  auto m_range          = _miss_range.load(std::memory_order_relaxed);
+  auto m_alloc_no_steal = _miss_state_allocated_no_steal.load(std::memory_order_relaxed);
+  auto m_steal_lost     = _miss_state_steal_cas_lost.load(std::memory_order_relaxed);
+  auto m_other          = _miss_state_other.load(std::memory_order_relaxed);
+  auto full             = _full_miss_count.load(std::memory_order_relaxed);
+  auto evicted_entries  = _evicted_entries.load(std::memory_order_relaxed);
+  auto evicted_chunks   = _evicted_chunks.load(std::memory_order_relaxed);
+  auto partial          = m_range + m_alloc_no_steal + m_steal_lost + m_other;
+  auto total            = hits + steals + partial + full;
+  auto pct              = [&](uint64_t n) {
     return total > 0 ? (100.0 * static_cast<double>(n) / static_cast<double>(total)) : 0.0;
   };
   auto s = fmt::format(
     "prefetching_cache: {} reads ({} hit {:.1f}% [of which {} waited on "
-    "loading], {} allocated-steal {:.1f}%, {} partial-miss {:.1f}%, "
+    "loading], {} allocated-steal {:.1f}%, {} partial-miss {:.1f}% "
+    "[range={} alloc-no-steal={} steal-cas-lost={} state-other={}], "
     "{} full-miss {:.1f}%); evicted {} entries / {} chunks; pool {}/{} chunks free",
     total,
     hits,
@@ -845,6 +882,10 @@ std::string prefetching_cache::summary() const
     pct(steals),
     partial,
     pct(partial),
+    m_range,
+    m_alloc_no_steal,
+    m_steal_lost,
+    m_other,
     full,
     pct(full),
     evicted_entries,
