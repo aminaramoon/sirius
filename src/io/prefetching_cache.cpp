@@ -903,6 +903,11 @@ std::string prefetching_cache::summary() const
   auto full             = _full_miss_count.load(std::memory_order_relaxed);
   auto evicted_entries  = _evicted_entries.load(std::memory_order_relaxed);
   auto evicted_chunks   = _evicted_chunks.load(std::memory_order_relaxed);
+  auto io_dispatched    = _io_dispatched_entries.load(std::memory_order_relaxed);
+  auto io_succ          = _io_load_success.load(std::memory_order_relaxed);
+  auto io_revert_ok     = _io_load_revert_success.load(std::memory_order_relaxed);
+  auto io_revert_lost   = _io_load_revert_failed.load(std::memory_order_relaxed);
+  auto evict_from_alloc = _evicted_from_allocated.load(std::memory_order_relaxed);
   auto partial          = m_range + m_alloc_no_steal + m_steal_lost + m_evicting + m_never_alloc +
                  m_post_evict + m_load_failed;
   auto total = hits + steals + partial + full;
@@ -914,7 +919,9 @@ std::string prefetching_cache::summary() const
     "loading], {} allocated-steal {:.1f}%, {} partial-miss {:.1f}% "
     "[range={} alloc-no-steal={} steal-cas-lost={} evicting={} "
     "empty-never-alloc={} empty-post-evict={} empty-load-failed={}], "
-    "{} full-miss {:.1f}%); evicted {} entries / {} chunks; pool {}/{} chunks free",
+    "{} full-miss {:.1f}%); io[dispatched={} success={} revert-ok={} "
+    "revert-lost={} alloc-evicted={}]; evicted {} entries / {} chunks; "
+    "pool {}/{} chunks free",
     total,
     hits,
     pct(hits),
@@ -932,6 +939,11 @@ std::string prefetching_cache::summary() const
     m_load_failed,
     full,
     pct(full),
+    io_dispatched,
+    io_succ,
+    io_revert_ok,
+    io_revert_lost,
+    evict_from_alloc,
     evicted_entries,
     evicted_chunks,
     _pool ? _pool->free_count() : 0U,
@@ -989,6 +1001,7 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
           size_t n = e->chunks.size();
           if (_pool) { _pool->deallocate_bulk(e->chunks); }
           e->state.mark_evicted();
+          _evicted_from_allocated.fetch_add(1, std::memory_order_relaxed);
           r.freed += n;
         }
         continue;
@@ -1016,41 +1029,14 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
     return r;
   };
 
-  // Drain the eviction queue, evicting only wrappers whose handles are
-  // gone:
-  //   - cancelled = handle.cancel() flipped alive to false
-  //   - exhausted = n_pending == 0 (all handles for this file dropped)
-  // n_pending is decremented EXCLUSIVELY by prefetching_handle::release()
-  // (handle dtor or move-out).  The evictor never decrements it — no
-  // time-based aging, no stale-threshold path.  Live wrappers (n_pending>0)
-  // are re-queued unchanged so they survive until their handles actually
-  // drop, even across many evictor wake-ups.
-  auto evict_disposed_entries = [&]() -> size_t {
-    size_t reclaimed        = 0;
-    size_t const n_to_check = _eviction_queue.size_approx();
-    for (size_t i = 0; i < n_to_check; ++i) {
-      if (stop.stop_requested()) break;
-      prefetch_request wrapper;
-      if (!_eviction_queue.try_dequeue(wrapper)) break;
-
-      auto const v         = wrapper.demand->load();
-      bool const cancelled = !wrapper.alive->load(std::memory_order_acquire);
-      bool const exhausted = (v.n_pending == 0);
-
-      if (cancelled || exhausted) {
-        auto r = walk_and_evict(wrapper);
-        reclaimed += r.freed;
-        if (!r.leftover.empty()) {
-          wrapper.entries = std::move(r.leftover);
-          _eviction_queue.enqueue(std::move(wrapper));
-        }
-      } else {
-        // Live wrapper: just rotate to tail unchanged.
-        _eviction_queue.enqueue(std::move(wrapper));
-      }
-    }
-    return reclaimed;
-  };
+  // Disposed-entries pass: NO-OP in the steady state.  Standard cache
+  // behavior — eviction is driven solely by pool pressure (evict_chunks
+  // below).  Cached and allocated entries persist past handle-drop / cancel
+  // so the next query iteration that re-fadvises the same ranges hits the
+  // cached data instead of re-loading.  Kept as a stub so notify_disposed
+  // signals don't block any future re-introduction of a disposed-path
+  // policy.
+  auto evict_disposed_entries = [&]() -> size_t { return 0; };
 
   // Walk the FIFO until at least @p needed chunks have been reclaimed.
   // Called when the allocator has an outstanding eviction_request.
@@ -1080,28 +1066,22 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
       }
       empty_ticks = 0;
 
-      auto const v         = wrapper.demand->load();
-      bool const cancelled = !wrapper.alive->load(std::memory_order_acquire);
-      bool const exhausted = (v.n_pending == 0);
-
-      if (cancelled || exhausted) {
-        auto r = walk_and_evict(wrapper);
-        reclaimed += r.freed;
-        if (!r.leftover.empty()) {
-          wrapper.entries = std::move(r.leftover);
-          _eviction_queue.enqueue(std::move(wrapper));
-        }
-      } else {
-        // Live wrapper: rotate to tail unchanged.  No time-based aging —
-        // n_pending only drops when handles go out of scope.  If every
-        // wrapper in the queue is live we can't make progress; bail out
-        // via the empty_ticks budget below rather than churning forever.
+      // Pool-pressure path: evict from ANY wrapper (regardless of
+      // n_pending or alive status).  walk_and_evict targets allocated
+      // and cached states; loading / in_use / evicting / empty are
+      // skipped naturally.  Live wrappers that still have evictable
+      // entries get their evictables reaped — the cache trades the
+      // user's "still wanted" signal for chunks the allocator needs.
+      auto r = walk_and_evict(wrapper);
+      reclaimed += r.freed;
+      if (!r.leftover.empty()) {
+        wrapper.entries = std::move(r.leftover);
         _eviction_queue.enqueue(std::move(wrapper));
-        if (reclaimed == 0 && ++empty_ticks > queue_size_hint) {
-          std::this_thread::sleep_for(EVICTOR_POLL_INTERVAL);
-          if (should_stop()) break;
-          empty_ticks = 0;
-        }
+      }
+      if (reclaimed == 0 && ++empty_ticks > queue_size_hint) {
+        std::this_thread::sleep_for(EVICTOR_POLL_INTERVAL);
+        if (should_stop()) break;
+        empty_ticks = 0;
       }
     }
     return reclaimed;
@@ -1397,6 +1377,7 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
       if (!e) continue;
       if (!e->state.try_start_loading()) continue;
       total_chunks += e->chunks.size();  // safe: CAS above gives us sole ownership
+      _io_dispatched_entries.fetch_add(1, std::memory_order_relaxed);
       batch.push_back(e);
     }
 
@@ -1475,7 +1456,8 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
         obj_ref,
         sb_ranges,
         sb_dsts,
-        [pool,
+        [self = this,  // for diagnostic counters
+         pool,
          batch  = std::move(sb_batch),
          slot   = slot_holder,  // shared across sub-batches
          io_obj = item.io_obj,  // copy, not move — used by later sub-batches
@@ -1496,12 +1478,18 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
             // (abort doesn't free chunks for the `loading` transition)
             // and must deallocate to avoid a leak.
             for (auto const& e : batch) {
-              if (e->state.try_mark_load_failed()) { pool->deallocate_bulk(e->chunks); }
+              if (!e->state.try_revert_loading_to_allocated()) {
+                self->_io_load_revert_failed.fetch_add(1, std::memory_order_relaxed);
+                pool->deallocate_bulk(e->chunks);
+              } else {
+                self->_io_load_revert_success.fetch_add(1, std::memory_order_relaxed);
+              }
             }
           } else {
             for (auto const& e : batch) {
               if (e->state.try_mark_cached()) {
                 e->ever_cached.store(true, std::memory_order_release);
+                self->_io_load_success.fetch_add(1, std::memory_order_relaxed);
               }
             }
           }
