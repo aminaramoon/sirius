@@ -394,6 +394,13 @@ class prefetching_cache {
   std::atomic<uint64_t> _evicted_entries{0};
   std::atomic<uint64_t> _evicted_chunks{0};
 
+  // io_dispatch_loop diagnostics — pipeline transitions per entry.
+  std::atomic<uint64_t> _io_dispatched_entries{0};   // entries CAS'd allocated→loading
+  std::atomic<uint64_t> _io_load_success{0};         // try_mark_cached succeeded
+  std::atomic<uint64_t> _io_load_revert_success{0};  // failure path: revert succeeded
+  std::atomic<uint64_t> _io_load_revert_failed{0};   // failure path: CAS lost, chunks freed
+  std::atomic<uint64_t> _evicted_from_allocated{0};  // allocated→evicting transitions
+
   mutable std::shared_mutex _map_mtx;
   std::unordered_map<std::string, std::unique_ptr<file_entry>> _file_cache;
 
