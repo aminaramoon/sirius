@@ -850,7 +850,7 @@ class prefetching_cache {
 
   /// Queue of allocated work items waiting for IO dispatch.  Produced by
   /// allocator_loop after chunks are assigned; consumed by io_dispatch_loop.
-  std::deque<work_item> _io_dispatch_deque;
+  std::deque<work_item> _io_dispatch_queue;
   std::mutex _io_dispatch_mtx;
   std::condition_variable _io_dispatch_cv;
 
