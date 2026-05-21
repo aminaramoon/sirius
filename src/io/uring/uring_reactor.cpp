@@ -541,7 +541,16 @@ void uring_reactor::worker_loop()
         continue;
       }
 
-      if (s.device_id >= 0) cudaSetDevice(s.device_id);
+      if (s.device_id >= 0) {
+        cudaError_t set_err = cudaSetDevice(s.device_id);
+        if (set_err != cudaSuccess) {
+          cudaGetLastError();
+          s.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+            std::string("uring_reactor: cudaSetDevice failed: ") + cudaGetErrorString(set_err))));
+          _slot_pool.release(si);
+          continue;
+        }
+      }
       cudaError_t cpy_err =
         cudaMemcpyAsync(s.destination_buf, src_buf, actual, cudaMemcpyHostToDevice, s.stream);
       if (cpy_err != cudaSuccess) {
@@ -560,14 +569,29 @@ void uring_reactor::worker_loop()
       } else {
         // Managed: stash ctx in cb_arg, register callback.
         // cudaStreamAddCallback fires even if the stream is in an error
-        // state — chunk_done/chunk_failed always fires.
+        // state — chunk_done/chunk_failed always fires, as long as the
+        // callback was successfully registered.
         // is_registered drives release: the callback is responsible for
         // recycling the bounce buffer (via _slot_pool.release).
         _cb_args[si].ctx = std::move(s.ctx);
         auto stream      = s.stream;
         _copying_count.fetch_add(1, std::memory_order_relaxed);
-        cudaStreamAddCallback(stream, cuda_copy_cb, &_cb_args[si], 0);
-        // Slot released in cuda_copy_cb.
+        cudaError_t cb_err = cudaStreamAddCallback(stream, cuda_copy_cb, &_cb_args[si], 0);
+        if (cb_err != cudaSuccess) {
+          // Registration failed: callback will not fire, so we own the
+          // cleanup that cuda_copy_cb would normally do — chunk_failed the
+          // ctx, drop the cb_arg's ctx ref, unwind _copying_count, and
+          // release the slot.  Without this rollback the slot leaks and
+          // _copying_count stays elevated, blocking shutdown forever.
+          cudaGetLastError();
+          auto ctx = std::move(_cb_args[si].ctx);
+          ctx->chunk_failed(std::make_exception_ptr(
+            std::runtime_error(std::string("uring_reactor: cudaStreamAddCallback failed: ") +
+                               cudaGetErrorString(cb_err))));
+          _copying_count.fetch_sub(1, std::memory_order_release);
+          _slot_pool.release(si);
+        }
+        // Otherwise: slot released in cuda_copy_cb.
       }
     }
     if (need_resubmit) {
