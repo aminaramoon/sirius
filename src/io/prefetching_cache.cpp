@@ -208,6 +208,10 @@ void cached_host_buffer::mark_cached_with_stream(cudaStream_t stream) noexcept
 {
   if (!_entry) return;
   if (_entry->state.try_finish_loading_pinned()) {
+    // IO succeeded — mark as ever_cached for diagnostics.  (The entry
+    // transits loading → in_use(1) → cached via the stream callback;
+    // the "was ever successfully loaded" signal we want fires here.)
+    _entry->ever_cached.store(true, std::memory_order_release);
     // Entry is ours in in_use(pin=1).  Hand it to a stream callback so
     // the pin is released after the caller's H2D copy drains.
     auto args       = std::make_unique<release_callback_args>();
@@ -850,14 +854,28 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
         static_cast<size_t>(entry->logical_range.offset()),
         static_cast<size_t>(entry->logical_range.size()));
     } else if (entry->ever_allocated.load(std::memory_order_acquire)) {
-      _miss_state_empty_post_drain.fetch_add(1, std::memory_order_relaxed);
-      spdlog::debug(
-        "prefetching_cache: miss_state_empty_post_drain off={} size={} entry_off={} "
-        "entry_size={}",
-        offset,
-        size,
-        static_cast<size_t>(entry->logical_range.offset()),
-        static_cast<size_t>(entry->logical_range.size()));
+      // Was allocated.  Was it ever loaded successfully (ever_cached)?
+      //   yes → entry was cached then evicted (true eviction churn).
+      //   no  → IO failed and mark_load_failed reset state to empty.
+      if (entry->ever_cached.load(std::memory_order_acquire)) {
+        _miss_state_empty_post_evict.fetch_add(1, std::memory_order_relaxed);
+        spdlog::debug(
+          "prefetching_cache: miss_state_empty_post_evict off={} size={} entry_off={} "
+          "entry_size={}",
+          offset,
+          size,
+          static_cast<size_t>(entry->logical_range.offset()),
+          static_cast<size_t>(entry->logical_range.size()));
+      } else {
+        _miss_state_empty_load_failed.fetch_add(1, std::memory_order_relaxed);
+        spdlog::debug(
+          "prefetching_cache: miss_state_empty_load_failed off={} size={} entry_off={} "
+          "entry_size={}",
+          offset,
+          size,
+          static_cast<size_t>(entry->logical_range.offset()),
+          static_cast<size_t>(entry->logical_range.size()));
+      }
     } else {
       _miss_state_empty_never_allocated.fetch_add(1, std::memory_order_relaxed);
       spdlog::debug(
@@ -882,12 +900,13 @@ std::string prefetching_cache::summary() const
   auto m_steal_lost     = _miss_state_steal_cas_lost.load(std::memory_order_relaxed);
   auto m_evicting       = _miss_state_evicting.load(std::memory_order_relaxed);
   auto m_never_alloc    = _miss_state_empty_never_allocated.load(std::memory_order_relaxed);
-  auto m_post_drain     = _miss_state_empty_post_drain.load(std::memory_order_relaxed);
+  auto m_post_evict     = _miss_state_empty_post_evict.load(std::memory_order_relaxed);
+  auto m_load_failed    = _miss_state_empty_load_failed.load(std::memory_order_relaxed);
   auto full             = _full_miss_count.load(std::memory_order_relaxed);
   auto evicted_entries  = _evicted_entries.load(std::memory_order_relaxed);
   auto evicted_chunks   = _evicted_chunks.load(std::memory_order_relaxed);
-  auto partial =
-    m_range + m_alloc_no_steal + m_steal_lost + m_evicting + m_never_alloc + m_post_drain;
+  auto partial          = m_range + m_alloc_no_steal + m_steal_lost + m_evicting + m_never_alloc +
+                 m_post_evict + m_load_failed;
   auto total = hits + steals + partial + full;
   auto pct   = [&](uint64_t n) {
     return total > 0 ? (100.0 * static_cast<double>(n) / static_cast<double>(total)) : 0.0;
@@ -896,7 +915,7 @@ std::string prefetching_cache::summary() const
     "prefetching_cache: {} reads ({} hit {:.1f}% [of which {} waited on "
     "loading], {} allocated-steal {:.1f}%, {} partial-miss {:.1f}% "
     "[range={} alloc-no-steal={} steal-cas-lost={} evicting={} "
-    "empty-never-alloc={} empty-post-drain={}], "
+    "empty-never-alloc={} empty-post-evict={} empty-load-failed={}], "
     "{} full-miss {:.1f}%); evicted {} entries / {} chunks; pool {}/{} chunks free",
     total,
     hits,
@@ -911,7 +930,8 @@ std::string prefetching_cache::summary() const
     m_steal_lost,
     m_evicting,
     m_never_alloc,
-    m_post_drain,
+    m_post_evict,
+    m_load_failed,
     full,
     pct(full),
     evicted_entries,
@@ -1457,8 +1477,11 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
               e->state.try_mark_load_failed();
             }
           } else {
-            for (auto const& e : batch)
-              e->state.try_mark_cached();
+            for (auto const& e : batch) {
+              if (e->state.try_mark_cached()) {
+                e->ever_cached.store(true, std::memory_order_release);
+              }
+            }
           }
           // `slot` and `io_obj` destruct here — budget is returned to
           // admission_control (which wakes any wait_for_idle waiter once

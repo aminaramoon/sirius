@@ -382,10 +382,15 @@ class prefetching_cache {
   //   reached it yet).  Indicates allocation is falling behind read
   //   consumption.
   std::atomic<uint64_t> _miss_state_empty_never_allocated{0};
-  // _miss_state_empty_post_drain: find_entry covered, state was `empty`,
-  //   and the entry HAS been allocated at some point in the past.
-  //   Indicates the entry was loaded and then evicted, or load failed.
-  std::atomic<uint64_t> _miss_state_empty_post_drain{0};
+  // _miss_state_empty_post_evict: find_entry covered, state was `empty`,
+  //   entry was allocated AND successfully cached at some point, then
+  //   evicted.  Indicates eviction churn — entry was loaded then dropped
+  //   while still being read.
+  std::atomic<uint64_t> _miss_state_empty_post_evict{0};
+  // _miss_state_empty_load_failed: find_entry covered, state was `empty`,
+  //   entry was allocated but never reached `cached`.  IO presumably
+  //   failed (mark_load_failed reset state to empty).
+  std::atomic<uint64_t> _miss_state_empty_load_failed{0};
   // _full_miss_count: file not in cache map, or no entry overlaps the read
   //   range at all.
   std::atomic<uint64_t> _full_miss_count{0};
