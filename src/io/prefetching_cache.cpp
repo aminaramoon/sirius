@@ -787,15 +787,16 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
       auto st = e->state.get_state();
 
       if (st == entry_state::queued) {
-        e->state.try_cancel_queued();
-        continue;
+        // If the CAS loses, the worker just moved the entry to allocated —
+        // re-observe and fall through to handle the new state.
+        if (e->state.try_cancel_queued()) continue;
+        st = e->state.get_state();
       }
 
       if (st == entry_state::allocated) {
         if (e->state.try_cancel_allocated()) {
           size_t n = e->chunks.size();
           if (_pool) { _pool->deallocate_bulk(e->chunks); }
-          e->chunks.clear();
           r.freed += n;
         }
         continue;
@@ -811,7 +812,14 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
         }
         continue;
       }
-      // loading / in_use / evicting / empty: in-flight or already gone; drop.
+
+      if (st == entry_state::in_use) {
+        // Reader is active; keep the entry in leftover so we retry eviction
+        // once the pin is released and the state returns to cached.
+        r.leftover.push_back(std::move(e));
+        continue;
+      }
+      // loading / evicting / empty: in-flight or already gone; drop.
     }
     return r;
   };
