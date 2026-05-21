@@ -588,7 +588,11 @@ class prefetching_handle {
   }
 
   /// Mark the prefetch as no longer wanted.  Idempotent; safe on an empty
-  /// handle.  Thread-safe with respect to the pipeline's cancellation checks.
+  /// handle.  Thread-safe with respect to the pipeline's cancellation checks:
+  /// concurrent calls to @c cancel() on the same handle from multiple threads
+  /// are safe (the alive flag is an atomic).  However, @c cancel() is NOT safe
+  /// concurrent with move-construction or move-assignment on the same handle
+  /// instance — handles are scoped per-caller and are not moved while in use.
   /// Flips the alive flag and signals the cache's evictor so it can reclaim
   /// any pre-allocated memory for this request immediately.
   /// Note: the per-file n_request counter is decremented on destruction (or
@@ -624,8 +628,11 @@ class prefetching_handle {
   file_demand* _demand{nullptr};
 
   /// Non-owning back-pointer to the owning cache.  Used by @c cancel() to
-  /// signal the evictor.  The cache outlives all handles (handles are vended
-  /// by the cache and callers never retain them past cache destruction).
+  /// signal the evictor.  The cache outlives all handles: handles are vended
+  /// by the cache, and callers must not retain them past cache destruction
+  /// (i.e. past @c sirius_ioctx::shutdown_cache()).  @c cancel() clears this
+  /// to nullptr after signalling; @c release() clears it unconditionally on
+  /// destruction or move-out.
   prefetching_cache* _cache{nullptr};
 };
 

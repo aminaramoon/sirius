@@ -354,10 +354,16 @@ file_demand::view file_demand::load(std::memory_order ord) const noexcept
 void prefetching_handle::cancel() noexcept
 {
   if (!_alive) return;
-  // Atomically flip alive to false exactly once. Exchange guarantees we only
-  // call notify_disposed() for the first caller when multiple threads race.
+  // Atomically flip alive to false exactly once.  acq_rel: the release half
+  // makes the flip visible to the worker's acquire-load; the acquire half on
+  // the true→false path is harmless (no corresponding release to sync with on
+  // the losing side).  The exchange guarantees exactly one caller reaches
+  // notify_disposed() even when multiple threads race on cancel().
   bool was_alive = _alive->exchange(false, std::memory_order_acq_rel);
-  if (was_alive && _cache) { _cache->notify_disposed(); }
+  if (was_alive && _cache) {
+    _cache->notify_disposed();
+    _cache = nullptr;  // prevent any future use; release is the definitive clear
+  }
 }
 
 void prefetching_handle::release() noexcept
