@@ -266,11 +266,6 @@ class prefetching_cache {
     file_demand demand;
   };
 
-  /// Per-file "this wrapper has been overtaken by K newer inserts on the
-  /// same file" cutoff.  Bigger means slower aging by staleness; the
-  /// demand counter aging still drives eviction in the steady state.
-  static constexpr uint64_t REQUEST_STALE_THRESHOLD = 8;
-
   // ---- helpers --------------------------------------------------------------
 
   void allocator_loop(std::stop_token stop);
@@ -297,23 +292,22 @@ class prefetching_cache {
 
   // ---- prefetch_request: per-insert wrapper carried in _eviction_queue ----
   //
-  // One per insert() call.  Bundles the entries the request produced
-  // plus the metadata the evictor uses for FIFO + per-file aging:
-  //   - @c file_request_state: non-owning pointer to the source
-  //     @c file_entry's packed (stamp:48 | n:16) atomic.  The cache
-  //     keeps file_entries alive for its lifetime; wrappers never
-  //     outlive the cache, so this raw pointer is safe.
-  //   - @c stamp_at_insert: snapshot of the file's stamp at insert
-  //     time.  The evictor compares against the file's current stamp
-  //     to detect requests that have been overtaken by newer activity
-  //     on the same file (per-file generation staleness).
+  // One per insert() call.  Bundles the entries the request produced plus
+  // the eviction-decision inputs:
+  //   - @c demand: non-owning pointer to the source @c file_entry's
+  //     packed (stamp:48 | n_pending:16) atomic.  The evictor reads
+  //     n_pending — when it hits zero the wrapper is "exhausted" and
+  //     its entries can be reclaimed.  The cache keeps file_entries
+  //     alive for its lifetime; wrappers never outlive the cache, so
+  //     this raw pointer is safe.
   //   - @c alive: shared with the corresponding @c work_item and the
   //     caller-side @c prefetching_handle.  Flipped to false by
   //     @c handle::cancel() (= fadvise(disposable)).
+  // n_pending is decremented EXCLUSIVELY by @c prefetching_handle::release
+  // (handle dtor / move-out).  The evictor never ages it.
   struct prefetch_request {
     std::vector<std::shared_ptr<cache_entry>> entries;
     file_demand* demand{nullptr};
-    uint64_t stamp_at_insert{0};
     std::shared_ptr<std::atomic<bool>> alive;
   };
 

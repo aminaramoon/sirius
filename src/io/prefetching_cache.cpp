@@ -723,34 +723,32 @@ prefetching_handle prefetching_cache::insert(
 
   file.entries = std::move(merged);
 
-  // Register this request with the file's demand counter (stamp+=1,
-  // n_pending+=1 saturating).  The new stamp is snapshotted on the
-  // eviction-queue wrapper so the evictor can later detect requests
-  // overtaken by newer activity on the same file.
-  uint64_t const new_stamp  = file.demand.register_request();
+  // Register this request with the file's demand counter (n_pending+=1
+  // saturating; the stamp field is bumped too for diagnostic ordering
+  // but the evictor no longer reads it).
+  file.demand.register_request();
   file_demand* const demand = &file.demand;
 
   file_lk.unlock();
 
   // Shared flag.  cancel() flips it; the worker checks it on dequeue and
-  // before dispatch; the evictor checks it on pop to short-circuit aging
-  // on cancelled requests.
+  // before dispatch; the evictor checks it on pop to short-circuit
+  // cancelled requests.
   auto alive = std::make_shared<std::atomic<bool>>(true);
 
   if (new_entries.empty()) {
     // Every range coalesced with an existing entry and no fresh prefetch
     // was scheduled — nothing for the worker to do, but we still hand
     // back a handle so the caller's per-file demand counter decrements
-    // when the request is done.
+    // when the handle drops.
     return prefetching_handle{std::move(alive), demand, this};
   }
 
   // Enqueue the eviction-queue wrapper BEFORE the work_item.  The wrapper
-  // sits in the queue from now until evicted (whether or not IO ever
-  // dispatches), so cancellation by handle drop doesn't need a separate
-  // enqueue path: the evictor pops, sees n_pending==0 (after handle
-  // dtor) or !alive, and drops the entries.
-  _eviction_queue.enqueue(prefetch_request{new_entries, demand, new_stamp, alive});
+  // sits in the queue from now until evicted: the evictor pops, sees
+  // n_pending==0 (all handles for this file have dropped) or !alive
+  // (handle.cancel()), and drops the entries.
+  _eviction_queue.enqueue(prefetch_request{new_entries, demand, alive});
 
   enqueue_work(prefetch_req{key, std::move(obj_sp), std::move(new_entries), alive});
   return prefetching_handle{std::move(alive), demand, this};
@@ -1018,9 +1016,15 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
     return r;
   };
 
-  // Drain the eviction queue, processing all disposed/stale/exhausted wrappers.
-  // Called on every wakeup (both dispose signals and allocation requests).
-  // Returns the total chunks freed so the allocation-request path can use it.
+  // Drain the eviction queue, evicting only wrappers whose handles are
+  // gone:
+  //   - cancelled = handle.cancel() flipped alive to false
+  //   - exhausted = n_pending == 0 (all handles for this file dropped)
+  // n_pending is decremented EXCLUSIVELY by prefetching_handle::release()
+  // (handle dtor or move-out).  The evictor never decrements it — no
+  // time-based aging, no stale-threshold path.  Live wrappers (n_pending>0)
+  // are re-queued unchanged so they survive until their handles actually
+  // drop, even across many evictor wake-ups.
   auto evict_disposed_entries = [&]() -> size_t {
     size_t reclaimed        = 0;
     size_t const n_to_check = _eviction_queue.size_approx();
@@ -1031,10 +1035,9 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
 
       auto const v         = wrapper.demand->load();
       bool const cancelled = !wrapper.alive->load(std::memory_order_acquire);
-      bool const stale     = v.stamp > wrapper.stamp_at_insert + REQUEST_STALE_THRESHOLD;
       bool const exhausted = (v.n_pending == 0);
 
-      if (cancelled || stale || exhausted) {
+      if (cancelled || exhausted) {
         auto r = walk_and_evict(wrapper);
         reclaimed += r.freed;
         if (!r.leftover.empty()) {
@@ -1042,8 +1045,7 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
           _eviction_queue.enqueue(std::move(wrapper));
         }
       } else {
-        // Live wrapper: age by one (clamped), rotate to tail.
-        wrapper.demand->unregister_request();
+        // Live wrapper: just rotate to tail unchanged.
         _eviction_queue.enqueue(std::move(wrapper));
       }
     }
@@ -1080,10 +1082,9 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
 
       auto const v         = wrapper.demand->load();
       bool const cancelled = !wrapper.alive->load(std::memory_order_acquire);
-      bool const stale     = v.stamp > wrapper.stamp_at_insert + REQUEST_STALE_THRESHOLD;
       bool const exhausted = (v.n_pending == 0);
 
-      if (cancelled || stale || exhausted) {
+      if (cancelled || exhausted) {
         auto r = walk_and_evict(wrapper);
         reclaimed += r.freed;
         if (!r.leftover.empty()) {
@@ -1091,7 +1092,10 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
           _eviction_queue.enqueue(std::move(wrapper));
         }
       } else {
-        wrapper.demand->unregister_request();
+        // Live wrapper: rotate to tail unchanged.  No time-based aging —
+        // n_pending only drops when handles go out of scope.  If every
+        // wrapper in the queue is live we can't make progress; bail out
+        // via the empty_ticks budget below rather than churning forever.
         _eviction_queue.enqueue(std::move(wrapper));
         if (reclaimed == 0 && ++empty_ticks > queue_size_hint) {
           std::this_thread::sleep_for(EVICTOR_POLL_INTERVAL);
@@ -1321,6 +1325,8 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
       // Every entry raced past empty; pre-allocated chunks already returned.
       continue;
     }
+
+    continue;
 
     // ---- Hand off allocated entries to io_dispatch_loop -------------------
     work_item dispatch{item.file_key, item.io_obj, std::move(batch), item.alive};

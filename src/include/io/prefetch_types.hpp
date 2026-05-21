@@ -53,8 +53,10 @@ namespace sirius::io {
 //   - evictor pop of a live wrapper   → unregister_request()  (aging)
 //
 // The evictor reads load() to decide whether a queued prefetch_request
-// is still wanted (n_pending > 0) and whether it's been overtaken by
-// newer activity (stamp_now > stamp_at_insert + STALE_THRESHOLD).
+// is still wanted (n_pending > 0).  When n_pending == 0 every handle
+// for this file has been released and the wrapper's entries can be
+// reclaimed.  The stamp field is no longer consulted for eviction
+// decisions (kept for potential diagnostics / future use).
 
 class file_demand {
  public:
