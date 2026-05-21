@@ -946,12 +946,10 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
     _work_seq.notify_one();
   });
 
-  // _pool and _io_ctx are const members baked at construction.  Threads
-  // only run when _armed (which already implies pool != nullptr and
-  // _io_ctx supports vector host read), so no per-iteration null checks
-  // or snapshots are needed.
-  buffer_pool* const pool    = _pool;
-  sirius_ioctx* const io_ctx = _io_ctx;
+  // _pool is a const member baked at construction.  Threads only run
+  // when _armed (which implies pool != nullptr), so no per-iteration
+  // null checks are needed.
+  buffer_pool* const pool = _pool;
 
   while (!stop.stop_requested()) {
     // Dequeue.  Park on _work_seq when the queue is empty; the dtor
@@ -1053,24 +1051,11 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
       }
     }
 
-    // ---- Phase 3: reserve the inflight budget for the upper bound ----------
-    // admission_control::acquire takes the stop_token; a disengaged slot
-    // means we were interrupted mid-wait.  Return chunks and exit.
-    auto budget_slot = _inflight_budget->acquire(upper_bound_chunks, stop);
-    if (!budget_slot) {
-      pool->deallocate_bulk(ptrs);
-      for (auto& e : item.entries)
-        if (e) e->state.try_cancel_queued();
-      break;
-    }
-
-    // ---- Phase 4: queued → allocated → loading + chunk assignment ----------
-    // Two-step transition: first claim the entry (queued → allocated), assign
-    // chunks, then commit it to loading.  Chunks are assigned between the two
-    // CASes so that IO dispatch (Phase 5) always sees a fully-populated chunk
-    // vector.  If try_allocate fails the entry raced past queued; return the
-    // pre-allocated chunks.  If try_start_loading fails the entry was cancelled
-    // after allocation; return its already-assigned chunks too.
+    // ---- Phase 4: queued → allocated + chunk assignment --------------------
+    // Claim each entry (queued → allocated) and assign pre-allocated chunks.
+    // IO dispatch (budget gating and loading transition) happens in
+    // io_dispatch_loop.  If try_allocate fails, the entry raced past queued;
+    // return its pre-allocated chunks and skip.
     std::vector<std::shared_ptr<cache_entry>> batch;
     batch.reserve(item.entries.size());
     size_t ptr_idx = 0;
@@ -1090,122 +1075,24 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
         continue;
       }
 
-      // Chunks assigned while in allocated state — visible to IO dispatch.
+      // Chunks assigned while in allocated state — visible to io_dispatch_loop.
       e->chunks.assign(ptrs.begin() + ptr_idx, ptrs.begin() + ptr_idx + n);
       ptr_idx += n;
-
-      if (!e->state.try_start_loading()) {
-        pool->deallocate_bulk(e->chunks);
-        e->chunks.clear();
-        continue;
-      }
       batch.push_back(e);
     }
 
     if (batch.empty()) {
-      // Every entry raced or resolved under us; budget_slot releases on scope
-      // exit, pool chunks already returned.
+      // Every entry raced past queued; pre-allocated chunks already returned.
       continue;
     }
 
-    // ---- Phase 5: dispatch IO in sub-batches -------------------------------
-    // Issue host_read_ranges_async_io for SUBBATCH-entry slices instead of
-    // the whole item, so a reader waiting on the first entry can wake as
-    // soon as the first sub-batch's callback fires — without waiting for
-    // the slowest IO across all (potentially 600+) entries.  Each sub-
-    // batch's lambda marks ITS entries cached/failed independently; the
-    // per-entry state-machine CAS already supports out-of-order
-    // transitions.
-    //
-    // Resources shared across sub-batches:
-    //   - slot_holder (shared_ptr<admission_control::slot>): one slot
-    //     covers the entire work_item's chunk count.  Per-sub-batch slot
-    //     acquisition would deadlock — if the cumulative request exceeds
-    //     the budget, later sub-batches' acquire() would block waiting
-    //     for slots that can't free until IOs we haven't dispatched yet
-    //     complete.  The single slot releases only when the LAST sub-
-    //     batch's callback (and thus the last shared_ptr) drops.
-    //   - io_obj, key, alive, pool: copied into each lambda (cheap —
-    //     shared_ptr ref-counts + a string copy).
-    //
-    // SUBBATCH at 16 trades dispatch count for HOL latency: a 600-range
-    // request becomes ~38 sub-dispatches; first-byte latency for the
-    // head reader drops from max(600 IOs) to max(16 IOs).
-    constexpr size_t SUBBATCH = 16;
-
-    auto slot_holder = std::make_shared<admission_control::slot>(std::move(budget_slot));
-    auto& obj_ref    = *item.io_obj;
-
-    for (size_t sb_start = 0; sb_start < batch.size(); sb_start += SUBBATCH) {
-      // Cancellation re-check between sub-batches: a fadvise(disposable)
-      // that fires after we already dispatched some sub-batches can still
-      // cancel the remaining ones.  Already-dispatched callbacks complete
-      // normally — their `alive` was true at dispatch time, and stopping
-      // them mid-flight requires reactor-level cancellation we don't have.
-      if (!item.alive->load(std::memory_order_acquire)) {
-        // Roll back the still-undispatched tail.
-        for (size_t i = sb_start; i < batch.size(); ++i) {
-          pool->deallocate_bulk(batch[i]->chunks);
-          batch[i]->state.try_mark_load_failed();
-        }
-        break;
-      }
-
-      size_t const sb_end = std::min(sb_start + SUBBATCH, batch.size());
-
-      // Build the chunk-flat io_ranges/io_dsts for this sub-batch.
-      std::vector<cudf::io::text::byte_range_info> sb_ranges;
-      std::vector<cudf::host_span<std::byte>> sb_dsts;
-      for (size_t i = sb_start; i < sb_end; ++i) {
-        auto const& e          = batch[i];
-        auto phys_off          = static_cast<size_t>(e->physical_range.offset());
-        auto phys_size         = static_cast<size_t>(e->physical_range.size());
-        auto const chunk_bytes = e->chunk_bytes;
-        for (size_t c = 0; c < e->chunks.size(); ++c) {
-          auto off = phys_off + c * chunk_bytes;
-          auto sz  = std::min(chunk_bytes, phys_size - c * chunk_bytes);
-          sb_ranges.emplace_back(static_cast<int64_t>(off), static_cast<int64_t>(sz));
-          sb_dsts.emplace_back(e->chunks[c], sz);
-        }
-      }
-
-      // Slice this sub-batch's entries into their own vector — each
-      // lambda owns its subset so the per-entry mark_cached/mark_load_failed
-      // in the callback below operates only on its sub-batch's entries.
-      std::vector<std::shared_ptr<cache_entry>> sb_batch(
-        batch.begin() + static_cast<std::ptrdiff_t>(sb_start),
-        batch.begin() + static_cast<std::ptrdiff_t>(sb_end));
-
-      io_ctx->host_read_ranges_async_io(
-        obj_ref,
-        sb_ranges,
-        sb_dsts,
-        [pool,
-         batch  = std::move(sb_batch),
-         slot   = slot_holder,  // shared across sub-batches
-         io_obj = item.io_obj,  // copy, not move — used by later sub-batches
-         key    = item.file_key]   // copy, not move
-        (size_t /*bytes*/, std::exception_ptr ep) {
-          if (ep) {
-            try {
-              std::rethrow_exception(std::move(ep));
-            } catch (std::exception const& ex) {
-              spdlog::error("prefetching_cache: IO failed for {}: {}", key, ex.what());
-            }
-            for (auto const& e : batch) {
-              pool->deallocate_bulk(e->chunks);
-              e->state.try_mark_load_failed();
-            }
-          } else {
-            for (auto const& e : batch)
-              e->state.try_mark_cached();
-          }
-          // `slot` and `io_obj` destruct here — budget is returned to
-          // admission_control (which wakes any wait_for_idle waiter once
-          // the last slot drops), and the file handle is released only
-          // after the IO backend is done with it.
-        });
+    // ---- Hand off allocated entries to io_dispatch_loop -------------------
+    work_item dispatch{item.file_key, item.io_obj, std::move(batch), item.alive};
+    {
+      std::lock_guard lk(_io_dispatch_mtx);
+      _io_dispatch_queue.push_back(std::move(dispatch));
     }
+    _io_dispatch_cv.notify_one();
   }
 }
 
