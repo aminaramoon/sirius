@@ -1368,15 +1368,7 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
     // ---- Cancellation check ------------------------------------------------
     // The handle may have been cancelled between allocator_loop's push and now.
     // Return chunks for all allocated entries and skip.
-    if (!item.alive->load(std::memory_order_acquire)) {
-      for (auto& e : item.entries) {
-        if (!e) continue;
-        if (e->state.try_cancel_allocated()) {
-          if (pool) { pool->deallocate_bulk(e->chunks); }
-        }
-      }
-      continue;
-    }
+    if (!item.alive->load(std::memory_order_acquire)) { continue; }
 
     // ---- allocated → loading + build batch ---------------------------------
     // try_start_loading() (allocated → loading) establishes exclusive ownership
@@ -1406,10 +1398,16 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
     // since some may have been cancelled between allocator_loop and here).
     auto budget_slot = _inflight_budget->acquire(total_chunks, stop);
     if (!budget_slot) {
-      // Stop requested while waiting for budget.  Return chunks and exit.
+      // Stop requested while waiting for budget.  Revert each entry
+      // loading → allocated so the chunks stay attached and a later
+      // device_read with out_buffer can steal-retry from `allocated`
+      // (rather than seeing `empty` and falling through to the
+      // backend).  If the CAS fails the entry was already moved out of
+      // `loading` (shutdown's abort_pending_entries raced) — abort
+      // doesn't free chunks for the loading transition, so we must
+      // deallocate them here.
       for (auto& e : batch) {
-        pool->deallocate_bulk(e->chunks);
-        e->state.try_mark_load_failed();
+        if (!e->state.try_revert_loading_to_allocated()) { pool->deallocate_bulk(e->chunks); }
       }
       break;
     }
@@ -1428,9 +1426,14 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
       // that fires after we dispatched some sub-batches can still cancel
       // the remaining ones.  Already-dispatched callbacks complete normally.
       if (!item.alive->load(std::memory_order_acquire)) {
+        // fadvise(disposable) raced between sub-batches.  Revert each
+        // remaining entry loading → allocated so the chunks stay
+        // attached for a future read-driven retry.  CAS-fail fallback
+        // mirrors the budget-bail path above.
         for (size_t i = sb_start; i < batch.size(); ++i) {
-          pool->deallocate_bulk(batch[i]->chunks);
-          batch[i]->state.try_mark_load_failed();
+          if (!batch[i]->state.try_revert_loading_to_allocated()) {
+            pool->deallocate_bulk(batch[i]->chunks);
+          }
         }
         break;
       }
@@ -1472,9 +1475,16 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
             } catch (std::exception const& ex) {
               spdlog::error("prefetching_cache: IO failed for {}: {}", key, ex.what());
             }
+            // Revert each entry loading → allocated rather than
+            // discarding to `empty`.  Chunks stay attached so a
+            // subsequent device_read with out_buffer can steal the
+            // entry and retry the load with a fresh request_context.
+            // The CAS only fails if shutdown's abort_pending_entries
+            // raced ahead — in that case we still own the chunks
+            // (abort doesn't free chunks for the `loading` transition)
+            // and must deallocate to avoid a leak.
             for (auto const& e : batch) {
-              pool->deallocate_bulk(e->chunks);
-              e->state.try_mark_load_failed();
+              if (!e->state.try_revert_loading_to_allocated()) { pool->deallocate_bulk(e->chunks); }
             }
           } else {
             for (auto const& e : batch) {

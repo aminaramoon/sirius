@@ -327,6 +327,22 @@ class entry_state {
     return ok;
   }
 
+  /// loading → allocated using CAS.  Returns false if the entry was
+  /// already resolved or aborted.  Used by io_dispatch_loop's failure
+  /// paths to revert an entry whose IO did not complete: the entry's
+  /// chunks stay attached so a subsequent allocated-steal read can
+  /// retry the load with a fresh request_context, instead of
+  /// discarding the entry to `empty` and forcing the next reader
+  /// through find_entry → miss_state_empty_post_drain.
+  bool try_revert_loading_to_allocated() noexcept
+  {
+    auto expected = pack(loading, 0);
+    bool ok =
+      _packed.compare_exchange_strong(expected, pack(allocated, 0), std::memory_order_acq_rel);
+    if (ok) { _packed.notify_all(); }
+    return ok;
+  }
+
   /// (allocated | loading) → empty.  Used during cache shutdown to wake
   /// readers parked on a load that may never complete.
   ///
