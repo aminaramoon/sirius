@@ -254,22 +254,29 @@ size_t sirius_ioctx::device_read(
     }
     if (chb) {
       // Allocated-steal path: chunks are pre-assigned, dispatch
-      // file → bounce → device directly through the new ioctx API.
+      // file → bounce → device directly through the new ioctx API.  Route
+      // any synchronous throw from device_read_async_io_using through the
+      // promise so fut.get() surfaces the original exception instead of
+      // std::future_error(broken_promise).
       std::promise<size_t> p;
       auto fut = p.get_future();
-      device_read_async_io_using(obj,
-                                 offset,
-                                 size,
-                                 dst,
-                                 stream,
-                                 std::move(chb),
-                                 [&p](size_t bytes_transferred, std::exception_ptr ep) {
-                                   if (ep) {
-                                     p.set_exception(std::move(ep));
-                                   } else {
-                                     p.set_value(bytes_transferred);
-                                   }
-                                 });
+      try {
+        device_read_async_io_using(obj,
+                                   offset,
+                                   size,
+                                   dst,
+                                   stream,
+                                   std::move(chb),
+                                   [&p](size_t bytes_transferred, std::exception_ptr ep) {
+                                     if (ep) {
+                                       p.set_exception(std::move(ep));
+                                     } else {
+                                       p.set_value(bytes_transferred);
+                                     }
+                                   });
+      } catch (...) {
+        p.set_exception(std::current_exception());
+      }
       return fut.get();
     }
   }
@@ -293,21 +300,27 @@ std::future<size_t> sirius_ioctx::device_read_async(
     }
     if (chb) {
       // Allocated-steal path: same as the sync flow above, but expose the
-      // future to the caller instead of blocking on it.
+      // future to the caller instead of blocking on it.  Synchronous throws
+      // are routed through the promise so callers always observe failure
+      // via the returned future rather than as a propagated exception.
       auto promise = std::make_shared<std::promise<size_t>>();
-      device_read_async_io_using(obj,
-                                 offset,
-                                 size,
-                                 dst,
-                                 stream,
-                                 std::move(chb),
-                                 [promise](size_t bytes_transferred, std::exception_ptr ep) {
-                                   if (ep) {
-                                     promise->set_exception(std::move(ep));
-                                   } else {
-                                     promise->set_value(bytes_transferred);
-                                   }
-                                 });
+      try {
+        device_read_async_io_using(obj,
+                                   offset,
+                                   size,
+                                   dst,
+                                   stream,
+                                   std::move(chb),
+                                   [promise](size_t bytes_transferred, std::exception_ptr ep) {
+                                     if (ep) {
+                                       promise->set_exception(std::move(ep));
+                                     } else {
+                                       promise->set_value(bytes_transferred);
+                                     }
+                                   });
+      } catch (...) {
+        promise->set_exception(std::current_exception());
+      }
       return promise->get_future();
     }
   }
