@@ -246,10 +246,31 @@ size_t sirius_ioctx::device_read(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
   if (uses_prefetching_cache()) {
-    if (auto view = _cache->read(obj, offset, size); view) {
+    cached_host_buffer chb;
+    if (auto view = _cache->read(obj, offset, size, stream.value(), &chb); view) {
       auto slices = view.slice(offset, size);
       auto copied = copy_pinned_slices_to_device(slices, dst, stream);
       return copied.get();
+    }
+    if (chb) {
+      // Allocated-steal path: chunks are pre-assigned, dispatch
+      // file → bounce → device directly through the new ioctx API.
+      std::promise<size_t> p;
+      auto fut = p.get_future();
+      device_read_async_io_using(obj,
+                                 offset,
+                                 size,
+                                 dst,
+                                 stream,
+                                 std::move(chb),
+                                 [&p](size_t bytes_transferred, std::exception_ptr ep) {
+                                   if (ep) {
+                                     p.set_exception(std::move(ep));
+                                   } else {
+                                     p.set_value(bytes_transferred);
+                                   }
+                                 });
+      return fut.get();
     }
   }
   return device_read_io(obj, offset, size, dst, stream);
@@ -259,7 +280,8 @@ std::future<size_t> sirius_ioctx::device_read_async(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
   if (uses_prefetching_cache()) {
-    if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
+    cached_host_buffer chb;
+    if (auto view = _cache->read(obj, offset, size, stream.value(), &chb); view) {
       auto slices = view.slice(offset, size);
       try {
         return copy_pinned_slices_to_device(slices, dst, stream);
@@ -268,6 +290,25 @@ std::future<size_t> sirius_ioctx::device_read_async(
           std::rethrow_exception(e);
         });
       }
+    }
+    if (chb) {
+      // Allocated-steal path: same as the sync flow above, but expose the
+      // future to the caller instead of blocking on it.
+      auto promise = std::make_shared<std::promise<size_t>>();
+      device_read_async_io_using(obj,
+                                 offset,
+                                 size,
+                                 dst,
+                                 stream,
+                                 std::move(chb),
+                                 [promise](size_t bytes_transferred, std::exception_ptr ep) {
+                                   if (ep) {
+                                     promise->set_exception(std::move(ep));
+                                   } else {
+                                     promise->set_value(bytes_transferred);
+                                   }
+                                 });
+      return promise->get_future();
     }
   }
   auto promise = std::make_shared<std::promise<size_t>>();
