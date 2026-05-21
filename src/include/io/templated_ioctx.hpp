@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <concepts>
 #include <cstdint>
 #include <future>
@@ -294,7 +295,7 @@ class templated_ioctx : public sirius_ioctx {
                                          if (user_handler) user_handler(bytes, ep);
                                        });
 
-    if (!ctx) return;  // n_chunks > 0 so create() can't return null, but guard anyway
+    assert(ctx);  // n_chunks == reqs.size() > 0, so create() never returns null here
 
     for (auto& r : reqs)
       r.ctx = ctx;
