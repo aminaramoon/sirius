@@ -126,12 +126,16 @@ void sirius_datasource::fadvise(prefetching_mode site,
                                 std::span<const cudf::io::text::byte_range_info> ranges)
 {
   // Disposable is always honored, regardless of the backend's preferred
-  // mode.  Cancel any handle a prior speculative/immediate call left on
-  // this datasource; if there's no handle, the cache worker has already
-  // taken (or never had) the request — nothing to do.
+  // mode.  Cancel the handle (flips alive=false so io_dispatch's
+  // cancellation gate skips loading) but DO NOT drop the handle.
+  // Dropping it would decrement the file's n_pending, and if that was
+  // the only handle keeping n_pending > 0 the evictor would immediately
+  // walk the wrapper and evict the allocated entries — defeating the
+  // purpose of the read-driven steal path.  The handle is released
+  // naturally when this datasource is destroyed (after the scan
+  // finishes reading).
   if (site == prefetching_mode::disposable) {
     _prefetch_handle.cancel();
-    _prefetch_handle = {};
     return;
   }
 
