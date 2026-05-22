@@ -156,6 +156,10 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 {
   reset();
 
+  if (_io_ctx && _io_ctx->cache()) {
+    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
+  }
+
   // Advance the cache age so the evictor can score this query's inserts
   // against entries left over from prior queries.
   // refresh_cache() removed — the cache no longer has a query-epoch
