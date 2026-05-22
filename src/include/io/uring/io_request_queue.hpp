@@ -86,7 +86,7 @@ class io_request_queue {
   void wait(uint64_t seq) noexcept { _seq.wait(seq, std::memory_order_relaxed); }
 
   // Bump the sequence and wake one waiter.  Called by producers after a
-  // successful enqueue and by cuda_copy_cb after a H2D copy completes.
+  // successful enqueue.
   void notify() noexcept
   {
     _seq.fetch_add(1, std::memory_order_release);

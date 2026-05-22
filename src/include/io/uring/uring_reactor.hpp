@@ -228,22 +228,18 @@ class uring_reactor {
  private:
   void worker_loop();
 
-  // Payload passed to cudaStreamAddCallback for managed device reads.
-  // `ctx` is set on each dispatch and reset in the callback after use.
-  // The reactor waits for all pending callbacks before destroying members
+  // Per-slot state for managed device reads.
+  // After cudaMemcpyAsync, `event` is recorded on the copy stream so the
+  // worker can poll completion via cudaEventQuery.  `ctx` is set on each
+  // dispatch and reset in poll_copy_completions after use.
+  // The reactor drains all pending events before destroying members
   // (guarded by `_copying_count`).
   struct cb_arg {
     uring_reactor* self;
     int slot;
     std::shared_ptr<request_context> ctx;
+    cudaEvent_t event{nullptr};
   };
-  // cudaStreamAddCallback signature (deprecated but used deliberately).
-  // Unlike cudaLaunchHostFunc, the callback fires even when the stream is
-  // already in an error state — so we never strand a slot waiting for a
-  // callback that wouldn't otherwise come.  The callback calls chunk_done /
-  // chunk_failed on ctx, releases the slot back to _slot_pool, and wakes the
-  // worker.
-  static void cuda_copy_cb(cudaStream_t stream, cudaError_t status, void* p) noexcept;
 
   // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
   // multiple_blocks_allocation destructor returns the blocks to the upstream

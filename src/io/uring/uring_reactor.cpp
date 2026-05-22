@@ -81,14 +81,27 @@ uring_reactor::uring_reactor(cucascade::memory::fixed_size_host_memory_resource&
       std::to_string(blocks.size()) + ") than required (" + std::to_string(NUM_CHUNKS) + ")");
   }
   for (int i = 0; i < static_cast<int>(NUM_CHUNKS); ++i) {
-    _bounce[i].buf = blocks[i];
-    _cb_args[i]    = {this, i, nullptr};
+    _bounce[i].buf     = blocks[i];
+    _cb_args[i]        = {this, i, nullptr};
+    cudaError_t ev_err = cudaEventCreateWithFlags(&_cb_args[i].event, cudaEventDisableTiming);
+    if (ev_err != cudaSuccess) {
+      for (int j = 0; j < i; ++j)
+        cudaEventDestroy(_cb_args[j].event);
+      throw std::runtime_error(std::string("uring_reactor: cudaEventCreateWithFlags failed: ") +
+                               cudaGetErrorString(ev_err));
+    }
   }
 
   _worker = std::thread([this] { worker_loop(); });
 }
 
-uring_reactor::~uring_reactor() { shutdown(); }
+uring_reactor::~uring_reactor()
+{
+  shutdown();
+  for (int i = 0; i < static_cast<int>(NUM_CHUNKS); ++i) {
+    if (_cb_args[i].event) cudaEventDestroy(_cb_args[i].event);
+  }
+}
 
 void uring_reactor::interrupt() { _request_queue.notify(); }
 
@@ -99,33 +112,6 @@ void uring_reactor::shutdown()
     interrupt();
     _worker.join();
   }
-}
-
-void uring_reactor::cuda_copy_cb(cudaStream_t /*stream*/, cudaError_t status, void* p) noexcept
-{
-  auto* arg = static_cast<cb_arg*>(p);
-  if (status != cudaSuccess) {
-    arg->ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
-      std::string("uring_reactor: H2D copy failed: ") + cudaGetErrorString(status))));
-  } else {
-    arg->ctx->chunk_done();
-  }
-  arg->ctx.reset();
-
-  // Capture self/slot BEFORE the _copying_count decrement.  The worker's
-  // shutdown-drain check observes _copying_count==0 + inflight==0 and breaks
-  // out of worker_loop; ~uring_reactor then destroys _slot_pool /
-  // _request_queue / _cb_args.  Any access to `arg->self` (or `arg->slot`,
-  // since arg itself lives inside _cb_args) after that decrement is a UAF.
-  // The fetch_sub must therefore be the LAST member access on the reactor;
-  // release is sufficient — it forbids reordering the slot_pool / queue
-  // stores below the decrement, which is the property we need to pair with
-  // the worker's acquire-load of _copying_count.
-  auto* self = arg->self;
-  int slot   = arg->slot;
-  self->_slot_pool.release(slot);
-  self->_request_queue.notify();
-  self->_copying_count.fetch_sub(1, std::memory_order_release);
 }
 
 cudf::io::text::byte_range_info uring_reactor::align_to_physical(
@@ -580,31 +566,27 @@ void uring_reactor::worker_loop()
         s.ctx->chunk_done();
         _slot_pool.release(si);
       } else {
-        // Managed: stash ctx in cb_arg, register callback.
-        // cudaStreamAddCallback fires even if the stream is in an error
-        // state — chunk_done/chunk_failed always fires, as long as the
-        // callback was successfully registered.
-        // is_registered drives release: the callback is responsible for
-        // recycling the bounce buffer (via _slot_pool.release).
+        // Managed: stash ctx in cb_arg and record an event on the copy
+        // stream.  poll_copy_completions() on the worker thread queries the
+        // event each iteration and drives chunk_done/chunk_failed + slot
+        // release when the H2D copy has finished.
         _cb_args[si].ctx = std::move(s.ctx);
         auto stream      = s.stream;
         _copying_count.fetch_add(1, std::memory_order_relaxed);
-        cudaError_t cb_err = cudaStreamAddCallback(stream, cuda_copy_cb, &_cb_args[si], 0);
-        if (cb_err != cudaSuccess) {
-          // Registration failed: callback will not fire, so we own the
-          // cleanup that cuda_copy_cb would normally do — chunk_failed the
-          // ctx, drop the cb_arg's ctx ref, unwind _copying_count, and
-          // release the slot.  Without this rollback the slot leaks and
-          // _copying_count stays elevated, blocking shutdown forever.
+        cudaError_t ev_err = cudaEventRecord(_cb_args[si].event, stream);
+        if (ev_err != cudaSuccess) {
+          // Event record failed: poll_copy_completions will never see this
+          // slot as ready, so roll back here exactly as we would in the
+          // callback path — chunk_failed the ctx, unwind _copying_count,
+          // and release the slot.
           cudaGetLastError();
           auto ctx = std::move(_cb_args[si].ctx);
-          ctx->chunk_failed(std::make_exception_ptr(
-            std::runtime_error(std::string("uring_reactor: cudaStreamAddCallback failed: ") +
-                               cudaGetErrorString(cb_err))));
+          ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+            std::string("uring_reactor: cudaEventRecord failed: ") + cudaGetErrorString(ev_err))));
           _copying_count.fetch_sub(1, std::memory_order_release);
           _slot_pool.release(si);
         }
-        // Otherwise: slot released in cuda_copy_cb.
+        // Otherwise: slot released in poll_copy_completions.
       }
     }
     if (need_resubmit) {
@@ -619,6 +601,32 @@ void uring_reactor::worker_loop()
   };
 
   // ---------------------------------------------------------------------------
+  // poll_copy_completions — drain slots whose H2D event has fired.
+  //
+  // Runs on the worker thread.  Iterates all slots that have a pending ctx,
+  // queries their cudaEvent, and on completion calls chunk_done/chunk_failed,
+  // resets the ctx, releases the slot back to _slot_pool, and decrements
+  // _copying_count.
+  // ---------------------------------------------------------------------------
+  auto poll_copy_completions = [&]() {
+    for (int i = 0; i < static_cast<int>(NUM_CHUNKS); ++i) {
+      if (!_cb_args[i].ctx) continue;
+      cudaError_t ev_status = cudaEventQuery(_cb_args[i].event);
+      if (ev_status == cudaErrorNotReady) continue;
+      if (ev_status == cudaSuccess) {
+        _cb_args[i].ctx->chunk_done();
+      } else {
+        cudaGetLastError();
+        _cb_args[i].ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+          std::string("uring_reactor: H2D copy failed: ") + cudaGetErrorString(ev_status))));
+      }
+      _cb_args[i].ctx.reset();
+      _slot_pool.release(i);
+      _copying_count.fetch_sub(1, std::memory_order_release);
+    }
+  };
+
+  // ---------------------------------------------------------------------------
   // Main loop
   //
   // Shutdown: queued-but-not-yet-submitted requests are cancelled immediately
@@ -626,12 +634,13 @@ void uring_reactor::worker_loop()
   // CUDA copies (_copying_count) are allowed to complete naturally.
   //
   // Park points:
-  //  A) queue empty and no in-flight IO: wait on _request_queue seq counter.
-  //     Covers truly idle (new work) and shutdown draining CUDA callbacks.
+  //  A) queue empty, no in-flight IO, no pending copies: block on the
+  //     _request_queue seq counter.  If copies are still in flight, yield
+  //     instead so the loop spins back to poll_copy_completions.
   //  B) in-flight IO: wait on io_uring_wait_cqe_timeout; reap releases slots.
-  //  C) inflight == 0 but pool exhausted (all slots in CUDA callbacks):
-  //     slot_pool::acquire() parks until cuda_copy_cb calls release().
-  //     Safe: inflight == 0 guarantees no io_uring op holds a slot.
+  //  C) inflight == 0 but pool exhausted (all slots held by H2D copies):
+  //     yield so the loop spins back to poll_copy_completions, which releases
+  //     slots as events fire.
   // ---------------------------------------------------------------------------
   static constexpr long SHUTDOWN_POLL_MS = 100;
   auto shutdown_err = std::make_exception_ptr(std::runtime_error("uring_reactor: shutting down"));
@@ -644,13 +653,22 @@ void uring_reactor::worker_loop()
       host_read_req_type hr;
       while (_request_queue.try_dequeue_host(hr))
         hr.ctx->chunk_failed(shutdown_err);
+      poll_copy_completions();
       if (inflight == 0 && _copying_count.load(std::memory_order_acquire) == 0) break;
     }
 
+    poll_copy_completions();
+
     // Park A: nothing queued and no io_uring work in flight.
     if (_request_queue.empty() && inflight == 0) {
-      uint64_t seq = _request_queue.current_seq();
-      if (_request_queue.empty()) _request_queue.wait(seq);
+      if (_copying_count.load(std::memory_order_acquire) == 0) {
+        // Truly idle: block until a producer enqueues work.
+        uint64_t seq = _request_queue.current_seq();
+        if (_request_queue.empty()) _request_queue.wait(seq);
+      } else {
+        // H2D copies still in flight: yield so we loop back to poll them.
+        std::this_thread::yield();
+      }
       continue;
     }
 
@@ -674,13 +692,10 @@ void uring_reactor::worker_loop()
       continue;
     }
 
-    // Park C: inflight == 0, queue non-empty, pool exhausted by CUDA callbacks.
-    // Acquire a slot to sleep until cuda_copy_cb fires, then release it —
-    // submit_pending will claim it on the next iteration.
-    if (!_slot_pool.any_free()) {
-      int si = _slot_pool.acquire();
-      _slot_pool.release(si);
-    }
+    // Park C: inflight == 0, queue non-empty, pool exhausted by H2D copies.
+    // Yield so the loop spins back to poll_copy_completions, which will
+    // release slots as events fire.
+    if (!_slot_pool.any_free()) { std::this_thread::yield(); }
   }
 }
 
