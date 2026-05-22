@@ -1139,13 +1139,11 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
   buffer_pool* const pool = _pool;
 
   while (!stop.stop_requested()) {
-    spdlog::info("allocator_loop: (queue size approx {})", _work_queue.size_approx());
     // Dequeue.  Park on _work_seq when the queue is empty; the dtor
     // bumps _work_seq + notify_all (and the stop_callback above re-bumps
     // it) so a stopped worker observes the token here and exits.
     work_item item;
     if (!_work_queue.try_dequeue(item)) {
-      spdlog::info("allocator_loop: waiting for work. ({})", _work_queue.size_approx());
       auto seq = _work_seq.load(std::memory_order_acquire);
       if (stop.stop_requested()) break;
       if (!_work_queue.try_dequeue(item)) {
@@ -1153,23 +1151,14 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
         continue;
       }
     }
-    if (stop.stop_requested()) {
-      spdlog::info("allocator_loop: stopping after dequeue.");
-      // Entries are still in `empty` (the CAS to `allocated` hasn't run
-      // yet); just drop the work_item.
-      break;
-    }
+    if (stop.stop_requested()) { break; }
 
     // ---- Cancellation gate -------------------------------------------------
     // The caller-side prefetching_handle may have flipped alive to false
     // between insert() and now (e.g. fadvise(disposable) fired before the
     // worker drained the queue).  alive is never null on a dequeued item:
     // insert() always constructs one before enqueuing.
-    if (!item.alive->load(std::memory_order_acquire)) {
-      spdlog::info("allocator_loop: skipping cancelled work item for file {}", item.file_key);
-      // Entries are still in `empty`; nothing to undo.
-      continue;
-    }
+    if (!item.alive->load(std::memory_order_acquire)) { continue; }
 
     // ---- Phase 1: compute an upper bound on chunks for the whole item ------
     // Peek at each entry's state to skip ones that obviously don't need
@@ -1198,14 +1187,7 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
     std::vector<std::byte*> ptrs;
     ptrs.reserve(upper_bound_chunks);
     auto got = pool->allocate_bulk(upper_bound_chunks, ptrs);
-    spdlog::info("allocator_loop: allocated {} / {} chunks for file {}",
-                 got,
-                 upper_bound_chunks,
-                 item.file_key);
     if (got < upper_bound_chunks) {
-      spdlog::info("allocator_loop: eviction needed to allocate {} additional chunks for file {}",
-                   upper_bound_chunks - got,
-                   item.file_key);
       // Bail before enqueueing if shutdown started.  Without this, the
       // allocator could push an eviction_request into a queue whose
       // evictor has already exited, and fut.get() below would block
@@ -1227,9 +1209,6 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
       _request_sem.release();
 
       try {
-        spdlog::info("allocator_loop: waiting for eviction to free {} chunks for file {}",
-                     shortfall,
-                     item.file_key);
         fut.get();
       } catch (...) {
         pool->deallocate_bulk(ptrs);
@@ -1241,8 +1220,6 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
       // a tearing-down system.
       if (stop.stop_requested()) {
         pool->deallocate_bulk(ptrs);
-        spdlog::info("allocator_loop: stopping after eviction wait.");
-        // Entries are still in `empty`; just drop the work_item.
         break;
       }
 
@@ -1275,9 +1252,6 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
       };
 
       if (!e->state.try_allocate()) {
-        spdlog::info("allocator_loop: entry {} for file {} raced past empty; skipping allocation",
-                     i,
-                     item.file_key);
         return_chunks();
         continue;
       }
@@ -1287,13 +1261,6 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
       // failed" (eviction churn).  release ordering pairs with the
       // acquire-load in read()'s miss-classifier.
       e->ever_allocated.store(true, std::memory_order_release);
-
-      spdlog::info("allocator_loop: allocated {} chunks for entry {} (file {}, offset {}, size {})",
-                   n,
-                   i,
-                   item.file_key,
-                   e->logical_range.offset(),
-                   e->logical_range.size());
 
       // Chunks assigned while in allocated state — visible to io_dispatch_loop.
       e->chunks.assign(ptrs.begin() + ptr_idx, ptrs.begin() + ptr_idx + n);
