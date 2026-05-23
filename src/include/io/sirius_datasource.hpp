@@ -93,18 +93,18 @@ class sirius_datasource : public cudf::io::datasource {
 
   // ---- Advisory IO ---------------------------------------------------------
 
-  /// Return a fresh datasource that shares this one's @c sirius_ioctx and
+  /// \brief Return a fresh datasource that shares this one's @c sirius_ioctx and
   /// @c sirius_io_object (so it points at the same file) but carries an
   /// empty @c prefetching_handle.
   ///
-  /// Used when a single file is split across multiple scans (e.g. several
+  /// \note Used when a single file is split across multiple scans (e.g. several
   /// row_group_slices from the same parquet file).  Each split owns its
   /// own datasource via @c duplicate so it can call @c fadvise without
   /// stomping on another scan's handle — io_objects are deliberately
   /// shareable across datasources, but handles are not.
   [[nodiscard]] std::unique_ptr<sirius_datasource> duplicate() const;
 
-  /// Hint the IO layer about @p ranges that this scan will (or might) read
+  /// \brief Hint the IO layer about @p ranges that this scan will (or might) read
   /// soon.
   ///
   /// The behaviour depends on @p site and the io_ctx's

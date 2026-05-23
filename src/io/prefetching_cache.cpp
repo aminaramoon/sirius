@@ -653,7 +653,13 @@ std::shared_ptr<cache_entry> prefetching_cache::find_entry(
 prefetching_handle prefetching_cache::insert(
   sirius_io_object& obj, const std::vector<cudf::io::text::byte_range_info>& ranges)
 {
-  spdlog::info("insert: obj={} ranges {}", obj.raw_file_cache_id(), ranges.size());
+  if (!_armed) {
+    // Unarmed cache: record the file_entry so subsequent reads can find
+    // metadata, but skip the per-range cache_entries — there's no pool
+    // to allocate chunks from and no worker to dispatch IO.
+    return {};
+  }
+
   assert(std::is_sorted(ranges.begin(),
                         ranges.end(),
                         [](auto const& a, auto const& b) { return a.offset() < b.offset(); }) &&
@@ -668,21 +674,16 @@ prefetching_handle prefetching_cache::insert(
 
   std::unique_lock map_lk(_map_mtx);
   auto [it, inserted] = _file_cache.try_emplace(key, nullptr);
-  if (inserted) it->second = std::make_unique<file_entry>();
+  if (inserted) {
+    auto fh       = std::make_unique<file_entry>();
+    fh->io_obj    = obj_sp;
+    fh->file_size = file_size;
+    it->second    = std::move(fh);
+  }
   auto& file = *it->second;
 
   std::unique_lock file_lk(file.mtx);
   map_lk.unlock();
-
-  file.io_obj    = obj_sp;
-  file.file_size = file_size;
-
-  if (!_armed) {
-    // Unarmed cache: record the file_entry so subsequent reads can find
-    // metadata, but skip the per-range cache_entries — there's no pool
-    // to allocate chunks from and no worker to dispatch IO.
-    return {};
-  }
 
   // Every range in the insert becomes a prefetch request, regardless of the
   // entry's current state.  The worker decides at dispatch time whether the
@@ -718,8 +719,9 @@ prefetching_handle prefetching_cache::insert(
     }
   }
   // Forward any trailing existing entries.
-  for (; ex_it != ex_end; ++ex_it)
+  for (; ex_it != ex_end; ++ex_it) {
     merged.push_back(std::move(*ex_it));
+  }
 
   file.entries = std::move(merged);
 
