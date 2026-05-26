@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/semi_future.hpp"
 #include "io/metadata_store.hpp"
 #include "io/prefetch_types.hpp"
 #include "io/types.hpp"
@@ -168,30 +169,16 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   virtual size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst);
 
-  virtual std::future<size_t> host_read_async(sirius_io_object& obj,
-                                              size_t offset,
-                                              size_t size,
-                                              uint8_t* dst);
+  virtual exec::semi_future<size_t> host_read_async(sirius_io_object& obj,
+                                                    size_t offset,
+                                                    size_t size,
+                                                    uint8_t* dst);
 
   virtual size_t device_read(
     sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
 
-  virtual std::future<size_t> device_read_async(
+  virtual exec::semi_future<size_t> device_read_async(
     sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
-
-  /// Issue a device read reusing the pre-allocated bounce buffers in @p buffer.
-  /// @p buffer must be in the @c loading state (caller already stole it from
-  /// the prefetching cache via @c prefetching_cache::read()).  On completion
-  /// the handler fires and the entry transitions to @c cached or @c empty.
-  /// Default implementation throws; only meaningful for backends that support
-  /// vector host reads (i.e. when @c supports_vector_host_read() is true).
-  virtual void device_read_async_io_using(sirius_io_object& obj,
-                                          size_t offset,
-                                          size_t size,
-                                          uint8_t* dst,
-                                          rmm::cuda_stream_view stream,
-                                          cached_host_buffer buffer,
-                                          io_completion_handler handler);
 
   // -- Physical range alignment ------------------------------------------------
 
@@ -203,11 +190,10 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
  protected:
   virtual size_t host_read_io(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
 
-  virtual void host_read_async_io(sirius_io_object& obj,
-                                  size_t offset,
-                                  size_t size,
-                                  uint8_t* dst,
-                                  io_completion_handler handler) = 0;
+  virtual exec::semi_future<size_t> host_read_async_io(sirius_io_object& obj,
+                                                       size_t offset,
+                                                       size_t size,
+                                                       uint8_t* dst) = 0;
 
   virtual size_t device_read_io(sirius_io_object& obj,
                                 size_t offset,
@@ -215,17 +201,23 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
                                 uint8_t* dst,
                                 rmm::cuda_stream_view stream) = 0;
 
-  virtual void device_read_async_io(sirius_io_object& obj,
-                                    size_t offset,
-                                    size_t size,
-                                    uint8_t* dst,
-                                    rmm::cuda_stream_view stream,
-                                    io_completion_handler handler) = 0;
+  virtual exec::semi_future<size_t> device_read_async_io(sirius_io_object& obj,
+                                                         size_t offset,
+                                                         size_t size,
+                                                         uint8_t* dst,
+                                                         rmm::cuda_stream_view stream) = 0;
 
-  virtual void host_read_ranges_async_io(sirius_io_object& obj,
-                                         std::vector<cudf::io::text::byte_range_info> const& ranges,
-                                         std::span<cudf::host_span<std::byte>> dst,
-                                         io_completion_handler handler) = 0;
+  virtual exec::semi_future<size_t> device_read_async_io_using(sirius_io_object& obj,
+                                                               size_t offset,
+                                                               size_t size,
+                                                               uint8_t* dst,
+                                                               rmm::cuda_stream_view stream,
+                                                               cached_host_buffer buffer);
+
+  virtual exec::semi_future<size_t> host_read_ranges_async_io(
+    sirius_io_object& obj,
+    std::vector<cudf::io::text::byte_range_info> const& ranges,
+    std::span<cudf::host_span<std::byte>> dst) = 0;
 
  protected:
   /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed

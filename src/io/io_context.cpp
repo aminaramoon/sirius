@@ -17,6 +17,7 @@
 #include "io/io_context.hpp"
 
 #include "driver_types.h"
+#include "exec/semi_future.hpp"
 #include "io/prefetching_cache.hpp"
 
 #include <rmm/device_buffer.hpp>
@@ -58,13 +59,8 @@ void sirius_ioctx::initialize_cache(buffer_pool* pool, size_t inflight_budget_ch
 
 void sirius_ioctx::shutdown_cache() noexcept { _cache.reset(); }
 
-void sirius_ioctx::device_read_async_io_using(sirius_io_object&,
-                                              size_t,
-                                              size_t,
-                                              uint8_t*,
-                                              rmm::cuda_stream_view,
-                                              cached_host_buffer buffer,
-                                              io_completion_handler)
+exec::semi_future<size_t> sirius_ioctx::device_read_async_io_using(
+  sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view, cached_host_buffer buffer)
 {
   throw std::runtime_error(
     "sirius_ioctx: device_read_async_io_using not supported by this backend");
@@ -72,7 +68,7 @@ void sirius_ioctx::device_read_async_io_using(sirius_io_object&,
 
 namespace {
 
-std::future<size_t> copy_pinned_slices_to_device(
+exec::semi_future<size_t> copy_pinned_slices_to_device(
   std::vector<cudf::io::datasource::non_owning_buffer> const& slices,
   uint8_t* dst,
   rmm::cuda_stream_view stream)
@@ -81,7 +77,7 @@ std::future<size_t> copy_pinned_slices_to_device(
   size_t n_nonempty =
     std::count_if(slices.begin(), slices.end(), [](auto const& s) { return s.size() > 0; });
 
-  if (n_nonempty == 0) return std::async(std::launch::deferred, []() { return size_t{0}; });
+  if (n_nonempty == 0) return exec::make_semi_future<size_t>(size_t{0});
 
   cucascade::cuda::cuda_event copy_done_event;
 
@@ -101,10 +97,11 @@ std::future<size_t> copy_pinned_slices_to_device(
       copied += s.size();
     }
     copy_done_event.record(stream);
-    return std::async(std::launch::deferred, [e = std::move(copy_done_event), copied]() mutable {
-      e.synchronize();
-      return copied;
-    });
+    return exec::make_semi_future<size_t>(size_t{0}).defer_value(
+      [e = std::move(copy_done_event), copied](size_t) mutable {
+        e.synchronize();
+        return copied;
+      });
   }
 
   // Build the batch descriptors. Copies within a batch are unordered with
@@ -139,11 +136,11 @@ std::future<size_t> copy_pinned_slices_to_device(
     total_copied += sizes[i];
   }
   copy_done_event.record(stream);
-  return std::async(std::launch::deferred,
-                    [e = std::move(copy_done_event), total_copied]() mutable {
-                      e.synchronize();
-                      return total_copied;
-                    });
+  return exec::make_semi_future<size_t>(size_t{0}).defer_value(
+    [e = std::move(copy_done_event), total_copied](size_t) mutable {
+      e.synchronize();
+      return total_copied;
+    });
 #else
   // Batch API available. It does not support legacy/null streams, so in
   // that case redirect to cudaStreamPerThread.  Once the batch completes
@@ -196,10 +193,11 @@ std::future<size_t> copy_pinned_slices_to_device(
                                cudaGetErrorString(wait_err));
     }
   }
-  return std::async(std::launch::deferred, [e = std::move(copy_done_event), copied]() mutable {
-    e.synchronize();
-    return copied;
-  });
+  return exec::make_semi_future<size_t>(size_t{0}).defer_value(
+    [e = std::move(copy_done_event), copied](size_t) mutable {
+      e.synchronize();
+      return copied;
+    });
 #endif
 }
 }  // namespace
@@ -224,38 +222,25 @@ size_t sirius_ioctx::host_read(sirius_io_object& obj, size_t offset, size_t size
   return host_read_io(obj, offset, size, dst);
 }
 
-std::future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
-                                                  size_t offset,
-                                                  size_t size,
-                                                  uint8_t* dst)
+exec::semi_future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
+                                                        size_t offset,
+                                                        size_t size,
+                                                        uint8_t* dst)
 {
   if (uses_prefetching_cache()) {
     if (auto view = _cache->read(obj, offset, size); view) {
       auto slices = view.slice(offset, size);
-      try {
+      return exec::make_semi_future_with([&]() -> size_t {
         size_t copied = 0;
         for (auto const& s : slices) {
           std::memcpy(dst + copied, s.data(), s.size());
           copied += s.size();
         }
-        return std::async(std::launch::deferred, [copied]() { return copied; });
-      } catch (...) {
-        return std::async(std::launch::deferred, [e = std::current_exception()]() -> size_t {
-          std::rethrow_exception(e);
-        });
-      }
+        return copied;
+      });
     }
   }
-  auto promise = std::make_shared<std::promise<size_t>>();
-  host_read_async_io(
-    obj, offset, size, dst, [promise](size_t bytes_transferred, std::exception_ptr ep) {
-      if (ep) {
-        promise->set_exception(std::move(ep));
-      } else {
-        promise->set_value(bytes_transferred);
-      }
-    });
-  return promise->get_future();
+  return host_read_async_io(obj, offset, size, dst);
 }
 
 size_t sirius_ioctx::device_read(
@@ -265,41 +250,22 @@ size_t sirius_ioctx::device_read(
     cached_host_buffer chb;
     if (auto view = _cache->read(obj, offset, size, stream.value(), &chb); view) {
       auto slices = view.slice(offset, size);
-      auto copied = copy_pinned_slices_to_device(slices, dst, stream);
-      return copied.get();
+      return std::move(copy_pinned_slices_to_device(slices, dst, stream)).get();
     }
     if (chb) {
       // Allocated-steal path: chunks are pre-assigned, dispatch
-      // file → bounce → device directly through the new ioctx API.  Route
-      // any synchronous throw from device_read_async_io_using through the
-      // promise so fut.get() surfaces the original exception instead of
-      // std::future_error(broken_promise).
-      std::promise<size_t> p;
-      auto fut = p.get_future();
-      try {
-        device_read_async_io_using(obj,
-                                   offset,
-                                   size,
-                                   dst,
-                                   stream,
-                                   std::move(chb),
-                                   [&p](size_t bytes_transferred, std::exception_ptr ep) {
-                                     if (ep) {
-                                       p.set_exception(std::move(ep));
-                                     } else {
-                                       p.set_value(bytes_transferred);
-                                     }
-                                   });
-      } catch (...) {
-        p.set_exception(std::current_exception());
-      }
-      return fut.get();
+      // file → bounce → device directly through the new ioctx API.
+      // device_read_async_io_using may throw synchronously (e.g. on a
+      // cudaGetDevice failure); let it propagate the same way the
+      // legacy code did via promise.set_exception followed by fut.get().
+      return std::move(device_read_async_io_using(obj, offset, size, dst, stream, std::move(chb)))
+        .get();
     }
   }
   return device_read_io(obj, offset, size, dst, stream);
 }
 
-std::future<size_t> sirius_ioctx::device_read_async(
+exec::semi_future<size_t> sirius_ioctx::device_read_async(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
   if (uses_prefetching_cache()) {
@@ -309,56 +275,31 @@ std::future<size_t> sirius_ioctx::device_read_async(
       try {
         return copy_pinned_slices_to_device(slices, dst, stream);
       } catch (...) {
-        return std::async(std::launch::deferred, [e = std::current_exception()]() -> size_t {
-          std::rethrow_exception(e);
-        });
+        return exec::make_semi_future(exec::try_t<size_t>(std::current_exception()));
       }
     }
     if (chb) {
       // Allocated-steal path: same as the sync flow above, but expose the
-      // future to the caller instead of blocking on it.  Synchronous throws
-      // are routed through the promise so callers always observe failure
-      // via the returned future rather than as a propagated exception.
-      auto promise = std::make_shared<std::promise<size_t>>();
+      // future to the caller instead of blocking on it.  Synchronous
+      // throws are folded into the returned future so callers always
+      // observe failure via the future rather than as a propagated
+      // exception.
       try {
-        device_read_async_io_using(obj,
-                                   offset,
-                                   size,
-                                   dst,
-                                   stream,
-                                   std::move(chb),
-                                   [promise](size_t bytes_transferred, std::exception_ptr ep) {
-                                     if (ep) {
-                                       promise->set_exception(std::move(ep));
-                                     } else {
-                                       promise->set_value(bytes_transferred);
-                                     }
-                                   });
+        return device_read_async_io_using(obj, offset, size, dst, stream, std::move(chb));
       } catch (...) {
-        promise->set_exception(std::current_exception());
+        return exec::make_semi_future(exec::try_t<size_t>(std::current_exception()));
       }
-      return promise->get_future();
     }
   }
   // Same try/catch shape as the allocated-steal path above: a synchronous
   // throw from device_read_async_io (e.g. cudaGetDevice failure inside
   // enqueue_device_read) must be delivered via the returned future, not
-  // propagated to the caller — otherwise the future has no setter and
-  // callers see broken_promise instead of the real error.
-  auto promise = std::make_shared<std::promise<size_t>>();
+  // propagated to the caller.
   try {
-    device_read_async_io(
-      obj, offset, size, dst, stream, [promise](size_t bytes_transferred, std::exception_ptr ep) {
-        if (ep) {
-          promise->set_exception(std::move(ep));
-        } else {
-          promise->set_value(bytes_transferred);
-        }
-      });
+    return device_read_async_io(obj, offset, size, dst, stream);
   } catch (...) {
-    promise->set_exception(std::current_exception());
+    return exec::make_semi_future(exec::try_t<size_t>(std::current_exception()));
   }
-  return promise->get_future();
 }
 
 }  // namespace sirius::io
