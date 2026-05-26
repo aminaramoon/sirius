@@ -284,13 +284,20 @@ class prefetching_cache {
   /// Release all chunks held by an entry back to the pool.
   void release_chunks(cache_entry& entry);
 
-  /// Binary search for an entry whose logical range fully covers
-  /// [offset, offset+size).  Returns nullptr on miss.  Updates
-  /// _miss_range / _full_miss_count based on the classification.
-  /// The caller updates _hit_count on successful pin.
-  std::shared_ptr<cache_entry> find_entry(const std::vector<std::shared_ptr<cache_entry>>& entries,
-                                          size_t offset,
-                                          size_t size);
+  /// Binary search + forward walk: return the contiguous sequence of
+  /// entries that collectively cover [offset, offset+size).  Returns
+  /// an empty vector on miss (with @c _miss_range / @c _full_miss_count
+  /// updated to classify the failure).  The caller updates @c _hit_count
+  /// on successful pin.
+  ///
+  /// A single-entry return is the common case (one prefetched range
+  /// fully covers the read).  Multi-entry returns happen when two or
+  /// more adjacent prefetched ranges (`insert()`'d separately) span
+  /// the read together.  Any gap between covering entries is reported
+  /// as @c _miss_range — the multi-entry hit path requires contiguous
+  /// coverage.
+  std::vector<std::shared_ptr<cache_entry>> find_entries(
+    const std::vector<std::shared_ptr<cache_entry>>& entries, size_t offset, size_t size);
 
   // ---- prefetch_request: per-insert wrapper carried in _eviction_queue ----
   //
