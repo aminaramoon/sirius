@@ -520,10 +520,18 @@ struct eviction_request {
 // pinned_view — RAII read guard with per-chunk access
 // ---------------------------------------------------------------------------
 //
-// Acquires a read pin on the cache_entry on construction (via
-// entry_state::try_acquire_read — a single atomic CAS that transitions
-// cached → in_use with pin_count+1).  Releases on destruction (via
-// entry_state::release_read).
+// Acquires a read pin on one or more contiguous cache_entries on
+// construction (via @c entry_state::try_acquire_read — a single atomic
+// CAS per entry that transitions cached → in_use with pin_count+1).
+// Releases on destruction (via @c entry_state::release_read on each
+// entry; one stream callback for the whole batch when @p stream is
+// non-null).
+//
+// Multi-entry views are produced when a read range spans two or more
+// adjacent prefetched entries that are all in @c cached / @c in_use.
+// Mixed-state coverage (any entry @c loading / @c allocated / @c
+// evicting / @c empty) is treated as a miss by the cache and is not
+// expressed through this type.
 //
 // Because chunks are scattered in memory there is NO single contiguous
 // span.  Instead the view exposes individual chunk spans via operator[].
@@ -531,6 +539,7 @@ struct eviction_request {
 class pinned_view {
  public:
   pinned_view() = default;
+
   /// @p stream is the caller's CUDA stream.  When non-null, the read pin
   /// is released via a host callback enqueued on this stream, so the entry
   /// stays in_use (and therefore non-evictable) until any cudaMemcpyAsync
@@ -538,6 +547,14 @@ class pinned_view {
   /// null, the read is released synchronously on destruction (host-only
   /// reads have no async work to wait on).
   pinned_view(std::shared_ptr<cache_entry> entry, cudaStream_t stream);
+
+  /// Multi-entry overload.  Tries to acquire a read pin on every entry;
+  /// on partial failure (any @c try_acquire_read returns false), the
+  /// pins already acquired are released and the view becomes empty.
+  /// Entries must be contiguous in logical-offset order — the multi-
+  /// entry hit path in @c prefetching_cache::read() guarantees this.
+  pinned_view(std::vector<std::shared_ptr<cache_entry>> entries, cudaStream_t stream);
+
   ~pinned_view();
 
   pinned_view(pinned_view&& o) noexcept;
@@ -546,34 +563,42 @@ class pinned_view {
   pinned_view(pinned_view const&)            = delete;
   pinned_view& operator=(pinned_view const&) = delete;
 
-  /// Number of 1MB chunks backing this range.
+  /// Number of 1MB chunks backing this view — sum across all entries.
   [[nodiscard]] size_t num_chunks() const noexcept;
 
   /// Access chunk @p i (physical data). Full CHUNK_BYTES except
-  /// possibly the last chunk which may be shorter.
+  /// possibly the last chunk in any entry, which may be shorter.
+  /// Indexing walks entries in order: chunks of entry 0, then entry 1, …
   [[nodiscard]] std::span<const std::byte> operator[](size_t i) const noexcept;
 
-  /// Logical range this view covers.
+  /// Logical range this view covers — the union extent of the
+  /// underlying entries.  For multi-entry views this assumes no gaps
+  /// between adjacent entries (enforced by the cache's hit path).
   [[nodiscard]] cudf::io::text::byte_range_info logical_range() const noexcept;
 
-  /// Physical (O_DIRECT aligned) range.
+  /// Physical (O_DIRECT aligned) range.  Union extent of the
+  /// underlying entries' physical ranges.  Only fully meaningful for
+  /// single-entry views; for multi-entry views the per-entry physical
+  /// ranges may overlap because each entry was independently aligned.
   [[nodiscard]] cudf::io::text::byte_range_info physical_range() const noexcept;
 
-  /// Logical size (what the user actually requested).
+  /// Logical size (sum of constituent entries' logical sizes).
   [[nodiscard]] size_t size() const noexcept;
 
   /// Slice the cached data at logical [offset, offset+size) into a vector of
-  /// non_owning_buffers, one per chunk boundary crossed.  The caller must
-  /// ensure [offset, offset+size) lies within the entry's logical range.
+  /// non_owning_buffers, one per chunk boundary crossed.  Adjacent buffers
+  /// that turn out to be virtually contiguous (same slab) are coalesced.
+  /// The caller must ensure [offset, offset+size) lies within
+  /// @c logical_range().
   [[nodiscard]] std::vector<cudf::io::datasource::non_owning_buffer> slice(size_t offset,
                                                                            size_t size) const;
 
-  explicit operator bool() const noexcept { return _entry != nullptr; }
+  explicit operator bool() const noexcept { return !_entries.empty(); }
 
  private:
   void unpin();
 
-  std::shared_ptr<cache_entry> _entry;
+  std::vector<std::shared_ptr<cache_entry>> _entries;
   cudaStream_t _stream{nullptr};
 };
 

@@ -151,33 +151,38 @@ void buffer_pool::reclaim_all()
 
 namespace {
 
-// Carries a strong ref to the entry until the host callback fires, so the
-// entry can't be destroyed mid-flight even if the cache map drops it.
+// Carries strong refs to the entries until the host callback fires, so
+// they can't be destroyed mid-flight even if the cache map drops them.
+// Multi-entry views collapse N per-entry callbacks into a single
+// callback owning a vector of entries.
 struct release_callback_args {
-  std::shared_ptr<cache_entry> entry;
+  std::vector<std::shared_ptr<cache_entry>> entries;
 };
 
 // cudaStreamAddCallback signature (deprecated but used deliberately).
 // Unlike cudaLaunchHostFunc, this callback fires even when the stream is
-// already in an error state — so a poisoned stream cannot leak the entry's
-// pin and its pool chunks forever.  Status is intentionally ignored: the
-// read pin must be released regardless of whether the H2D copy succeeded.
+// already in an error state — so a poisoned stream cannot leak the
+// entries' pins and their pool chunks forever.  Status is intentionally
+// ignored: each read pin must be released regardless of whether the
+// H2D copy succeeded.
 void CUDART_CB release_read_host_callback(cudaStream_t /*stream*/,
                                           cudaError_t /*status*/,
                                           void* p) noexcept
 {
   std::unique_ptr<release_callback_args> args(static_cast<release_callback_args*>(p));
-  args->entry->state.release_read();
+  for (auto& e : args->entries) {
+    e->state.release_read();
+  }
 }
 
 // Recover from a failed cudaStreamAddCallback registration.  The callback
 // will never fire, so the caller hands us the raw args pointer it had
 // already `args.release()`'d and we do the callback's work inline:
 //   1. Drain the stream so any cudaMemcpyAsync the caller had already
-//      submitted against this entry's chunks completes (or fails fast)
-//      before we drop the pin — otherwise the evictor could recycle the
-//      chunks while the copy is still consuming them.
-//   2. Drop the pin via release_read so the entry is no longer
+//      submitted against the entries' chunks completes (or fails fast)
+//      before we drop the pins — otherwise the evictor could recycle
+//      the chunks while the copy is still consuming them.
+//   2. Drop each pin via release_read so the entries are no longer
 //      non-evictable.  We do this even if the synchronize itself failed,
 //      preferring a user-visible CUDA fault on the failing stream over a
 //      permanent cache leak.
@@ -189,7 +194,9 @@ void release_args_inline_on_callback_failure(cudaStream_t stream,
   cudaGetLastError();
   std::unique_ptr<release_callback_args> reown(raw);
   if (cudaStreamSynchronize(stream) != cudaSuccess) cudaGetLastError();
-  reown->entry->state.release_read();
+  for (auto& e : reown->entries) {
+    e->state.release_read();
+  }
 }
 
 }  // namespace
@@ -213,9 +220,11 @@ void cached_host_buffer::mark_cached_with_stream(cudaStream_t stream) noexcept
     // the "was ever successfully loaded" signal we want fires here.)
     _entry->ever_cached.store(true, std::memory_order_release);
     // Entry is ours in in_use(pin=1).  Hand it to a stream callback so
-    // the pin is released after the caller's H2D copy drains.
-    auto args       = std::make_unique<release_callback_args>();
-    args->entry     = std::move(_entry);
+    // the pin is released after the caller's H2D copy drains.  The
+    // callback owns a vector of entries (single-element here) — same
+    // path used by pinned_view's multi-entry release.
+    auto args = std::make_unique<release_callback_args>();
+    args->entries.push_back(std::move(_entry));
     auto* raw       = args.release();
     cudaError_t err = cudaStreamAddCallback(stream, &release_read_host_callback, raw, 0);
     if (err != cudaSuccess) release_args_inline_on_callback_failure(stream, raw);
@@ -231,124 +240,175 @@ void cached_host_buffer::mark_cached_with_stream(cudaStream_t stream) noexcept
   }
 }
 
-pinned_view::pinned_view(std::shared_ptr<cache_entry> entry, cudaStream_t stream)
-  : _entry(nullptr), _stream(stream)
+pinned_view::pinned_view(std::shared_ptr<cache_entry> entry, cudaStream_t stream) : _stream(stream)
 {
   if (!entry) return;
   if (!entry->state.try_acquire_read()) return;
-  _entry = std::move(entry);
+  _entries.push_back(std::move(entry));
+}
+
+pinned_view::pinned_view(std::vector<std::shared_ptr<cache_entry>> entries, cudaStream_t stream)
+  : _stream(stream)
+{
+  if (entries.empty()) return;
+  _entries.reserve(entries.size());
+  for (auto& e : entries) {
+    if (!e->state.try_acquire_read()) {
+      // Partial acquisition — release everything we already pinned and
+      // leave the view empty.  No async release needed here since no
+      // user H2D copy can have been queued against this view yet.
+      for (auto& acquired : _entries) {
+        acquired->state.release_read();
+      }
+      _entries.clear();
+      return;
+    }
+    _entries.push_back(std::move(e));
+  }
 }
 
 pinned_view::~pinned_view() { unpin(); }
 
-pinned_view::pinned_view(pinned_view&& o) noexcept : _entry(std::move(o._entry)), _stream(o._stream)
+pinned_view::pinned_view(pinned_view&& o) noexcept
+  : _entries(std::move(o._entries)), _stream(o._stream)
 {
-  o._entry.reset();
 }
 
 pinned_view& pinned_view::operator=(pinned_view&& o) noexcept
 {
   if (this != &o) {
     unpin();
-    _entry = std::move(o._entry);
-    o._entry.reset();
-    _stream = o._stream;
+    _entries = std::move(o._entries);
+    _stream  = o._stream;
   }
   return *this;
 }
 
 void pinned_view::unpin()
 {
-  if (!_entry) return;
+  if (_entries.empty()) return;
 
-  // The wrapper this entry came from is already in the eviction queue
-  // (pushed at insert time).  We just need to release the read pin so
-  // the entry transitions back from in_use to cached and becomes
-  // evictable.  No candidate-queue push.
+  // The wrappers these entries came from are already in the eviction
+  // queue (pushed at insert time).  We just need to release each read
+  // pin so the entries transition back from in_use to cached and
+  // become evictable.  No candidate-queue push.
 
   if (_stream == nullptr) {
     // Synchronous path (host reads): no async ops outstanding, release now.
-    _entry->state.release_read();
-    _entry.reset();
+    for (auto& e : _entries) {
+      e->state.release_read();
+    }
+    _entries.clear();
   } else {
-    // Async path (device reads): defer release_read via a host callback so
-    // it fires only after the caller's stream reaches this point.  Any
-    // cudaMemcpyAsync submitted earlier against this entry's pinned chunks
-    // therefore completes before pin_count drops to zero — at which point
-    // the entry transitions in_use → cached and becomes evictable.
-    auto args   = std::make_unique<release_callback_args>();
-    args->entry = std::move(_entry);
-    auto* raw   = args.release();
+    // Async path (device reads): defer release_read via a single host
+    // callback so it fires only after the caller's stream reaches this
+    // point.  Any cudaMemcpyAsync submitted earlier against the pinned
+    // chunks therefore completes before any pin_count drops to zero.
+    // For multi-entry views this is one callback for the whole batch
+    // (rather than N callbacks) — saves a host-callback enqueue per
+    // extra entry on the hot read path.
+    auto args     = std::make_unique<release_callback_args>();
+    args->entries = std::move(_entries);
+    auto* raw     = args.release();
     // cudaStreamAddCallback (not cudaLaunchHostFunc): fires on error too,
     // so the release_read() is guaranteed even if the user's stream is
     // poisoned by an unrelated failure.  Otherwise a single stream error
-    // would permanently leak this entry's pin and its pinned chunks.
+    // would permanently leak these entries' pins and their pinned chunks.
     cudaError_t err = cudaStreamAddCallback(_stream, &release_read_host_callback, raw, 0);
     if (err != cudaSuccess) release_args_inline_on_callback_failure(_stream, raw);
   }
 }
 
-size_t pinned_view::num_chunks() const noexcept { return _entry ? _entry->chunks.size() : 0; }
+size_t pinned_view::num_chunks() const noexcept
+{
+  size_t n = 0;
+  for (auto const& e : _entries)
+    n += e->chunks.size();
+  return n;
+}
 
 std::span<const std::byte> pinned_view::operator[](size_t i) const noexcept
 {
-  if (!_entry || i >= _entry->chunks.size()) return {};
-  auto phys_size   = static_cast<size_t>(_entry->physical_range.size());
-  auto chunk_bytes = _entry->chunk_bytes;
-  auto chunk_start = i * chunk_bytes;
-  auto chunk_sz    = std::min(chunk_bytes, phys_size - chunk_start);
-  return {_entry->chunks[i], chunk_sz};
+  for (auto const& e : _entries) {
+    auto const n = e->chunks.size();
+    if (i < n) {
+      auto phys_size   = static_cast<size_t>(e->physical_range.size());
+      auto chunk_bytes = e->chunk_bytes;
+      auto chunk_start = i * chunk_bytes;
+      auto chunk_sz    = std::min(chunk_bytes, phys_size - chunk_start);
+      return {e->chunks[i], chunk_sz};
+    }
+    i -= n;
+  }
+  return {};
 }
 
 cudf::io::text::byte_range_info pinned_view::logical_range() const noexcept
 {
-  if (!_entry) return {0, 0};
-  return _entry->logical_range;
+  if (_entries.empty()) return {0, 0};
+  auto first_off = static_cast<size_t>(_entries.front()->logical_range.offset());
+  auto last_end  = static_cast<size_t>(_entries.back()->logical_range.offset()) +
+                  static_cast<size_t>(_entries.back()->logical_range.size());
+  return {static_cast<int64_t>(first_off), static_cast<int64_t>(last_end - first_off)};
 }
 
 cudf::io::text::byte_range_info pinned_view::physical_range() const noexcept
 {
-  if (!_entry) return {0, 0};
-  return _entry->physical_range;
+  if (_entries.empty()) return {0, 0};
+  auto first_off = static_cast<size_t>(_entries.front()->physical_range.offset());
+  auto last_end  = static_cast<size_t>(_entries.back()->physical_range.offset()) +
+                  static_cast<size_t>(_entries.back()->physical_range.size());
+  return {static_cast<int64_t>(first_off), static_cast<int64_t>(last_end - first_off)};
 }
 
 size_t pinned_view::size() const noexcept
 {
-  return _entry ? static_cast<size_t>(_entry->logical_range.size()) : 0;
+  size_t total = 0;
+  for (auto const& e : _entries)
+    total += static_cast<size_t>(e->logical_range.size());
+  return total;
 }
 
-std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t offset,
-                                                                        size_t size) const
-{
-  std::vector<cudf::io::datasource::non_owning_buffer> result;
-  if (!_entry || size == 0) return result;
+namespace {
 
+// Slice a single entry over its [cursor, cursor+take) sub-range,
+// appending coalesced non_owning_buffers to @p result.  Coalescing
+// works across calls — when adjacent entries' chunks happen to live in
+// the same slab (virtually contiguous), the trailing buffer of the
+// previous entry merges with the leading buffer of the next.
+void slice_one_entry(cache_entry const& e,
+                     size_t cursor,
+                     size_t take,
+                     std::vector<cudf::io::datasource::non_owning_buffer>& result)
+{
   // Physical range starts at a potentially earlier (aligned) offset.
   // The delta tells us where logical byte 0 sits inside the physical buffer.
-  auto phys_off    = static_cast<size_t>(_entry->physical_range.offset());
-  auto logical_off = static_cast<size_t>(_entry->logical_range.offset());
-  auto phys_size   = static_cast<size_t>(_entry->physical_range.size());
+  auto phys_off    = static_cast<size_t>(e.physical_range.offset());
+  auto logical_off = static_cast<size_t>(e.logical_range.offset());
+  auto phys_size   = static_cast<size_t>(e.physical_range.size());
 
-  // Convert logical [offset, offset+size) to physical byte position
+  // Convert logical [cursor, cursor+take) to physical byte position
   // within the chunked buffer.
-  size_t phys_start = (offset - logical_off) + (logical_off - phys_off);
-  size_t remaining  = size;
+  size_t phys_start = (cursor - logical_off) + (logical_off - phys_off);
+  size_t remaining  = take;
 
-  // Walk the chunks that span [phys_start, phys_start + size).
-  auto const chunk_bytes = _entry->chunk_bytes;
+  // Walk the chunks that span [phys_start, phys_start + take).
+  auto const chunk_bytes = e.chunk_bytes;
   size_t chunk_idx       = phys_start / chunk_bytes;
   size_t off_in_chunk    = phys_start % chunk_bytes;
 
-  while (remaining > 0 && chunk_idx < _entry->chunks.size()) {
+  while (remaining > 0 && chunk_idx < e.chunks.size()) {
     auto chunk_avail =
       std::min(chunk_bytes - off_in_chunk, phys_size - chunk_idx * chunk_bytes - off_in_chunk);
     auto n  = std::min(remaining, chunk_avail);
-    auto* p = reinterpret_cast<uint8_t const*>(_entry->chunks[chunk_idx]) + off_in_chunk;
+    auto* p = reinterpret_cast<uint8_t const*>(e.chunks[chunk_idx]) + off_in_chunk;
 
-    // Coalesce with the previous slice if this chunk is contiguous with the
-    // tail of the previous slice in the pinned host address space.  Adjacent
-    // chunks within the same slab are virtually contiguous (the slab is one
-    // cudaHostAlloc), which is the common case for a freshly-filled pool.
+    // Coalesce with the previous slice if this chunk is virtually
+    // contiguous with its tail.  Adjacent chunks in the same slab are
+    // contiguous (the slab is one cudaHostAlloc), which is the common
+    // case for a freshly-filled pool — and also coalesces across the
+    // entry boundary when both entries happened to land in the same
+    // slab.
     if (!result.empty()) {
       auto const& last = result.back();
       if (last.data() + last.size() == p) {
@@ -364,6 +424,38 @@ std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t o
     remaining -= n;
     ++chunk_idx;
     off_in_chunk = 0;
+  }
+}
+
+}  // namespace
+
+std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t offset,
+                                                                        size_t size) const
+{
+  std::vector<cudf::io::datasource::non_owning_buffer> result;
+  if (_entries.empty() || size == 0) return result;
+
+  size_t cursor    = offset;
+  size_t remaining = size;
+
+  for (auto const& e : _entries) {
+    if (remaining == 0) break;
+    auto e_off = static_cast<size_t>(e->logical_range.offset());
+    auto e_end = e_off + static_cast<size_t>(e->logical_range.size());
+
+    // Skip entries that lie entirely before the requested range.
+    if (cursor >= e_end) continue;
+
+    // The cache's hit path guarantees contiguous coverage, so the
+    // first entry whose tail extends past `cursor` must also start at
+    // or before `cursor`.  An assert (release-elided) flags any
+    // breakage of that invariant before we read out-of-range bytes.
+    assert(e_off <= cursor && "pinned_view::slice: gap in covering entries");
+
+    size_t take = std::min(remaining, e_end - cursor);
+    slice_one_entry(*e, cursor, take, result);
+    cursor += take;
+    remaining -= take;
   }
 
   return result;
@@ -627,14 +719,14 @@ void prefetching_cache::abort_pending_entries() noexcept
 }
 
 // ===========================================================================
-// find_entry — binary search + hit/miss classification
+// find_entries — binary search + forward walk for contiguous coverage
 // ===========================================================================
 
-std::shared_ptr<cache_entry> prefetching_cache::find_entry(
+std::vector<std::shared_ptr<cache_entry>> prefetching_cache::find_entries(
   const std::vector<std::shared_ptr<cache_entry>>& entries, size_t offset, size_t size)
 {
-  // upper_bound: first entry whose offset > requested offset.  The candidate
-  // is pos-1 (the last entry whose offset <= requested offset).
+  // upper_bound: first entry whose offset > requested offset.  The starting
+  // candidate is pos-1 (the last entry whose offset <= requested offset).
   auto pos =
     std::upper_bound(entries.begin(), entries.end(), offset, [](size_t off, auto const& e) {
       return off < static_cast<size_t>(e->logical_range.offset());
@@ -643,29 +735,62 @@ std::shared_ptr<cache_entry> prefetching_cache::find_entry(
   // No entry starts at or before our offset — nothing covers us.
   if (pos == entries.begin()) {
     _full_miss_count.fetch_add(1, std::memory_order_relaxed);
-    return nullptr;
+    return {};
   }
   --pos;
-  auto entry_end = static_cast<size_t>((*pos)->logical_range.offset()) +
-                   static_cast<size_t>((*pos)->logical_range.size());
 
-  // Candidate ends before our offset — no overlap at all.
-  if (entry_end <= offset) {
-    _full_miss_count.fetch_add(1, std::memory_order_relaxed);
-    return nullptr;
+  // Walk forward, accumulating contiguous entries until [offset, offset+size)
+  // is fully covered or we hit a gap / run off the end.
+  std::vector<std::shared_ptr<cache_entry>> result;
+  size_t const end = offset + size;
+  size_t cursor    = offset;
+
+  while (cursor < end) {
+    if (pos == entries.end()) {
+      // Ran off the end without finishing coverage.
+      _miss_range.fetch_add(1, std::memory_order_relaxed);
+      spdlog::debug("prefetching_cache: miss_range (ran past last entry) read_off={} read_size={}",
+                    offset,
+                    size);
+      return {};
+    }
+    auto e_start = static_cast<size_t>((*pos)->logical_range.offset());
+    auto e_end   = e_start + static_cast<size_t>((*pos)->logical_range.size());
+
+    if (e_start > cursor) {
+      // Gap: previous entry ended before the next entry starts, and the
+      // unread bytes in between aren't in the cache.  On the very first
+      // iteration this means the upper_bound predecessor doesn't reach
+      // `offset` at all — full miss.  On subsequent iterations the read
+      // straddles a hole between two prefetched ranges — miss_range.
+      if (result.empty()) {
+        _full_miss_count.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        _miss_range.fetch_add(1, std::memory_order_relaxed);
+        spdlog::debug(
+          "prefetching_cache: miss_range (gap between entries) read_off={} read_size={} "
+          "gap_start={} gap_end={}",
+          offset,
+          size,
+          cursor,
+          e_start);
+      }
+      return {};
+    }
+    if (e_end <= cursor) {
+      // Defensive: zero-size or moved-past entry — shouldn't happen
+      // because upper_bound guarantees e_start <= cursor on the first
+      // iteration and the loop sets cursor = previous e_end before
+      // advancing pos.
+      _miss_range.fetch_add(1, std::memory_order_relaxed);
+      return {};
+    }
+    result.push_back(*pos);
+    cursor = e_end;
+    ++pos;
   }
-  // Candidate overlaps but doesn't fully contain the requested tail.
-  if (offset + size > entry_end) {
-    _miss_range.fetch_add(1, std::memory_order_relaxed);
-    spdlog::debug(
-      "prefetching_cache: miss_range read_off={} read_size={} entry_off={} entry_size={}",
-      offset,
-      size,
-      static_cast<size_t>((*pos)->logical_range.offset()),
-      static_cast<size_t>((*pos)->logical_range.size()));
-    return nullptr;
-  }
-  return *pos;
+
+  return result;
 }
 
 // ===========================================================================
@@ -686,6 +811,21 @@ prefetching_handle prefetching_cache::insert(
                         ranges.end(),
                         [](auto const& a, auto const& b) { return a.offset() < b.offset(); }) &&
          "ranges must be sorted by offset");
+
+  // Non-overlap is a precondition of the per-offset coalesce logic below
+  // (which compares only `offset() == off`) and of the cached-hit path in
+  // read() (which walks adjacent entries and assumes no double-coverage of
+  // any byte).  Overlapping ranges would create two cache_entries spanning
+  // a shared byte; find_entry's upper_bound picks one and the other
+  // becomes unreachable for that read.  Compile-out in release builds.
+  assert(std::adjacent_find(ranges.begin(),
+                            ranges.end(),
+                            [](auto const& a, auto const& b) {
+                              return static_cast<size_t>(a.offset()) +
+                                       static_cast<size_t>(a.size()) >
+                                     static_cast<size_t>(b.offset());
+                            }) == ranges.end() &&
+         "ranges must not overlap");
 
   // shared_from_this() throws std::bad_weak_ptr if @p obj isn't owned by a
   // shared_ptr — the contract is enforced at the call site, no null check
@@ -801,8 +941,44 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
   std::shared_lock file_lk(file.mtx);
   map_lk.unlock();
 
-  auto entry = find_entry(file.entries, offset, size);
-  if (!entry) return {};
+  auto covering = find_entries(file.entries, offset, size);
+  if (covering.empty()) return {};
+
+  // Multi-entry coverage: the read spans two or more adjacent prefetched
+  // ranges.  Only the cached/in_use fast path is supported here — mixed
+  // states across entries (one cached, one loading, one allocated, ...)
+  // would require coordinating per-entry waits / steals, which we don't
+  // currently model.  Any non-cached entry → miss, caller falls back.
+  //
+  // The single-entry path below preserves all state dispatch (steal,
+  // wait-on-load, miss classification) since it's the common case and
+  // the only one with reasonable wait/steal semantics.
+  if (covering.size() > 1) {
+    for (auto const& e : covering) {
+      auto st = e->state.get_state();
+      if (st != entry_state::cached && st != entry_state::in_use) {
+        // Some entry isn't ready — multi-entry hit fails, report miss.
+        // miss_range is the closest classifier (request straddles
+        // ranges and one of them is in a non-cached state).
+        _miss_range.fetch_add(1, std::memory_order_relaxed);
+        return {};
+      }
+    }
+    pinned_view view{std::move(covering), stream};
+    if (view) {
+      _hit_count.fetch_add(1, std::memory_order_relaxed);
+      return view;
+    }
+    // try_acquire_read lost a race on at least one entry; the view's
+    // ctor already released anything it acquired.  Report as
+    // miss_range — a multi-entry view doesn't retry the way the
+    // single-entry path does (no clean way to resume across N CASes).
+    _miss_range.fetch_add(1, std::memory_order_relaxed);
+    return {};
+  }
+
+  // Single-entry coverage — the original state machine, unchanged.
+  auto& entry = covering.front();
 
   // Dispatch on state:
   //   cached / in_use → pin immediately.
