@@ -16,42 +16,12 @@
 
 #include "io/kvikio/kvikio_context.hpp"
 
-#include "exec/semi_future.hpp"
 #include "io/sirius_datasource.hpp"
 
-#include <future>
-#include <memory>
 #include <stdexcept>
-#include <thread>
 #include <utility>
 
 namespace sirius::io {
-
-namespace {
-
-// Bridge cudf's std::future<size_t> into an exec::semi_future<size_t> by
-// spawning a detached waiter thread that satisfies an exec::promise once
-// the std::future resolves.  This is only used by kvikio_context, the
-// one backend whose underlying read API is cudf's std::future-returning
-// shape.  All other Sirius backends produce semi_future directly via the
-// request_context machinery and never need this bridge.
-exec::semi_future<size_t> bridge_std_future(std::future<size_t> fut)
-{
-  exec::promise<size_t> p;
-  auto sf      = p.get_semi_future();
-  auto shared  = std::make_shared<std::future<size_t>>(std::move(fut));
-  auto promise = std::make_shared<exec::promise<size_t>>(std::move(p));
-  std::thread([shared = std::move(shared), promise = std::move(promise)]() mutable {
-    try {
-      promise->set_value(shared->get());
-    } catch (...) {
-      promise->set_exception(std::current_exception());
-    }
-  }).detach();
-  return sf;
-}
-
-}  // namespace
 
 namespace {
 
@@ -100,12 +70,12 @@ size_t kvikio_context::host_read(sirius_io_object& obj, size_t offset, size_t si
   return as_kvikio(obj).datasource().host_read(offset, size, dst);
 }
 
-exec::semi_future<size_t> kvikio_context::host_read_async(sirius_io_object& obj,
-                                                          size_t offset,
-                                                          size_t size,
-                                                          uint8_t* dst)
+std::future<size_t> kvikio_context::host_read_async(sirius_io_object& obj,
+                                                    size_t offset,
+                                                    size_t size,
+                                                    uint8_t* dst)
 {
-  return bridge_std_future(as_kvikio(obj).datasource().host_read_async(offset, size, dst));
+  return as_kvikio(obj).datasource().host_read_async(offset, size, dst);
 }
 
 size_t kvikio_context::device_read(
@@ -114,11 +84,10 @@ size_t kvikio_context::device_read(
   return as_kvikio(obj).datasource().device_read(offset, size, dst, stream);
 }
 
-exec::semi_future<size_t> kvikio_context::device_read_async(
+std::future<size_t> kvikio_context::device_read_async(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
-  return bridge_std_future(
-    as_kvikio(obj).datasource().device_read_async(offset, size, dst, stream));
+  return as_kvikio(obj).datasource().device_read_async(offset, size, dst, stream);
 }
 
 cudf::io::text::byte_range_info kvikio_context::compute_physical_range(
