@@ -24,6 +24,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cstddef>
+#include <future>
 #include <memory>
 #include <span>
 #include <string>
@@ -169,15 +170,15 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   virtual size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst);
 
-  virtual exec::semi_future<size_t> host_read_async(sirius_io_object& obj,
-                                                    size_t offset,
-                                                    size_t size,
-                                                    uint8_t* dst);
+  virtual std::future<size_t> host_read_async(sirius_io_object& obj,
+                                              size_t offset,
+                                              size_t size,
+                                              uint8_t* dst);
 
   virtual size_t device_read(
     sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
 
-  virtual exec::semi_future<size_t> device_read_async(
+  virtual std::future<size_t> device_read_async(
     sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
 
   // -- Physical range alignment ------------------------------------------------

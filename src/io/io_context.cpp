@@ -68,6 +68,25 @@ exec::semi_future<size_t> sirius_ioctx::device_read_async_io_using(
 
 namespace {
 
+// Bridge an @c exec::semi_future<size_t> into a @c std::future<size_t> for
+// the public read API (which keeps cudf's std::future shape).  Uses
+// push-mode @c install_callback so the std::promise is satisfied exactly
+// when the upstream chain produces its result — no extra thread, no
+// blocking wait.
+std::future<size_t> bridge_semi_to_std(exec::semi_future<size_t>&& sf)
+{
+  auto p   = std::make_shared<std::promise<size_t>>();
+  auto fut = p->get_future();
+  std::move(sf).install_callback([p = std::move(p)](exec::try_t<size_t>&& t) {
+    if (t.has_exception()) {
+      p->set_exception(std::move(t).exception());
+    } else {
+      p->set_value(std::move(t).value());
+    }
+  });
+  return fut;
+}
+
 exec::semi_future<size_t> copy_pinned_slices_to_device(
   std::vector<cudf::io::datasource::non_owning_buffer> const& slices,
   uint8_t* dst,
@@ -222,25 +241,29 @@ size_t sirius_ioctx::host_read(sirius_io_object& obj, size_t offset, size_t size
   return host_read_io(obj, offset, size, dst);
 }
 
-exec::semi_future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
-                                                        size_t offset,
-                                                        size_t size,
-                                                        uint8_t* dst)
+std::future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
+                                                  size_t offset,
+                                                  size_t size,
+                                                  uint8_t* dst)
 {
   if (uses_prefetching_cache()) {
     if (auto view = _cache->read(obj, offset, size); view) {
       auto slices = view.slice(offset, size);
-      return exec::make_semi_future_with([&]() -> size_t {
+      try {
         size_t copied = 0;
         for (auto const& s : slices) {
           std::memcpy(dst + copied, s.data(), s.size());
           copied += s.size();
         }
-        return copied;
-      });
+        return std::async(std::launch::deferred, [copied]() { return copied; });
+      } catch (...) {
+        return std::async(std::launch::deferred, [e = std::current_exception()]() -> size_t {
+          std::rethrow_exception(e);
+        });
+      }
     }
   }
-  return host_read_async_io(obj, offset, size, dst);
+  return bridge_semi_to_std(host_read_async_io(obj, offset, size, dst));
 }
 
 size_t sirius_ioctx::device_read(
@@ -265,7 +288,7 @@ size_t sirius_ioctx::device_read(
   return device_read_io(obj, offset, size, dst, stream);
 }
 
-exec::semi_future<size_t> sirius_ioctx::device_read_async(
+std::future<size_t> sirius_ioctx::device_read_async(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
   if (uses_prefetching_cache()) {
@@ -273,21 +296,26 @@ exec::semi_future<size_t> sirius_ioctx::device_read_async(
     if (auto view = _cache->read(obj, offset, size, stream.value(), &chb); view) {
       auto slices = view.slice(offset, size);
       try {
-        return copy_pinned_slices_to_device(slices, dst, stream);
+        return bridge_semi_to_std(copy_pinned_slices_to_device(slices, dst, stream));
       } catch (...) {
-        return exec::make_semi_future(exec::try_t<size_t>(std::current_exception()));
+        return std::async(std::launch::deferred, [e = std::current_exception()]() -> size_t {
+          std::rethrow_exception(e);
+        });
       }
     }
     if (chb) {
       // Allocated-steal path: same as the sync flow above, but expose the
-      // future to the caller instead of blocking on it.  Synchronous
-      // throws are folded into the returned future so callers always
-      // observe failure via the future rather than as a propagated
-      // exception.
+      // future to the caller instead of blocking on it.  A synchronous
+      // throw from device_read_async_io_using is folded into the
+      // returned future so callers always observe failure via the
+      // future rather than as a propagated exception.
       try {
-        return device_read_async_io_using(obj, offset, size, dst, stream, std::move(chb));
+        return bridge_semi_to_std(
+          device_read_async_io_using(obj, offset, size, dst, stream, std::move(chb)));
       } catch (...) {
-        return exec::make_semi_future(exec::try_t<size_t>(std::current_exception()));
+        return std::async(std::launch::deferred, [e = std::current_exception()]() -> size_t {
+          std::rethrow_exception(e);
+        });
       }
     }
   }
@@ -296,9 +324,10 @@ exec::semi_future<size_t> sirius_ioctx::device_read_async(
   // enqueue_device_read) must be delivered via the returned future, not
   // propagated to the caller.
   try {
-    return device_read_async_io(obj, offset, size, dst, stream);
+    return bridge_semi_to_std(device_read_async_io(obj, offset, size, dst, stream));
   } catch (...) {
-    return exec::make_semi_future(exec::try_t<size_t>(std::current_exception()));
+    return std::async(std::launch::deferred,
+                      [e = std::current_exception()]() -> size_t { std::rethrow_exception(e); });
   }
 }
 

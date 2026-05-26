@@ -16,7 +16,6 @@
 
 #include "io/sirius_datasource.hpp"
 
-#include "exec/semi_future.hpp"
 #include "io/prefetching_cache.hpp"
 
 #include <rmm/device_buffer.hpp>
@@ -32,31 +31,6 @@
 #include <vector>
 
 namespace sirius::io {
-
-namespace {
-
-// Bridge an exec::semi_future<value_t> into a std::future<value_t> so we can
-// satisfy cudf's datasource interface (which returns std::future).  Uses
-// push-mode install_callback so the std::promise is settled exactly when the
-// upstream chain produces its result — no extra thread, no blocking wait.
-template <class value_t>
-std::future<value_t> bridge_to_std_future(exec::semi_future<value_t>&& sf)
-{
-  auto p   = std::make_shared<std::promise<value_t>>();
-  auto fut = p->get_future();
-  std::move(sf).install_callback([p = std::move(p)](exec::try_t<value_t>&& t) {
-    if (t.has_exception()) {
-      p->set_exception(std::move(t).exception());
-    } else if constexpr (std::is_void_v<value_t>) {
-      p->set_value();
-    } else {
-      p->set_value(std::move(t).value());
-    }
-  });
-  return fut;
-}
-
-}  // namespace
 
 sirius_datasource::sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
                                      std::shared_ptr<sirius_io_object> io_object)
@@ -95,7 +69,7 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  return bridge_to_std_future(_io_ctx->host_read_async(*_io_object, offset, size, dst));
+  return _io_ctx->host_read_async(*_io_object, offset, size, dst);
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
@@ -104,12 +78,13 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
   auto file_size = _io_object->size();
   size           = std::min(size, file_size > offset ? file_size - offset : size_t{0});
   auto buf       = std::make_shared<std::vector<uint8_t>>(size);
-  auto sf =
-    _io_ctx->host_read_async(*_io_object, offset, size, buf->data()).defer_value([buf](size_t n) {
-      buf->resize(n);
-      return cudf::io::datasource::buffer::create(std::move(*buf));
-    });
-  return bridge_to_std_future(std::move(sf));
+  auto inner_fut = std::make_shared<std::future<size_t>>(
+    _io_ctx->host_read_async(*_io_object, offset, size, buf->data()));
+  return std::async(std::launch::deferred, [buf, inner_fut]() mutable {
+    auto n = inner_fut->get();
+    buf->resize(n);
+    return datasource::buffer::create(std::move(*buf));
+  });
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
@@ -135,7 +110,7 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          rmm::cuda_stream_view stream)
 {
-  return bridge_to_std_future(_io_ctx->device_read_async(*_io_object, offset, size, dst, stream));
+  return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream);
 }
 
 std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
