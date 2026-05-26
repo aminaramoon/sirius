@@ -459,6 +459,14 @@ prefetching_cache::prefetching_cache(buffer_pool* pool,
   // consumes the work queue, and insert() short-circuits before
   // enqueuing anything anyway; read() simply misses on every lookup.
   if (_armed) {
+    // Spin up the IO-completion callback pool first.  io_dispatch_loop
+    // installs callbacks on the futures returned from
+    // host_read_ranges_async_io that do real work (state reverts,
+    // mark_cached, budget release); routing them through this 2-thread
+    // pool keeps the reactor thread off the hot completion path.
+    _io_callback_pool.emplace(/*num_threads=*/2, "prefetch_cb");
+    _io_callback_dispatcher.emplace(*_io_callback_pool, /*max_concurrent_task=*/2);
+
     _evictor_thread   = std::jthread([this](std::stop_token st) { evictor_loop(std::move(st)); });
     _allocator_thread = std::jthread([this](std::stop_token st) { allocator_loop(std::move(st)); });
     _io_dispatch_thread =
@@ -554,6 +562,18 @@ prefetching_cache::~prefetching_cache()
   } catch (...) {
     // Best-effort drain.
   }
+
+  // Drain the IO-completion dispatcher before tearing down its pool.
+  // wait_for_all blocks until any callback already scheduled on the
+  // 2-thread pool has run to completion; without it the pool's dtor
+  // could join while a callback still holds references into this
+  // cache (admission slot, file handle, pool).
+  if (_io_callback_dispatcher) {
+    _io_callback_dispatcher->request_stop();
+    _io_callback_dispatcher->wait_for_all();
+  }
+  _io_callback_dispatcher.reset();
+  _io_callback_pool.reset();
 
   abort_pending_entries();
 }
@@ -1421,51 +1441,63 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
         batch.begin() + static_cast<std::ptrdiff_t>(sb_start),
         batch.begin() + static_cast<std::ptrdiff_t>(sb_end));
 
-      io_ctx->host_read_ranges_async_io(
-        obj_ref,
-        sb_ranges,
-        sb_dsts,
-        [self = this,  // for diagnostic counters
+      // host_read_ranges_async_io now returns a semi_future.  The
+      // completion bookkeeping (state reverts, mark_cached, counters,
+      // and the admission-slot / io_obj release) is real work and
+      // must not run on the reactor thread — route it through the
+      // cache's 2-thread callback pool via the scoped_dispatcher.
+      auto sb_fut = io_ctx->host_read_ranges_async_io(obj_ref, sb_ranges, sb_dsts);
+
+      std::move(sb_fut).install_callback(
+        [self = this,
          pool,
-         batch  = std::move(sb_batch),
-         slot   = slot_holder,  // shared across sub-batches
-         io_obj = item.io_obj,  // copy, not move — used by later sub-batches
-         key    = item.file_key]   // copy, not move
-        (size_t /*bytes*/, std::exception_ptr ep) {
-          if (ep) {
-            try {
-              std::rethrow_exception(std::move(ep));
-            } catch (std::exception const& ex) {
-              spdlog::error("prefetching_cache: IO failed for {}: {}", key, ex.what());
-            }
-            // Revert each entry loading → allocated rather than
-            // discarding to `empty`.  Chunks stay attached so a
-            // subsequent device_read with out_buffer can steal the
-            // entry and retry the load with a fresh request_context.
-            // The CAS only fails if shutdown's abort_pending_entries
-            // raced ahead — in that case we still own the chunks
-            // (abort doesn't free chunks for the `loading` transition)
-            // and must deallocate to avoid a leak.
-            for (auto const& e : batch) {
-              if (!e->state.try_revert_loading_to_allocated()) {
-                self->_io_load_revert_failed.fetch_add(1, std::memory_order_relaxed);
-                pool->deallocate_bulk(e->chunks);
-              } else {
-                self->_io_load_revert_success.fetch_add(1, std::memory_order_relaxed);
+         batch      = std::move(sb_batch),
+         slot       = slot_holder,
+         io_obj     = item.io_obj,
+         key        = item.file_key,
+         dispatcher = &(*_io_callback_dispatcher)](exec::try_t<size_t>&& t) mutable {
+          dispatcher->enqueue([self,
+                               pool,
+                               batch  = std::move(batch),
+                               slot   = std::move(slot),
+                               io_obj = std::move(io_obj),
+                               key    = std::move(key),
+                               t      = std::move(t)]() mutable {
+            if (t.has_exception()) {
+              try {
+                std::rethrow_exception(t.exception());
+              } catch (std::exception const& ex) {
+                spdlog::error("prefetching_cache: IO failed for {}: {}", key, ex.what());
+              }
+              // Revert each entry loading → allocated rather than
+              // discarding to `empty`.  Chunks stay attached so a
+              // subsequent device_read with out_buffer can steal the
+              // entry and retry the load with a fresh request_context.
+              // The CAS only fails if shutdown's abort_pending_entries
+              // raced ahead — in that case we still own the chunks
+              // (abort doesn't free chunks for the `loading` transition)
+              // and must deallocate to avoid a leak.
+              for (auto const& e : batch) {
+                if (!e->state.try_revert_loading_to_allocated()) {
+                  self->_io_load_revert_failed.fetch_add(1, std::memory_order_relaxed);
+                  pool->deallocate_bulk(e->chunks);
+                } else {
+                  self->_io_load_revert_success.fetch_add(1, std::memory_order_relaxed);
+                }
+              }
+            } else {
+              for (auto const& e : batch) {
+                if (e->state.try_mark_cached()) {
+                  e->ever_cached.store(true, std::memory_order_release);
+                  self->_io_load_success.fetch_add(1, std::memory_order_relaxed);
+                }
               }
             }
-          } else {
-            for (auto const& e : batch) {
-              if (e->state.try_mark_cached()) {
-                e->ever_cached.store(true, std::memory_order_release);
-                self->_io_load_success.fetch_add(1, std::memory_order_relaxed);
-              }
-            }
-          }
-          // `slot` and `io_obj` destruct here — budget is returned to
-          // admission_control (which wakes any wait_for_idle waiter once
-          // the last slot drops), and the file handle is released only
-          // after the IO backend is done with it.
+            // `slot` and `io_obj` destruct here — budget is returned
+            // to admission_control (which wakes any wait_for_idle
+            // waiter once the last slot drops), and the file handle is
+            // released only after the IO backend is done with it.
+          });
         });
     }
   }

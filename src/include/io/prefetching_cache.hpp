@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "exec/scoped_dispatcher.hpp"
+#include "exec/thread_pool.hpp"
 #include "io/admission_control.hpp"
 #include "io/prefetch_types.hpp"
 
@@ -25,6 +27,7 @@
 #include <condition_variable>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <semaphore>
 #include <shared_mutex>
 #include <stop_token>
@@ -434,6 +437,19 @@ class prefetching_cache {
   std::jthread _evictor_thread;
   std::jthread _allocator_thread;
   std::jthread _io_dispatch_thread;
+
+  /// 2-thread pool that hosts the completion callbacks installed on the
+  /// semi_futures returned from @c host_read_ranges_async_io.  The
+  /// callbacks do real work (state CAS reverts, mark_cached, counters,
+  /// admission-control budget release) so they cannot run inline on the
+  /// reactor thread.  @c _io_callback_dispatcher caps concurrent
+  /// callbacks at the pool's thread count and is drained explicitly in
+  /// the dtor before the pool joins.
+  ///
+  /// Built lazily (only when @c _armed is true) because an unarmed
+  /// cache never dispatches IO.
+  std::optional<sirius::exec::static_thread_pool> _io_callback_pool;
+  std::optional<sirius::exec::scoped_dispatcher> _io_callback_dispatcher;
 };
 
 }  // namespace sirius::io

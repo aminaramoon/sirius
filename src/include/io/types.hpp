@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "exec/semi_future.hpp"
+
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 
@@ -24,22 +26,12 @@
 #include <atomic>
 #include <cstddef>
 #include <exception>
-#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 namespace sirius::io {
-
-// ---------------------------------------------------------------------------
-// Completion handler
-// ---------------------------------------------------------------------------
-
-/// Boost.Asio-style completion handler for async I/O.
-/// @param bytes_transferred  Total bytes read on success.
-/// @param ep                 Non-null on failure.
-using io_completion_handler = std::function<void(size_t bytes_transferred, std::exception_ptr ep)>;
 
 // ---------------------------------------------------------------------------
 // IO constants
@@ -93,14 +85,16 @@ class sirius_io_object_metadata {
  * @brief Shared completion state for one logical read call (host or device).
  *
  * A single read may be split into multiple sub-requests. All sub-requests
- * decrement @c pending; the last one resolves the handler.
+ * decrement @c pending; the last one resolves the embedded
+ * @c exec::promise<size_t>.  The caller obtains an @c exec::semi_future<size_t>
+ * from @c create() and consumes (or chains) it.
  *
  * Construction is gated by @c create() so callers can't forget to set
- * @c pending or @c handler (a missed setup would silently deadlock the
- * caller).  The destructor is a safety net: if @c handler hasn't been
- * fired by the time the last @c shared_ptr drops (e.g., a sub-request
- * was silently dropped somewhere in the dispatch chain), it fires with
- * an explicit error so the caller sees a failure instead of hanging.
+ * @c pending (a missed setup would silently deadlock the caller).  The
+ * destructor is a safety net: if the promise hasn't been satisfied by
+ * the time the last @c shared_ptr drops (e.g., a sub-request was
+ * silently dropped somewhere in the dispatch chain), it fires with an
+ * explicit error so the caller sees a failure instead of hanging.
  */
 struct request_context {
  private:
@@ -116,56 +110,40 @@ struct request_context {
   request_context& operator=(request_context const&) = delete;
 
   /// Construct a request_context expecting @p n_chunks chunk_done /
-  /// chunk_failed calls.
+  /// chunk_failed calls, and return both the context and the
+  /// @c semi_future the caller awaits.
   ///
-  /// - If @p n_chunks == 0: invokes @p handler with (0, nullptr) immediately
-  ///   and returns nullptr.  Caller checks `if (!ctx) return;`.
-  /// - If @p handler is null and @p n_chunks > 0: throws
-  ///   @c std::invalid_argument.  A pending count with no handler would
-  ///   silently deadlock the caller.
-  /// - Otherwise: returns a fully-populated shared_ptr.
-  [[nodiscard]] static std::shared_ptr<request_context> create(size_t n_chunks,
-                                                               size_t total_bytes,
-                                                               io_completion_handler handler)
+  /// - If @p n_chunks == 0: returns a null context and a ready
+  ///   @c semi_future holding 0.  Caller checks `if (!ctx) ...`.
+  /// - Otherwise: returns a fully-populated context plus its
+  ///   associated future.
+  [[nodiscard]] static std::pair<std::shared_ptr<request_context>, exec::semi_future<size_t>>
+  create(size_t n_chunks, size_t total_bytes)
   {
-    if (n_chunks == 0) {
-      if (handler) {
-        try {
-          handler(0, nullptr);
-        } catch (...) {
-          // Caller's handler threw on the zero-work path; nothing useful
-          // to do here.
-        }
-      }
-      return nullptr;
-    }
-    if (!handler) {
-      throw std::invalid_argument("request_context::create: handler is null but n_chunks > 0");
-    }
+    if (n_chunks == 0) { return {nullptr, exec::make_semi_future<size_t>(size_t{0})}; }
     auto ctx         = std::make_shared<request_context>(create_passkey{});
-    ctx->handler     = std::move(handler);
     ctx->total_bytes = total_bytes;
     ctx->pending.store(n_chunks, std::memory_order_relaxed);
-    return ctx;
+    auto fut = ctx->promise.get_semi_future();
+    return {std::move(ctx), std::move(fut)};
   }
 
   ~request_context() noexcept
   {
-    // Safety net: if the handler hasn't been fired by the normal path
-    // (e.g., a sub-request was silently dropped between enqueue and
-    // completion), fire it now with an explicit error so the caller
-    // doesn't hang forever waiting on a handler that will never come.
+    // Safety net: if the promise hasn't been satisfied by the normal
+    // path (e.g., a sub-request was silently dropped between enqueue
+    // and completion), set an explicit error so the caller doesn't
+    // hang forever waiting on a future that would otherwise reach
+    // broken_promise.
     bool expected = false;
-    if (handler_fired.compare_exchange_strong(expected, true, std::memory_order_acq_rel) &&
-        handler) {
+    if (handler_fired.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
       try {
-        handler(0,
-                std::make_exception_ptr(
-                  std::runtime_error("request_context destructed before all chunks completed — "
-                                     "handler resolved by safety net")));
+        promise.set_exception(
+          std::make_exception_ptr(std::runtime_error("request_context destructed before all "
+                                                     "chunks completed — resolved by safety net")));
       } catch (...) {
-        // A throwing handler at destruction time can't propagate anywhere
-        // useful — swallow to keep the destructor noexcept.
+        // promise may have already been satisfied via a racy path;
+        // swallow to keep the destructor noexcept.
       }
     }
   }
@@ -174,16 +152,17 @@ struct request_context {
   {
     if (pending.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
 
-    // Last chunk — fire the handler exactly once.  The CAS guard makes
-    // this idempotent against the destructor safety net and against any
-    // future imbalance where chunk_done could be called extra times.
+    // Last chunk — satisfy the promise exactly once.  The CAS guard
+    // makes this idempotent against the destructor safety net and
+    // against any future imbalance where chunk_done could be called
+    // extra times.
     bool expected = false;
     if (!handler_fired.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
 
     if (failed.load(std::memory_order_relaxed)) {
-      handler(0, exc);
+      promise.set_exception(exc);
     } else {
-      handler(total_bytes, nullptr);
+      promise.set_value(total_bytes);
     }
   }
 
@@ -196,14 +175,14 @@ struct request_context {
     chunk_done();
   }
 
-  io_completion_handler handler;
+  exec::promise<size_t> promise;
   std::atomic<size_t> pending{0};
   size_t total_bytes{0};
   std::atomic<bool> failed{false};
   std::exception_ptr exc;
-  /// Set (via CAS) by whichever path resolves the handler — normal
+  /// Set (via CAS) by whichever path resolves the promise — normal
   /// completion in chunk_done() or the destructor safety net.
-  /// Guarantees the handler fires at most once.
+  /// Guarantees the promise is satisfied at most once.
   std::atomic<bool> handler_fired{false};
 };
 

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/semi_future.hpp"
 #include "io/io_context.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
@@ -27,7 +28,6 @@
 #include <cassert>
 #include <concepts>
 #include <cstdint>
-#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -219,19 +219,18 @@ class templated_ioctx : public sirius_ioctx {
     return next_reactor().host_read(tobj.host_handle(), offset, size, dst);
   }
 
-  void host_read_async_io(sirius_io_object& obj,
-                          size_t offset,
-                          size_t size,
-                          uint8_t* dst,
-                          io_completion_handler handler) override
+  exec::semi_future<size_t> host_read_async_io(sirius_io_object& obj,
+                                               size_t offset,
+                                               size_t size,
+                                               uint8_t* dst) override
   {
     auto& tobj = as_typed(obj);
     size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
 
-    // size==0 case is folded into create(): it fires the handler with
-    // (0, nullptr) and returns nullptr.
-    auto ctx = request_context::create(size == 0 ? 0 : 1, size, std::move(handler));
-    if (!ctx) return;
+    // size==0 case is folded into create(): it returns a null ctx and
+    // a ready future with 0 bytes.
+    auto [ctx, fut] = request_context::create(size == 0 ? 0 : 1, size);
+    if (!ctx) return std::move(fut);
 
     host_read_req_type req;
     req.handle = tobj.host_handle();
@@ -240,6 +239,7 @@ class templated_ioctx : public sirius_ioctx {
     req.dst    = dst;
     req.ctx    = std::move(ctx);
     next_reactor().host_read_async(std::move(req));
+    return std::move(fut);
   }
 
   // -- Device reads (generic chunking; reactor-backed) ----------------------
@@ -250,19 +250,16 @@ class templated_ioctx : public sirius_ioctx {
                         uint8_t* dst,
                         rmm::cuda_stream_view stream) override
   {
-    return sync_via_promise([&](io_completion_handler h) {
-      enqueue_device_read(as_typed(obj), offset, size, dst, stream.value(), std::move(h));
-    });
+    return std::move(enqueue_device_read(as_typed(obj), offset, size, dst, stream.value())).get();
   }
 
-  void device_read_async_io(sirius_io_object& obj,
-                            size_t offset,
-                            size_t size,
-                            uint8_t* dst,
-                            rmm::cuda_stream_view stream,
-                            io_completion_handler handler) override
+  exec::semi_future<size_t> device_read_async_io(sirius_io_object& obj,
+                                                 size_t offset,
+                                                 size_t size,
+                                                 uint8_t* dst,
+                                                 rmm::cuda_stream_view stream) override
   {
-    enqueue_device_read(as_typed(obj), offset, size, dst, stream.value(), std::move(handler));
+    return enqueue_device_read(as_typed(obj), offset, size, dst, stream.value());
   }
 
   // -- Device read using pre-allocated bounce buffers -----------------------
@@ -281,13 +278,12 @@ class templated_ioctx : public sirius_ioctx {
   /// @p offset must be **file-absolute** (same coordinate space as the
   /// entry's @c physical_range.offset()); see
   /// @c cached_host_buffer::prepare_device_requests for the full contract.
-  void device_read_async_io_using(sirius_io_object& obj,
-                                  size_t offset,
-                                  size_t size,
-                                  uint8_t* dst,
-                                  rmm::cuda_stream_view stream,
-                                  cached_host_buffer buffer,
-                                  io_completion_handler handler) override
+  exec::semi_future<size_t> device_read_async_io_using(sirius_io_object& obj,
+                                                       size_t offset,
+                                                       size_t size,
+                                                       uint8_t* dst,
+                                                       rmm::cuda_stream_view stream,
+                                                       cached_host_buffer buffer) override
   {
     auto& tobj = as_typed(obj);
 
@@ -302,15 +298,12 @@ class templated_ioctx : public sirius_ioctx {
 
     if (reqs.empty()) {
       buffer.mark_load_failed();
-      if (handler) {
-        handler(0,
-                std::make_exception_ptr(
-                  std::runtime_error("device_read_async_io_using: cache entry has no chunks")));
-      }
-      return;
+      return exec::make_semi_future_with([]() -> size_t {
+        throw std::runtime_error("device_read_async_io_using: cache entry has no chunks");
+      });
     }
 
-    // shared_ptr makes the lambda copy-constructible (required by std::function);
+    // shared_ptr keeps the buffer alive across the deferred completion stage;
     // cached_host_buffer itself is move-only.  Capture stream.value() so the
     // success path can defer the read-pin release via cudaStreamAddCallback —
     // this keeps the entry pinned across the H2D copy that the reactor
@@ -318,19 +311,8 @@ class templated_ioctx : public sirius_ioctx {
     // recycling pool buffers while the copy is still in flight.
     auto shared_buf = std::make_shared<cached_host_buffer>(std::move(buffer));
     auto raw_stream = stream.value();
-    auto ctx        = request_context::create(
-      reqs.size(),
-      size,
-      [buf = std::move(shared_buf), user_handler = std::move(handler), raw_stream](
-        size_t bytes, const std::exception_ptr& ep) mutable {
-        if (ep) {
-          buf->mark_load_failed();
-        } else {
-          buf->mark_cached_with_stream(raw_stream);
-        }
-        if (user_handler) user_handler(bytes, ep);
-      });
 
+    auto [ctx, fut] = request_context::create(reqs.size(), size);
     assert(ctx);  // n_chunks == reqs.size() > 0, so create() never returns null here
 
     for (auto& r : reqs)
@@ -349,22 +331,34 @@ class templated_ioctx : public sirius_ioctx {
         std::span<device_read_req_type>(reqs.data() + off, group_size));
       off += group_size;
     }
+
+    // Chain the entry-state bookkeeping onto the future.  The deferred
+    // stage runs on whichever thread fires the upstream completion (the
+    // reactor thread in push mode, or the caller's thread in pull mode),
+    // so mark_cached / mark_load_failed lands before the consumer
+    // observes the result.
+    return std::move(fut).defer(
+      [buf = std::move(shared_buf), raw_stream](exec::try_t<size_t>&& t) -> exec::try_t<size_t> {
+        if (t.has_exception()) {
+          buf->mark_load_failed();
+        } else {
+          buf->mark_cached_with_stream(raw_stream);
+        }
+        return std::move(t);
+      });
   }
 
   // -- Batch host reads (generic: dispatch to reactor host_read_async) ------
 
-  void host_read_ranges_async_io(sirius_io_object& obj,
-                                 std::vector<cudf::io::text::byte_range_info> const& ranges,
-                                 std::span<cudf::host_span<std::byte>> dst,
-                                 io_completion_handler handler) override
+  exec::semi_future<size_t> host_read_ranges_async_io(
+    sirius_io_object& obj,
+    std::vector<cudf::io::text::byte_range_info> const& ranges,
+    std::span<cudf::host_span<std::byte>> dst) override
   {
     auto& tobj     = as_typed(obj);
     auto file_size = tobj.size();
 
-    if (ranges.empty()) {
-      handler(0, nullptr);
-      return;
-    }
+    if (ranges.empty()) { return exec::make_semi_future<size_t>(size_t{0}); }
 
     // Build every valid request up-front; we need the exact count before
     // creating the ctx so that pending starts at the right value, and we
@@ -385,11 +379,11 @@ class templated_ioctx : public sirius_ioctx {
       reqs.push_back(std::move(req));
       total += sz;
     }
-    // reqs.empty() case is folded into create(): it fires the handler with
-    // (0, nullptr) and returns nullptr.  Early-return retained as a fast
+    // reqs.empty() case is folded into create(): it returns a null ctx
+    // and a ready future with 0 bytes.  Early-return retained as a fast
     // path that skips the per-reactor split loop below.
-    auto ctx = request_context::create(reqs.size(), total, std::move(handler));
-    if (!ctx) return;
+    auto [ctx, fut] = request_context::create(reqs.size(), total);
+    if (!ctx) return std::move(fut);
     for (auto& r : reqs)
       r.ctx = ctx;
 
@@ -410,6 +404,7 @@ class templated_ioctx : public sirius_ioctx {
         std::span<host_read_req_type>(reqs.data() + off, group_size));
       off += group_size;
     }
+    return std::move(fut);
   }
 
   cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
@@ -431,19 +426,13 @@ class templated_ioctx : public sirius_ioctx {
     return static_cast<io_object_type&>(obj);
   }
 
-  void enqueue_device_read(io_object_type& obj,
-                           size_t offset,
-                           size_t size,
-                           uint8_t* dst,
-                           cudaStream_t stream,
-                           io_completion_handler handler)
+  exec::semi_future<size_t> enqueue_device_read(
+    io_object_type& obj, size_t offset, size_t size, uint8_t* dst, cudaStream_t stream)
   {
     auto file_size = obj.size();
     if (size == 0 || offset >= file_size) {
-      // Nothing to read — fire the handler now via a no-chunk create.
-      // The returned nullptr is intentionally discarded.
-      [[maybe_unused]] auto _ = request_context::create(0, 0, std::move(handler));
-      return;
+      // Nothing to read — return a ready future with 0 bytes.
+      return exec::make_semi_future<size_t>(size_t{0});
     }
     size = std::min(size, file_size - offset);
 
@@ -457,14 +446,14 @@ class templated_ioctx : public sirius_ioctx {
 
     // Capture the caller's CUDA device BEFORE creating the request_context
     // so that a failure throws cleanly without leaving a ctx whose
-    // destructor safety net would fire the handler with a less specific
-    // error.  In multi-GPU usage a single reactor thread serves streams
-    // bound to different devices, and silently defaulting to "don't
-    // switch" lands the H2D on the wrong device.
+    // destructor safety net would fire a less specific error.  In
+    // multi-GPU usage a single reactor thread serves streams bound to
+    // different devices, and silently defaulting to "don't switch"
+    // lands the H2D on the wrong device.
     int const device_id = detail::current_cuda_device();
 
-    auto ctx = request_context::create(n_chunks, size, std::move(handler));
-    if (!ctx) return;
+    auto [ctx, fut] = request_context::create(n_chunks, size);
+    if (!ctx) return std::move(fut);
 
     // Build the chunks into one flat vector, then hand each reactor a
     // contiguous span slice.  Collapses N wake-notifies to at most M
@@ -501,20 +490,7 @@ class templated_ioctx : public sirius_ioctx {
         std::span<device_read_req_type>(reqs.data() + off, group_size));
       off += group_size;
     }
-  }
-
-  template <class Enqueue>
-  static size_t sync_via_promise(Enqueue&& enqueue)
-  {
-    std::promise<size_t> p;
-    auto f = p.get_future();
-    enqueue([&p](size_t n, std::exception_ptr e) {
-      if (e)
-        p.set_exception(e);
-      else
-        p.set_value(n);
-    });
-    return f.get();
+    return std::move(fut);
   }
 };
 

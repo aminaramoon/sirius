@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/semi_future.hpp"
 #include "io/io_context.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -71,11 +72,10 @@ class kvikio_io_object final : public sirius_io_object {
  * Why override the public read API directly instead of the protected
  * @c _io primitives?  cudf's async path returns @c std::future<size_t>,
  * but the protected @c host_read_async_io / @c device_read_async_io
- * contract is push/callback (@c io_completion_handler).  Converting one
- * to the other requires either spawning a thread to wait on the future
- * or blocking the caller — both wrong.  Instead we override the public
- * read APIs so the future flows through unchanged; the protected @c _io
- * primitives become unreachable placeholders.
+ * contract now returns @c exec::semi_future<size_t>.  Bridging via a
+ * detached waiter thread on every read would be wasteful, so kvikio
+ * overrides the public read APIs and bridges once at the top — the
+ * protected @c _io primitives are unreachable placeholders.
  *
  * Capabilities:
  *   - @c supports_device_read: true (cudf's datasource supports it where the
@@ -120,10 +120,10 @@ class kvikio_context final : public sirius_ioctx {
 
   size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
 
-  std::future<size_t> host_read_async(sirius_io_object& obj,
-                                      size_t offset,
-                                      size_t size,
-                                      uint8_t* dst) final;
+  exec::semi_future<size_t> host_read_async(sirius_io_object& obj,
+                                            size_t offset,
+                                            size_t size,
+                                            uint8_t* dst) final;
 
   size_t device_read(sirius_io_object& obj,
                      size_t offset,
@@ -131,11 +131,11 @@ class kvikio_context final : public sirius_ioctx {
                      uint8_t* dst,
                      rmm::cuda_stream_view stream) final;
 
-  std::future<size_t> device_read_async(sirius_io_object& obj,
-                                        size_t offset,
-                                        size_t size,
-                                        uint8_t* dst,
-                                        rmm::cuda_stream_view stream) final;
+  exec::semi_future<size_t> device_read_async(sirius_io_object& obj,
+                                              size_t offset,
+                                              size_t size,
+                                              uint8_t* dst,
+                                              rmm::cuda_stream_view stream) final;
 
   /// kvikio handles its own alignment internally; pass the logical range
   /// through unchanged.
@@ -155,11 +155,10 @@ class kvikio_context final : public sirius_ioctx {
 
   size_t host_read_io(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
 
-  void host_read_async_io(sirius_io_object& obj,
-                          size_t offset,
-                          size_t size,
-                          uint8_t* dst,
-                          io_completion_handler handler) final;
+  exec::semi_future<size_t> host_read_async_io(sirius_io_object& obj,
+                                               size_t offset,
+                                               size_t size,
+                                               uint8_t* dst) final;
 
   size_t device_read_io(sirius_io_object& obj,
                         size_t offset,
@@ -167,17 +166,16 @@ class kvikio_context final : public sirius_ioctx {
                         uint8_t* dst,
                         rmm::cuda_stream_view stream) final;
 
-  void device_read_async_io(sirius_io_object& obj,
-                            size_t offset,
-                            size_t size,
-                            uint8_t* dst,
-                            rmm::cuda_stream_view stream,
-                            io_completion_handler handler) final;
+  exec::semi_future<size_t> device_read_async_io(sirius_io_object& obj,
+                                                 size_t offset,
+                                                 size_t size,
+                                                 uint8_t* dst,
+                                                 rmm::cuda_stream_view stream) final;
 
-  void host_read_ranges_async_io(sirius_io_object& obj,
-                                 std::vector<cudf::io::text::byte_range_info> const& ranges,
-                                 std::span<cudf::host_span<std::byte>> dst,
-                                 io_completion_handler handler) final;
+  exec::semi_future<size_t> host_read_ranges_async_io(
+    sirius_io_object& obj,
+    std::vector<cudf::io::text::byte_range_info> const& ranges,
+    std::span<cudf::host_span<std::byte>> dst) final;
 };
 
 }  // namespace sirius::io
