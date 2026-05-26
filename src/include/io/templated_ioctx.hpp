@@ -253,38 +253,34 @@ class templated_ioctx : public sirius_ioctx {
     return std::move(enqueue_device_read(as_typed(obj), offset, size, dst, stream.value())).get();
   }
 
+  /// Issue an async device read for the range [offset, offset+size) into
+  /// @p dst.
+  ///
+  /// When @p buffer is empty (the default), the reactor allocates its
+  /// own bounce slots — the no-cache fast path.
+  ///
+  /// When @p buffer is non-empty, the read reuses the pinned host
+  /// chunks already allocated in @p buffer.  @p buffer MUST be in the
+  /// @c loading state (caller already flipped it from @c allocated via
+  /// @c prefetching_cache::read()).  The deferred completion stage
+  /// calls @c buffer.mark_cached_with_stream() on success or
+  /// @c buffer.mark_load_failed() on failure, transitioning the cache
+  /// entry to its terminal state and waking any parked readers.  In
+  /// this mode @p offset must be **file-absolute** (same coordinate
+  /// space as the entry's @c physical_range.offset()); see
+  /// @c cached_host_buffer::prepare_device_requests for the full contract.
   exec::semi_future<size_t> device_read_async_io(sirius_io_object& obj,
                                                  size_t offset,
                                                  size_t size,
                                                  uint8_t* dst,
-                                                 rmm::cuda_stream_view stream) override
+                                                 rmm::cuda_stream_view stream,
+                                                 cached_host_buffer buffer = {}) override
   {
-    return enqueue_device_read(as_typed(obj), offset, size, dst, stream.value());
-  }
+    if (!buffer) {
+      // No-cache path: reactor allocates its own bounce slots.
+      return enqueue_device_read(as_typed(obj), offset, size, dst, stream.value());
+    }
 
-  // -- Device read using pre-allocated bounce buffers -----------------------
-
-  /// Issue an async device read for the range [offset, offset+size) into
-  /// @p dst, reusing the pinned host chunks already allocated in
-  /// @p buffer.  @p buffer MUST be in the @c loading state (the caller
-  /// already flipped it from @c allocated via
-  /// @c prefetching_cache::read()).
-  ///
-  /// On IO completion the reactor fires @p handler.  The wrapped
-  /// completion callback also calls @p buffer.mark_cached() on success or
-  /// @p buffer.mark_load_failed() on failure, which transitions the entry
-  /// to its terminal state and wakes any parked readers.
-  ///
-  /// @p offset must be **file-absolute** (same coordinate space as the
-  /// entry's @c physical_range.offset()); see
-  /// @c cached_host_buffer::prepare_device_requests for the full contract.
-  exec::semi_future<size_t> device_read_async_io_using(sirius_io_object& obj,
-                                                       size_t offset,
-                                                       size_t size,
-                                                       uint8_t* dst,
-                                                       rmm::cuda_stream_view stream,
-                                                       cached_host_buffer buffer) override
-  {
     auto& tobj = as_typed(obj);
 
     // Capture the caller's device before we move `buffer` into shared
@@ -299,7 +295,7 @@ class templated_ioctx : public sirius_ioctx {
     if (reqs.empty()) {
       buffer.mark_load_failed();
       return exec::make_semi_future_with([]() -> size_t {
-        throw std::runtime_error("device_read_async_io_using: cache entry has no chunks");
+        throw std::runtime_error("device_read_async_io: cache entry has no chunks");
       });
     }
 

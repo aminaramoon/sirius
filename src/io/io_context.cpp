@@ -59,13 +59,6 @@ void sirius_ioctx::initialize_cache(buffer_pool* pool, size_t inflight_budget_ch
 
 void sirius_ioctx::shutdown_cache() noexcept { _cache.reset(); }
 
-exec::semi_future<size_t> sirius_ioctx::device_read_async_io_using(
-  sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view, cached_host_buffer buffer)
-{
-  throw std::runtime_error(
-    "sirius_ioctx: device_read_async_io_using not supported by this backend");
-}
-
 namespace {
 
 // Bridge an @c exec::semi_future<size_t> into a @c std::future<size_t> for
@@ -277,12 +270,11 @@ size_t sirius_ioctx::device_read(
     }
     if (chb) {
       // Allocated-steal path: chunks are pre-assigned, dispatch
-      // file → bounce → device directly through the new ioctx API.
-      // device_read_async_io_using may throw synchronously (e.g. on a
+      // file → bounce → device directly through the unified ioctx API.
+      // device_read_async_io may throw synchronously (e.g. on a
       // cudaGetDevice failure); let it propagate the same way the
       // legacy code did via promise.set_exception followed by fut.get().
-      return std::move(device_read_async_io_using(obj, offset, size, dst, stream, std::move(chb)))
-        .get();
+      return std::move(device_read_async_io(obj, offset, size, dst, stream, std::move(chb))).get();
     }
   }
   return device_read_io(obj, offset, size, dst, stream);
@@ -306,12 +298,12 @@ std::future<size_t> sirius_ioctx::device_read_async(
     if (chb) {
       // Allocated-steal path: same as the sync flow above, but expose the
       // future to the caller instead of blocking on it.  A synchronous
-      // throw from device_read_async_io_using is folded into the
-      // returned future so callers always observe failure via the
-      // future rather than as a propagated exception.
+      // throw from device_read_async_io is folded into the returned
+      // future so callers always observe failure via the future rather
+      // than as a propagated exception.
       try {
         return bridge_semi_to_std(
-          device_read_async_io_using(obj, offset, size, dst, stream, std::move(chb)));
+          device_read_async_io(obj, offset, size, dst, stream, std::move(chb)));
       } catch (...) {
         return std::async(std::launch::deferred, [e = std::current_exception()]() -> size_t {
           std::rethrow_exception(e);

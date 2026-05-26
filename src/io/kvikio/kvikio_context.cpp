@@ -141,7 +141,8 @@ exec::semi_future<size_t> kvikio_context::device_read_async_io(sirius_io_object&
                                                                size_t /*offset*/,
                                                                size_t /*size*/,
                                                                uint8_t* /*dst*/,
-                                                               rmm::cuda_stream_view /*stream*/)
+                                                               rmm::cuda_stream_view /*stream*/,
+                                                               cached_host_buffer /*buffer*/)
 {
   unreachable_io_primitive("device_read_async_io");
 }

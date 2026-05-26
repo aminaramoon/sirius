@@ -171,7 +171,8 @@ class kvikio_context final : public sirius_ioctx {
                                                  size_t offset,
                                                  size_t size,
                                                  uint8_t* dst,
-                                                 rmm::cuda_stream_view stream) final;
+                                                 rmm::cuda_stream_view stream,
+                                                 cached_host_buffer buffer = {}) final;
 
   exec::semi_future<size_t> host_read_ranges_async_io(
     sirius_io_object& obj,

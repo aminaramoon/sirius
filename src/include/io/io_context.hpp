@@ -202,18 +202,21 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
                                 uint8_t* dst,
                                 rmm::cuda_stream_view stream) = 0;
 
-  virtual exec::semi_future<size_t> device_read_async_io(sirius_io_object& obj,
-                                                         size_t offset,
-                                                         size_t size,
-                                                         uint8_t* dst,
-                                                         rmm::cuda_stream_view stream) = 0;
-
-  virtual exec::semi_future<size_t> device_read_async_io_using(sirius_io_object& obj,
-                                                               size_t offset,
-                                                               size_t size,
-                                                               uint8_t* dst,
-                                                               rmm::cuda_stream_view stream,
-                                                               cached_host_buffer buffer);
+  /// Issue an async device read for the range @c [offset, offset+size).
+  ///
+  /// When @p buffer is non-empty the read reuses the pre-allocated pinned
+  /// bounce chunks it owns (caller already flipped the cache entry from
+  /// @c allocated to @c loading via @c prefetching_cache::read()); on
+  /// completion the entry transitions to @c cached or @c empty depending
+  /// on success/failure.  When @p buffer is empty (the default) the
+  /// reactor uses its own bounce slots — the no-cache fast path.
+  virtual exec::semi_future<size_t> device_read_async_io(
+    sirius_io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    rmm::cuda_stream_view stream,
+    cached_host_buffer buffer = cached_host_buffer{}) = 0;
 
   virtual exec::semi_future<size_t> host_read_ranges_async_io(
     sirius_io_object& obj,

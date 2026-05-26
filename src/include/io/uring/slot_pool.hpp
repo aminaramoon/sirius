@@ -129,7 +129,7 @@ class slot_pool {
   }
 
   // Approximate (relaxed) count of free slots — suitable for heuristics only.
-  std::size_t approx_free() const noexcept
+  [[nodiscard]] std::size_t approx_free() const noexcept
   {
     std::size_t n = 0;
     for (std::size_t w = 0; w < num_words; ++w)
@@ -137,7 +137,7 @@ class slot_pool {
     return n;
   }
 
-  bool any_free() const noexcept
+  [[nodiscard]] bool any_free() const noexcept
   {
     for (std::size_t w = 0; w < num_words; ++w)
       if (_words[w].bits.load(std::memory_order_relaxed) != 0) return true;
