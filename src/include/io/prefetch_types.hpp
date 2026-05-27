@@ -590,6 +590,15 @@ class pinned_view {
   /// that turn out to be virtually contiguous (same slab) are coalesced.
   /// The caller must ensure [offset, offset+size) lies within
   /// @c logical_range().
+  ///
+  /// Multi-entry boundary: for non-terminal entries the cut between
+  /// adjacent entries falls at the LEFT entry's @c physical_range.end
+  /// (page-aligned) rather than its logical end.  The two adjacent
+  /// entries' physical ranges overlap on [logical_end_left,
+  /// physical_end_left), so those bytes are served from the left
+  /// entry's chunks; the right entry contributes [physical_end_left,
+  /// ...).  This gives the downstream consumer a page-aligned cut and
+  /// avoids a small unaligned head on the right entry's first chunk.
   [[nodiscard]] std::vector<cudf::io::datasource::non_owning_buffer> slice(size_t offset,
                                                                            size_t size) const;
 
