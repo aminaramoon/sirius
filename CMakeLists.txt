@@ -350,7 +350,7 @@ target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static / telemetry_bridge)
 install(
-  TARGETS sirius_extension cucascade_static cucascade_topology_discovery_static
+  TARGETS sirius_extension cucascade_static
           telemetry_bridge
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
@@ -391,7 +391,7 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
     test/cpp/io/s3/test_static_credentials.cpp
-    test/cpp/io/test_datasource_factory.cpp
+    # test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp

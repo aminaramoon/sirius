@@ -341,44 +341,45 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       std::sort(chunk_ranges.begin(), chunk_ranges.end(), [](auto const& a, auto const& b) {
         return a.offset() < b.offset();
       });
-      std::vector<range_t> merged;
-      merged.reserve(chunk_ranges.size());
-      if (!chunk_ranges.empty()) {
-        auto cur_start = chunk_ranges[0].offset();
-        auto cur_end   = cur_start + chunk_ranges[0].size();
-        for (auto const& r : chunk_ranges) {
-          auto const rs = r.offset();
-          auto const re = rs + r.size();
-          if (rs <= cur_end) {
-            cur_end = std::max(cur_end, re);
-          } else {
-            merged.emplace_back(cur_start, cur_end - cur_start);
-            cur_start = rs;
-            cur_end   = re;
-          }
-        }
-        merged.emplace_back(cur_start, cur_end - cur_start);
-      }
+      file_ranges = chunk_ranges;
+      // merged.reserve(chunk_ranges.size());
+      // if (!chunk_ranges.empty()) {
+      //   auto cur_start = chunk_ranges[0].offset();
+      //   auto cur_end   = cur_start + chunk_ranges[0].size();
+      //   for (auto const& r : chunk_ranges) {
+      //     auto const rs = r.offset();
+      //     auto const re = rs + r.size();
+      //     if (rs <= cur_end) {
+      //       cur_end = std::max(cur_end, re);
+      //     } else {
+      //       merged.emplace_back(cur_start, cur_end - cur_start);
+      //       cur_start = rs;
+      //       cur_end   = re;
+      //     }
+      //   }
+      //   merged.emplace_back(cur_start, cur_end - cur_start);
+      // }
 
       // footer_offset / footer_size mirror parquet_scan_task's computation:
       // the trailer is 8 bytes (4 footer_len + 4 magic) and the footer body
       // length (excluding the trailer) is recorded on parquet_metadata so we
       // don't need the original footer buffer to recompute the range.
-      constexpr std::size_t FOOTER_TAIL_SIZE = 8;
-      auto const file_size                   = file_io_object->size();
-      auto const footer_off  = static_cast<int64_t>(file_size - FOOTER_TAIL_SIZE - footer_byte_len);
-      auto const footer_size = static_cast<int64_t>(FOOTER_TAIL_SIZE + footer_byte_len);
+      // constexpr std::size_t FOOTER_TAIL_SIZE = 8;
+      // auto const file_size                   = file_io_object->size();
+      // auto const footer_off  = static_cast<int64_t>(file_size - FOOTER_TAIL_SIZE -
+      // footer_byte_len); auto const footer_size = static_cast<int64_t>(FOOTER_TAIL_SIZE +
+      // footer_byte_len);
 
-      file_ranges.reserve(merged.size() + 2);
-      file_ranges.emplace_back(0, 4);  // PAR1 header
-      file_ranges.insert(file_ranges.end(), merged.begin(), merged.end());
-      file_ranges.emplace_back(footer_off, footer_size);
-      // Cache requires sorted-by-offset.  Header is at 0, footer is at file end,
-      // and merged column chunks live in between — a defensive sort handles any
-      // pathological layout where a column chunk starts before the header.
-      std::sort(file_ranges.begin(), file_ranges.end(), [](auto const& a, auto const& b) {
-        return a.offset() < b.offset();
-      });
+      // file_ranges.reserve(merged.size() + 2);
+      // file_ranges.emplace_back(0, 4);  // PAR1 header
+      // file_ranges.insert(file_ranges.end(), merged.begin(), merged.end());
+      // file_ranges.emplace_back(footer_off, footer_size);
+      // // Cache requires sorted-by-offset.  Header is at 0, footer is at file end,
+      // // and merged column chunks live in between — a defensive sort handles any
+      // // pathological layout where a column chunk starts before the header.
+      // std::sort(file_ranges.begin(), file_ranges.end(), [](auto const& a, auto const& b) {
+      //   return a.offset() < b.offset();
+      // });
     }
 
     // Stash freshly-parsed metadata so a subsequent scan of this file can

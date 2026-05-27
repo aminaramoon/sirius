@@ -663,8 +663,8 @@ prefetching_cache::~prefetching_cache()
   // could join while a callback still holds references into this
   // cache (admission slot, file handle, pool).
   if (_io_callback_dispatcher) {
-    _io_callback_dispatcher->request_stop();
     _io_callback_dispatcher->wait_for_all();
+    _io_callback_dispatcher->request_stop();
   }
   _io_callback_dispatcher.reset();  // dispatcher first, then its backing pool
   _io_callback_pool.reset();
@@ -1472,8 +1472,6 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
       // Every entry raced past empty; pre-allocated chunks already returned.
       continue;
     }
-
-    continue;
 
     // ---- Hand off allocated entries to io_dispatch_loop -------------------
     work_item dispatch{item.file_key, item.io_obj, std::move(batch), item.alive};
