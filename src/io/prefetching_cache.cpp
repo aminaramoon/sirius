@@ -27,6 +27,7 @@
 #include <cmath>
 #include <memory>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace sirius::io {
 
@@ -811,12 +812,13 @@ prefetching_handle prefetching_cache::insert(
                         [](auto const& a, auto const& b) { return a.offset() < b.offset(); }) &&
          "ranges must be sorted by offset");
 
-  // Non-overlap is a precondition of the per-offset coalesce logic below
-  // (which compares only `offset() == off`) and of the cached-hit path in
-  // read() (which walks adjacent entries and assumes no double-coverage of
-  // any byte).  Overlapping ranges would create two cache_entries spanning
-  // a shared byte; find_entry's upper_bound picks one and the other
-  // becomes unreachable for that read.  Compile-out in release builds.
+  // Non-overlapping input ranges keep the pre-merge below well-defined
+  // (it only merges aligned spans that touch or overlap from a sorted
+  // input).  Two LOGICAL ranges that overlap would also break the
+  // caller-side accounting for what bytes a given handle covers.  The
+  // chunk-aligned spans we build downstream may still overlap each
+  // other's source ranges — the pre-merge collapses them so the cache
+  // remains disjoint.  Compile-out in release builds.
   assert(std::adjacent_find(ranges.begin(),
                             ranges.end(),
                             [](auto const& a, auto const& b) {
@@ -853,54 +855,115 @@ prefetching_handle prefetching_cache::insert(
   // trigger a fresh prefetch.
   std::vector<std::shared_ptr<cache_entry>> new_entries;
 
-  std::vector<std::shared_ptr<cache_entry>> merged;
-  merged.reserve(file.entries.size() + ranges.size());
   new_entries.reserve(ranges.size());
 
-  auto ex_it  = file.entries.begin();
-  auto ex_end = file.entries.end();
-
-  // Each input range is rounded out to chunk-aligned boundaries
-  // (align_down on start, align_up on end, clamped to file_size).
-  // Step 33 will replace the per-input single-entry mapping below with
-  // a multi-entry gap-filling pass that resolves overlap against
-  // existing entries; for now we keep the offset-equality coalesce and
-  // accept that two input ranges whose tails fall in the same chunk
-  // can produce overlapping chunk-aligned entries.
+  // Step 1: chunk-align each input range and merge overlapping/touching
+  // aligned spans into a sorted, disjoint demand list.  Two adjacent
+  // input ranges that fall in the same chunk would otherwise produce
+  // overlapping chunk-aligned spans; merging avoids that and keeps
+  // disjointedness for the cache.
   auto const chunk_bytes = _pool->chunk_bytes();
   auto align_down        = [chunk_bytes](size_t v) { return v - (v % chunk_bytes); };
   auto align_up          = [chunk_bytes](size_t v) {
     return (v + chunk_bytes - 1) / chunk_bytes * chunk_bytes;
   };
 
+  struct aligned_span {
+    size_t start;
+    size_t end;
+  };
+  std::vector<aligned_span> aligned;
+  aligned.reserve(ranges.size());
   for (auto const& logical : ranges) {
     auto const log_off = static_cast<size_t>(logical.offset());
     auto const log_end = log_off + static_cast<size_t>(logical.size());
+    if (log_end <= log_off) continue;
     auto const a_start = align_down(log_off);
     auto const a_end   = std::min(align_up(log_end), file_size);
-    cudf::io::text::byte_range_info aligned{static_cast<int64_t>(a_start),
-                                            static_cast<int64_t>(a_end - a_start)};
-
-    while (ex_it != ex_end && static_cast<size_t>((*ex_it)->range.offset()) < a_start) {
-      merged.push_back(std::move(*ex_it));
-      ++ex_it;
-    }
-    if (ex_it != ex_end && static_cast<size_t>((*ex_it)->range.offset()) == a_start) {
-      // Coalesce: reuse the existing entry.  Per-entry demand counters
-      // are gone (we now count demand per-file via request_state).
-      new_entries.push_back(*ex_it);
-      merged.push_back(std::move(*ex_it));
-      ++ex_it;
+    if (a_end <= a_start) continue;
+    if (!aligned.empty() && aligned.back().end >= a_start) {
+      aligned.back().end = std::max(aligned.back().end, a_end);
     } else {
-      auto e = std::make_shared<cache_entry>(aligned, chunk_bytes);
-      new_entries.push_back(e);
-      merged.push_back(std::move(e));
+      aligned.push_back({a_start, a_end});
     }
   }
-  // Forward any trailing existing entries.
-  for (; ex_it != ex_end; ++ex_it) {
-    merged.push_back(std::move(*ex_it));
+
+  // Step 2: for each aligned demand span, find existing entries that
+  // overlap it (binary search + forward walk), reuse them (deduped via
+  // @c reused_seen), and create new entries for the gaps in between.
+  // The new entries inherit chunk-aligned boundaries (their starts
+  // either equal an aligned span start, an existing entry's end, or
+  // an aligned span end — all chunk-aligned), so the disjoint +
+  // chunk-aligned invariants on @c file.entries are preserved.
+  std::vector<std::shared_ptr<cache_entry>> new_created;
+  std::unordered_set<cache_entry*> reused_seen;
+  new_created.reserve(aligned.size());
+
+  for (auto const& span : aligned) {
+    auto const a_start = span.start;
+    auto const a_end   = span.end;
+
+    // Find the first existing entry whose range ends after a_start.
+    auto it = std::lower_bound(
+      file.entries.begin(), file.entries.end(), a_start, [](auto const& e, size_t v) {
+        return static_cast<size_t>(e->range.offset()) < v;
+      });
+    if (it != file.entries.begin()) {
+      auto prev = std::prev(it);
+      auto prev_end =
+        static_cast<size_t>((*prev)->range.offset()) + static_cast<size_t>((*prev)->range.size());
+      if (prev_end > a_start) it = prev;
+    }
+
+    size_t cursor = a_start;
+    while (cursor < a_end) {
+      if (it == file.entries.end()) {
+        // No more existing — fill rest of this span with one new entry.
+        cudf::io::text::byte_range_info gap{static_cast<int64_t>(cursor),
+                                            static_cast<int64_t>(a_end - cursor)};
+        auto e = std::make_shared<cache_entry>(gap, chunk_bytes);
+        new_entries.push_back(e);
+        new_created.push_back(std::move(e));
+        cursor = a_end;
+        break;
+      }
+      auto e_off = static_cast<size_t>((*it)->range.offset());
+      auto e_end = e_off + static_cast<size_t>((*it)->range.size());
+
+      if (e_off > cursor) {
+        // Gap from cursor to min(e_off, a_end) — fill with new entry.
+        size_t gap_end = std::min(e_off, a_end);
+        cudf::io::text::byte_range_info gap{static_cast<int64_t>(cursor),
+                                            static_cast<int64_t>(gap_end - cursor)};
+        auto e = std::make_shared<cache_entry>(gap, chunk_bytes);
+        new_entries.push_back(e);
+        new_created.push_back(std::move(e));
+        cursor = gap_end;
+      } else {
+        // e_off <= cursor < e_end — existing entry covers cursor.  Reuse
+        // it (deduped across aligned spans within this insert) and
+        // advance past it.
+        if (reused_seen.insert(it->get()).second) { new_entries.push_back(*it); }
+        cursor = e_end;
+        ++it;
+      }
+    }
   }
+
+  // Step 3: rebuild file.entries as the sorted union of the existing
+  // entries (already sorted by offset) and the newly created ones
+  // (sorted here by offset, since they were appended per-span).
+  std::sort(new_created.begin(), new_created.end(), [](auto const& a, auto const& b) {
+    return a->range.offset() < b->range.offset();
+  });
+  std::vector<std::shared_ptr<cache_entry>> merged;
+  merged.reserve(file.entries.size() + new_created.size());
+  std::merge(file.entries.begin(),
+             file.entries.end(),
+             new_created.begin(),
+             new_created.end(),
+             std::back_inserter(merged),
+             [](auto const& a, auto const& b) { return a->range.offset() < b->range.offset(); });
 
   file.entries = std::move(merged);
 
