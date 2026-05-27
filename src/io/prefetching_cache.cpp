@@ -438,21 +438,39 @@ std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t o
   size_t cursor    = offset;
   size_t remaining = size;
 
-  for (auto const& e : _entries) {
+  for (size_t i = 0; i < _entries.size(); ++i) {
     if (remaining == 0) break;
-    auto e_off = static_cast<size_t>(e->logical_range.offset());
-    auto e_end = e_off + static_cast<size_t>(e->logical_range.size());
+    auto const& e   = _entries[i];
+    auto e_log_off  = static_cast<size_t>(e->logical_range.offset());
+    auto e_log_end  = e_log_off + static_cast<size_t>(e->logical_range.size());
+    auto e_phys_end = static_cast<size_t>(e->physical_range.offset()) +
+                      static_cast<size_t>(e->physical_range.size());
 
-    // Skip entries that lie entirely before the requested range.
-    if (cursor >= e_end) continue;
+    // Skip entries whose logical bytes lie entirely before the cursor.
+    // The cursor may already be past `e_log_end` when the previous
+    // iteration extended through its physical tail (see boundary
+    // selection below).
+    if (cursor >= e_log_end) continue;
 
     // The cache's hit path guarantees contiguous coverage, so the
     // first entry whose tail extends past `cursor` must also start at
     // or before `cursor`.  An assert (release-elided) flags any
     // breakage of that invariant before we read out-of-range bytes.
-    assert(e_off <= cursor && "pinned_view::slice: gap in covering entries");
+    assert(e_log_off <= cursor && "pinned_view::slice: gap in covering entries");
 
-    size_t take = std::min(remaining, e_end - cursor);
+    // For non-terminal entries, extend the slice up to this entry's
+    // PHYSICAL end (page-aligned) rather than its logical end.  Adjacent
+    // prefetched ranges with `logical_end_left == logical_off_right`
+    // overlap physically (left.physical_end >= right.physical_off), so
+    // the bytes [logical_end_left, physical_end_left) live in BOTH
+    // entries' chunks.  Reading them from the left entry hands the
+    // downstream consumer a page-aligned cut instead of an unaligned
+    // sub-page head on the right entry's first chunk.  The terminal
+    // entry still uses its logical end so we never overshoot the
+    // requested range.
+    size_t const boundary = (i + 1 < _entries.size()) ? e_phys_end : e_log_end;
+
+    size_t take = std::min(remaining, boundary - cursor);
     slice_one_entry(*e, cursor, take, result);
     cursor += take;
     remaining -= take;
@@ -1472,6 +1490,8 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
       // Every entry raced past empty; pre-allocated chunks already returned.
       continue;
     }
+
+    continue;
 
     // ---- Hand off allocated entries to io_dispatch_loop -------------------
     work_item dispatch{item.file_key, item.io_obj, std::move(batch), item.alive};
