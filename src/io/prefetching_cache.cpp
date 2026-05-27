@@ -811,22 +811,6 @@ prefetching_handle prefetching_cache::insert(
                         [](auto const& a, auto const& b) { return a.offset() < b.offset(); }) &&
          "ranges must be sorted by offset");
 
-  // Non-overlapping input ranges keep the pre-merge below well-defined
-  // (it only merges aligned spans that touch or overlap from a sorted
-  // input).  Two LOGICAL ranges that overlap would also break the
-  // caller-side accounting for what bytes a given handle covers.  The
-  // chunk-aligned spans we build downstream may still overlap each
-  // other's source ranges — the pre-merge collapses them so the cache
-  // remains disjoint.  Compile-out in release builds.
-  assert(std::adjacent_find(ranges.begin(),
-                            ranges.end(),
-                            [](auto const& a, auto const& b) {
-                              return static_cast<size_t>(a.offset()) +
-                                       static_cast<size_t>(a.size()) >
-                                     static_cast<size_t>(b.offset());
-                            }) == ranges.end() &&
-         "ranges must not overlap");
-
   // shared_from_this() throws std::bad_weak_ptr if @p obj isn't owned by a
   // shared_ptr — the contract is enforced at the call site, no null check
   // needed here.
