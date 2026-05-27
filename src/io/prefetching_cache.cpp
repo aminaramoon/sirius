@@ -332,10 +332,10 @@ std::span<const std::byte> pinned_view::operator[](size_t i) const noexcept
   for (auto const& e : _entries) {
     auto const n = e->chunks.size();
     if (i < n) {
-      auto phys_size   = static_cast<size_t>(e->physical_range.size());
+      auto range_size  = static_cast<size_t>(e->range.size());
       auto chunk_bytes = e->chunk_bytes;
       auto chunk_start = i * chunk_bytes;
-      auto chunk_sz    = std::min(chunk_bytes, phys_size - chunk_start);
+      auto chunk_sz    = std::min(chunk_bytes, range_size - chunk_start);
       return {e->chunks[i], chunk_sz};
     }
     i -= n;
@@ -343,21 +343,12 @@ std::span<const std::byte> pinned_view::operator[](size_t i) const noexcept
   return {};
 }
 
-cudf::io::text::byte_range_info pinned_view::logical_range() const noexcept
+cudf::io::text::byte_range_info pinned_view::range() const noexcept
 {
   if (_entries.empty()) return {0, 0};
-  auto first_off = static_cast<size_t>(_entries.front()->logical_range.offset());
-  auto last_end  = static_cast<size_t>(_entries.back()->logical_range.offset()) +
-                  static_cast<size_t>(_entries.back()->logical_range.size());
-  return {static_cast<int64_t>(first_off), static_cast<int64_t>(last_end - first_off)};
-}
-
-cudf::io::text::byte_range_info pinned_view::physical_range() const noexcept
-{
-  if (_entries.empty()) return {0, 0};
-  auto first_off = static_cast<size_t>(_entries.front()->physical_range.offset());
-  auto last_end  = static_cast<size_t>(_entries.back()->physical_range.offset()) +
-                  static_cast<size_t>(_entries.back()->physical_range.size());
+  auto first_off = static_cast<size_t>(_entries.front()->range.offset());
+  auto last_end  = static_cast<size_t>(_entries.back()->range.offset()) +
+                  static_cast<size_t>(_entries.back()->range.size());
   return {static_cast<int64_t>(first_off), static_cast<int64_t>(last_end - first_off)};
 }
 
@@ -365,7 +356,7 @@ size_t pinned_view::size() const noexcept
 {
   size_t total = 0;
   for (auto const& e : _entries)
-    total += static_cast<size_t>(e->logical_range.size());
+    total += static_cast<size_t>(e->range.size());
   return total;
 }
 
@@ -381,25 +372,23 @@ void slice_one_entry(cache_entry const& e,
                      size_t take,
                      std::vector<cudf::io::datasource::non_owning_buffer>& result)
 {
-  // Physical range starts at a potentially earlier (aligned) offset.
-  // The delta tells us where logical byte 0 sits inside the physical buffer.
-  auto phys_off    = static_cast<size_t>(e.physical_range.offset());
-  auto logical_off = static_cast<size_t>(e.logical_range.offset());
-  auto phys_size   = static_cast<size_t>(e.physical_range.size());
+  // @c cursor is a file-absolute byte position inside the entry's
+  // chunk-aligned range.  Subtracting the range start gives the offset
+  // into the entry's chunked buffer.
+  auto range_off  = static_cast<size_t>(e.range.offset());
+  auto range_size = static_cast<size_t>(e.range.size());
 
-  // Convert logical [cursor, cursor+take) to physical byte position
-  // within the chunked buffer.
-  size_t phys_start = (cursor - logical_off) + (logical_off - phys_off);
-  size_t remaining  = take;
+  size_t pos_in_range = cursor - range_off;
+  size_t remaining    = take;
 
-  // Walk the chunks that span [phys_start, phys_start + take).
+  // Walk the chunks that span [pos_in_range, pos_in_range + take).
   auto const chunk_bytes = e.chunk_bytes;
-  size_t chunk_idx       = phys_start / chunk_bytes;
-  size_t off_in_chunk    = phys_start % chunk_bytes;
+  size_t chunk_idx       = pos_in_range / chunk_bytes;
+  size_t off_in_chunk    = pos_in_range % chunk_bytes;
 
   while (remaining > 0 && chunk_idx < e.chunks.size()) {
     auto chunk_avail =
-      std::min(chunk_bytes - off_in_chunk, phys_size - chunk_idx * chunk_bytes - off_in_chunk);
+      std::min(chunk_bytes - off_in_chunk, range_size - chunk_idx * chunk_bytes - off_in_chunk);
     auto n  = std::min(remaining, chunk_avail);
     auto* p = reinterpret_cast<uint8_t const*>(e.chunks[chunk_idx]) + off_in_chunk;
 
@@ -438,39 +427,24 @@ std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t o
   size_t cursor    = offset;
   size_t remaining = size;
 
-  for (size_t i = 0; i < _entries.size(); ++i) {
+  for (auto const& e : _entries) {
     if (remaining == 0) break;
-    auto const& e   = _entries[i];
-    auto e_log_off  = static_cast<size_t>(e->logical_range.offset());
-    auto e_log_end  = e_log_off + static_cast<size_t>(e->logical_range.size());
-    auto e_phys_end = static_cast<size_t>(e->physical_range.offset()) +
-                      static_cast<size_t>(e->physical_range.size());
+    auto e_off = static_cast<size_t>(e->range.offset());
+    auto e_end = e_off + static_cast<size_t>(e->range.size());
 
-    // Skip entries whose logical bytes lie entirely before the cursor.
-    // The cursor may already be past `e_log_end` when the previous
-    // iteration extended through its physical tail (see boundary
-    // selection below).
-    if (cursor >= e_log_end) continue;
+    // Skip entries that lie entirely before the cursor.
+    if (cursor >= e_end) continue;
 
     // The cache's hit path guarantees contiguous coverage, so the
     // first entry whose tail extends past `cursor` must also start at
     // or before `cursor`.  An assert (release-elided) flags any
     // breakage of that invariant before we read out-of-range bytes.
-    assert(e_log_off <= cursor && "pinned_view::slice: gap in covering entries");
+    assert(e_off <= cursor && "pinned_view::slice: gap in covering entries");
 
-    // For non-terminal entries, extend the slice up to this entry's
-    // PHYSICAL end (page-aligned) rather than its logical end.  Adjacent
-    // prefetched ranges with `logical_end_left == logical_off_right`
-    // overlap physically (left.physical_end >= right.physical_off), so
-    // the bytes [logical_end_left, physical_end_left) live in BOTH
-    // entries' chunks.  Reading them from the left entry hands the
-    // downstream consumer a page-aligned cut instead of an unaligned
-    // sub-page head on the right entry's first chunk.  The terminal
-    // entry still uses its logical end so we never overshoot the
-    // requested range.
-    size_t const boundary = (i + 1 < _entries.size()) ? e_phys_end : e_log_end;
-
-    size_t take = std::min(remaining, boundary - cursor);
+    // Entries are chunk-aligned and disjoint, so transitioning at the
+    // current entry's end naturally lands at the next entry's start
+    // (no overlap, no gap, no small unaligned head).
+    size_t take = std::min(remaining, e_end - cursor);
     slice_one_entry(*e, cursor, take, result);
     cursor += take;
     remaining -= take;
@@ -747,7 +721,7 @@ std::vector<std::shared_ptr<cache_entry>> prefetching_cache::find_entries(
   // candidate is pos-1 (the last entry whose offset <= requested offset).
   auto pos =
     std::upper_bound(entries.begin(), entries.end(), offset, [](size_t off, auto const& e) {
-      return off < static_cast<size_t>(e->logical_range.offset());
+      return off < static_cast<size_t>(e->range.offset());
     });
 
   // No entry starts at or before our offset — nothing covers us.
@@ -772,8 +746,8 @@ std::vector<std::shared_ptr<cache_entry>> prefetching_cache::find_entries(
                     size);
       return {};
     }
-    auto e_start = static_cast<size_t>((*pos)->logical_range.offset());
-    auto e_end   = e_start + static_cast<size_t>((*pos)->logical_range.size());
+    auto e_start = static_cast<size_t>((*pos)->range.offset());
+    auto e_end   = e_start + static_cast<size_t>((*pos)->range.size());
 
     if (e_start > cursor) {
       // Gap: previous entry ended before the next entry starts, and the
@@ -800,6 +774,13 @@ std::vector<std::shared_ptr<cache_entry>> prefetching_cache::find_entries(
       // because upper_bound guarantees e_start <= cursor on the first
       // iteration and the loop sets cursor = previous e_end before
       // advancing pos.
+      spdlog::debug(
+        "prefetching_cache: skipping entry with end <= cursor (shouldn't happen) read_off={} "
+        "read_size={} entry_start={} entry_end={}",
+        offset,
+        size,
+        e_start,
+        e_end);
       _miss_range.fetch_add(1, std::memory_order_relaxed);
       return {};
     }
@@ -879,21 +860,39 @@ prefetching_handle prefetching_cache::insert(
   auto ex_it  = file.entries.begin();
   auto ex_end = file.entries.end();
 
+  // Each input range is rounded out to chunk-aligned boundaries
+  // (align_down on start, align_up on end, clamped to file_size).
+  // Step 33 will replace the per-input single-entry mapping below with
+  // a multi-entry gap-filling pass that resolves overlap against
+  // existing entries; for now we keep the offset-equality coalesce and
+  // accept that two input ranges whose tails fall in the same chunk
+  // can produce overlapping chunk-aligned entries.
+  auto const chunk_bytes = _pool->chunk_bytes();
+  auto align_down        = [chunk_bytes](size_t v) { return v - (v % chunk_bytes); };
+  auto align_up          = [chunk_bytes](size_t v) {
+    return (v + chunk_bytes - 1) / chunk_bytes * chunk_bytes;
+  };
+
   for (auto const& logical : ranges) {
-    auto off = logical.offset();
-    while (ex_it != ex_end && (*ex_it)->logical_range.offset() < off) {
+    auto const log_off = static_cast<size_t>(logical.offset());
+    auto const log_end = log_off + static_cast<size_t>(logical.size());
+    auto const a_start = align_down(log_off);
+    auto const a_end   = std::min(align_up(log_end), file_size);
+    cudf::io::text::byte_range_info aligned{static_cast<int64_t>(a_start),
+                                            static_cast<int64_t>(a_end - a_start)};
+
+    while (ex_it != ex_end && static_cast<size_t>((*ex_it)->range.offset()) < a_start) {
       merged.push_back(std::move(*ex_it));
       ++ex_it;
     }
-    if (ex_it != ex_end && (*ex_it)->logical_range.offset() == off) {
+    if (ex_it != ex_end && static_cast<size_t>((*ex_it)->range.offset()) == a_start) {
       // Coalesce: reuse the existing entry.  Per-entry demand counters
       // are gone (we now count demand per-file via request_state).
       new_entries.push_back(*ex_it);
       merged.push_back(std::move(*ex_it));
       ++ex_it;
     } else {
-      auto physical = _io_ctx->compute_physical_range(logical, file_size);
-      auto e        = std::make_shared<cache_entry>(logical, physical, _pool->chunk_bytes());
+      auto e = std::make_shared<cache_entry>(aligned, chunk_bytes);
       new_entries.push_back(e);
       merged.push_back(std::move(e));
     }
@@ -978,6 +977,14 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
         // Some entry isn't ready — multi-entry hit fails, report miss.
         // miss_range is the closest classifier (request straddles
         // ranges and one of them is in a non-cached state).
+        spdlog::debug(
+          "prefetching_cache: miss_range (multi-entry coverage with non-cached entry) read_off={} "
+          "read_size={} entry_off={} entry_size={} entry_state={}",
+          offset,
+          size,
+          static_cast<size_t>(e->range.offset()),
+          static_cast<size_t>(e->range.size()),
+          static_cast<int>(st));
         _miss_range.fetch_add(1, std::memory_order_relaxed);
         return {};
       }
@@ -991,6 +998,13 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
     // ctor already released anything it acquired.  Report as
     // miss_range — a multi-entry view doesn't retry the way the
     // single-entry path does (no clean way to resume across N CASes).
+    spdlog::debug(
+      "prefetching_cache: miss_range (multi-entry coverage with concurrent eviction) read_off={} "
+      "read_size={} view_range_offset={} view_range_size={}",
+      offset,
+      size,
+      static_cast<size_t>(view.range().offset()),
+      static_cast<size_t>(view.range().size()));
     _miss_range.fetch_add(1, std::memory_order_relaxed);
     return {};
   }
@@ -1031,8 +1045,8 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
           "entry_size={}",
           offset,
           size,
-          static_cast<size_t>(entry->logical_range.offset()),
-          static_cast<size_t>(entry->logical_range.size()));
+          static_cast<size_t>(entry->range.offset()),
+          static_cast<size_t>(entry->range.size()));
         return {};
       }
       // Try to flip allocated → loading so we own the entry for device IO.
@@ -1067,8 +1081,8 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
         "prefetching_cache: miss_state_evicting off={} size={} entry_off={} entry_size={}",
         offset,
         size,
-        static_cast<size_t>(entry->logical_range.offset()),
-        static_cast<size_t>(entry->logical_range.size()));
+        static_cast<size_t>(entry->range.offset()),
+        static_cast<size_t>(entry->range.size()));
     } else if (entry->ever_allocated.load(std::memory_order_acquire)) {
       // Was allocated.  Was it ever loaded successfully (ever_cached)?
       //   yes → entry was cached then evicted (true eviction churn).
@@ -1080,8 +1094,8 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
           "entry_size={}",
           offset,
           size,
-          static_cast<size_t>(entry->logical_range.offset()),
-          static_cast<size_t>(entry->logical_range.size()));
+          static_cast<size_t>(entry->range.offset()),
+          static_cast<size_t>(entry->range.size()));
       } else {
         _miss_state_empty_load_failed.fetch_add(1, std::memory_order_relaxed);
         spdlog::debug(
@@ -1089,8 +1103,8 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
           "entry_size={}",
           offset,
           size,
-          static_cast<size_t>(entry->logical_range.offset()),
-          static_cast<size_t>(entry->logical_range.size()));
+          static_cast<size_t>(entry->range.offset()),
+          static_cast<size_t>(entry->range.size()));
       }
     } else {
       _miss_state_empty_never_allocated.fetch_add(1, std::memory_order_relaxed);
@@ -1099,8 +1113,8 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
         "entry_size={}",
         offset,
         size,
-        static_cast<size_t>(entry->logical_range.offset()),
-        static_cast<size_t>(entry->logical_range.size()));
+        static_cast<size_t>(entry->range.offset()),
+        static_cast<size_t>(entry->range.size()));
     }
     return {};
   }
@@ -1390,8 +1404,8 @@ void prefetching_cache::allocator_loop(std::stop_token stop)
       auto const& e = item.entries[i];
       auto st       = e->state.get_state();
       if (st != entry_state::empty) continue;
-      auto phys_size      = static_cast<size_t>(e->physical_range.size());
-      auto n              = (phys_size + chunk_bytes - 1) / chunk_bytes;
+      auto range_size     = static_cast<size_t>(e->range.size());
+      auto n              = (range_size + chunk_bytes - 1) / chunk_bytes;
       per_entry_chunks[i] = n;
       upper_bound_chunks += n;
     }
@@ -1622,12 +1636,12 @@ void prefetching_cache::io_dispatch_loop(std::stop_token stop)
       std::vector<cudf::host_span<std::byte>> sb_dsts;
       for (size_t i = sb_start; i < sb_end; ++i) {
         auto const& e          = batch[i];
-        auto phys_off          = static_cast<size_t>(e->physical_range.offset());
-        auto phys_size         = static_cast<size_t>(e->physical_range.size());
+        auto range_off         = static_cast<size_t>(e->range.offset());
+        auto range_size        = static_cast<size_t>(e->range.size());
         auto const chunk_bytes = e->chunk_bytes;
         for (size_t c = 0; c < e->chunks.size(); ++c) {
-          auto off = phys_off + c * chunk_bytes;
-          auto sz  = std::min(chunk_bytes, phys_size - c * chunk_bytes);
+          auto off = range_off + c * chunk_bytes;
+          auto sz  = std::min(chunk_bytes, range_size - c * chunk_bytes);
           sb_ranges.emplace_back(static_cast<int64_t>(off), static_cast<int64_t>(sz));
           sb_dsts.emplace_back(e->chunks[c], sz);
         }
