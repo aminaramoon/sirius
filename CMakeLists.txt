@@ -350,8 +350,7 @@ target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static / telemetry_bridge)
 install(
-  TARGETS sirius_extension cucascade_static
-          telemetry_bridge
+  TARGETS sirius_extension cucascade_static telemetry_bridge
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
