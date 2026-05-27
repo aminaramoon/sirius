@@ -27,7 +27,6 @@
 #include <cmath>
 #include <memory>
 #include <stdexcept>
-#include <unordered_set>
 
 namespace sirius::io {
 
@@ -896,7 +895,11 @@ prefetching_handle prefetching_cache::insert(
   // an aligned span end — all chunk-aligned), so the disjoint +
   // chunk-aligned invariants on @c file.entries are preserved.
   std::vector<std::shared_ptr<cache_entry>> new_created;
-  std::unordered_set<cache_entry*> reused_seen;
+  // Sorted vector of reused cache_entry* — small N (one entry per
+  // distinct existing range touched by this insert), and we only need
+  // membership tests + ordered insert.  lower_bound is O(log n) and
+  // the linear cost of insert is negligible at this scale.
+  std::vector<cache_entry*> reused_seen;
   new_created.reserve(aligned.size());
 
   for (auto const& span : aligned) {
@@ -943,7 +946,12 @@ prefetching_handle prefetching_cache::insert(
         // e_off <= cursor < e_end — existing entry covers cursor.  Reuse
         // it (deduped across aligned spans within this insert) and
         // advance past it.
-        if (reused_seen.insert(it->get()).second) { new_entries.push_back(*it); }
+        auto* raw = it->get();
+        auto pos  = std::lower_bound(reused_seen.begin(), reused_seen.end(), raw);
+        if (pos == reused_seen.end() || *pos != raw) {
+          reused_seen.insert(pos, raw);
+          new_entries.push_back(*it);
+        }
         cursor = e_end;
         ++it;
       }
