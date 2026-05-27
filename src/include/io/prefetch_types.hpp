@@ -464,8 +464,14 @@ class entry_state {
 // See entry_state's state machine diagram for the full picture.
 
 struct alignas(64) cache_entry {
-  cudf::io::text::byte_range_info logical_range;
-  cudf::io::text::byte_range_info physical_range;
+  /// File-absolute byte range this entry covers.  Chunk-aligned: both
+  /// the start and the end are multiples of @c chunk_bytes (with the
+  /// terminal entry's end optionally clamped to file size, so the last
+  /// chunk may be partial).  The cache builds reads from any byte
+  /// position within this range — `range.offset() <= read_off` and
+  /// `read_off + read_size <= range.end()` is the per-entry coverage
+  /// invariant.
+  cudf::io::text::byte_range_info range;
 
   /// Size of each chunk in @c chunks (== buffer_pool::chunk_bytes() at the
   /// time of entry creation).  Stored on the entry so pinned_view doesn't
@@ -493,10 +499,8 @@ struct alignas(64) cache_entry {
   /// load-failed" (ever_cached=false).  Never cleared after set.
   std::atomic<bool> ever_cached{false};
 
-  cache_entry(cudf::io::text::byte_range_info logical,
-              cudf::io::text::byte_range_info physical,
-              size_t chunk_bytes)
-    : logical_range(logical), physical_range(physical), chunk_bytes(chunk_bytes)
+  cache_entry(cudf::io::text::byte_range_info range, size_t chunk_bytes)
+    : range(range), chunk_bytes(chunk_bytes)
   {
   }
 
@@ -551,8 +555,8 @@ class pinned_view {
   /// Multi-entry overload.  Tries to acquire a read pin on every entry;
   /// on partial failure (any @c try_acquire_read returns false), the
   /// pins already acquired are released and the view becomes empty.
-  /// Entries must be contiguous in logical-offset order — the multi-
-  /// entry hit path in @c prefetching_cache::read() guarantees this.
+  /// Entries must be contiguous in offset order — the multi-entry
+  /// hit path in @c prefetching_cache::read() guarantees this.
   pinned_view(std::vector<std::shared_ptr<cache_entry>> entries, cudaStream_t stream);
 
   ~pinned_view();
@@ -571,34 +575,22 @@ class pinned_view {
   /// Indexing walks entries in order: chunks of entry 0, then entry 1, …
   [[nodiscard]] std::span<const std::byte> operator[](size_t i) const noexcept;
 
-  /// Logical range this view covers — the union extent of the
-  /// underlying entries.  For multi-entry views this assumes no gaps
-  /// between adjacent entries (enforced by the cache's hit path).
-  [[nodiscard]] cudf::io::text::byte_range_info logical_range() const noexcept;
+  /// Byte range this view covers — the union extent of the underlying
+  /// entries' (chunk-aligned) ranges.  For multi-entry views this
+  /// assumes no gaps between adjacent entries (enforced by the cache's
+  /// hit path).
+  [[nodiscard]] cudf::io::text::byte_range_info range() const noexcept;
 
-  /// Physical (O_DIRECT aligned) range.  Union extent of the
-  /// underlying entries' physical ranges.  Only fully meaningful for
-  /// single-entry views; for multi-entry views the per-entry physical
-  /// ranges may overlap because each entry was independently aligned.
-  [[nodiscard]] cudf::io::text::byte_range_info physical_range() const noexcept;
-
-  /// Logical size (sum of constituent entries' logical sizes).
+  /// Size of the view (sum of constituent entries' ranges).
   [[nodiscard]] size_t size() const noexcept;
 
-  /// Slice the cached data at logical [offset, offset+size) into a vector of
+  /// Slice the cached data at [offset, offset+size) into a vector of
   /// non_owning_buffers, one per chunk boundary crossed.  Adjacent buffers
   /// that turn out to be virtually contiguous (same slab) are coalesced.
   /// The caller must ensure [offset, offset+size) lies within
-  /// @c logical_range().
-  ///
-  /// Multi-entry boundary: for non-terminal entries the cut between
-  /// adjacent entries falls at the LEFT entry's @c physical_range.end
-  /// (page-aligned) rather than its logical end.  The two adjacent
-  /// entries' physical ranges overlap on [logical_end_left,
-  /// physical_end_left), so those bytes are served from the left
-  /// entry's chunks; the right entry contributes [physical_end_left,
-  /// ...).  This gives the downstream consumer a page-aligned cut and
-  /// avoids a small unaligned head on the right entry's first chunk.
+  /// @c range().  For multi-entry views the cut between adjacent
+  /// entries falls at their shared chunk-aligned boundary (entries are
+  /// disjoint by construction).
   [[nodiscard]] std::vector<cudf::io::datasource::non_owning_buffer> slice(size_t offset,
                                                                            size_t size) const;
 
@@ -674,13 +666,12 @@ class cached_host_buffer {
   explicit operator bool() const noexcept { return _entry != nullptr; }
 
   /// Build one @c device_read_req per chunk in the entry, covering the full
-  /// physical range.  Chunks overlapping [offset, offset+size) are configured
-  /// to H2D-copy into @p dst; alignment-padding chunks carry
+  /// (chunk-aligned) range.  Chunks overlapping [offset, offset+size) are
+  /// configured to H2D-copy into @p dst; alignment-padding chunks carry
   /// @c data_size == 0 (IO-only, no copy).
   ///
   /// @p offset and @p size are **file-absolute** byte positions (same coordinate
-  /// space as @c physical_range.offset()).  The caller is responsible for
-  /// translating any logical offset before calling.
+  /// space as @c cache_entry::range.offset()).
   ///
   /// The returned requests have a null @c ctx field.  The caller must create
   /// a @c request_context with @c pending == reqs.size() and patch it onto
@@ -695,8 +686,8 @@ class cached_host_buffer {
                                                                              int device_id) const
   {
     assert(_entry != nullptr);
-    auto const phys_off    = static_cast<size_t>(_entry->physical_range.offset());
-    auto const phys_size   = static_cast<size_t>(_entry->physical_range.size());
+    auto const range_off   = static_cast<size_t>(_entry->range.offset());
+    auto const range_size  = static_cast<size_t>(_entry->range.size());
     auto const chunk_bytes = _entry->chunk_bytes;
     auto const n_chunks    = _entry->chunks.size();
 
@@ -705,8 +696,8 @@ class cached_host_buffer {
 
     size_t produced = 0;
     for (size_t i = 0; i < n_chunks; ++i) {
-      auto const chunk_file_off = phys_off + i * chunk_bytes;
-      auto const chunk_io_size  = std::min(chunk_bytes, phys_size - i * chunk_bytes);
+      auto const chunk_file_off = range_off + i * chunk_bytes;
+      auto const chunk_io_size  = std::min(chunk_bytes, range_size - i * chunk_bytes);
       auto const chunk_file_end = chunk_file_off + chunk_io_size;
 
       device_read_req<Handle> req;
