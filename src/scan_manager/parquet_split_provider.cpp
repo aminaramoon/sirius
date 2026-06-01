@@ -81,7 +81,7 @@ parquet_split_provider::parquet_split_provider(
     // Default to a kvikio_context when no ioctx is supplied — keeps test
     // sites that construct the provider directly working without forcing
     // each one to plumb an explicit ioctx.
-    _io_ctx(io_ctx ? std::move(io_ctx) : std::make_shared<sirius::io::kvikio_context>()),
+    _io_ctx(std::move(io_ctx)),
     _op_name(std::move(op_name)),
     _op_id(op_id),
     _pipeline_id(pipeline_id),
@@ -257,7 +257,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     std::size_t footer_byte_len = 0;
     std::unique_ptr<op::scan::hybrid_scan_reader> reader_ptr;
 
-    if (auto cached = _io_ctx->metadata().get_metadata(*file_io_object)) {
+    if (auto cached = _io_ctx->metadata_store().get_metadata(*file_io_object)) {
       cached_parquet_metadata = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached));
     }
 
@@ -385,7 +385,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     // skip the footer fetch.  Lives on the ioctx, independent of any
     // prefetch work that fadvise schedules below.
     if (!cached_parquet_metadata) {
-      _io_ctx->metadata().register_metadata(
+      _io_ctx->metadata_store().register_metadata(
         *file_io_object,
         std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
           std::make_shared<parquet_metadata>(file_metadata, footer_byte_len)));

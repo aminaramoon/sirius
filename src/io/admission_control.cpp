@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "io/admission_control.hpp"
+#include "io/details/admission_control.hpp"
 
 namespace sirius::io {
 

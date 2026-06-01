@@ -23,7 +23,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace sirius::io {
+namespace sirius::io::cache {
 
 /**
  * @brief Thread-safe per-file metadata cache, keyed by an io_object's
@@ -63,4 +63,4 @@ class metadata_store {
   std::unordered_map<std::string, std::shared_ptr<sirius_io_object_metadata>> _by_key;
 };
 
-}  // namespace sirius::io
+}  // namespace sirius::io::cache

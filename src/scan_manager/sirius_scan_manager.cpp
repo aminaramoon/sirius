@@ -17,8 +17,8 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include "exec/thread_pool.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "io/kvikio/kvikio_context.hpp"
-#include "io/prefetching_cache.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
@@ -83,12 +83,9 @@ sirius_scan_manager::sirius_scan_manager(
         "[sirius_scan_manager] use_sirius_datasource is true but the reservation "
         "manager has no HOST-tier fixed_size_host_memory_resource");
     }
-    _io_ctx = std::make_shared<sirius::io::uring_ioctx>(
-      _config.uring_n_reactors, _config.uring_ring_entries, *host_mr);
-    SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
-      _config.uring_n_reactors,
-      _config.uring_ring_entries);
+    _io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(_config.uring_n_reactors, *host_mr);
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
+                     _config.uring_n_reactors);
   } else {
     // kvikio's cudf datasource doesn't model per-device file handles, so
     // it only works correctly when there's a single active GPU.  Fail
@@ -111,12 +108,13 @@ sirius_scan_manager::sirius_scan_manager(
   // arms itself iff (pool != nullptr && io_ctx->supports_vector_host_read()
   // && budget > 0); otherwise it's a metadata-only store.
   if (host_mr != nullptr) {
-    auto const slab_bytes = host_mr->get_block_size() *
-                            static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
+    auto const slab_bytes =
+      host_mr->get_block_size() *
+      static_cast<std::size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB);
     auto const max_slabs =
       static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-    _buffer_pool =
-      std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs, /*initial_slabs=*/max_slabs);
+    _buffer_pool = std::make_unique<sirius::io::cache::buffer_pool>(
+      *host_mr, max_slabs, /*initial_slabs=*/max_slabs);
   }
 
   // Build the prefetching cache on the ioctx.  Budget=0 keeps the

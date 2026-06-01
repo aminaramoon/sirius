@@ -116,7 +116,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_i
                     scan_data->rg_slices.size());
     for (auto& slice : scan_data->rg_slices) {
       if (slice.datasource) {
-        slice.datasource->fadvise(sirius::io::prefetching_mode::immediate, slice.ranges);
+        slice.datasource->fadvise(sirius::io::cache::prefetching_mode::immediate, slice.ranges);
       }
     }
   }

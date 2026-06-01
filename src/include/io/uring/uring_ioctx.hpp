@@ -19,7 +19,7 @@
 #include "io/templated_ioctx.hpp"
 #include "io/uring/uring_reactor.hpp"
 
-namespace sirius::io {
+namespace sirius::io::uring {
 
 // ---------------------------------------------------------------------------
 // uring_ioctx
@@ -34,9 +34,7 @@ class uring_ioctx : public templated_ioctx<uring_reactor> {
   /// Each @c uring_reactor in the pool allocates its bounce slots from
   /// @p mr; @p mr must outlive this ioctx.  The bounce-slot size is taken
   /// from @c mr.get_block_size().
-  uring_ioctx(size_t n_reactors,
-              unsigned ring_entries,
-              cucascade::memory::fixed_size_host_memory_resource& mr);
+  uring_ioctx(size_t n_reactors, cucascade::memory::fixed_size_host_memory_resource& mr);
 };
 
-}  // namespace sirius::io
+}  // namespace sirius::io::uring

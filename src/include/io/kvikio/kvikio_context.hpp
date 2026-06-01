@@ -25,7 +25,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace sirius::io {
 
@@ -95,20 +94,20 @@ class kvikio_context final : public sirius_ioctx {
     this->pre_destroy();
   }
 
-  void shutdown() override {}
+  void shutdown() noexcept override {}
 
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
 
   std::unique_ptr<cudf::io::datasource> make_datasource(
     std::shared_ptr<sirius_io_object> io_object) override;
 
-  [[nodiscard]] bool supports(std::string_view path) const override;
-
-  [[nodiscard]] bool supports_device_read() const override { return true; }
-  [[nodiscard]] bool supports_vector_host_read() const override { return false; }
-  [[nodiscard]] prefetching_mode preferred_prefetching_mode() const override
+  [[nodiscard]] bool supports(std::string_view path) const noexcept override;
+  [[nodiscard]] bool supports_device_read() const noexcept override { return true; }
+  [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
+  [[nodiscard]] cache::prefetching_mode preferred_prefetching_mode() const noexcept override
   {
-    return prefetching_mode::none;
+    return cache::prefetching_mode::none;
   }
 
   // -- Public read API (override the base virtuals directly) ----------------
@@ -119,29 +118,26 @@ class kvikio_context final : public sirius_ioctx {
   // @c supports_vector_host_read == false, so @c uses_prefetching_cache()
   // is also false on the base class read path.
 
-  size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
+  size_t host_read_sync(const sirius_io_object& obj,
+                        size_t offset,
+                        size_t size,
+                        uint8_t* dst) final;
 
-  std::future<size_t> host_read_async(sirius_io_object& obj,
-                                      size_t offset,
-                                      size_t size,
-                                      uint8_t* dst) final;
+  exec::semi_future<size_t> host_read_async(const sirius_io_object& obj,
+                                            size_t offset,
+                                            size_t size,
+                                            uint8_t* dst) noexcept final;
 
-  size_t device_read(sirius_io_object& obj,
-                     size_t offset,
-                     size_t size,
-                     uint8_t* dst,
-                     rmm::cuda_stream_view stream) final;
-
-  std::future<size_t> device_read_async(sirius_io_object& obj,
-                                        size_t offset,
-                                        size_t size,
-                                        uint8_t* dst,
-                                        rmm::cuda_stream_view stream) final;
+  exec::semi_future<size_t> device_read_async(const sirius_io_object& obj,
+                                              size_t offset,
+                                              size_t size,
+                                              uint8_t* dst,
+                                              rmm::cuda_stream_view stream) noexcept final;
 
   /// kvikio handles its own alignment internally; pass the logical range
   /// through unchanged.
   cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
-                                                         size_t file_size) const final;
+                                                         size_t file_size) const noexcept final;
 
  protected:
   // -- Protected _io primitives -------------------------------------------
@@ -154,30 +150,29 @@ class kvikio_context final : public sirius_ioctx {
   // instantiable; any future caller that bypasses the public API will see
   // a clear failure rather than silent misbehaviour.
 
-  size_t host_read_io(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
+  size_t host_read_io(const sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
 
-  exec::semi_future<size_t> host_read_async_io(sirius_io_object& obj,
+  exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
                                                size_t offset,
                                                size_t size,
-                                               uint8_t* dst) final;
+                                               uint8_t* dst) noexcept final;
 
-  size_t device_read_io(sirius_io_object& obj,
-                        size_t offset,
-                        size_t size,
-                        uint8_t* dst,
-                        rmm::cuda_stream_view stream) final;
-
-  exec::semi_future<size_t> device_read_async_io(sirius_io_object& obj,
+  exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
                                                  size_t offset,
                                                  size_t size,
                                                  uint8_t* dst,
-                                                 rmm::cuda_stream_view stream,
-                                                 cached_host_buffer buffer = {}) final;
+                                                 rmm::cuda_stream_view stream) noexcept final;
+
+  exec::semi_future<size_t> host_to_device_read_async_io(
+    const sirius_io_object& obj,
+    std::span<io_object_segment> slices,
+    size_t offset,
+    size_t size,
+    uint8_t* device_dst,
+    rmm::cuda_stream_view stream) noexcept final;
 
   exec::semi_future<size_t> host_read_ranges_async_io(
-    sirius_io_object& obj,
-    std::vector<cudf::io::text::byte_range_info> const& ranges,
-    std::span<cudf::host_span<std::byte>> dst) final;
+    const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept final;
 };
 
 }  // namespace sirius::io

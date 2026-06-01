@@ -67,6 +67,61 @@ class slot_pool {
   static constexpr std::size_t capacity = N;
   static constexpr int no_slot          = -1;
 
+  // RAII handle for an acquired slot.  Move-only; releases the slot back to
+  // its owning pool on destruction (or on move-assignment over a valid token).
+  // A default-constructed or moved-from token is invalid and releases nothing.
+  class token {
+   public:
+    token() noexcept = default;
+
+    token(const token&)            = delete;
+    token& operator=(const token&) = delete;
+
+    token(token&& other) noexcept : _pool(other._pool), _slot(other._slot)
+    {
+      other._pool = nullptr;
+      other._slot = no_slot;
+    }
+
+    token& operator=(token&& other) noexcept
+    {
+      if (this != &other) {
+        reset();
+        _pool       = other._pool;
+        _slot       = other._slot;
+        other._pool = nullptr;
+        other._slot = no_slot;
+      }
+      return *this;
+    }
+
+    ~token() { reset(); }
+
+    [[nodiscard]] bool valid() const noexcept { return _pool != nullptr && _slot != no_slot; }
+
+    explicit operator bool() const noexcept { return valid(); }
+
+    [[nodiscard]] int slot_index() const noexcept { return _slot; }
+
+    // Releases the held slot early (if any) and makes the token invalid.
+    void reset() noexcept
+    {
+      if (_pool != nullptr && _slot != no_slot) {
+        _pool->release(_slot);
+        _pool = nullptr;
+        _slot = no_slot;
+      }
+    }
+
+   private:
+    friend class slot_pool;
+
+    token(slot_pool* pool, int slot) noexcept : _pool(pool), _slot(slot) {}
+
+    slot_pool* _pool = nullptr;
+    int _slot        = no_slot;
+  };
+
   slot_pool() noexcept
   {
     for (std::size_t w = 0; w < num_words; ++w) {
@@ -106,6 +161,19 @@ class slot_pool {
       if (int idx = try_acquire(hint); idx != no_slot) return idx;
       _release_seq.wait(seq, std::memory_order_relaxed);
     }
+  }
+
+  // RAII variants: hand back a token that releases itself on destruction.
+  // try_acquire_token() returns an invalid token when the pool is exhausted;
+  // acquire_token() blocks and always returns a valid token.
+  [[nodiscard]] token try_acquire_token(unsigned hint = 0) noexcept
+  {
+    return token{this, try_acquire(hint)};
+  }
+
+  [[nodiscard]] token acquire_token(unsigned hint = 0) noexcept
+  {
+    return token{this, acquire(hint)};
   }
 
   // Returns the slot to the pool.  The caller must have previously acquired

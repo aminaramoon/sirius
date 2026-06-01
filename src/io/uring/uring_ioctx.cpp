@@ -16,16 +16,20 @@
 
 #include "io/uring/uring_ioctx.hpp"
 
+#include "io/uring/uring_reactor.hpp"
+
 #include <memory>
 
-namespace sirius::io {
+namespace sirius::io::uring {
 
-uring_ioctx::uring_ioctx(size_t n_reactors,
-                         unsigned ring_entries,
-                         cucascade::memory::fixed_size_host_memory_resource& mr)
+uring_ioctx::uring_ioctx(size_t n_reactors, cucascade::memory::fixed_size_host_memory_resource& mr)
   : templated_ioctx<uring_reactor>(
-      n_reactors, [&mr, ring_entries] { return std::make_unique<uring_reactor>(mr, ring_entries); })
+      n_reactors,
+      uring_reactor::reactor_config_type{.bounce_size = mr.get_block_size()},
+      [&mr, i = 0](const uring_reactor::reactor_config_type&) mutable {
+        return std::make_unique<uring_reactor>(mr, fmt::format("reactor-{}", i++));
+      })
 {
 }
 
-}  // namespace sirius::io
+}  // namespace sirius::io::uring

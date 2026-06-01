@@ -16,30 +16,47 @@
 
 #pragma once
 
-#include "exec/semi_future.hpp"
-
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 
 #include <cuda_runtime.h>
 
-#include <atomic>
 #include <cstddef>
-#include <exception>
 #include <memory>
-#include <stdexcept>
 #include <string>
-#include <utility>
 
 namespace sirius::io {
 
-// ---------------------------------------------------------------------------
-// IO constants
-// ---------------------------------------------------------------------------
+static constexpr size_t IO_BLOCK_SIZE = 4096;  // O_DIRECT page size
 
-static constexpr size_t CHUNK_SIZE    = 1UL << 20;  ///< Bounce-buffer chunk size (1 MiB).
-static constexpr size_t NUM_CHUNKS    = 128;        ///< Number of bounce slots per reactor.
-static constexpr size_t IO_BLOCK_SIZE = 4096;       ///< O_DIRECT alignment requirement (bytes).
+/**
+ * @brief RAII wrapper for a POSIX file descriptor.
+ *
+ * Non-copyable, movable. Closes the underlying fd on destruction.
+ */
+struct file_descriptor {
+  int fd{-1};
+  file_descriptor() = default;
+  explicit file_descriptor(int f) noexcept : fd(f) {}
+  ~file_descriptor() noexcept
+  {
+    if (fd >= 0) ::close(fd);
+  }
+  file_descriptor(file_descriptor const&)            = delete;
+  file_descriptor& operator=(file_descriptor const&) = delete;
+  file_descriptor(file_descriptor&& o) noexcept : fd(std::exchange(o.fd, -1)) {}
+  file_descriptor& operator=(file_descriptor&& o) noexcept
+  {
+    if (this != &o) {
+      if (fd >= 0) ::close(fd);
+      fd = std::exchange(o.fd, -1);
+    }
+    return *this;
+  }
+  [[nodiscard]] int get() const noexcept { return fd; }
+  [[nodiscard]] int native_handle() const noexcept { return fd; }
+  explicit operator bool() const noexcept { return fd >= 0; }
+};
 
 // ---------------------------------------------------------------------------
 // sirius_io_object
@@ -77,158 +94,48 @@ class sirius_io_object_metadata {
   virtual ~sirius_io_object_metadata() = default;
 };
 
-// ---------------------------------------------------------------------------
-// request_context
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Shared completion state for one logical read call (host or device).
- *
- * A single read may be split into multiple sub-requests. All sub-requests
- * decrement @c pending; the last one resolves the embedded
- * @c exec::promise<size_t>.  The caller obtains an @c exec::semi_future<size_t>
- * from @c create() and consumes (or chains) it.
- *
- * Construction is gated by @c create() so callers can't forget to set
- * @c pending (a missed setup would silently deadlock the caller).  The
- * destructor is a safety net: if the promise hasn't been satisfied by
- * the time the last @c shared_ptr drops (e.g., a sub-request was
- * silently dropped somewhere in the dispatch chain), it fires with an
- * explicit error so the caller sees a failure instead of hanging.
- */
-struct request_context {
- private:
-  // Private tag so only create() can construct.  Public ctor signature so
-  // std::make_shared still works (preserves the single-allocation control
-  // block + object layout).
-  struct create_passkey {};
-
+class io_object_segment {
  public:
-  explicit request_context(create_passkey) noexcept {}
+  io_object_segment() = default;
 
-  request_context(request_context const&)            = delete;
-  request_context& operator=(request_context const&) = delete;
+  io_object_segment(size_t offset, size_t size) : offset(offset), size(size) {}
 
-  /// Construct a request_context expecting @p n_chunks chunk_done /
-  /// chunk_failed calls, and return both the context and the
-  /// @c semi_future the caller awaits.
-  ///
-  /// - If @p n_chunks == 0: returns a null context and a ready
-  ///   @c semi_future holding 0.  Caller checks `if (!ctx) ...`.
-  /// - Otherwise: returns a fully-populated context plus its
-  ///   associated future.
-  [[nodiscard]] static std::pair<std::shared_ptr<request_context>, exec::semi_future<size_t>>
-  create(size_t n_chunks, size_t total_bytes)
+  io_object_segment(size_t offset, size_t size, void* data, bool is_device_accessible = false)
+    : offset(offset),
+      size(size),
+      _data(static_cast<uint8_t*>(data)),
+      _is_device_accessible(is_device_accessible)
+
   {
-    if (n_chunks == 0) { return {nullptr, exec::make_semi_future<size_t>(size_t{0})}; }
-    auto ctx         = std::make_shared<request_context>(create_passkey{});
-    ctx->total_bytes = total_bytes;
-    ctx->pending.store(n_chunks, std::memory_order_relaxed);
-    auto fut = ctx->promise.get_semi_future();
-    return {std::move(ctx), std::move(fut)};
   }
 
-  ~request_context() noexcept
+  void set_data(uint8_t* data, bool is_device_accessible = false)
   {
-    // Safety net: if the promise hasn't been satisfied by the normal
-    // path (e.g., a sub-request was silently dropped between enqueue
-    // and completion), set an explicit error so the caller doesn't
-    // hang forever waiting on a future that would otherwise reach
-    // broken_promise.
-    bool expected = false;
-    if (handler_fired.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-      try {
-        promise.set_exception(
-          std::make_exception_ptr(std::runtime_error("request_context destructed before all "
-                                                     "chunks completed — resolved by safety net")));
-      } catch (...) {
-        // promise may have already been satisfied via a racy path;
-        // swallow to keep the destructor noexcept.
-      }
-    }
+    _data                 = data;
+    _is_device_accessible = is_device_accessible;
   }
 
-  void chunk_done()
+  [[nodiscard]] uint8_t* data() const noexcept { return _data; }
+
+  [[nodiscard]] bool is_device_accessible() const noexcept { return _is_device_accessible; }
+
+  [[nodiscard]] bool is_buffer_allocated() const noexcept { return _data != nullptr; }
+
+  [[nodiscard]] bool is_odirect_compatible() const noexcept
   {
-    if (pending.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
-
-    // Last chunk — satisfy the promise exactly once.  The CAS guard
-    // makes this idempotent against the destructor safety net and
-    // against any future imbalance where chunk_done could be called
-    // extra times.
-    bool expected = false;
-    if (!handler_fired.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
-
-    if (failed.load(std::memory_order_relaxed)) {
-      promise.set_exception(exc);
-    } else {
-      promise.set_value(total_bytes);
-    }
+    return (offset % IO_BLOCK_SIZE == 0) && (size % IO_BLOCK_SIZE == 0) &&
+           (_data == nullptr || reinterpret_cast<uintptr_t>(_data) % IO_BLOCK_SIZE == 0);
   }
 
-  void chunk_failed(std::exception_ptr e)
-  {
-    bool expected = false;
-    if (failed.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
-      exc = std::move(e);
-    }
-    chunk_done();
-  }
-
-  exec::promise<size_t> promise;
-  std::atomic<size_t> pending{0};
-  size_t total_bytes{0};
-  std::atomic<bool> failed{false};
-  std::exception_ptr exc;
-  /// Set (via CAS) by whichever path resolves the promise — normal
-  /// completion in chunk_done() or the destructor safety net.
-  /// Guarantees the promise is satisfied at most once.
-  std::atomic<bool> handler_fired{false};
-};
-
-// ---------------------------------------------------------------------------
-// device_read_req / host_read_req
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Descriptor for one aligned 1 MiB I/O chunk pushed to a reactor for
- *        a device (GPU) read.  Templated on the backend's native handle type
- *        (e.g. @c int for a POSIX file descriptor).
- */
-template <typename Handle>
-struct device_read_req {
-  Handle handle{};
-  size_t file_off{0};
-  size_t io_size{0};
-  size_t data_off{0};
-  size_t data_size{0};
-  uint8_t* dst{nullptr};
-  cudaStream_t stream{nullptr};
-  /// CUDA device index that owns @c dst and @c stream.  The reactor thread
-  /// may be running with a different current device, so it must
-  /// cudaSetDevice(device_id) before issuing the H2D copy in multi-GPU
-  /// deployments.  -1 means "don't switch" (single-GPU fast path).
-  int device_id{-1};
-  std::shared_ptr<request_context> ctx;
-  /// Optional caller-supplied pinned bounce buffer.  When non-null the
-  /// reactor reads the file into this buffer instead of allocating one of
-  /// its own managed bounce slots.  The buffer must be at least @c io_size
-  /// bytes, page-aligned (for O_DIRECT), and remain valid until the
-  /// completion handler fires (i.e. until @c ctx->chunk_done() is called).
-  uint8_t* bounce{nullptr};
-};
-
-/**
- * @brief Descriptor for one buffered host read pushed to a reactor.
- *        Templated on the backend's native handle type.
- */
-template <typename Handle>
-struct host_read_req {
-  Handle handle{};
   size_t offset{0};
   size_t size{0};
-  uint8_t* dst{nullptr};
-  std::shared_ptr<request_context> ctx;
+
+ private:
+  uint8_t* _data{nullptr};  // null means the destination buffer is not yet allocated; non-null
+                            // means the caller has pre-allocated a buffer for this segment, doesn't
+                            // mean the buffer is populated with data yet
+  bool _is_device_accessible{
+    false};  // true if the caller intends to read directly into device memory
 };
 
 }  // namespace sirius::io

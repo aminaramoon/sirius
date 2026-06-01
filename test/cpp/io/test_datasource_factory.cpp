@@ -91,7 +91,7 @@ class mock_ioctx : public sirius_ioctx {
     throw std::logic_error("unused");
   }
 
-  void host_read_ranges_async_io(sirius_io_object&,
+  void host_read_ranges_async_io(const sirius_io_object&,
                                  std::vector<cudf::io::text::byte_range_info> const&,
                                  std::span<cudf::host_span<std::byte>>,
                                  io_completion_handler) override

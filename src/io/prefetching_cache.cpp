@@ -14,9 +14,15 @@
  * limitations under the License.
  */
 
-#include "io/prefetching_cache.hpp"
+#include "io/cache/prefetching_cache.hpp"
 
+#include "cucascade/cuda/event.hpp"
+#include "exec/semi_future.hpp"
+#include "exec/try.hpp"
 #include "io/io_context.hpp"
+#include "io/types.hpp"
+
+#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
 
@@ -26,9 +32,14 @@
 #include <cassert>
 #include <cmath>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <random>
+#include <shared_mutex>
 #include <stdexcept>
+#include <utility>
 
-namespace sirius::io {
+namespace sirius::io::cache {
 
 // ===========================================================================
 // buffer_pool
@@ -145,1619 +156,478 @@ void buffer_pool::reclaim_all()
   _total_chunks.store(static_cast<uint32_t>(total), std::memory_order_relaxed);
 }
 
-// ===========================================================================
-// pinned_view
-// ===========================================================================
-
-namespace {
-
-// Carries strong refs to the entries until the host callback fires, so
-// they can't be destroyed mid-flight even if the cache map drops them.
-// Multi-entry views collapse N per-entry callbacks into a single
-// callback owning a vector of entries.
-struct release_callback_args {
-  std::vector<std::shared_ptr<cache_entry>> entries;
-};
-
-// cudaStreamAddCallback signature (deprecated but used deliberately).
-// Unlike cudaLaunchHostFunc, this callback fires even when the stream is
-// already in an error state — so a poisoned stream cannot leak the
-// entries' pins and their pool chunks forever.  Status is intentionally
-// ignored: each read pin must be released regardless of whether the
-// H2D copy succeeded.
-void CUDART_CB release_read_host_callback(cudaStream_t /*stream*/,
-                                          cudaError_t /*status*/,
-                                          void* p) noexcept
+std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
+  std::span<size_t> incoming, uint32_t ticker)
 {
-  std::unique_ptr<release_callback_args> args(static_cast<release_callback_args*>(p));
-  for (auto& e : args->entries) {
-    e->state.release_read();
-  }
-}
+  std::vector<cached_chunk*> result(incoming.size());
 
-// Recover from a failed cudaStreamAddCallback registration.  The callback
-// will never fire, so the caller hands us the raw args pointer it had
-// already `args.release()`'d and we do the callback's work inline:
-//   1. Drain the stream so any cudaMemcpyAsync the caller had already
-//      submitted against the entries' chunks completes (or fails fast)
-//      before we drop the pins — otherwise the evictor could recycle
-//      the chunks while the copy is still consuming them.
-//   2. Drop each pin via release_read so the entries are no longer
-//      non-evictable.  We do this even if the synchronize itself failed,
-//      preferring a user-visible CUDA fault on the failing stream over a
-//      permanent cache leak.
-// The cudaGetLastError calls clear sticky thread-local errors so they
-// don't surface on an unrelated CUDA call later in this thread.
-void release_args_inline_on_callback_failure(cudaStream_t stream,
-                                             release_callback_args* raw) noexcept
-{
-  cudaGetLastError();
-  std::unique_ptr<release_callback_args> reown(raw);
-  if (cudaStreamSynchronize(stream) != cudaSuccess) cudaGetLastError();
-  for (auto& e : reown->entries) {
-    e->state.release_read();
-  }
-}
+  // Phase 1: classify under shared lock — find which offsets already exist.
+  // Track the indices of incoming items that need to be inserted.
+  std::vector<size_t> missing_indices;  // indices into `incoming`/`result`
+  {
+    std::shared_lock lock(mtx);
 
-}  // namespace
+    auto s           = chunks.begin();
+    const auto s_end = chunks.end();
 
-// ===========================================================================
-// cached_host_buffer::mark_cached_with_stream
-// ===========================================================================
-//
-// Out-of-line so the implementation can reuse the file-local
-// release_callback_args + release_read_host_callback machinery above.
-// Mirrors pinned_view's async release path: cudaStreamAddCallback (not
-// cudaLaunchHostFunc) so a poisoned stream still fires the callback and
-// releases the read pin.
+    for (size_t i = 0; i < incoming.size(); ++i) {
+      const size_t off = incoming[i];
+      s = std::lower_bound(s, s_end, off, [](const std::unique_ptr<cached_chunk>& c, size_t v) {
+        return c->offset < v;
+      });
 
-void cached_host_buffer::mark_cached_with_stream(cudaStream_t stream) noexcept
-{
-  if (!_entry) return;
-  if (_entry->state.try_finish_loading_pinned()) {
-    // IO succeeded — mark as ever_cached for diagnostics.  (The entry
-    // transits loading → in_use(1) → cached via the stream callback;
-    // the "was ever successfully loaded" signal we want fires here.)
-    _entry->ever_cached.store(true, std::memory_order_release);
-    // Entry is ours in in_use(pin=1).  Hand it to a stream callback so
-    // the pin is released after the caller's H2D copy drains.  The
-    // callback owns a vector of entries (single-element here) — same
-    // path used by pinned_view's multi-entry release.
-    auto args = std::make_unique<release_callback_args>();
-    args->entries.push_back(std::move(_entry));
-    auto* raw       = args.release();
-    cudaError_t err = cudaStreamAddCallback(stream, &release_read_host_callback, raw, 0);
-    if (err != cudaSuccess) release_args_inline_on_callback_failure(stream, raw);
-  } else {
-    // try_finish_loading_pinned failed — only possible because
-    // shutdown's abort_pending_entries flipped loading → empty.  abort
-    // does NOT free chunks on the loading-state transition (its
-    // contract is "the in-flight loader owns them") — and we ARE that
-    // loader.  Free them now before the last shared_ptr to the entry
-    // drops, or they leak in the slab until pool destruction.
-    if (_pool) _pool->deallocate_bulk(_entry->chunks);
-    _entry = nullptr;
-  }
-}
-
-pinned_view::pinned_view(std::shared_ptr<cache_entry> entry, cudaStream_t stream) : _stream(stream)
-{
-  if (!entry) return;
-  if (!entry->state.try_acquire_read()) return;
-  _entries.push_back(std::move(entry));
-}
-
-pinned_view::pinned_view(std::vector<std::shared_ptr<cache_entry>> entries, cudaStream_t stream)
-  : _stream(stream)
-{
-  if (entries.empty()) return;
-  _entries.reserve(entries.size());
-  for (auto& e : entries) {
-    if (!e->state.try_acquire_read()) {
-      // Partial acquisition — release everything we already pinned and
-      // leave the view empty.  No async release needed here since no
-      // user H2D copy can have been queued against this view yet.
-      for (auto& acquired : _entries) {
-        acquired->state.release_read();
-      }
-      _entries.clear();
-      return;
-    }
-    _entries.push_back(std::move(e));
-  }
-}
-
-pinned_view::~pinned_view() { unpin(); }
-
-pinned_view::pinned_view(pinned_view&& o) noexcept
-  : _entries(std::move(o._entries)), _stream(o._stream)
-{
-}
-
-pinned_view& pinned_view::operator=(pinned_view&& o) noexcept
-{
-  if (this != &o) {
-    unpin();
-    _entries = std::move(o._entries);
-    _stream  = o._stream;
-  }
-  return *this;
-}
-
-void pinned_view::unpin()
-{
-  if (_entries.empty()) return;
-
-  // The wrappers these entries came from are already in the eviction
-  // queue (pushed at insert time).  We just need to release each read
-  // pin so the entries transition back from in_use to cached and
-  // become evictable.  No candidate-queue push.
-
-  if (_stream == nullptr) {
-    // Synchronous path (host reads): no async ops outstanding, release now.
-    for (auto& e : _entries) {
-      e->state.release_read();
-    }
-    _entries.clear();
-  } else {
-    // Async path (device reads): defer release_read via a single host
-    // callback so it fires only after the caller's stream reaches this
-    // point.  Any cudaMemcpyAsync submitted earlier against the pinned
-    // chunks therefore completes before any pin_count drops to zero.
-    // For multi-entry views this is one callback for the whole batch
-    // (rather than N callbacks) — saves a host-callback enqueue per
-    // extra entry on the hot read path.
-    auto args     = std::make_unique<release_callback_args>();
-    args->entries = std::move(_entries);
-    auto* raw     = args.release();
-    // cudaStreamAddCallback (not cudaLaunchHostFunc): fires on error too,
-    // so the release_read() is guaranteed even if the user's stream is
-    // poisoned by an unrelated failure.  Otherwise a single stream error
-    // would permanently leak these entries' pins and their pinned chunks.
-    cudaError_t err = cudaStreamAddCallback(_stream, &release_read_host_callback, raw, 0);
-    if (err != cudaSuccess) release_args_inline_on_callback_failure(_stream, raw);
-  }
-}
-
-size_t pinned_view::num_chunks() const noexcept
-{
-  size_t n = 0;
-  for (auto const& e : _entries)
-    n += e->chunks.size();
-  return n;
-}
-
-std::span<const std::byte> pinned_view::operator[](size_t i) const noexcept
-{
-  for (auto const& e : _entries) {
-    auto const n = e->chunks.size();
-    if (i < n) {
-      auto range_size  = static_cast<size_t>(e->range.size());
-      auto chunk_bytes = e->chunk_bytes;
-      auto chunk_start = i * chunk_bytes;
-      auto chunk_sz    = std::min(chunk_bytes, range_size - chunk_start);
-      return {e->chunks[i], chunk_sz};
-    }
-    i -= n;
-  }
-  return {};
-}
-
-cudf::io::text::byte_range_info pinned_view::range() const noexcept
-{
-  if (_entries.empty()) return {0, 0};
-  auto first_off = static_cast<size_t>(_entries.front()->range.offset());
-  auto last_end  = static_cast<size_t>(_entries.back()->range.offset()) +
-                  static_cast<size_t>(_entries.back()->range.size());
-  return {static_cast<int64_t>(first_off), static_cast<int64_t>(last_end - first_off)};
-}
-
-size_t pinned_view::size() const noexcept
-{
-  size_t total = 0;
-  for (auto const& e : _entries)
-    total += static_cast<size_t>(e->range.size());
-  return total;
-}
-
-namespace {
-
-// Slice a single entry over its [cursor, cursor+take) sub-range,
-// appending coalesced non_owning_buffers to @p result.  Coalescing
-// works across calls — when adjacent entries' chunks happen to live in
-// the same slab (virtually contiguous), the trailing buffer of the
-// previous entry merges with the leading buffer of the next.
-void slice_one_entry(cache_entry const& e,
-                     size_t cursor,
-                     size_t take,
-                     std::vector<cudf::io::datasource::non_owning_buffer>& result)
-{
-  // @c cursor is a file-absolute byte position inside the entry's
-  // chunk-aligned range.  Subtracting the range start gives the offset
-  // into the entry's chunked buffer.
-  auto range_off  = static_cast<size_t>(e.range.offset());
-  auto range_size = static_cast<size_t>(e.range.size());
-
-  size_t pos_in_range = cursor - range_off;
-  size_t remaining    = take;
-
-  // Walk the chunks that span [pos_in_range, pos_in_range + take).
-  auto const chunk_bytes = e.chunk_bytes;
-  size_t chunk_idx       = pos_in_range / chunk_bytes;
-  size_t off_in_chunk    = pos_in_range % chunk_bytes;
-
-  while (remaining > 0 && chunk_idx < e.chunks.size()) {
-    auto chunk_avail =
-      std::min(chunk_bytes - off_in_chunk, range_size - chunk_idx * chunk_bytes - off_in_chunk);
-    auto n  = std::min(remaining, chunk_avail);
-    auto* p = reinterpret_cast<uint8_t const*>(e.chunks[chunk_idx]) + off_in_chunk;
-
-    // Coalesce with the previous slice if this chunk is virtually
-    // contiguous with its tail.  Adjacent chunks in the same slab are
-    // contiguous (the slab is one cudaHostAlloc), which is the common
-    // case for a freshly-filled pool — and also coalesces across the
-    // entry boundary when both entries happened to land in the same
-    // slab.
-    if (!result.empty()) {
-      auto const& last = result.back();
-      if (last.data() + last.size() == p) {
-        result.back() = cudf::io::datasource::non_owning_buffer(last.data(), last.size() + n);
-        remaining -= n;
-        ++chunk_idx;
-        off_in_chunk = 0;
-        continue;
+      if (s != s_end && (*s)->offset == off) {
+        s->get()->lifecycle.on_request(ticker);
+        result[i] = s->get();  // existing
+      } else {
+        missing_indices.push_back(i);  // mark for insertion
       }
     }
 
-    result.emplace_back(p, n);
-    remaining -= n;
-    ++chunk_idx;
-    off_in_chunk = 0;
+    if (missing_indices.empty()) {
+      return result;  // fast path: nothing to insert
+    }
   }
-}
 
-}  // namespace
+  // Phase 2: upgrade to exclusive lock and insert missing chunks.
+  // Another writer may have inserted some of our "missing" offsets in the
+  // gap between unlocking and re-locking, so re-check each one.
+  std::vector<std::unique_ptr<cached_chunk>> to_insert;
+  to_insert.reserve(missing_indices.size());
 
-std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t offset,
-                                                                        size_t size) const
-{
-  std::vector<cudf::io::datasource::non_owning_buffer> result;
-  if (_entries.empty() || size == 0) return result;
+  {
+    std::unique_lock lock(mtx);
 
-  size_t cursor    = offset;
-  size_t remaining = size;
+    auto s     = chunks.begin();
+    auto s_end = chunks.end();
 
-  for (auto const& e : _entries) {
-    if (remaining == 0) break;
-    auto e_off = static_cast<size_t>(e->range.offset());
-    auto e_end = e_off + static_cast<size_t>(e->range.size());
+    for (size_t idx : missing_indices) {
+      const size_t off = incoming[idx];
+      s = std::lower_bound(s, s_end, off, [](const std::unique_ptr<cached_chunk>& c, size_t v) {
+        return c->offset < v;
+      });
 
-    // Skip entries that lie entirely before the cursor.
-    if (cursor >= e_end) continue;
+      if (s != s_end && (*s)->offset == off) {
+        result[idx] = s->get();  // someone else inserted it
+      } else {
+        auto chunk = std::make_unique<cached_chunk>(off);
+        chunk->lifecycle.on_request(ticker);
+        result[idx] = chunk.get();  // capture raw ptr before move
+        to_insert.push_back(std::move(chunk));
+      }
+    }
 
-    // The cache's hit path guarantees contiguous coverage, so the
-    // first entry whose tail extends past `cursor` must also start at
-    // or before `cursor`.  An assert (release-elided) flags any
-    // breakage of that invariant before we read out-of-range bytes.
-    assert(e_off <= cursor && "pinned_view::slice: gap in covering entries");
+    if (to_insert.empty()) {
+      return result;  // all races lost, but result is filled
+    }
 
-    // Entries are chunk-aligned and disjoint, so transitioning at the
-    // current entry's end naturally lands at the next entry's start
-    // (no overlap, no gap, no small unaligned head).
-    size_t take = std::min(remaining, e_end - cursor);
-    slice_one_entry(*e, cursor, take, result);
-    cursor += take;
-    remaining -= take;
+    // Bulk merge: to_insert is sorted because missing_indices is in order
+    // and incoming is sorted+unique.
+    const auto mid = chunks.size();
+    chunks.reserve(mid + to_insert.size());
+    chunks.insert(chunks.end(),
+                  std::make_move_iterator(to_insert.begin()),
+                  std::make_move_iterator(to_insert.end()));
+    std::inplace_merge(
+      chunks.begin(),
+      chunks.begin() + mid,
+      chunks.end(),
+      [](const std::unique_ptr<cached_chunk>& a, const std::unique_ptr<cached_chunk>& b) {
+        return a->offset < b->offset;
+      });
   }
 
   return result;
 }
 
-// ===========================================================================
-// file_demand
-// ===========================================================================
-
-uint64_t file_demand::register_request() noexcept
+std::vector<cached_chunk*> prefetching_cache::file_entry::fetch_chunks(std::size_t offset,
+                                                                       std::size_t size) const
 {
-  uint64_t cur = _packed.load(std::memory_order_relaxed);
-  while (true) {
-    auto v          = unpack(cur);
-    auto next_stamp = v.stamp + 1;
-    auto next_n =
-      static_cast<uint16_t>(std::min<uint32_t>(static_cast<uint32_t>(v.n_pending) + 1, N_MASK));
-    auto next = pack(next_stamp, next_n);
-    if (_packed.compare_exchange_weak(
-          cur, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-      return next_stamp;
-    }
+  constexpr size_t chunk_size = 1 << 20;  // must match buffer_pool's chunk size
+  if (size == 0) return {};
+
+  std::shared_lock lock(mtx);
+
+  // Align the request to chunk boundaries.
+  const std::size_t first_chunk_off = (offset / chunk_size) * chunk_size;
+  const std::size_t end_off         = offset + size;
+  const std::size_t last_chunk_off  = ((end_off - 1) / chunk_size) * chunk_size;
+  const std::size_t expected_count  = (last_chunk_off - first_chunk_off) / chunk_size + 1;
+
+  if (chunks.size() < expected_count) return {};
+
+  // Find the chunk containing `offset`.
+  auto first_it = std::lower_bound(
+    chunks.begin(),
+    chunks.end(),
+    first_chunk_off,
+    [](const std::unique_ptr<cached_chunk>& c, std::size_t v) { return c->offset < v; });
+
+  if (first_it == chunks.end() || (*first_it)->offset != first_chunk_off) {
+    return {};  // first chunk missing
   }
-}
 
-void file_demand::unregister_request() noexcept
-{
-  uint64_t cur = _packed.load(std::memory_order_relaxed);
-  while (true) {
-    auto v = unpack(cur);
-    if (v.n_pending == 0) return;  // clamped no-op
-    auto next = pack(v.stamp, static_cast<uint16_t>(v.n_pending - 1));
-    if (_packed.compare_exchange_weak(
-          cur, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-      return;
-    }
+  // Check the last chunk is at the expected position.
+  const std::size_t first_idx = std::distance(chunks.begin(), first_it);
+  const std::size_t last_idx  = first_idx + expected_count - 1;
+
+  if (last_idx >= chunks.size()) return {};
+  if (chunks[last_idx]->offset != last_chunk_off) return {};
+
+  // Coverage confirmed by the invariant: sorted + non-overlapping + fixed-size
+  // means consecutive chunks differ by exactly chunk_size. If the first is at
+  // first_chunk_off and the (expected_count-1)th is at last_chunk_off, the
+  // intermediates are forced.
+  std::vector<cached_chunk*> result;
+  result.reserve(expected_count);
+  for (std::size_t i = 0; i < expected_count; ++i) {
+    auto* chunk = chunks[first_idx + i].get();
+    chunk->lifecycle.on_consume();
+    result.push_back(chunk);
   }
+  return result;
 }
-
-file_demand::view file_demand::load(std::memory_order ord) const noexcept
-{
-  return unpack(_packed.load(ord));
-}
-
-// ===========================================================================
-// prefetching_handle — cancel / release
-// ===========================================================================
-
-void prefetching_handle::cancel() noexcept
-{
-  if (!_alive) return;
-  // Atomically flip alive to false exactly once.  acq_rel: the release half
-  // makes the flip visible to the worker's acquire-load; the acquire half on
-  // the true→false path is harmless (no corresponding release to sync with on
-  // the losing side).  The exchange guarantees exactly one caller reaches
-  // notify_disposed() even when multiple threads race on cancel().
-  bool was_alive = _alive->exchange(false, std::memory_order_acq_rel);
-  if (was_alive && _cache) {
-    _cache->notify_disposed();
-    _cache = nullptr;  // prevent any future use; release is the definitive clear
-  }
-}
-
-void prefetching_handle::release() noexcept
-{
-  if (_demand == nullptr) return;
-  _demand->unregister_request();
-  _demand = nullptr;
-  _cache  = nullptr;
-}
-
-// ===========================================================================
-// prefetching_cache — construction / destruction
-// ===========================================================================
-
-namespace {
-// armed iff every dependency the prefetch machinery needs is present.
-bool compute_armed(buffer_pool* pool, sirius_ioctx const* io_ctx, size_t budget) noexcept
-{
-  return pool != nullptr && io_ctx != nullptr && io_ctx->supports_vector_host_read() && budget > 0;
-}
-}  // namespace
 
 prefetching_cache::prefetching_cache(buffer_pool* pool,
                                      sirius_ioctx* io_ctx,
                                      size_t inflight_budget_chunks)
-  : _pool(pool),
-    _io_ctx(io_ctx),
-    _armed(compute_armed(pool, _io_ctx, inflight_budget_chunks)),
-    _inflight_budget(_armed ? std::make_unique<admission_control>(inflight_budget_chunks) : nullptr)
+  : _pool(pool), _io_ctx(io_ctx), _armed(true), _rate_limiter(inflight_budget_chunks)
 {
-  // Threads only run when the cache is armed.  When unarmed nobody
-  // consumes the work queue, and insert() short-circuits before
-  // enqueuing anything anyway; read() simply misses on every lookup.
-  if (_armed) {
-    // Spin up the IO-completion callback pool first.  io_dispatch_loop
-    // attaches via() + then_try on the futures returned from
-    // host_read_ranges_async_io so the bookkeeping (state reverts,
-    // mark_cached, budget release) runs on this 2-thread pool — never
-    // on the reactor thread.
-    _io_callback_pool = std::make_unique<sirius::exec::static_thread_pool>(
-      /*num_threads=*/2, "prefetch_cb");
-    _io_callback_dispatcher = std::make_unique<sirius::exec::scoped_dispatcher>(
-      *_io_callback_pool, /*max_concurrent_task=*/2);
-
-    _evictor_thread   = std::jthread([this](std::stop_token st) { evictor_loop(std::move(st)); });
-    _allocator_thread = std::jthread([this](std::stop_token st) { allocator_loop(std::move(st)); });
-    _io_dispatch_thread =
-      std::jthread([this](std::stop_token st) { io_dispatch_loop(std::move(st)); });
-  }
+  _preparation_thread = std::jthread([this](std::stop_token st) { prepare_loop(std::move(st)); });
+  _prefetch_thread    = std::jthread([this](std::stop_token st) { prefetch_loop(std::move(st)); });
+  _evictor_thread     = std::jthread([this](std::stop_token st) { evict_loop(std::move(st)); });
 }
 
 prefetching_cache::~prefetching_cache()
 {
-  if (!_armed) {
-    // Nothing to drain — no threads, no in-flight IO.  The file_cache map
-    // and LRU list will be destroyed by member destruction.
-    return;
-  }
-
-  // Flip the shutdown flag BEFORE request_stop on either thread.  This
-  // closes the deadlock window where the allocator was past its
-  // stop-check inside Phase 2's shortfall path: it now bails out at the
-  // _shutting_down check just before its enqueue.  The microsecond race
-  // (allocator past the flag check but pre-enqueue) is handled below by
-  // keeping the evictor alive across join(allocator) so the late-pushed
-  // eviction_request gets resolved instead of stranding fut.get().
   _shutting_down.store(true, std::memory_order_release);
-
-  // Stop the ALLOCATOR first.  The evictor stays running so it can
-  // resolve any eviction_request the allocator pushed in its dying
-  // breath; its evict_chunks loop also observes _shutting_down and
-  // bails fast (returns 0 → promise.set_exception), so the allocator
-  // unblocks promptly.
-  _allocator_thread.request_stop();
-  _work_seq.fetch_add(1, std::memory_order_release);
-  _work_seq.notify_all();
-
-  // Wake readers waiting on entries that were loading when shutdown began.
-  // Outstanding backend requests may still resolve via their request_context
-  // safety net, but waiters shouldn't depend on that happening.
-  abort_pending_entries();
-
-  // Drain pending work items.  The allocator won't dequeue these now.
-  // The entries inside are still in `empty` state (the allocator hadn't
-  // yet CAS'd them to `allocated`), so simply dropping the work_item is
-  // enough — no state to rewind, no chunks to free.
-  work_item drained;
-  while (_work_queue.try_dequeue(drained)) { /* drop */
-  }
-
-  // Join allocator.  It exits because either it was idle (woken by the
-  // stop_callback + work_seq notify above) or it was in Phase 2's
-  // shortfall wait, in which case the still-running evictor resolves
-  // its eviction_request (set_exception via evict_chunks's
-  // _shutting_down bail).  No _request_sem.release() needed during this
-  // window: the evictor's main loop uses try_acquire_for(50ms) so it
-  // self-wakes and picks up the late-pushed request on the next poll.
-  if (_allocator_thread.joinable()) { _allocator_thread.join(); }
-
-  // Now stop the evictor.  No new eviction_requests can arrive (the
-  // allocator is gone).  The evictor's own exit-drain handles anything
-  // still in the request queue.
-  _evictor_thread.request_stop();
-  _request_sem.release();
-  if (_evictor_thread.joinable()) { _evictor_thread.join(); }
-
-  // Belt-and-suspenders drain.  The evictor's exit-drain should have
-  // resolved any pending requests; this catches anything that slipped
-  // through (e.g. a request enqueued after the evictor's drain ran but
-  // before it terminated — impossible by construction now, but cheap).
-  eviction_request ereq;
-  while (_request_queue.try_dequeue(ereq)) {
-    ereq.promise.set_exception(
-      std::make_exception_ptr(std::runtime_error("eviction aborted — cache shutting down")));
-  }
-
-  // Stop the dispatch thread only after the allocator is fully joined, so
-  // no more work_items can be pushed to _io_dispatch_queue.  The stop_callback
-  // registered in io_dispatch_loop fires notify_all on _io_dispatch_cv, which
-  // wakes the thread.  The thread then drains the queue and exits.
-  _io_dispatch_thread.request_stop();
-  if (_io_dispatch_thread.joinable()) { _io_dispatch_thread.join(); }
-
-  // Wait for every in-flight IO callback to release its admission slot.
-  // Each callback captures the raw _pool pointer; the owner of the pool
-  // (scan_manager) is required to keep the pool alive until @c
-  // sirius_ioctx::shutdown_cache returns — which only happens after
-  // this destructor runs — so callbacks observing the pool here are
-  // safe.  The owning ioctx is similarly required to stay alive while
-  // this destructor is in progress (the scan_manager holds a
-  // @c shared_ptr<sirius_ioctx> across @c shutdown_cache).
-  //
-  // Wrapped in try/catch: a destructor must be noexcept and a hanging
-  // wait is preferable to a UAF.
-  try {
-    _inflight_budget->wait_for_idle();
-  } catch (...) {
-    // Best-effort drain.
-  }
-
-  // Drain the IO-completion dispatcher before tearing down its pool.
-  // wait_for_all blocks until any callback already scheduled on the
-  // 2-thread pool has run to completion; without it the pool's dtor
-  // could join while a callback still holds references into this
-  // cache (admission slot, file handle, pool).
-  if (_io_callback_dispatcher) {
-    _io_callback_dispatcher->wait_for_all();
-    _io_callback_dispatcher->request_stop();
-  }
-  _io_callback_dispatcher.reset();  // dispatcher first, then its backing pool
-  _io_callback_pool.reset();
-
-  abort_pending_entries();
-}
-
-void prefetching_cache::enqueue_work(work_item item)
-{
-  _work_queue.enqueue(std::move(item));
-  _work_seq.fetch_add(1, std::memory_order_release);
-  _work_seq.notify_one();
-}
-
-void prefetching_cache::notify_disposed() noexcept
-{
-  // Wake the evictor so it can immediately reclaim any memory that was
-  // pre-allocated (allocated state) for the cancelled request.  The
-  // evictor checks the alive flag on every eviction queue pop and will
-  // free allocated/cached entries for the cancelled wrapper.
-  _request_sem.release();
-}
-
-void prefetching_cache::release_chunks(cache_entry& entry)
-{
-  if (_pool) {
-    for (auto* p : entry.chunks)
-      _pool->deallocate(p);
-  }
-  entry.chunks.clear();
-}
-
-void prefetching_cache::abort_pending_entries() noexcept
-{
-  try {
-    std::shared_lock map_lk(_map_mtx);
-    for (auto const& [_, file_ptr] : _file_cache) {
-      if (!file_ptr) { continue; }
-      std::shared_lock file_lk(file_ptr->mtx);
-      for (auto const& entry : file_ptr->entries) {
-        if (!entry) continue;
-        auto old_st = entry->state.try_abort_pending();
-        if (old_st == entry_state::allocated && _pool) {
-          _pool->deallocate_bulk(entry->chunks);
-          entry->chunks.clear();
-        }
-      }
-    }
-  } catch (...) {
-    // Destructors must not throw; best effort wake-up only.
-  }
-}
-
-// ===========================================================================
-// find_entries — binary search + forward walk for contiguous coverage
-// ===========================================================================
-
-std::vector<std::shared_ptr<cache_entry>> prefetching_cache::find_entries(
-  const std::vector<std::shared_ptr<cache_entry>>& entries, size_t offset, size_t size)
-{
-  // upper_bound: first entry whose offset > requested offset.  The starting
-  // candidate is pos-1 (the last entry whose offset <= requested offset).
-  auto pos =
-    std::upper_bound(entries.begin(), entries.end(), offset, [](size_t off, auto const& e) {
-      return off < static_cast<size_t>(e->range.offset());
-    });
-
-  // No entry starts at or before our offset — nothing covers us.
-  if (pos == entries.begin()) {
-    _full_miss_count.fetch_add(1, std::memory_order_relaxed);
-    return {};
-  }
-  --pos;
-
-  // Walk forward, accumulating contiguous entries until [offset, offset+size)
-  // is fully covered or we hit a gap / run off the end.
-  std::vector<std::shared_ptr<cache_entry>> result;
-  size_t const end = offset + size;
-  size_t cursor    = offset;
-
-  while (cursor < end) {
-    if (pos == entries.end()) {
-      // Ran off the end without finishing coverage.
-      _miss_range.fetch_add(1, std::memory_order_relaxed);
-      spdlog::debug("prefetching_cache: miss_range (ran past last entry) read_off={} read_size={}",
-                    offset,
-                    size);
-      return {};
-    }
-    auto e_start = static_cast<size_t>((*pos)->range.offset());
-    auto e_end   = e_start + static_cast<size_t>((*pos)->range.size());
-
-    if (e_start > cursor) {
-      // Gap: previous entry ended before the next entry starts, and the
-      // unread bytes in between aren't in the cache.  On the very first
-      // iteration this means the upper_bound predecessor doesn't reach
-      // `offset` at all — full miss.  On subsequent iterations the read
-      // straddles a hole between two prefetched ranges — miss_range.
-      if (result.empty()) {
-        _full_miss_count.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        _miss_range.fetch_add(1, std::memory_order_relaxed);
-        spdlog::debug(
-          "prefetching_cache: miss_range (gap between entries) read_off={} read_size={} "
-          "gap_start={} gap_end={}",
-          offset,
-          size,
-          cursor,
-          e_start);
-      }
-      return {};
-    }
-    if (e_end <= cursor) {
-      // Defensive: zero-size or moved-past entry — shouldn't happen
-      // because upper_bound guarantees e_start <= cursor on the first
-      // iteration and the loop sets cursor = previous e_end before
-      // advancing pos.
-      spdlog::debug(
-        "prefetching_cache: skipping entry with end <= cursor (shouldn't happen) read_off={} "
-        "read_size={} entry_start={} entry_end={}",
-        offset,
-        size,
-        e_start,
-        e_end);
-      _miss_range.fetch_add(1, std::memory_order_relaxed);
-      return {};
-    }
-    result.push_back(*pos);
-    cursor = e_end;
-    ++pos;
-  }
-
-  return result;
+  _preparation_stop_source.request_stop();
+  _prefetch_stop_source.request_stop();
+  _evictor_stop_source.request_stop();
 }
 
 // ===========================================================================
 // insert
 // ===========================================================================
 
-prefetching_handle prefetching_cache::insert(
-  sirius_io_object& obj, const std::vector<cudf::io::text::byte_range_info>& ranges)
+prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
+  const sirius_io_object& obj)
 {
-  if (!_armed) {
-    // Unarmed cache: record the file_entry so subsequent reads can find
-    // metadata, but skip the per-range cache_entries — there's no pool
-    // to allocate chunks from and no worker to dispatch IO.
-    return {};
-  }
-
-  assert(std::is_sorted(ranges.begin(),
-                        ranges.end(),
-                        [](auto const& a, auto const& b) { return a.offset() < b.offset(); }) &&
-         "ranges must be sorted by offset");
-
-  // shared_from_this() throws std::bad_weak_ptr if @p obj isn't owned by a
-  // shared_ptr — the contract is enforced at the call site, no null check
-  // needed here.
-  auto obj_sp     = obj.shared_from_this();
-  auto const& key = obj.raw_file_cache_id();
-  auto file_size  = obj.size();
-
-  std::unique_lock map_lk(_map_mtx);
-  auto [it, inserted] = _file_cache.try_emplace(key, nullptr);
-  if (inserted) {
-    auto fh       = std::make_unique<file_entry>();
-    fh->io_obj    = obj_sp;
-    fh->file_size = file_size;
-    it->second    = std::move(fh);
-  }
-  auto& file = *it->second;
-
-  std::unique_lock file_lk(file.mtx);
-  map_lk.unlock();
-
-  // Every range in the insert becomes a prefetch request, regardless of the
-  // entry's current state.  The worker decides at dispatch time whether the
-  // entry actually needs loading (via state check in try_start_loading).
-  // This lets inserts that land on an evicted-then-inserted-again range
-  // trigger a fresh prefetch.
-  std::vector<std::shared_ptr<cache_entry>> new_entries;
-
-  new_entries.reserve(ranges.size());
-
-  // Step 1: chunk-align each input range and merge overlapping/touching
-  // aligned spans into a sorted, disjoint demand list.  Two adjacent
-  // input ranges that fall in the same chunk would otherwise produce
-  // overlapping chunk-aligned spans; merging avoids that and keeps
-  // disjointedness for the cache.
-  auto const chunk_bytes = _pool->chunk_bytes();
-  auto align_down        = [chunk_bytes](size_t v) { return v - (v % chunk_bytes); };
-  auto align_up          = [chunk_bytes](size_t v) {
-    return (v + chunk_bytes - 1) / chunk_bytes * chunk_bytes;
-  };
-
-  struct aligned_span {
-    size_t start;
-    size_t end;
-  };
-  std::vector<aligned_span> aligned;
-  aligned.reserve(ranges.size());
-  for (auto const& logical : ranges) {
-    auto const log_off = static_cast<size_t>(logical.offset());
-    auto const log_end = log_off + static_cast<size_t>(logical.size());
-    if (log_end <= log_off) continue;
-    auto const a_start = align_down(log_off);
-    auto const a_end   = std::min(align_up(log_end), file_size);
-    if (a_end <= a_start) continue;
-    if (!aligned.empty() && aligned.back().end >= a_start) {
-      aligned.back().end = std::max(aligned.back().end, a_end);
-    } else {
-      aligned.push_back({a_start, a_end});
-    }
-  }
-
-  // Step 2: for each aligned demand span, find existing entries that
-  // overlap it (binary search + forward walk), reuse them (deduped via
-  // @c reused_seen), and create new entries for the gaps in between.
-  // The new entries inherit chunk-aligned boundaries (their starts
-  // either equal an aligned span start, an existing entry's end, or
-  // an aligned span end — all chunk-aligned), so the disjoint +
-  // chunk-aligned invariants on @c file.entries are preserved.
-  std::vector<std::shared_ptr<cache_entry>> new_created;
-  // Sorted vector of reused cache_entry* — small N (one entry per
-  // distinct existing range touched by this insert), and we only need
-  // membership tests + ordered insert.  lower_bound is O(log n) and
-  // the linear cost of insert is negligible at this scale.
-  std::vector<cache_entry*> reused_seen;
-  new_created.reserve(aligned.size());
-
-  for (auto const& span : aligned) {
-    auto const a_start = span.start;
-    auto const a_end   = span.end;
-
-    // Find the first existing entry whose range ends after a_start.
-    auto it = std::lower_bound(
-      file.entries.begin(), file.entries.end(), a_start, [](auto const& e, size_t v) {
-        return static_cast<size_t>(e->range.offset()) < v;
-      });
-    if (it != file.entries.begin()) {
-      auto prev = std::prev(it);
-      auto prev_end =
-        static_cast<size_t>((*prev)->range.offset()) + static_cast<size_t>((*prev)->range.size());
-      if (prev_end > a_start) it = prev;
-    }
-
-    size_t cursor = a_start;
-    while (cursor < a_end) {
-      if (it == file.entries.end()) {
-        // No more existing — fill rest of this span with one new entry.
-        cudf::io::text::byte_range_info gap{static_cast<int64_t>(cursor),
-                                            static_cast<int64_t>(a_end - cursor)};
-        auto e = std::make_shared<cache_entry>(gap, chunk_bytes);
-        new_entries.push_back(e);
-        new_created.push_back(std::move(e));
-        cursor = a_end;
-        break;
-      }
-      auto e_off = static_cast<size_t>((*it)->range.offset());
-      auto e_end = e_off + static_cast<size_t>((*it)->range.size());
-
-      if (e_off > cursor) {
-        // Gap from cursor to min(e_off, a_end) — fill with new entry.
-        size_t gap_end = std::min(e_off, a_end);
-        cudf::io::text::byte_range_info gap{static_cast<int64_t>(cursor),
-                                            static_cast<int64_t>(gap_end - cursor)};
-        auto e = std::make_shared<cache_entry>(gap, chunk_bytes);
-        new_entries.push_back(e);
-        new_created.push_back(std::move(e));
-        cursor = gap_end;
-      } else {
-        // e_off <= cursor < e_end — existing entry covers cursor.  Reuse
-        // it (deduped across aligned spans within this insert) and
-        // advance past it.
-        auto* raw = it->get();
-        auto pos  = std::lower_bound(reused_seen.begin(), reused_seen.end(), raw);
-        if (pos == reused_seen.end() || *pos != raw) {
-          reused_seen.insert(pos, raw);
-          new_entries.push_back(*it);
-        }
-        cursor = e_end;
-        ++it;
-      }
-    }
-  }
-
-  // Step 3: rebuild file.entries as the sorted union of the existing
-  // entries (already sorted by offset) and the newly created ones
-  // (sorted here by offset, since they were appended per-span).
-  std::sort(new_created.begin(), new_created.end(), [](auto const& a, auto const& b) {
-    return a->range.offset() < b->range.offset();
-  });
-  std::vector<std::shared_ptr<cache_entry>> merged;
-  merged.reserve(file.entries.size() + new_created.size());
-  std::merge(file.entries.begin(),
-             file.entries.end(),
-             new_created.begin(),
-             new_created.end(),
-             std::back_inserter(merged),
-             [](auto const& a, auto const& b) { return a->range.offset() < b->range.offset(); });
-
-  file.entries = std::move(merged);
-
-  // Register this request with the file's demand counter (n_pending+=1
-  // saturating; the stamp field is bumped too for diagnostic ordering
-  // but the evictor no longer reads it).
-  file.demand.register_request();
-  file_demand* const demand = &file.demand;
-
-  file_lk.unlock();
-
-  // Shared flag.  cancel() flips it; the worker checks it on dequeue and
-  // before dispatch; the evictor checks it on pop to short-circuit
-  // cancelled requests.
-  auto alive = std::make_shared<std::atomic<bool>>(true);
-
-  if (new_entries.empty()) {
-    // Every range coalesced with an existing entry and no fresh prefetch
-    // was scheduled — nothing for the worker to do, but we still hand
-    // back a handle so the caller's per-file demand counter decrements
-    // when the handle drops.
-    return prefetching_handle{std::move(alive), demand, this};
-  }
-
-  // Enqueue the eviction-queue wrapper BEFORE the work_item.  The wrapper
-  // sits in the queue from now until evicted: the evictor pops, sees
-  // n_pending==0 (all handles for this file have dropped) or !alive
-  // (handle.cancel()), and drops the entries.
-  _eviction_queue.enqueue(prefetch_request{new_entries, demand, alive});
-
-  enqueue_work(prefetch_req{key, std::move(obj_sp), std::move(new_entries), alive});
-  return prefetching_handle{std::move(alive), demand, this};
-}
-
-// ===========================================================================
-// read — non-blocking, single range by offset
-// ===========================================================================
-
-pinned_view prefetching_cache::read(const sirius_io_object& obj,
-                                    size_t offset,
-                                    size_t size,
-                                    cudaStream_t stream,
-                                    cached_host_buffer* out_buffer)
-{
-  auto const& key = obj.raw_file_cache_id();
-
-  std::shared_lock map_lk(_map_mtx);
+  const auto& key = obj.raw_file_cache_id();
+  std::shared_lock lk(_map_mtx);
   auto it = _file_cache.find(key);
   if (it == _file_cache.end()) {
-    _full_miss_count.fetch_add(1, std::memory_order_relaxed);
-    return {};
+    lk.unlock();
+    std::unique_lock ulk(_map_mtx);
+    auto [new_it, inserted] = _file_cache.try_emplace(key, std::make_unique<file_entry>());
+    it                      = new_it;
+    if (inserted) {
+      it->second->file_size = obj.size();
+      it->second->io_obj    = obj.shared_from_this();
+      it->second->chunks.reserve((obj.size() + _pool->chunk_bytes() - 1) / _pool->chunk_bytes());
+    }
   }
-  auto& file = *it->second;
-
-  std::shared_lock file_lk(file.mtx);
-  map_lk.unlock();
-
-  auto covering = find_entries(file.entries, offset, size);
-  if (covering.empty()) return {};
-
-  // Multi-entry coverage: the read spans two or more adjacent prefetched
-  // ranges.  Only the cached/in_use fast path is supported here — mixed
-  // states across entries (one cached, one loading, one allocated, ...)
-  // would require coordinating per-entry waits / steals, which we don't
-  // currently model.  Any non-cached entry → miss, caller falls back.
-  //
-  // The single-entry path below preserves all state dispatch (steal,
-  // wait-on-load, miss classification) since it's the common case and
-  // the only one with reasonable wait/steal semantics.
-  if (covering.size() > 1) {
-    for (auto const& e : covering) {
-      auto st = e->state.get_state();
-      if (st != entry_state::cached && st != entry_state::in_use) {
-        // Some entry isn't ready — multi-entry hit fails, report miss.
-        // miss_range is the closest classifier (request straddles
-        // ranges and one of them is in a non-cached state).
-        spdlog::debug(
-          "prefetching_cache: miss_range (multi-entry coverage with non-cached entry) read_off={} "
-          "read_size={} entry_off={} entry_size={} entry_state={}",
-          offset,
-          size,
-          static_cast<size_t>(e->range.offset()),
-          static_cast<size_t>(e->range.size()),
-          static_cast<int>(st));
-        _miss_range.fetch_add(1, std::memory_order_relaxed);
-        return {};
-      }
-    }
-    pinned_view view{std::move(covering), stream};
-    if (view) {
-      _hit_count.fetch_add(1, std::memory_order_relaxed);
-      return view;
-    }
-    // try_acquire_read lost a race on at least one entry; the view's
-    // ctor already released anything it acquired.  Report as
-    // miss_range — a multi-entry view doesn't retry the way the
-    // single-entry path does (no clean way to resume across N CASes).
-    spdlog::debug(
-      "prefetching_cache: miss_range (multi-entry coverage with concurrent eviction) read_off={} "
-      "read_size={} view_range_offset={} view_range_size={}",
-      offset,
-      size,
-      static_cast<size_t>(view.range().offset()),
-      static_cast<size_t>(view.range().size()));
-    _miss_range.fetch_add(1, std::memory_order_relaxed);
-    return {};
-  }
-
-  // Single-entry coverage — the original state machine, unchanged.
-  auto& entry = covering.front();
-
-  // Dispatch on state:
-  //   cached / in_use → pin immediately.
-  //   allocated       → if out_buffer is non-null, try to steal the entry
-  //                     for a direct device read by flipping it to loading;
-  //                     otherwise treat as miss (io_dispatch_loop will load it).
-  //   loading         → wait for the load to complete, then retry.
-  //   evicting / empty → miss (caller falls back).
-  bool waited_on_load = false;
-  while (true) {
-    auto st = entry->state.get_state();
-    if (st == entry_state::cached || st == entry_state::in_use) {
-      pinned_view view{entry, stream};
-      if (view) {
-        _hit_count.fetch_add(1, std::memory_order_relaxed);
-        if (waited_on_load) _hit_after_wait.fetch_add(1, std::memory_order_relaxed);
-        return view;
-      }
-      // try_acquire_read lost a race; re-observe the state.
-      continue;
-    }
-    if (st == entry_state::allocated) {
-      if (out_buffer == nullptr) {
-        // Host read: no out_buffer means we can't steal the entry.  Today
-        // we report a miss, but the load IS imminent (io_dispatch_loop's
-        // try_start_loading is one CAS away); ideally we'd wait through
-        // this transient state instead of forcing the caller to fall back
-        // to the backend.
-        _miss_state_allocated_no_steal.fetch_add(1, std::memory_order_relaxed);
-        spdlog::debug(
-          "prefetching_cache: miss_state_allocated_no_steal off={} size={} entry_off={} "
-          "entry_size={}",
-          offset,
-          size,
-          static_cast<size_t>(entry->range.offset()),
-          static_cast<size_t>(entry->range.size()));
-        return {};
-      }
-      // Try to flip allocated → loading so we own the entry for device IO.
-      // On CAS failure the evictor raced us; out_buffer is left
-      // default-constructed (operator bool() == false) and we report a miss.
-      if (entry->state.try_start_loading()) {
-        *out_buffer = cached_host_buffer{entry, _pool};
-        _allocated_steal_count.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        _miss_state_steal_cas_lost.fetch_add(1, std::memory_order_relaxed);
-      }
-      return {};
-    }
-    if (st == entry_state::loading) {
-      waited_on_load = true;
-      // Release file_lk across the wait: the entry is pinned by our local
-      // shared_ptr, and file.mtx no longer protects anything we touch while
-      // parked.  Holding it shared would stall every concurrent insert() on
-      // this file (and, under writer-preference shared_mutex, every reader
-      // queued behind that insert).
-      file_lk.unlock();
-      entry->state.wait_while_pending();
-      file_lk.lock();
-      continue;
-    }
-    // State is `empty` or `evicting`.  Differentiate so we can tell
-    // "allocation falling behind reads" from "entry was loaded then
-    // evicted / load-failed" — both look like state == empty otherwise.
-    if (st == entry_state::evicting) {
-      _miss_state_evicting.fetch_add(1, std::memory_order_relaxed);
-      spdlog::debug(
-        "prefetching_cache: miss_state_evicting off={} size={} entry_off={} entry_size={}",
-        offset,
-        size,
-        static_cast<size_t>(entry->range.offset()),
-        static_cast<size_t>(entry->range.size()));
-    } else if (entry->ever_allocated.load(std::memory_order_acquire)) {
-      // Was allocated.  Was it ever loaded successfully (ever_cached)?
-      //   yes → entry was cached then evicted (true eviction churn).
-      //   no  → IO failed and mark_load_failed reset state to empty.
-      if (entry->ever_cached.load(std::memory_order_acquire)) {
-        _miss_state_empty_post_evict.fetch_add(1, std::memory_order_relaxed);
-        spdlog::debug(
-          "prefetching_cache: miss_state_empty_post_evict off={} size={} entry_off={} "
-          "entry_size={}",
-          offset,
-          size,
-          static_cast<size_t>(entry->range.offset()),
-          static_cast<size_t>(entry->range.size()));
-      } else {
-        _miss_state_empty_load_failed.fetch_add(1, std::memory_order_relaxed);
-        spdlog::debug(
-          "prefetching_cache: miss_state_empty_load_failed off={} size={} entry_off={} "
-          "entry_size={}",
-          offset,
-          size,
-          static_cast<size_t>(entry->range.offset()),
-          static_cast<size_t>(entry->range.size()));
-      }
-    } else {
-      _miss_state_empty_never_allocated.fetch_add(1, std::memory_order_relaxed);
-      spdlog::debug(
-        "prefetching_cache: miss_state_empty_never_allocated off={} size={} entry_off={} "
-        "entry_size={}",
-        offset,
-        size,
-        static_cast<size_t>(entry->range.offset()),
-        static_cast<size_t>(entry->range.size()));
-    }
-    return {};
-  }
+  return *it->second;
 }
 
-std::string prefetching_cache::summary() const
+prefetching_handle prefetching_cache::insert(
+  const sirius_io_object& obj, const std::vector<cudf::io::text::byte_range_info>& ranges)
 {
-  auto hits             = _hit_count.load(std::memory_order_relaxed);
-  auto hits_after_wait  = _hit_after_wait.load(std::memory_order_relaxed);
-  auto steals           = _allocated_steal_count.load(std::memory_order_relaxed);
-  auto m_range          = _miss_range.load(std::memory_order_relaxed);
-  auto m_alloc_no_steal = _miss_state_allocated_no_steal.load(std::memory_order_relaxed);
-  auto m_steal_lost     = _miss_state_steal_cas_lost.load(std::memory_order_relaxed);
-  auto m_evicting       = _miss_state_evicting.load(std::memory_order_relaxed);
-  auto m_never_alloc    = _miss_state_empty_never_allocated.load(std::memory_order_relaxed);
-  auto m_post_evict     = _miss_state_empty_post_evict.load(std::memory_order_relaxed);
-  auto m_load_failed    = _miss_state_empty_load_failed.load(std::memory_order_relaxed);
-  auto full             = _full_miss_count.load(std::memory_order_relaxed);
-  auto evicted_entries  = _evicted_entries.load(std::memory_order_relaxed);
-  auto evicted_chunks   = _evicted_chunks.load(std::memory_order_relaxed);
-  auto io_dispatched    = _io_dispatched_entries.load(std::memory_order_relaxed);
-  auto io_succ          = _io_load_success.load(std::memory_order_relaxed);
-  auto io_revert_ok     = _io_load_revert_success.load(std::memory_order_relaxed);
-  auto io_revert_lost   = _io_load_revert_failed.load(std::memory_order_relaxed);
-  auto evict_from_alloc = _evicted_from_allocated.load(std::memory_order_relaxed);
-  auto partial          = m_range + m_alloc_no_steal + m_steal_lost + m_evicting + m_never_alloc +
-                 m_post_evict + m_load_failed;
-  auto total = hits + steals + partial + full;
-  auto pct   = [&](uint64_t n) {
-    return total > 0 ? (100.0 * static_cast<double>(n) / static_cast<double>(total)) : 0.0;
-  };
-  auto s = fmt::format(
-    "prefetching_cache: {} reads ({} hit {:.1f}% [of which {} waited on "
-    "loading], {} allocated-steal {:.1f}%, {} partial-miss {:.1f}% "
-    "[range={} alloc-no-steal={} steal-cas-lost={} evicting={} "
-    "empty-never-alloc={} empty-post-evict={} empty-load-failed={}], "
-    "{} full-miss {:.1f}%); io[dispatched={} success={} revert-ok={} "
-    "revert-lost={} alloc-evicted={}]; evicted {} entries / {} chunks; "
-    "pool {}/{} chunks free",
-    total,
-    hits,
-    pct(hits),
-    hits_after_wait,
-    steals,
-    pct(steals),
-    partial,
-    pct(partial),
-    m_range,
-    m_alloc_no_steal,
-    m_steal_lost,
-    m_evicting,
-    m_never_alloc,
-    m_post_evict,
-    m_load_failed,
-    full,
-    pct(full),
-    io_dispatched,
-    io_succ,
-    io_revert_ok,
-    io_revert_lost,
-    evict_from_alloc,
-    evicted_entries,
-    evicted_chunks,
-    _pool ? _pool->free_count() : 0U,
-    _pool ? _pool->total_chunks() : 0U);
-  spdlog::info("{}", s);
-  return s;
-}
+  const auto& key = obj.raw_file_cache_id();
+  auto& file      = get_or_create_file_entry(obj);
 
-// ===========================================================================
-// evictor_loop — dispose-signal + on-demand eviction (no periodic pressure)
-// ===========================================================================
-
-void prefetching_cache::evictor_loop(std::stop_token stop)
-{
-  std::stop_callback stop_cb(stop, [this] { _request_sem.release(); });
-
-  // Evict a single cached entry (cached → evicting → empty, returns chunks).
-  // Returns the number of chunks freed (0 if the entry is not evictable).
-  auto try_evict_cached = [this](cache_entry& entry) -> size_t {
-    if (entry.state.get_state() != entry_state::cached) return 0;
-    if (!entry.state.try_start_evicting()) return 0;
-    size_t n = entry.chunks.size();
-    if (_pool) { _pool->deallocate_bulk(entry.chunks); }
-    entry.state.mark_evicted();
-    _evicted_entries.fetch_add(1, std::memory_order_relaxed);
-    _evicted_chunks.fetch_add(n, std::memory_order_relaxed);
-    return n;
-  };
-
-  // Walk a wrapper's entries, evicting everything that can be reclaimed.
-  // Handles the pre-data `allocated` state in addition to `cached`.
-  //
-  //   allocated → empty         (return pre-allocated chunks to pool)
-  //   cached    → evicting → empty (return loaded chunks to pool)
-  //   loading / in_use / evicting / empty → skip (in-flight or already gone)
-  //
-  // Returns:
-  //   .freed:    total chunk count freed
-  //   .leftover: entries still pinned (cached + pin_count>0); re-enqueued by caller
-  struct walk_result {
-    size_t freed{0};
-    std::vector<std::shared_ptr<cache_entry>> leftover;
-  };
-  auto walk_and_evict = [&](prefetch_request& req) -> walk_result {
-    walk_result r;
-    r.leftover.reserve(req.entries.size());
-    for (auto& e : req.entries) {
-      if (!e) continue;
-      auto st = e->state.get_state();
-
-      if (st == entry_state::allocated) {
-        // Unified eviction path: allocated → evicting → empty, same
-        // shape as the cached → evicting → empty transition below.
-        if (e->state.try_start_evicting_from_allocated()) {
-          size_t n = e->chunks.size();
-          if (_pool) { _pool->deallocate_bulk(e->chunks); }
-          e->state.mark_evicted();
-          _evicted_from_allocated.fetch_add(1, std::memory_order_relaxed);
-          r.freed += n;
-        }
-        continue;
-      }
-
-      if (st == entry_state::cached) {
-        size_t freed = try_evict_cached(*e);
-        if (freed > 0) {
-          r.freed += freed;
-        } else if (e->state.get_state() == entry_state::cached) {
-          // Still cached but pin_count > 0 — reader holds it.  Retry later.
-          r.leftover.push_back(std::move(e));
-        }
-        continue;
-      }
-
-      if (st == entry_state::in_use) {
-        // Reader is active; keep the entry in leftover so we retry eviction
-        // once the pin is released and the state returns to cached.
-        r.leftover.push_back(std::move(e));
-        continue;
-      }
-      // loading / evicting / empty: in-flight or already gone; drop.
+  std::vector<size_t> chunk_offsets;  // sorted
+  std::size_t last_offset = 0;
+  std::ranges::for_each(ranges, [&](auto const& r) {
+    auto const off         = static_cast<size_t>(r.offset());
+    auto const sz          = static_cast<size_t>(r.size());
+    auto const chunk_bytes = _pool->chunk_bytes();
+    auto const aligned_off = (r.offset() / chunk_bytes) * chunk_bytes;
+    auto const aligned_sz =
+      ((off + sz + chunk_bytes - 1) / chunk_bytes) * chunk_bytes - aligned_off;
+    for (size_t o = aligned_off; o < aligned_off + aligned_sz; o += chunk_bytes) {
+      if (o < last_offset) continue;  // already covered by a previous range, overlapping ranges
+      last_offset = o;
+      chunk_offsets.push_back(o);
     }
-    return r;
-  };
-
-  // Disposed-entries pass: NO-OP in the steady state.  Standard cache
-  // behavior — eviction is driven solely by pool pressure (evict_chunks
-  // below).  Cached and allocated entries persist past handle-drop / cancel
-  // so the next query iteration that re-fadvises the same ranges hits the
-  // cached data instead of re-loading.  Kept as a stub so notify_disposed
-  // signals don't block any future re-introduction of a disposed-path
-  // policy.
-  auto evict_disposed_entries = [&]() -> size_t { return 0; };
-
-  // Walk the FIFO until at least @p needed chunks have been reclaimed.
-  // Called when the allocator has an outstanding eviction_request.
-  auto evict_chunks = [&](size_t needed) -> size_t {
-    size_t reclaimed             = 0;
-    size_t empty_ticks           = 0;
-    size_t const queue_size_hint = std::max<size_t>(_eviction_queue.size_approx(), 1);
-
-    // Compound stop predicate: stop_token (normal shutdown signal) OR
-    // _shutting_down (set by the dtor BEFORE request_stop so that we can
-    // bail before evict_chunks's natural termination conditions kick in
-    // — needed so the allocator's late-pushed eviction_request resolves
-    // promptly during shutdown and doesn't block join(allocator)).
-    auto should_stop = [&] {
-      return stop.stop_requested() || _shutting_down.load(std::memory_order_acquire);
-    };
-
-    while (reclaimed < needed) {
-      if (should_stop()) break;
-
-      prefetch_request wrapper;
-      if (!_eviction_queue.try_dequeue(wrapper)) {
-        std::this_thread::sleep_for(EVICTOR_POLL_INTERVAL);
-        if (should_stop()) break;
-        if (++empty_ticks > 4) break;
-        continue;
-      }
-      empty_ticks = 0;
-
-      // Pool-pressure path: evict from ANY wrapper (regardless of
-      // n_pending or alive status).  walk_and_evict targets allocated
-      // and cached states; loading / in_use / evicting / empty are
-      // skipped naturally.  Live wrappers that still have evictable
-      // entries get their evictables reaped — the cache trades the
-      // user's "still wanted" signal for chunks the allocator needs.
-      auto r = walk_and_evict(wrapper);
-      reclaimed += r.freed;
-      if (!r.leftover.empty()) {
-        wrapper.entries = std::move(r.leftover);
-        _eviction_queue.enqueue(std::move(wrapper));
-      }
-      if (reclaimed == 0 && ++empty_ticks > queue_size_hint) {
-        std::this_thread::sleep_for(EVICTOR_POLL_INTERVAL);
-        if (should_stop()) break;
-        empty_ticks = 0;
-      }
-    }
-    return reclaimed;
-  };
-
-  while (!stop.stop_requested()) {
-    // Wait for any signal: allocation shortfall OR handle dispose.
-    // Both paths release _request_sem.
-    bool signalled = _request_sem.try_acquire_for(EVICTOR_POLL_INTERVAL);
-    if (stop.stop_requested()) break;
-    if (!signalled) continue;  // timeout — no work queued
-
-    // Always scan for disposed entries first so memory is reclaimed
-    // immediately after cancel() fires, before fulfilling any allocation
-    // request that may have arrived at the same time.
-    evict_disposed_entries();
-
-    // Fulfil any pending on-demand allocation request.
-    eviction_request chunk_req;
-    if (!_request_queue.try_dequeue(chunk_req)) continue;
-
-    size_t const needed    = chunk_req.n_chunks_needed;
-    size_t const reclaimed = evict_chunks(needed);
-
-    if (reclaimed >= needed) {
-      chunk_req.promise.set_value();
-    } else {
-      chunk_req.promise.set_exception(std::make_exception_ptr(
-        std::runtime_error("eviction aborted — couldn't satisfy chunk request")));
-    }
-  }
-
-  // Drain any pending chunk requests on shutdown so allocators in fut.get() unblock.
-  eviction_request req;
-  while (_request_queue.try_dequeue(req)) {
-    req.promise.set_exception(
-      std::make_exception_ptr(std::runtime_error("eviction aborted — cache shutting down")));
-  }
-}
-
-// ===========================================================================
-// allocator_loop
-// ===========================================================================
-
-void prefetching_cache::allocator_loop(std::stop_token stop)
-{
-  std::stop_callback stop_cb(stop, [this] {
-    _work_seq.fetch_add(1, std::memory_order_release);
-    _work_seq.notify_one();
   });
 
-  // _pool is a const member baked at construction.  Threads only run
-  // when _armed (which implies pool != nullptr), so no per-iteration
-  // null checks are needed.
-  buffer_pool* const pool = _pool;
+  auto chunks_to_fetch =
+    file.update_and_get_chunks(chunk_offsets, _ticker.load(std::memory_order_relaxed));
 
-  while (!stop.stop_requested()) {
-    // Dequeue.  Park on _work_seq when the queue is empty; the dtor
-    // bumps _work_seq + notify_all (and the stop_callback above re-bumps
-    // it) so a stopped worker observes the token here and exits.
-    work_item item;
-    if (!_work_queue.try_dequeue(item)) {
-      auto seq = _work_seq.load(std::memory_order_acquire);
-      if (stop.stop_requested()) break;
-      if (!_work_queue.try_dequeue(item)) {
-        _work_seq.wait(seq, std::memory_order_relaxed);
-        continue;
-      }
-    }
-    if (stop.stop_requested()) { break; }
+  auto [work, handle] = preparation_work_item::create(file, std::move(chunks_to_fetch));
+  _preparation_queue.enqueue(std::move(work));
 
-    // ---- Cancellation gate -------------------------------------------------
-    // The caller-side prefetching_handle may have flipped alive to false
-    // between insert() and now (e.g. fadvise(disposable) fired before the
-    // worker drained the queue).  alive is never null on a dequeued item:
-    // insert() always constructs one before enqueuing.
-    if (!item.alive->load(std::memory_order_acquire)) { continue; }
-
-    // ---- Phase 1: compute an upper bound on chunks for the whole item ------
-    // Peek at each entry's state to skip ones that obviously don't need
-    // loading (already cached / loading / etc.).  Peeks are racy, but only
-    // as an optimisation — entries that transition out from under us get
-    // filtered again in Phase 4 by try_start_loading.
-    std::vector<size_t> per_entry_chunks(item.entries.size(), 0);
-    size_t upper_bound_chunks = 0;
-    auto const chunk_bytes    = pool->chunk_bytes();
-    for (size_t i = 0; i < item.entries.size(); ++i) {
-      auto const& e = item.entries[i];
-      auto st       = e->state.get_state();
-      if (st != entry_state::empty) continue;
-      auto range_size     = static_cast<size_t>(e->range.size());
-      auto n              = (range_size + chunk_bytes - 1) / chunk_bytes;
-      per_entry_chunks[i] = n;
-      upper_bound_chunks += n;
-    }
-
-    if (upper_bound_chunks == 0) continue;
-
-    // ---- Phase 2: allocate chunks up-front, with at most one eviction wait.
-    // No entry has been transitioned to loading yet, so if anything here
-    // fails we can abandon the work_item cleanly — readers see the original
-    // state (empty/cached/etc.) and take their normal paths.
-    std::vector<std::byte*> ptrs;
-    ptrs.reserve(upper_bound_chunks);
-    auto got = pool->allocate_bulk(upper_bound_chunks, ptrs);
-    if (got < upper_bound_chunks) {
-      // Bail before enqueueing if shutdown started.  Without this, the
-      // allocator could push an eviction_request into a queue whose
-      // evictor has already exited, and fut.get() below would block
-      // forever, hanging the dtor's join(allocator).  Combined with the
-      // dtor reorder (allocator joined while evictor still alive) and
-      // the evictor's own _shutting_down check inside evict_chunks, this
-      // makes shutdown deadlock-free.
-      if (_shutting_down.load(std::memory_order_acquire) || stop.stop_requested()) {
-        pool->deallocate_bulk(ptrs);
-        // Entries are still in `empty`; just drop the work_item.
-        break;
-      }
-
-      size_t shortfall = upper_bound_chunks - got;
-      eviction_request req;
-      req.n_chunks_needed = shortfall;
-      auto fut            = req.promise.get_future();
-      _request_queue.enqueue(std::move(req));
-      _request_sem.release();
-
-      try {
-        fut.get();
-      } catch (...) {
-        pool->deallocate_bulk(ptrs);
-        continue;
-      }
-
-      // After the wait — re-check stop.  If the evictor resolved us
-      // mid-shutdown, drop the work cleanly instead of pushing IO into
-      // a tearing-down system.
-      if (stop.stop_requested()) {
-        pool->deallocate_bulk(ptrs);
-        break;
-      }
-
-      auto extra = pool->allocate_bulk(shortfall, ptrs);
-      if (extra < shortfall) {
-        pool->deallocate_bulk(ptrs);
-        continue;
-      }
-    }
-
-    // ---- Phase 4: empty → allocated + chunk assignment --------------------
-    // Claim each entry via CAS (empty → allocated) and assign
-    // pre-allocated chunks.  IO dispatch (budget gating and loading
-    // transition) happens in io_dispatch_loop.  If try_allocate fails,
-    // the entry transitioned out of empty between our Phase 1 peek and
-    // this CAS (another allocator pass claimed it, or it was already
-    // cached / loading); return the pre-allocated chunks and skip.
-    std::vector<std::shared_ptr<cache_entry>> batch;
-    batch.reserve(item.entries.size());
-    size_t ptr_idx = 0;
-    for (size_t i = 0; i < item.entries.size(); ++i) {
-      auto n = per_entry_chunks[i];
-      if (n == 0) continue;
-
-      auto const& e      = item.entries[i];
-      auto return_chunks = [&] {
-        for (size_t j = 0; j < n; ++j)
-          pool->deallocate(ptrs[ptr_idx + j]);
-        ptr_idx += n;
-      };
-
-      if (!e->state.try_allocate()) {
-        return_chunks();
-        continue;
-      }
-      // Diagnostic: mark the entry as having reached `allocated` at
-      // least once.  Lets read() distinguish "never allocated yet"
-      // (allocation behind reads) from "allocated but evicted/load-
-      // failed" (eviction churn).  release ordering pairs with the
-      // acquire-load in read()'s miss-classifier.
-      e->ever_allocated.store(true, std::memory_order_release);
-
-      // Chunks assigned while in allocated state — visible to io_dispatch_loop.
-      e->chunks.assign(ptrs.begin() + ptr_idx, ptrs.begin() + ptr_idx + n);
-      ptr_idx += n;
-      batch.push_back(e);
-    }
-
-    if (batch.empty()) {
-      // Every entry raced past empty; pre-allocated chunks already returned.
-      continue;
-    }
-
-    continue;
-
-    // ---- Hand off allocated entries to io_dispatch_loop -------------------
-    work_item dispatch{item.file_key, item.io_obj, std::move(batch), item.alive};
-    {
-      std::lock_guard lk(_io_dispatch_mtx);
-      _io_dispatch_queue.push_back(std::move(dispatch));
-    }
-    _io_dispatch_cv.notify_one();
-  }
+  return std::move(handle);
 }
 
-// ===========================================================================
-// io_dispatch_loop
-// ===========================================================================
-
-void prefetching_cache::io_dispatch_loop(std::stop_token stop)
+bool prefetching_cache::host_read(const sirius_io_object& obj,
+                                  size_t offset,
+                                  size_t size,
+                                  std::byte* dst)
 {
-  std::stop_callback stop_cb(stop, [this] { _io_dispatch_cv.notify_all(); });
+  if (size == 0 || dst == nullptr) return true;
 
-  buffer_pool* const pool    = _pool;
-  sirius_ioctx* const io_ctx = _io_ctx;
+  file_entry* file = nullptr;
+  {
+    std::shared_lock lk(_map_mtx);
+    auto it = _file_cache.find(obj.raw_file_cache_id());
+    if (it == _file_cache.end()) { return {}; }
+    file = it->second.get();
+  }
 
-  while (!stop.stop_requested()) {
-    // ---- Wait for work from allocator_loop ---------------------------------
-    work_item item;
-    {
-      std::unique_lock lk(_io_dispatch_mtx);
-      _io_dispatch_cv.wait(lk,
-                           [&] { return !_io_dispatch_queue.empty() || stop.stop_requested(); });
-      if (stop.stop_requested()) {
-        // Drain any remaining items so allocator_loop doesn't block.
-        // Use the unified allocated → evicting → empty path so all
-        // evictions land at `empty` via `evicting`.
-        while (!_io_dispatch_queue.empty()) {
-          auto& front = _io_dispatch_queue.front();
-          for (auto& e : front.entries) {
-            if (!e) continue;
-            if (e->state.try_start_evicting_from_allocated()) {
-              if (pool) { pool->deallocate_bulk(e->chunks); }
-              e->state.mark_evicted();
-            }
-          }
-          _io_dispatch_queue.pop_front();
-        }
-        break;
-      }
-      item = std::move(_io_dispatch_queue.front());
-      _io_dispatch_queue.pop_front();
+  auto chunks = file->fetch_chunks(offset, size);
+  if (chunks.empty()) { return false; }  // full-miss
+
+  auto iter =
+    std::ranges::find_if(chunks, [](cached_chunk* c) { return !c->state.acquire_read(); });
+
+  if (iter != chunks.end()) {
+    std::for_each(chunks.begin(), iter, [](cached_chunk* c) { c->state.release_read(); });
+    return false;
+  }
+
+  auto const end_offset = offset + size;
+  auto const chunk_size = _pool->chunk_bytes();
+
+  for (auto* chunk : chunks) {
+    auto const chunk_begin = std::max(offset, chunk->offset);
+    auto const chunk_end   = std::min(end_offset, chunk->offset + chunk_size);
+    auto const copy_size   = chunk_end - chunk_begin;
+    auto const src_offset  = chunk_begin - chunk->offset;
+    auto const dst_offset  = chunk_begin - offset;
+
+    std::memcpy(dst + dst_offset, chunk->data + src_offset, copy_size);
+    chunk->state.release_read();
+  }
+
+  return true;
+}
+
+exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_object& obj,
+                                                             size_t offset,
+                                                             size_t size,
+                                                             std::byte* dst,
+                                                             rmm::cuda_stream_view stream)
+{
+  if (size == 0 || dst == nullptr) return true;
+
+  file_entry* file = nullptr;
+  {
+    std::shared_lock lk(_map_mtx);
+    auto it = _file_cache.find(obj.raw_file_cache_id());
+    if (it == _file_cache.end()) { return false; }
+    file = it->second.get();
+  }
+
+  auto chunks = file->fetch_chunks(offset, size);
+  if (chunks.empty()) { return false; }  // full-miss
+
+  // check marks that are cached, or in-use for reuse
+  auto partition_point = std::partition(
+    chunks.begin(), chunks.end(), [](cached_chunk* c) { return c->state.acquire_read(); });
+
+  if (!_io_ctx->supports_host_to_device_read() && partition_point != chunks.end()) {
+    std::for_each(
+      chunks.begin(), partition_point, [](cached_chunk* c) { c->state.release_read(); });
+    return false;
+  }
+
+  // check if any chunks is allocated but not yet loaded, which means we can reuse it for the
+  // current read and skip waiting for the prefetch to complete.
+  auto last_loading_pnt = std::find_if(
+    partition_point, chunks.end(), [](cached_chunk* c) { return !c->state.mark_loading(); });
+
+  // we are not waiting for currently loading one
+  if (last_loading_pnt != chunks.end()) {
+    std::for_each(
+      chunks.begin(), partition_point, [](cached_chunk* c) { c->state.release_read(); });
+    std::for_each(partition_point, last_loading_pnt, [](cached_chunk* c) {
+      static_cast<void>(c->state.mark_load_failed());
+    });
+    return false;
+  }
+
+  // copy cached chunks to destination buffer asynchronously
+  std::optional<cucascade::cuda::cuda_event> copy_evnt;
+  if (partition_point != chunks.begin()) {
+    copy_evnt.emplace();
+    size_t chunk_bytes = _pool->chunk_bytes();
+    size_t dst_off     = 0;
+    for (cached_chunk* c : std::span(chunks.begin(), partition_point)) {
+      size_t chunk_start = c->offset;
+      size_t copy_start  = std::max(chunk_start, offset);
+      size_t copy_end    = std::min(chunk_start + chunk_bytes, offset + size);
+      size_t copy_size   = copy_end - copy_start;
+      size_t src_off     = copy_start - chunk_start;
+      cudaMemcpyAsync(dst + dst_off, c->data + src_off, copy_size, cudaMemcpyHostToDevice, stream);
+      dst_off += copy_size;
     }
+    copy_evnt->record(stream);
+  }
 
-    // ---- Cancellation check ------------------------------------------------
-    // The handle may have been cancelled between allocator_loop's push and now.
-    // Return chunks for all allocated entries and skip.
-    if (!item.alive->load(std::memory_order_acquire)) { continue; }
-
-    // ---- allocated → loading + build batch ---------------------------------
-    // try_start_loading() (allocated → loading) establishes exclusive ownership
-    // of the entry's chunks via an acq_rel CAS.  Reading e->chunks BEFORE
-    // this CAS would race with the evictor's try_cancel_allocated() which
-    // clears the vector.  We therefore count chunks and build the batch in
-    // a single pass, reading chunks only after the CAS succeeds.
-    // Entries where try_start_loading fails were cancelled by the evictor,
-    // which already freed their chunks.
-    std::vector<std::shared_ptr<cache_entry>> batch;
-    batch.reserve(item.entries.size());
-    size_t total_chunks = 0;
-    for (auto& e : item.entries) {
-      if (!e) continue;
-      if (!e->state.try_start_loading()) continue;
-      total_chunks += e->chunks.size();  // safe: CAS above gives us sole ownership
-      _io_dispatched_entries.fetch_add(1, std::memory_order_relaxed);
-      batch.push_back(e);
+  if (partition_point != chunks.end()) {
+    std::vector<io::io_object_segment> segments;
+    segments.reserve(std::distance(partition_point, chunks.end()));
+    for (cached_chunk* c : std::span(partition_point, chunks.end())) {
+      size_t chunk_start = c->offset;
+      size_t copy_start  = std::max(chunk_start, offset);
+      size_t copy_end    = std::min(chunk_start + _pool->chunk_bytes(), offset + size);
+      size_t copy_size   = copy_end - copy_start;
+      segments.emplace_back(copy_start, copy_size, c->data + (copy_start - chunk_start), true);
     }
+    auto io_fut = _io_ctx->host_to_device_read_async_io(
+      obj, segments, offset, size, reinterpret_cast<uint8_t*>(dst), stream);
 
-    if (batch.empty()) {
-      // All entries cancelled; nothing to dispatch.
+    // Return a future that, when awaited, first waits for the prefetch IO to
+    // complete and then synchronizes on the H2D copy event for the chunks that
+    // were already cached.  The event is moved into the closure so it outlives
+    // this call.  A failed IO is surfaced as an exception (not a false result):
+    // reaching this path means we attempted the read, so callers must not retry
+    // it through a different code path.
+    return std::move(io_fut).defer(
+      [copy_evnt = std::move(copy_evnt)](exec::try_t<size_t>&& res) mutable -> bool {
+        if (copy_evnt) { copy_evnt->synchronize(); }
+        if (res.has_exception()) { std::rethrow_exception(std::move(res).exception()); }
+        return true;
+      });
+  }
+
+  // All requested chunks were already cached: return a future that, when
+  // awaited, synchronizes on the H2D copy event.
+  return exec::make_semi_future(true).defer(
+    [copy_evnt = std::move(copy_evnt),
+     chunks    = std::move(chunks)](exec::try_t<bool>&& status) mutable -> bool {
+      if (copy_evnt) { copy_evnt->synchronize(); }
+      return true;
+    });
+}
+
+std::string prefetching_cache::summary() const { return ""; }
+
+void prefetching_cache::prepare_for_query() noexcept
+{
+  _ticker.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ===========================================================================
+
+void prefetching_cache::prepare_loop(std::stop_token st)
+{
+  while (!_shutting_down && !st.stop_requested()) {
+    preparation_request req = nullptr;
+    _preparation_queue.wait_dequeue(req);
+    if (req == nullptr) { continue; }  // spurious wakeup or shutdown
+
+    if (req->is_cancelled()) { continue; }  // request was cancelled
+
+    auto& chunks = req->chunks;
+
+    // how many buffers we need to allocate from the pool to prepare this request?
+    std::size_t n_chunks_needed = std::ranges::count_if(
+      chunks, [](cached_chunk* c) { return c->state.get_state() == entry_state::empty; });
+
+    std::vector<std::byte*> buffers;
+    buffers.reserve(n_chunks_needed);
+    auto n_allocated = _pool->allocate_bulk(n_chunks_needed, buffers);
+    if (n_allocated != n_chunks_needed) {
+      // Pool is exhausted and cannot grow.  Return the buffers we did get and
+      // re-enqueue the work for a retry after the evictor frees some.
+      // todo(amin): needs eviction and then backoff
+      if (n_allocated > 0) _pool->deallocate_bulk(buffers);
+      _preparation_queue.enqueue(std::move(req));
       continue;
     }
 
-    // ---- Phase 3: acquire inflight budget ----------------------------------
-    // Budget is sized to the exact chunks we own (not all allocated entries,
-    // since some may have been cancelled between allocator_loop and here).
-    auto budget_slot = _inflight_budget->acquire(total_chunks, stop);
-    if (!budget_slot) {
-      // Stop requested while waiting for budget.  Revert each entry
-      // loading → allocated so the chunks stay attached and a later
-      // device_read with out_buffer can steal-retry from `allocated`
-      // (rather than seeing `empty` and falling through to the
-      // backend).  If the CAS fails the entry was already moved out of
-      // `loading` (shutdown's abort_pending_entries raced) — abort
-      // doesn't free chunks for the loading transition, so we must
-      // deallocate them here.
-      for (auto& e : batch) {
-        if (!e->state.try_revert_loading_to_allocated()) { pool->deallocate_bulk(e->chunks); }
-      }
-      break;
-    }
-
-    // ---- Phase 5: dispatch IO in sub-batches -------------------------------
-    // SUBBATCH at 16 trades dispatch count for HOL latency: a 600-range
-    // request becomes ~38 sub-dispatches; first-byte latency for the
-    // head reader drops from max(600 IOs) to max(16 IOs).
-    constexpr size_t SUBBATCH = 16;
-
-    auto slot_holder = std::make_shared<admission_control::slot>(std::move(budget_slot));
-    auto& obj_ref    = *item.io_obj;
-
-    for (size_t sb_start = 0; sb_start < batch.size(); sb_start += SUBBATCH) {
-      // Cancellation re-check between sub-batches: a fadvise(disposable)
-      // that fires after we dispatched some sub-batches can still cancel
-      // the remaining ones.  Already-dispatched callbacks complete normally.
-      if (!item.alive->load(std::memory_order_acquire)) {
-        // fadvise(disposable) raced between sub-batches.  Revert each
-        // remaining entry loading → allocated so the chunks stay
-        // attached for a future read-driven retry.  CAS-fail fallback
-        // mirrors the budget-bail path above.
-        for (size_t i = sb_start; i < batch.size(); ++i) {
-          if (!batch[i]->state.try_revert_loading_to_allocated()) {
-            pool->deallocate_bulk(batch[i]->chunks);
-          }
-        }
-        break;
-      }
-
-      size_t const sb_end = std::min(sb_start + SUBBATCH, batch.size());
-
-      std::vector<cudf::io::text::byte_range_info> sb_ranges;
-      std::vector<cudf::host_span<std::byte>> sb_dsts;
-      for (size_t i = sb_start; i < sb_end; ++i) {
-        auto const& e          = batch[i];
-        auto range_off         = static_cast<size_t>(e->range.offset());
-        auto range_size        = static_cast<size_t>(e->range.size());
-        auto const chunk_bytes = e->chunk_bytes;
-        for (size_t c = 0; c < e->chunks.size(); ++c) {
-          auto off = range_off + c * chunk_bytes;
-          auto sz  = std::min(chunk_bytes, range_size - c * chunk_bytes);
-          sb_ranges.emplace_back(static_cast<int64_t>(off), static_cast<int64_t>(sz));
-          sb_dsts.emplace_back(e->chunks[c], sz);
+    for (size_t i = 0; i < n_chunks_needed; ++i) {
+      if (chunks[i]->state.mark_queued()) {
+        chunks[i]->data = buffers[i];  // revert the swap if we lost the
+        if (!chunks[i]->state.mark_allocated()) {
+          spdlog::error(
+            "prefetching_cache: chunk at offset {} was marked queued but failed to mark "
+            "allocated",
+            chunks[i]->offset);
         }
       }
-
-      std::vector<std::shared_ptr<cache_entry>> sb_batch(
-        batch.begin() + static_cast<std::ptrdiff_t>(sb_start),
-        batch.begin() + static_cast<std::ptrdiff_t>(sb_end));
-
-      // host_read_ranges_async_io returns a semi_future.  Bind it to
-      // the cache's 2-thread callback dispatcher with .via() so the
-      // bookkeeping below (state reverts, mark_cached, counters,
-      // admission-slot / io_obj release) runs on a worker thread —
-      // never inline on the reactor thread.  The future returned by
-      // then_try is intentionally discarded: the chain still fires
-      // for its side effects.
-      io_ctx->host_read_ranges_async_io(obj_ref, sb_ranges, sb_dsts)
-        .via(_io_callback_dispatcher.get())
-        .then_try([self = this,
-                   pool,
-                   batch  = std::move(sb_batch),
-                   slot   = slot_holder,
-                   io_obj = item.io_obj,
-                   key    = item.file_key](exec::try_t<size_t>&& t) mutable {
-          if (t.has_exception()) {
-            try {
-              std::rethrow_exception(t.exception());
-            } catch (std::exception const& ex) {
-              spdlog::error("prefetching_cache: IO failed for {}: {}", key, ex.what());
-            }
-            // Revert each entry loading → allocated rather than
-            // discarding to `empty`.  Chunks stay attached so a
-            // subsequent device_read with out_buffer can steal the
-            // entry and retry the load with a fresh request_context.
-            // The CAS only fails if shutdown's abort_pending_entries
-            // raced ahead — in that case we still own the chunks
-            // (abort doesn't free chunks for the `loading` transition)
-            // and must deallocate to avoid a leak.
-            for (auto const& e : batch) {
-              if (!e->state.try_revert_loading_to_allocated()) {
-                self->_io_load_revert_failed.fetch_add(1, std::memory_order_relaxed);
-                pool->deallocate_bulk(e->chunks);
-              } else {
-                self->_io_load_revert_success.fetch_add(1, std::memory_order_relaxed);
-              }
-            }
-          } else {
-            for (auto const& e : batch) {
-              if (e->state.try_mark_cached()) {
-                e->ever_cached.store(true, std::memory_order_release);
-                self->_io_load_success.fetch_add(1, std::memory_order_relaxed);
-              }
-            }
-          }
-          // `slot` and `io_obj` destruct here — budget is returned
-          // to admission_control (which wakes any wait_for_idle
-          // waiter once the last slot drops), and the file handle is
-          // released only after the IO backend is done with it.
-        });
     }
+
+    if (!_io_ctx->supports_vector_host_read() ||
+        _io_ctx->preferred_prefetching_mode() == prefetching_mode::disposable) {
+      // either the backend doesn't support scatter-gather reads or it prefers not to reuse
+      // buffers for multiple reads.  In either case, we can skip the prefetching step and let the
+      // read() path handle the IO directly into the caller's buffer.
+      continue;
+    }
+
+    auto prefetch_req    = std::make_unique<prefetch_work_item>();
+    prefetch_req->file   = req->file;
+    prefetch_req->chunks = std::move(chunks);
+    prefetch_req->alive  = req->state();
+
+    if (!st.stop_requested()) { _prefetch_queue.enqueue(std::move(prefetch_req)); }
   }
 }
 
-}  // namespace sirius::io
+void prefetching_cache::prefetch_loop(std::stop_token st)
+{
+  constexpr bool device_accessible = true;
+  while (!_shutting_down && !st.stop_requested()) {
+    prefetch_request req = nullptr;
+    _prefetch_queue.wait_dequeue(req);
+    if (req == nullptr || req->is_cancelled()) { continue; }
+
+    auto& allocated_chunks = req->chunks;
+    auto& io_obj           = req->file->io_obj;
+    std::vector<io::io_object_segment> segments;
+
+    segments.reserve(allocated_chunks.size());
+    allocated_chunks.erase(
+      std::remove_if(allocated_chunks.begin(),
+                     allocated_chunks.end(),
+                     [&](cached_chunk* c) {
+                       if (c->state.mark_loading()) {
+                         segments.emplace_back(
+                           c->offset, _pool->chunk_bytes(), c->data, device_accessible);
+                         return false;
+                       }
+                       return true;
+                     }),
+      allocated_chunks.end());
+
+    // request was cancelled
+    if (req->is_cancelled()) {
+      std::ranges::for_each(
+        allocated_chunks, [&](cached_chunk* c) { static_cast<void>(c->state.mark_load_failed()); });
+      continue;
+    }
+
+    _io_ctx->host_read_ranges_async_io(*io_obj, segments)
+      .via(&_io_cb_dispatcher)
+      .then_try([chunks = std::move(allocated_chunks)](exec::try_t<size_t>&& res) mutable {
+        auto transition =
+          res.has_value() ? [](cached_chunk* c) { static_cast<void>(c->state.mark_cached()); }
+                          : [](cached_chunk* c) { static_cast<void>(c->state.mark_load_failed()); };
+        std::ranges::for_each(chunks, transition);
+      });
+  }
+}
+
+void prefetching_cache::evict_loop(std::stop_token st)
+{
+  while (!_shutting_down && !st.stop_requested()) {}
+}
+
+// ===========================================================================
+// prefetching_handle
+// ===========================================================================
+
+void prefetching_handle::cancel() noexcept
+{
+  if (!_alive) return;
+  // Flip the shared alive flag to false.  The cache's preparation / prefetch
+  // workers read this through work_item::is_cancelled() and drop still-pending
+  // entries.  Idempotent and thread-safe (the flag is atomic).
+  _alive->store(false, std::memory_order_release);
+}
+
+}  // namespace sirius::io::cache

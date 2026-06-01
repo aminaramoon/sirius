@@ -43,7 +43,9 @@ class memory_reservation_manager;
 
 namespace sirius::io {
 class sirius_ioctx;
+namespace cache {
 class buffer_pool;
+}  // namespace cache
 }  // namespace sirius::io
 
 namespace sirius::op::scan {
@@ -258,7 +260,7 @@ class sirius_scan_manager {
   /// null otherwise.  The cache (owned by @c _io_ctx) holds the pool
   /// by raw pointer, so the destructor MUST call
   /// @c _io_ctx->shutdown_cache() before resetting this pool.
-  std::unique_ptr<sirius::io::buffer_pool> _buffer_pool;
+  std::unique_ptr<sirius::io::cache::buffer_pool> _buffer_pool;
   std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _scan_op_order;

@@ -16,8 +16,8 @@
 
 #pragma once
 
+#include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
-#include "io/prefetching_cache.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
@@ -44,9 +44,6 @@ namespace sirius::io {
  */
 class sirius_datasource : public cudf::io::datasource {
  public:
-  static constexpr size_t NUM_BUFFERS = NUM_CHUNKS;
-  static constexpr size_t BUFFER_SIZE = CHUNK_SIZE;
-
   explicit sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
                              std::shared_ptr<sirius_io_object> io_object);
 
@@ -123,7 +120,8 @@ class sirius_datasource : public cudf::io::datasource {
   /// already stored emits a warning: the datasource lifecycle expects one
   /// speculative-or-immediate insert per scan, with a single
   /// @c disposable call at consume time.
-  void fadvise(prefetching_mode site, std::span<const cudf::io::text::byte_range_info> ranges);
+  void fadvise(cache::prefetching_mode site,
+               std::span<const cudf::io::text::byte_range_info> ranges);
 
  private:
   std::shared_ptr<sirius_ioctx> _io_ctx;
@@ -131,7 +129,7 @@ class sirius_datasource : public cudf::io::datasource {
   /// Handle of the most recent speculative/immediate insert into the
   /// prefetching cache, or empty if none was made.  fadvise(disposable)
   /// uses this to cancel still-pending work.
-  prefetching_handle _prefetch_handle;
+  cache::prefetching_handle _prefetch_handle;
 };
 
 }  // namespace sirius::io

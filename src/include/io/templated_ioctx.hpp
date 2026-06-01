@@ -17,10 +17,14 @@
 #pragma once
 
 #include "exec/semi_future.hpp"
+#include "io/cache/prefetching_cache.hpp"
+#include "io/cache/types.hpp"
 #include "io/io_context.hpp"
-#include "io/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/types.hpp"
 
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <algorithm>
@@ -28,6 +32,8 @@
 #include <cassert>
 #include <concepts>
 #include <cstdint>
+#include <exception>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -59,59 +65,107 @@ namespace detail {
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
-// Concept: io_object_c
-// ---------------------------------------------------------------------------
-//
-// A concrete io_object for use with templated_ioctx<Reactor> must:
-//   - derive from sirius_io_object
-//   - expose device_handle() / host_handle() returning Handle
-
-template <class O, class Handle>
-concept io_object_c = std::derived_from<O, sirius_io_object> && requires(O o) {
-  { o.device_handle() } -> std::convertible_to<Handle>;
-  { o.host_handle() } -> std::convertible_to<Handle>;
-};
-
-// ---------------------------------------------------------------------------
 // Concept: io_reactor_c
 // ---------------------------------------------------------------------------
 
+// Baseline reactor contract.  Every reactor must provide buffered host reads
+// (the single-range prep_host_rx_request + the synchronous host_read),
+// lifecycle (shutdown / interrupt), dispatch (enqueue), io_object creation,
+// and the static capability queries.  The optional dispatch paths (device
+// reads, bounce-staged device reads, vectored host reads) are detected
+// separately via reactor_traits below, so a reactor only defines the prep_*
+// overloads for the paths it actually supports.
 template <class R>
 concept io_reactor_c = requires(R r,
-                                std::span<typename R::device_read_req_type> dbatch,
-                                std::span<typename R::host_read_req_type> hbatch,
-                                typename R::host_read_req_type hreq,
-                                typename R::native_handle_type handle,
+                                typename R::io_object_type file,
+                                typename R::request_type_ptr rx_req,
+                                typename R::reactor_config_type cfg,
                                 size_t offset,
                                 size_t size,
                                 uint8_t* dst,
-                                cudf::io::text::byte_range_info logical,
-                                size_t file_size,
                                 std::string_view path,
                                 std::string path_str) {
-  typename R::native_handle_type;
   typename R::io_object_type;
-  typename R::device_read_req_type;
-  typename R::host_read_req_type;
+  typename R::request_type;
+  typename R::request_type_ptr;
+  typename R::reactor_config_type;
 
-  requires io_object_c<typename R::io_object_type, typename R::native_handle_type>;
+  {
+    r.prep_host_rx_request(cfg, file, io_object_segment{offset, size, dst, false})
+  } -> std::same_as<typename R::request_type_ptr>;
 
-  { r.enqueue_bulk(dbatch) };
-  { r.host_read(handle, offset, size, dst) } -> std::same_as<size_t>;
-  { r.host_read_async(std::move(hreq)) };
-  { r.host_enqueue_bulk(hbatch) };
+  { r.enqueue(std::move(rx_req)) };
+  { r.host_read(file, offset, size, dst) } -> std::same_as<size_t>;
+
   { r.shutdown() };
-  { R::align_to_physical(logical, file_size) } -> std::same_as<cudf::io::text::byte_range_info>;
-  { R::supports(path) } -> std::same_as<bool>;
+  { r.interrupt() };
+
   {
     R::create_io_object(std::move(path_str))
   } -> std::same_as<std::unique_ptr<typename R::io_object_type>>;
-  { R::size(handle) } -> std::same_as<size_t>;
 
   // -- capabilities --------------------------------------------------------
-  { R::supports_device_read() } -> std::same_as<bool>;
-  { R::supports_vector_host_read() } -> std::same_as<bool>;
-  { R::preferred_prefetching_mode() } -> std::same_as<prefetching_mode>;
+  { R::supports(path) } -> std::same_as<bool>;
+  { R::preferred_prefetching_mode() } -> std::same_as<cache::prefetching_mode>;
+};
+
+// ---------------------------------------------------------------------------
+// Reactor capability detection
+// ---------------------------------------------------------------------------
+//
+// Optional dispatch paths are advertised structurally: a reactor supports a
+// path iff it provides the matching create_* overload.  reactor_traits<R>
+// probes for each one so a reactor no longer hand-maintains
+// supports_device_read / supports_vector_host_read booleans that must be kept
+// in sync with the methods it actually defines.
+
+template <class R>
+concept reactor_has_device_rx = requires(R r,
+                                         typename R::io_object_type file,
+                                         typename R::reactor_config_type cfg,
+                                         uint8_t* dst,
+                                         size_t offset,
+                                         size_t size,
+                                         rmm::cuda_stream_view stream) {
+  {
+    r.prep_device_rx_request(cfg, file, dst, offset, size, stream, 1)
+  } -> std::same_as<typename R::request_type_ptr>;
+};
+
+template <class R>
+concept reactor_has_host_to_device_rx = requires(R r,
+                                                 typename R::io_object_type file,
+                                                 typename R::reactor_config_type cfg,
+                                                 uint8_t* dst,
+                                                 size_t offset,
+                                                 size_t size,
+                                                 rmm::cuda_stream_view stream,
+                                                 std::span<io_object_segment> bounce) {
+  {
+    r.prep_host_to_device_rx_request(cfg, file, bounce, dst, offset, size, stream, 1)
+  } -> std::same_as<typename R::request_type_ptr>;
+};
+
+template <class R>
+concept reactor_has_vector_host_rx = requires(R r,
+                                              typename R::io_object_type file,
+                                              typename R::reactor_config_type cfg,
+                                              std::span<io_object_segment> dsts) {
+  { r.prep_host_rxv_request(cfg, file, dsts) } -> std::same_as<typename R::request_type_ptr>;
+};
+
+template <class R>
+struct reactor_traits {
+  /// BYO-device-buffer reads: caller supplies the device destination and the
+  /// reactor streams file → device (directly or via its own bounce slots).
+  static constexpr bool supports_device_read = reactor_has_device_rx<R>;
+
+  /// Device reads staged through a caller-supplied pinned host bounce buffer
+  /// (a cache::bounce_buffer_provider).
+  static constexpr bool supports_host_to_device_read = reactor_has_host_to_device_rx<R>;
+
+  /// Batched (vectored) host reads dispatched in a single call.
+  static constexpr bool supports_vector_host_read = reactor_has_vector_host_rx<R>;
 };
 
 // ---------------------------------------------------------------------------
@@ -127,27 +181,32 @@ concept io_reactor_c = requires(R r,
 template <io_reactor_c Reactor>
 class templated_ioctx : public sirius_ioctx {
  public:
-  using reactor_type         = Reactor;
-  using native_handle_type   = typename Reactor::native_handle_type;
-  using io_object_type       = typename Reactor::io_object_type;
-  using device_read_req_type = typename Reactor::device_read_req_type;
-  using host_read_req_type   = typename Reactor::host_read_req_type;
+  using reactor_type        = Reactor;
+  using io_object_type      = typename Reactor::io_object_type;
+  using request_type        = typename Reactor::request_type;
+  using request_type_ptr    = typename Reactor::request_type_ptr;
+  using reactor_traits_t    = reactor_traits<Reactor>;
+  using reactor_config_type = typename Reactor::reactor_config_type;
+
+  enum class io_op_type { host, host_async, device_async, host_vector_async };
 
   /// Construct with a pre-built vector of reactors (most flexible).
-  explicit templated_ioctx(std::vector<std::unique_ptr<Reactor>> reactors)
-    : _reactors(std::move(reactors))
+  explicit templated_ioctx(const reactor_config_type& cfg,
+                           std::vector<std::unique_ptr<Reactor>> reactors)
+    : _config(cfg), _reactors(std::move(reactors))
   {
   }
 
   /// Construct by invoking @p factory @p n_reactors times to build the pool.
   template <class Factory>
-    requires std::invocable<Factory&> &&
-             std::convertible_to<std::invoke_result_t<Factory&>, std::unique_ptr<Reactor>>
-  templated_ioctx(size_t n_reactors, Factory factory)
+    requires std::invocable<Factory&, const reactor_config_type&> &&
+             std::convertible_to<std::invoke_result_t<Factory&, const reactor_config_type&>,
+                                 std::unique_ptr<Reactor>>
+  templated_ioctx(size_t n_reactors, const reactor_config_type& cfg, Factory factory) : _config(cfg)
   {
     _reactors.reserve(n_reactors);
     for (size_t i = 0; i < n_reactors; ++i)
-      _reactors.emplace_back(factory());
+      _reactors.emplace_back(factory(_config));
   }
 
   ~templated_ioctx() override
@@ -160,10 +219,16 @@ class templated_ioctx : public sirius_ioctx {
     shutdown();
   }
 
-  void shutdown() override
+  void shutdown() noexcept override
   {
     for (auto& r : _reactors) {
-      r->shutdown();
+      try {
+        r->shutdown();
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_ERROR("templated_ioctx: reactor shutdown failed: {}", e.what());
+      } catch (...) {
+        SIRIUS_LOG_ERROR("templated_ioctx: reactor shutdown failed: unknown error");
+      }
     }
   }
 
@@ -178,315 +243,206 @@ class templated_ioctx : public sirius_ioctx {
     return std::shared_ptr<sirius_io_object>(Reactor::create_io_object(std::move(path)));
   }
 
-  [[nodiscard]] bool supports(std::string_view path) const override
+  [[nodiscard]] bool supports(std::string_view path) const noexcept final
   {
     return Reactor::supports(path);
   }
 
   // -- Capabilities (delegate to the reactor) -------------------------------
 
-  [[nodiscard]] bool supports_device_read() const override
+  [[nodiscard]] bool supports_device_read() const noexcept final
   {
-    return Reactor::supports_device_read();
+    return reactor_traits_t::supports_device_read;
   }
 
-  [[nodiscard]] bool supports_vector_host_read() const override
+  [[nodiscard]] bool supports_host_to_device_read() const noexcept final
   {
-    return Reactor::supports_vector_host_read();
+    return reactor_traits_t::supports_host_to_device_read;
   }
 
-  [[nodiscard]] prefetching_mode preferred_prefetching_mode() const override
+  [[nodiscard]] bool supports_vector_host_read() const noexcept final
+  {
+    return reactor_traits_t::supports_vector_host_read;
+  }
+
+  [[nodiscard]] cache::prefetching_mode preferred_prefetching_mode() const noexcept override
   {
     // Vector host read is the cheap dispatch path the prefetcher relies on.
     // Without it, force prefetching off regardless of the reactor's preference.
-    if (!Reactor::supports_vector_host_read()) return prefetching_mode::none;
+    if (!reactor_traits_t::supports_vector_host_read) { return cache::prefetching_mode::none; }
     return Reactor::preferred_prefetching_mode();
   }
 
-  Reactor& next_reactor()
-  {
-    size_t idx = _next.fetch_add(1, std::memory_order_relaxed) % _reactors.size();
-    return *_reactors.at(idx);
-  }
-
-  // -- Host reads (generic: delegate to io_object_type + std::async) --------
-
-  size_t host_read_io(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) override
-  {
-    auto& tobj = as_typed(obj);
-    size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
-    if (size == 0) return 0;
-    return next_reactor().host_read(tobj.host_handle(), offset, size, dst);
-  }
-
-  exec::semi_future<size_t> host_read_async_io(sirius_io_object& obj,
-                                               size_t offset,
-                                               size_t size,
-                                               uint8_t* dst) override
-  {
-    auto& tobj = as_typed(obj);
-    size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
-
-    // size==0 case is folded into create(): it returns a null ctx and
-    // a ready future with 0 bytes.
-    auto [ctx, fut] = request_context::create(size == 0 ? 0 : 1, size);
-    if (!ctx) return std::move(fut);
-
-    host_read_req_type req;
-    req.handle = tobj.host_handle();
-    req.offset = offset;
-    req.size   = size;
-    req.dst    = dst;
-    req.ctx    = std::move(ctx);
-    next_reactor().host_read_async(std::move(req));
-    return std::move(fut);
-  }
-
-  // -- Device reads (generic chunking; reactor-backed) ----------------------
-
-  size_t device_read_io(sirius_io_object& obj,
-                        size_t offset,
-                        size_t size,
-                        uint8_t* dst,
-                        rmm::cuda_stream_view stream) override
-  {
-    return std::move(enqueue_device_read(as_typed(obj), offset, size, dst, stream.value())).get();
-  }
-
-  /// Issue an async device read for the range [offset, offset+size) into
-  /// @p dst.
-  ///
-  /// When @p buffer is empty (the default), the reactor allocates its
-  /// own bounce slots — the no-cache fast path.
-  ///
-  /// When @p buffer is non-empty, the read reuses the pinned host
-  /// chunks already allocated in @p buffer.  @p buffer MUST be in the
-  /// @c loading state (caller already flipped it from @c allocated via
-  /// @c prefetching_cache::read()).  The deferred completion stage
-  /// calls @c buffer.mark_cached_with_stream() on success or
-  /// @c buffer.mark_load_failed() on failure, transitioning the cache
-  /// entry to its terminal state and waking any parked readers.  In
-  /// this mode @p offset must be **file-absolute** (same coordinate
-  /// space as the entry's @c physical_range.offset()); see
-  /// @c cached_host_buffer::prepare_device_requests for the full contract.
-  exec::semi_future<size_t> device_read_async_io(sirius_io_object& obj,
-                                                 size_t offset,
-                                                 size_t size,
-                                                 uint8_t* dst,
-                                                 rmm::cuda_stream_view stream,
-                                                 cached_host_buffer buffer = {}) override
-  {
-    if (!buffer) {
-      // No-cache path: reactor allocates its own bounce slots.
-      return enqueue_device_read(as_typed(obj), offset, size, dst, stream.value());
-    }
-
-    auto& tobj = as_typed(obj);
-
-    // Capture the caller's device before we move `buffer` into shared
-    // ownership: a throw here unwinds the stack with `buffer` still
-    // local, so its dtor's mark_load_failed deallocates the entry's
-    // chunks and resets state instead of stranding them.
-    int const device_id = detail::current_cuda_device();
-
-    auto reqs = buffer.template prepare_device_requests<native_handle_type>(
-      tobj.device_handle(), offset, size, dst, stream.value(), device_id);
-
-    if (reqs.empty()) {
-      buffer.mark_load_failed();
-      return exec::make_semi_future_with([]() -> size_t {
-        throw std::runtime_error("device_read_async_io: cache entry has no chunks");
-      });
-    }
-
-    // shared_ptr keeps the buffer alive across the deferred completion stage;
-    // cached_host_buffer itself is move-only.  Capture stream.value() so the
-    // success path can defer the read-pin release via cudaStreamAddCallback —
-    // this keeps the entry pinned across the H2D copy that the reactor
-    // launches against the entry's chunks, preventing the evictor from
-    // recycling pool buffers while the copy is still in flight.
-    auto shared_buf = std::make_shared<cached_host_buffer>(std::move(buffer));
-    auto raw_stream = stream.value();
-
-    auto [ctx, fut] = request_context::create(reqs.size(), size);
-    assert(ctx);  // n_chunks == reqs.size() > 0, so create() never returns null here
-
-    for (auto& r : reqs)
-      r.ctx = ctx;
-
-    auto const m = _reactors.size();
-    size_t start = _next.fetch_add(1, std::memory_order_relaxed) % m;
-    size_t base  = reqs.size() / m;
-    size_t rem   = reqs.size() % m;
-    size_t off   = 0;
-    for (size_t k = 0; k < m; ++k) {
-      size_t group_size = base + (k < rem ? 1 : 0);
-      if (group_size == 0) continue;
-      size_t reactor_idx = (start + k) % m;
-      _reactors[reactor_idx]->enqueue_bulk(
-        std::span<device_read_req_type>(reqs.data() + off, group_size));
-      off += group_size;
-    }
-
-    // Chain the entry-state bookkeeping onto the future.  The deferred
-    // stage runs on whichever thread fires the upstream completion (the
-    // reactor thread in push mode, or the caller's thread in pull mode),
-    // so mark_cached / mark_load_failed lands before the consumer
-    // observes the result.
-    return std::move(fut).defer(
-      [buf = std::move(shared_buf), raw_stream](exec::try_t<size_t>&& t) -> exec::try_t<size_t> {
-        if (t.has_exception()) {
-          buf->mark_load_failed();
-        } else {
-          buf->mark_cached_with_stream(raw_stream);
-        }
-        return std::move(t);
-      });
-  }
-
-  // -- Batch host reads (generic: dispatch to reactor host_read_async) ------
-
-  exec::semi_future<size_t> host_read_ranges_async_io(
-    sirius_io_object& obj,
-    std::vector<cudf::io::text::byte_range_info> const& ranges,
-    std::span<cudf::host_span<std::byte>> dst) override
-  {
-    auto& tobj     = as_typed(obj);
-    auto file_size = tobj.size();
-
-    if (ranges.empty()) { return exec::make_semi_future<size_t>(size_t{0}); }
-
-    // Build every valid request up-front; we need the exact count before
-    // creating the ctx so that pending starts at the right value, and we
-    // want the full vector in hand to split across reactors.
-    std::vector<host_read_req_type> reqs;
-    reqs.reserve(ranges.size());
-    size_t total = 0;
-    for (size_t i = 0; i < ranges.size(); ++i) {
-      auto off  = static_cast<size_t>(ranges[i].offset());
-      size_t sz = std::min(static_cast<size_t>(ranges[i].size()),
-                           file_size > off ? file_size - off : size_t{0});
-      if (sz == 0 || sz > dst[i].size()) continue;
-      host_read_req_type req;
-      req.handle = tobj.host_handle();
-      req.offset = off;
-      req.size   = sz;
-      req.dst    = reinterpret_cast<uint8_t*>(dst[i].data());
-      reqs.push_back(std::move(req));
-      total += sz;
-    }
-    // reqs.empty() case is folded into create(): it returns a null ctx
-    // and a ready future with 0 bytes.  Early-return retained as a fast
-    // path that skips the per-reactor split loop below.
-    auto [ctx, fut] = request_context::create(reqs.size(), total);
-    if (!ctx) return std::move(fut);
-    for (auto& r : reqs)
-      r.ctx = ctx;
-
-    // Split evenly across reactors with a rotating start.  Each reactor
-    // gets a contiguous slice of @c reqs as a span — no per-reactor vector
-    // allocation, no per-request moves.  host_enqueue_bulk moves elements
-    // out of the span; @c reqs remains alive until end of scope.
-    auto const m = _reactors.size();
-    size_t start = _next.fetch_add(1, std::memory_order_relaxed) % m;
-    size_t base  = reqs.size() / m;
-    size_t rem   = reqs.size() % m;
-    size_t off   = 0;
-    for (size_t k = 0; k < m; ++k) {
-      size_t group_size = base + (k < rem ? 1 : 0);
-      if (group_size == 0) continue;
-      size_t reactor_idx = (start + k) % m;
-      _reactors[reactor_idx]->host_enqueue_bulk(
-        std::span<host_read_req_type>(reqs.data() + off, group_size));
-      off += group_size;
-    }
-    return std::move(fut);
-  }
-
-  cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
-                                                         size_t file_size) const override
+  [[nodiscard]] cudf::io::text::byte_range_info compute_physical_range(
+    cudf::io::text::byte_range_info logical, size_t file_size) const noexcept override
   {
     return Reactor::align_to_physical(logical, file_size);
   }
 
+  virtual std::vector<Reactor*> next_reactor([[maybe_unused]] const io_object_type& obj,
+                                             [[maybe_unused]] size_t n_chunks,
+                                             [[maybe_unused]] io_op_type type,
+                                             [[maybe_unused]] int device_id = -1) noexcept
+  {
+    size_t idx = _next.fetch_add(1, std::memory_order_relaxed) % _reactors.size();
+    return {_reactors.at(idx).get()};
+  }
+
+  // -- Host reads (generic: delegate to io_object_type + std::async) --------
+
+  size_t host_read_io(const sirius_io_object& obj,
+                      size_t offset,
+                      size_t size,
+                      uint8_t* dst) override
+  {
+    auto& tobj = as_typed(obj);
+    size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
+    if (size == 0) return 0;
+    return next_reactor(tobj, 1, io_op_type::host).at(0)->host_read(tobj, offset, size, dst);
+  }
+
+  exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
+                                               size_t offset,
+                                               size_t size,
+                                               uint8_t* dst) noexcept override
+  {
+    try {
+      auto& tobj = as_typed(obj);
+      size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
+
+      auto reactors = next_reactor(tobj, 1, io_op_type::host_async);
+      if (reactors.empty()) {
+        return exec::make_semi_future<size_t>(
+          std::make_exception_ptr(std::runtime_error("host_read_async_io: no available reactors")));
+      }
+
+      auto req =
+        Reactor::prep_host_rx_request(_config, tobj, io_object_segment{offset, size, dst, false});
+      auto semi = req->get_future();
+      auto reqs = request_type::splits(std::move(req), reactors.size());
+      assert(reqs.size() <= reactors.size());
+      std::for_each(std::make_move_iterator(reqs.begin()),
+                    std::make_move_iterator(reqs.end()),
+                    [&reactors, i = 0](auto&& r) mutable { reactors[i++]->enqueue(std::move(r)); });
+      return semi;
+    } catch (...) {
+      return exec::make_semi_future<size_t>(std::current_exception());
+    }
+  }
+
+  // -- Device reads (generic chunking; reactor-backed) ----------------------
+
+  exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
+                                                 size_t offset,
+                                                 size_t size,
+                                                 uint8_t* dst,
+                                                 rmm::cuda_stream_view stream) noexcept override
+  {
+    if constexpr (reactor_traits_t::supports_device_read) {
+      try {
+        auto& tobj    = as_typed(obj);
+        int device_id = rmm::get_current_cuda_device().value();
+        auto reactors = next_reactor(tobj, 0, io_op_type::device_async, device_id);
+        if (reactors.empty()) {
+          return exec::make_semi_future<size_t>(std::make_exception_ptr(
+            std::runtime_error("device_read_async_io: no available reactors")));
+        }
+        request_type_ptr req =
+          Reactor::prep_device_rx_request(_config, tobj, dst, offset, size, stream, device_id);
+        auto semi = req->get_future();
+        auto reqs = request_type::splits(std::move(req), reactors.size());
+        assert(reqs.size() <= reactors.size());
+        std::for_each(
+          std::make_move_iterator(reqs.begin()),
+          std::make_move_iterator(reqs.end()),
+          [&reactors, i = 0](auto&& r) mutable { reactors[i++]->enqueue(std::move(r)); });
+        return semi;
+      } catch (...) {
+        return exec::make_semi_future<size_t>(std::current_exception());
+      }
+    } else {
+      return exec::make_semi_future<size_t>(
+        std::make_exception_ptr(std::runtime_error("device_read_async_io: unsupported operation")));
+    }
+  }
+
+  exec::semi_future<size_t> host_to_device_read_async_io(
+    const sirius_io_object& obj,
+    std::span<io_object_segment> slices,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    rmm::cuda_stream_view stream) noexcept override
+  {
+    if constexpr (reactor_traits_t::supports_host_to_device_read) {
+      try {
+        auto& tobj    = as_typed(obj);
+        int device_id = rmm::get_current_cuda_device().value();
+        auto reactors = next_reactor(tobj, 0, io_op_type::device_async, device_id);
+        if (reactors.empty()) {
+          return exec::make_semi_future<size_t>(std::make_exception_ptr(
+            std::runtime_error("host_to_device_read_async_io: no available reactors")));
+        }
+        request_type_ptr req = Reactor::prep_host_to_device_rx_request(
+          _config, tobj, slices, dst, offset, size, stream, device_id);
+        auto semi = req->get_future();
+        auto reqs = request_type::splits(std::move(req), reactors.size());
+        assert(reqs.size() <= reactors.size());
+        std::for_each(
+          std::make_move_iterator(reqs.begin()),
+          std::make_move_iterator(reqs.end()),
+          [&reactors, i = 0](auto&& r) mutable { reactors[i++]->enqueue(std::move(r)); });
+        return semi;
+      } catch (...) {
+        return exec::make_semi_future<size_t>(std::current_exception());
+      }
+    } else {
+      return exec::make_semi_future<size_t>(std::make_exception_ptr(
+        std::runtime_error("host_to_device_read_async_io: unsupported operation")));
+    }
+  }
+  // -- Batch host reads (generic: dispatch to reactor host_read_async) ------
+
+  exec::semi_future<size_t> host_read_ranges_async_io(
+    const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept override
+  {
+    if constexpr (reactor_traits_t::supports_vector_host_read) {
+      try {
+        auto& tobj = as_typed(obj);
+
+        auto reactors = next_reactor(tobj, segments.size(), io_op_type::host_vector_async);
+        if (reactors.empty()) {
+          return exec::make_semi_future<size_t>(std::make_exception_ptr(
+            std::runtime_error("host_read_ranges_async_io: no available reactors")));
+        }
+
+        auto req  = Reactor::prep_host_rxv_request(_config, tobj, segments);
+        auto semi = req->get_future();
+        auto reqs = request_type::splits(std::move(req), reactors.size());
+        assert(reqs.size() <= reactors.size());
+        std::for_each(
+          std::make_move_iterator(reqs.begin()),
+          std::make_move_iterator(reqs.end()),
+          [&reactors, i = 0](auto&& r) mutable { reactors[i++]->enqueue(std::move(r)); });
+        return semi;
+      } catch (...) {
+        return exec::make_semi_future<size_t>(std::current_exception());
+      }
+    } else {
+      return exec::make_semi_future<size_t>(std::make_exception_ptr(
+        std::runtime_error("host_read_ranges_async_io: unsupported operation")));
+    }
+  }
+
  protected:
+  reactor_config_type _config;
   std::vector<std::unique_ptr<Reactor>> _reactors;
   std::atomic<size_t> _next{0};
 
  private:
-  static io_object_type& as_typed(sirius_io_object& obj)
+  static const io_object_type& as_typed(const sirius_io_object& obj) noexcept
   {
-    // make_datasource() only accepts sirius_io_object subclasses; backends
-    // are expected to hand in an io_object_type instance.  A misuse here is
-    // a programmer error, not runtime user input.
-    return static_cast<io_object_type&>(obj);
-  }
-
-  exec::semi_future<size_t> enqueue_device_read(
-    io_object_type& obj, size_t offset, size_t size, uint8_t* dst, cudaStream_t stream)
-  {
-    auto file_size = obj.size();
-    if (size == 0 || offset >= file_size) {
-      // Nothing to read — return a ready future with 0 bytes.
-      return exec::make_semi_future<size_t>(size_t{0});
-    }
-    size = std::min(size, file_size - offset);
-
-    auto phys = Reactor::align_to_physical(
-      {static_cast<int64_t>(offset), static_cast<int64_t>(size)}, file_size);
-    size_t a_start = static_cast<size_t>(phys.offset());
-    size_t a_end   = a_start + static_cast<size_t>(phys.size());
-    size_t prefix  = offset - a_start;
-
-    size_t n_chunks = (a_end - a_start + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
-    // Capture the caller's CUDA device BEFORE creating the request_context
-    // so that a failure throws cleanly without leaving a ctx whose
-    // destructor safety net would fire a less specific error.  In
-    // multi-GPU usage a single reactor thread serves streams bound to
-    // different devices, and silently defaulting to "don't switch"
-    // lands the H2D on the wrong device.
-    int const device_id = detail::current_cuda_device();
-
-    auto [ctx, fut] = request_context::create(n_chunks, size);
-    if (!ctx) return std::move(fut);
-
-    // Build the chunks into one flat vector, then hand each reactor a
-    // contiguous span slice.  Collapses N wake-notifies to at most M
-    // (reactor count) and avoids M per-reactor vector allocations.
-    std::vector<device_read_req_type> reqs;
-    reqs.reserve(n_chunks);
-
-    size_t produced = 0;
-    for (size_t cur = a_start; cur < a_end; cur += CHUNK_SIZE) {
-      device_read_req_type req;
-      req.handle    = obj.device_handle();
-      req.file_off  = cur;
-      req.io_size   = std::min(CHUNK_SIZE, a_end - cur);
-      req.data_off  = (cur == a_start) ? prefix : 0;
-      req.data_size = std::min(req.io_size - req.data_off, size - produced);
-      req.dst       = dst + produced;
-      req.stream    = stream;
-      req.device_id = device_id;
-      req.ctx       = ctx;
-      produced += req.data_size;
-      reqs.push_back(std::move(req));
-    }
-
-    auto const m = _reactors.size();
-    size_t start = _next.fetch_add(1, std::memory_order_relaxed) % m;
-    size_t base  = reqs.size() / m;
-    size_t rem   = reqs.size() % m;
-    size_t off   = 0;
-    for (size_t k = 0; k < m; ++k) {
-      size_t group_size = base + (k < rem ? 1 : 0);
-      if (group_size == 0) continue;
-      size_t reactor_idx = (start + k) % m;
-      _reactors[reactor_idx]->enqueue_bulk(
-        std::span<device_read_req_type>(reqs.data() + off, group_size));
-      off += group_size;
-    }
-    return std::move(fut);
+    return static_cast<const io_object_type&>(obj);
   }
 };
 

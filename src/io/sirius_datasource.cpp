@@ -16,7 +16,7 @@
 
 #include "io/sirius_datasource.hpp"
 
-#include "io/prefetching_cache.hpp"
+#include "io/cache/prefetching_cache.hpp"
 
 #include <rmm/device_buffer.hpp>
 
@@ -56,20 +56,22 @@ bool sirius_datasource::is_device_read_preferred(size_t) const
 
 size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
-  return _io_ctx->host_read(*_io_object, offset, size, dst);
+  return _io_ctx->host_read_sync(*_io_object, offset, size, dst);
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_t offset,
                                                                            size_t size)
 {
   std::vector<uint8_t> buf(size);
-  _io_ctx->host_read(*_io_object, offset, size, buf.data());
+  _io_ctx->host_read_sync(*_io_object, offset, size, buf.data());
   return cudf::io::datasource::buffer::create(std::move(buf));
 }
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  return _io_ctx->host_read_async(*_io_object, offset, size, dst);
+  auto semi = _io_ctx->host_read_async(*_io_object, offset, size, dst);
+  return std::async(std::launch::deferred,
+                    [semi = std::move(semi)]() mutable { return std::move(semi).get(); });
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
@@ -77,23 +79,26 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
 {
   auto file_size = _io_object->size();
   size           = std::min(size, file_size > offset ? file_size - offset : size_t{0});
-  auto buf       = std::make_shared<std::vector<uint8_t>>(size);
-  auto inner_fut = std::make_shared<std::future<size_t>>(
-    _io_ctx->host_read_async(*_io_object, offset, size, buf->data()));
-  return std::async(std::launch::deferred, [buf, inner_fut]() mutable {
-    auto n = inner_fut->get();
-    buf->resize(n);
-    return datasource::buffer::create(std::move(*buf));
-  });
+  auto buf       = std::vector<uint8_t>(size);
+  auto semi      = _io_ctx->host_read_async(*_io_object, offset, size, buf.data());
+  return std::async(std::launch::deferred,
+                    [buffer = std::move(buf), semi = std::move(semi)]() mutable {
+                      auto n = std::move(semi).get();
+                      buffer.resize(n);
+                      return datasource::buffer::create(std::move(buffer));
+                    });
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
   size_t offset, size_t size, rmm::cuda_stream_view stream)
 {
   rmm::device_buffer buf(size, stream);
+  stream.synchronize();
   size_t n =
-    _io_ctx->device_read(*_io_object, offset, size, static_cast<uint8_t*>(buf.data()), stream);
+    _io_ctx->device_read_async(*_io_object, offset, size, static_cast<uint8_t*>(buf.data()), stream)
+      .get();
   buf.resize(n, stream);
+  stream.synchronize();
   return cudf::io::datasource::buffer::create(std::move(buf));
 }
 
@@ -102,7 +107,7 @@ size_t sirius_datasource::device_read(size_t offset,
                                       uint8_t* dst,
                                       rmm::cuda_stream_view stream)
 {
-  return _io_ctx->device_read(*_io_object, offset, size, dst, stream);
+  return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream).get();
 }
 
 std::future<size_t> sirius_datasource::device_read_async(size_t offset,
@@ -110,7 +115,9 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          rmm::cuda_stream_view stream)
 {
-  return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream);
+  auto semi = _io_ctx->device_read_async(*_io_object, offset, size, dst, stream);
+  return std::async(std::launch::deferred,
+                    [semi = std::move(semi)]() mutable { return std::move(semi).get(); });
 }
 
 std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
@@ -122,7 +129,7 @@ std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
   return std::make_unique<sirius_datasource>(_io_ctx, _io_object);
 }
 
-void sirius_datasource::fadvise(prefetching_mode site,
+void sirius_datasource::fadvise(cache::prefetching_mode site,
                                 std::span<const cudf::io::text::byte_range_info> ranges)
 {
   // Disposable is always honored, regardless of the backend's preferred
@@ -134,7 +141,7 @@ void sirius_datasource::fadvise(prefetching_mode site,
   // purpose of the read-driven steal path.  The handle is released
   // naturally when this datasource is destroyed (after the scan
   // finishes reading).
-  if (site == prefetching_mode::disposable) {
+  if (site == cache::prefetching_mode::disposable) {
     _prefetch_handle.cancel();
     return;
   }
@@ -144,7 +151,7 @@ void sirius_datasource::fadvise(prefetching_mode site,
   // calls fadvise at every tier and the backend's preference is what
   // decides where the work actually lands).
   auto const preferred = _io_ctx->preferred_prefetching_mode();
-  if (preferred == prefetching_mode::none || site != preferred) { return; }
+  if (preferred == cache::prefetching_mode::none || site != preferred) { return; }
 
   // The contract is "one scan, one datasource": a second
   // speculative/immediate fadvise on a datasource that already carries a

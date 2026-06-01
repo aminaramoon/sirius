@@ -18,6 +18,7 @@
 
 #include "io/sirius_datasource.hpp"
 
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
 
@@ -25,12 +26,12 @@ namespace sirius::io {
 
 namespace {
 
-kvikio_io_object& as_kvikio(sirius_io_object& obj)
+const kvikio_io_object& as_kvikio(const sirius_io_object& obj)
 {
   // Concrete type is enforced by create_io_object below; a mismatch is a
   // programmer error (e.g. mixing io_objects across backends), not user
   // input, so a static_cast is appropriate.
-  return static_cast<kvikio_io_object&>(obj);
+  return static_cast<const kvikio_io_object&>(obj);
 }
 
 }  // namespace
@@ -55,7 +56,7 @@ std::unique_ptr<cudf::io::datasource> kvikio_context::make_datasource(
   return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
 }
 
-bool kvikio_context::supports(std::string_view /*path*/) const
+bool kvikio_context::supports(std::string_view /*path*/) const noexcept
 {
   // cudf::io::datasource::create handles file paths, URIs, and registered
   // protocol handlers; the actual feasibility check happens at
@@ -65,33 +66,38 @@ bool kvikio_context::supports(std::string_view /*path*/) const
 
 // -- Public read API ---------------------------------------------------------
 
-size_t kvikio_context::host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst)
+size_t kvikio_context::host_read_sync(const sirius_io_object& obj,
+                                      size_t offset,
+                                      size_t size,
+                                      uint8_t* dst)
 {
   return as_kvikio(obj).datasource().host_read(offset, size, dst);
 }
 
-std::future<size_t> kvikio_context::host_read_async(sirius_io_object& obj,
-                                                    size_t offset,
-                                                    size_t size,
-                                                    uint8_t* dst)
+exec::semi_future<size_t> kvikio_context::host_read_async(const sirius_io_object& obj,
+                                                          size_t offset,
+                                                          size_t size,
+                                                          uint8_t* dst) noexcept
 {
-  return as_kvikio(obj).datasource().host_read_async(offset, size, dst);
+  // cudf's datasource returns a std::future; the base contract is an
+  // exec::semi_future.  make_semi_future_with materialises the result (and
+  // captures any exception) into a ready semi_future.
+  return exec::make_semi_future_with(
+    [&] { return as_kvikio(obj).datasource().host_read_async(offset, size, dst).get(); });
 }
 
-size_t kvikio_context::device_read(
-  sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
+exec::semi_future<size_t> kvikio_context::device_read_async(const sirius_io_object& obj,
+                                                            size_t offset,
+                                                            size_t size,
+                                                            uint8_t* dst,
+                                                            rmm::cuda_stream_view stream) noexcept
 {
-  return as_kvikio(obj).datasource().device_read(offset, size, dst, stream);
-}
-
-std::future<size_t> kvikio_context::device_read_async(
-  sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
-{
-  return as_kvikio(obj).datasource().device_read_async(offset, size, dst, stream);
+  return exec::make_semi_future_with(
+    [&] { return as_kvikio(obj).datasource().device_read_async(offset, size, dst, stream).get(); });
 }
 
 cudf::io::text::byte_range_info kvikio_context::compute_physical_range(
-  cudf::io::text::byte_range_info logical, size_t /*file_size*/) const
+  cudf::io::text::byte_range_info logical, size_t /*file_size*/) const noexcept
 {
   return logical;
 }
@@ -112,7 +118,7 @@ namespace {
 }
 }  // namespace
 
-size_t kvikio_context::host_read_io(sirius_io_object& /*obj*/,
+size_t kvikio_context::host_read_io(const sirius_io_object& /*obj*/,
                                     size_t /*offset*/,
                                     size_t /*size*/,
                                     uint8_t* /*dst*/)
@@ -120,37 +126,37 @@ size_t kvikio_context::host_read_io(sirius_io_object& /*obj*/,
   unreachable_io_primitive("host_read_io");
 }
 
-exec::semi_future<size_t> kvikio_context::host_read_async_io(sirius_io_object& /*obj*/,
+exec::semi_future<size_t> kvikio_context::host_read_async_io(const sirius_io_object& /*obj*/,
                                                              size_t /*offset*/,
                                                              size_t /*size*/,
-                                                             uint8_t* /*dst*/)
+                                                             uint8_t* /*dst*/) noexcept
 {
   unreachable_io_primitive("host_read_async_io");
 }
 
-size_t kvikio_context::device_read_io(sirius_io_object& /*obj*/,
-                                      size_t /*offset*/,
-                                      size_t /*size*/,
-                                      uint8_t* /*dst*/,
-                                      rmm::cuda_stream_view /*stream*/)
-{
-  unreachable_io_primitive("device_read_io");
-}
-
-exec::semi_future<size_t> kvikio_context::device_read_async_io(sirius_io_object& /*obj*/,
-                                                               size_t /*offset*/,
-                                                               size_t /*size*/,
-                                                               uint8_t* /*dst*/,
-                                                               rmm::cuda_stream_view /*stream*/,
-                                                               cached_host_buffer /*buffer*/)
+exec::semi_future<size_t> kvikio_context::device_read_async_io(
+  const sirius_io_object& obj,
+  size_t offset,
+  size_t size,
+  uint8_t* dst,
+  rmm::cuda_stream_view stream) noexcept
 {
   unreachable_io_primitive("device_read_async_io");
 }
 
+exec::semi_future<size_t> kvikio_context::host_to_device_read_async_io(
+  const sirius_io_object& obj,
+  std::span<io_object_segment> slices,
+  size_t offset,
+  size_t size,
+  uint8_t* device_dst,
+  rmm::cuda_stream_view stream) noexcept
+{
+  unreachable_io_primitive("host_to_device_read_async_io");
+}
+
 exec::semi_future<size_t> kvikio_context::host_read_ranges_async_io(
-  sirius_io_object& /*obj*/,
-  std::vector<cudf::io::text::byte_range_info> const& /*ranges*/,
-  std::span<cudf::host_span<std::byte>> /*dst*/)
+  const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept
 {
   unreachable_io_primitive("host_read_ranges_async_io");
 }

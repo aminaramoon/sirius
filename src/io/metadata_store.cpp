@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-#include "io/metadata_store.hpp"
+#include "io/cache/metadata_store.hpp"
 
 #include <utility>
 
-namespace sirius::io {
+namespace sirius::io::cache {
 
 void metadata_store::register_metadata(sirius_io_object const& obj,
                                        std::shared_ptr<sirius_io_object_metadata> metadata)
@@ -39,4 +39,4 @@ std::shared_ptr<sirius_io_object_metadata> metadata_store::get_metadata(
   return it->second;
 }
 
-}  // namespace sirius::io
+}  // namespace sirius::io::cache

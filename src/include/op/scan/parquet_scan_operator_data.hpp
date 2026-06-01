@@ -193,7 +193,7 @@ class parquet_scan_data : public op::operator_data {
                     rg_slices.size());
     for (auto& slice : rg_slices) {
       if (slice.datasource) {
-        slice.datasource->fadvise(sirius::io::prefetching_mode::disposable, {});
+        slice.datasource->fadvise(sirius::io::cache::prefetching_mode::disposable, {});
       }
     }
   };
