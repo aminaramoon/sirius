@@ -122,7 +122,7 @@ sirius_scan_manager::sirius_scan_manager(
   // user has disabled prefetching so the construction is always
   // unconditional and there's no "is the cache present" branch to
   // worry about in callers.
-  if (_config.enable_prefetch_cache && !_buffer_pool) {
+  if (_config.enable_prefetch_cache && _buffer_pool) {
     _io_ctx->initialize_cache(_buffer_pool.get(), _config.prefetch_inflight_budget_chunks);
   }
 
@@ -157,6 +157,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 
   if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
+    _io_ctx->cache()->prepare_for_query();
   }
 
   // Advance the cache age so the evictor can score this query's inserts
@@ -394,17 +395,10 @@ void sirius_scan_manager::start_metadata_processing()
 
 void sirius_scan_manager::reset()
 {
-  return;
-  // Dispatcher::request_stop fires its internal stop_token, which the
-  // sequencer task polls every SEQUENCER_POLL_INTERVAL ms — so it bails
-  // mid-pipeline without a side-channel stop_source.
   _dispatcher->request_stop();
   _dispatcher->wait_for_all();
   _scan_op_order.clear();
   _providers_by_op.clear();
-  // Providers (whose run_batch holds slot pointers) and the sequencer
-  // task have both finished by now, so it's safe to tear down the
-  // manager and the slots it owns.
   _prefetch_manager.reset();
   _dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads);

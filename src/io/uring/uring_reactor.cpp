@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <system_error>
@@ -159,6 +160,9 @@ struct io_slot {
   size_t const req_end = req_offset + req_size;
   size_t const data_lo = std::max(req_offset, window_off);
   size_t const data_hi = std::min(req_end, window_off + read_size);
+  assert(data_lo < data_hi &&
+         "make_device_chunk: window does not overlap the request — caller must filter "
+         "non-overlapping segments before building a device copy");
 
   auto req   = std::make_unique<chunked_rx_request>();
   req->fd    = fd;
@@ -401,29 +405,45 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
   // or skip it entirely.
   if (size == 0 || segments.empty()) { return rx_request::create({}); }
 
-  auto manager =
-    std::make_shared<request_manager>(segments.size() * cfg.bounce_size, segments.size());
-
   int const fd         = file.odirect_handle();
   size_t const req_end = offset + size;
 
+  // Keep only the segments whose chunk range actually overlaps the destination
+  // window [offset, req_end).  Each surviving segment becomes exactly one chunk
+  // whose device_cpy_request copies just the overlapping bytes; a segment that
+  // covers no part of the destination is dropped so it can neither underflow
+  // make_device_chunk's copy size nor inflate the request_manager's chunk count
+  // past the chunks we actually create (which would let the future resolve
+  // while a dst region is still unwritten).
+  std::vector<io_object_segment> covering;
+  covering.reserve(segments.size());
+  std::copy_if(segments.begin(),
+               segments.end(),
+               std::back_inserter(covering),
+               [&](io_object_segment const& s) {
+                 return std::max(offset, s.offset) < std::min(req_end, s.offset + s.size);
+               });
+  if (covering.empty()) { return rx_request::create({}); }
+
+  auto manager =
+    std::make_shared<request_manager>(covering.size() * cfg.bounce_size, covering.size());
+
+  // O_DIRECT requires the read length to stay block-aligned, so the per-chunk
+  // read is clamped to the block-rounded file end rather than the raw file
+  // size: the file's final partial block is read in full and the bytes past
+  // EOF are simply never copied into dst (the copy is clipped to the request,
+  // which never exceeds file_size).  Without this clamp a chunk at the tail of
+  // the file short-reads and the worker resubmits the remainder at a
+  // non-block-aligned offset, which O_DIRECT rejects with EINVAL.
+  size_t const file_end_aligned =
+    (file.size() + IO_BLOCK_SIZE - 1) & ~(static_cast<size_t>(IO_BLOCK_SIZE) - 1);
+
   std::vector<chunk_io_request_type_ptr> chunks;
-  size_t const first = (offset / cfg.bounce_size) * cfg.bounce_size;
-  for (size_t w = first; w < req_end; w += cfg.bounce_size) {
-    uint8_t* host_buf = nullptr;
-    bool covered      = false;
-    for (auto const& s : segments) {
-      if (s.offset == w) {
-        host_buf = s.data();
-        covered  = true;
-        break;
-      }
-    }
-    // Covered: read straight into the provider's buffer.  Gap: read through an
-    // internal bounce slot (host_buf == nullptr) or skip it entirely.
-    if (!covered) continue;
+  chunks.reserve(covering.size());
+  for (auto const& s : covering) {
+    size_t const read_size = std::min(s.size, file_end_aligned - s.offset);
     chunks.push_back(make_device_chunk(
-      fd, w, cfg.bounce_size, host_buf, offset, size, dst, stream, device_id, manager));
+      fd, s.offset, read_size, s.data(), offset, size, dst, stream, device_id, manager));
   }
   return rx_request::create(std::move(chunks));
 }

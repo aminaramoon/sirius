@@ -415,6 +415,8 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
                                                              std::byte* dst,
                                                              rmm::cuda_stream_view stream)
 {
+  std::cerr << "device_read_async: offset=" << offset << ", size=" << size << std::endl;
+
   if (size == 0 || dst == nullptr) { return true; }
 
   file_entry* file = nullptr;
@@ -457,22 +459,31 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
   if (cached_pnt != chunks.begin()) {
     copy_evnt.emplace();
     size_t chunk_bytes = _pool->chunk_bytes();
-    size_t dst_off     = 0;
     for (cached_chunk* c : std::span(chunks.begin(), cached_pnt)) {
       size_t chunk_start = c->offset;
       size_t copy_start  = std::max(chunk_start, offset);
       size_t copy_end    = std::min(chunk_start + chunk_bytes, offset + size);
       size_t copy_size   = copy_end - copy_start;
       size_t src_off     = copy_start - chunk_start;
+      size_t dst_off     = copy_start - offset;
       cudaMemcpyAsync(dst + dst_off, c->data + src_off, copy_size, cudaMemcpyHostToDevice, stream);
-      dst_off += copy_size;
     }
     copy_evnt->record(stream);
+
+    std::cerr << fmt::format("enqueued H2D copy for {} {}",
+                             std::distance(chunks.begin(), cached_pnt),
+                             (cached_pnt == chunks.end() ? "full copying" : "copy_and_caching"))
+              << std::endl;
   }
 
   // populate the cache for the missing chunks through prefetching, and we can read from the cache
   // once the prefetching is done,
   if (cached_pnt != chunks.end()) {
+    std::cerr << fmt::format("read from host to device {} cached chunks. {}",
+                             std::distance(cached_pnt, chunks.end()),
+                             (cached_pnt == chunks.begin() ? "full caching" : "copy_and_caching"))
+              << std::endl;
+
     std::vector<io::io_object_segment> segments;
     segments.reserve(std::distance(cached_pnt, chunks.end()));
     for (cached_chunk* c : std::span(cached_pnt, chunks.end())) {
@@ -518,7 +529,7 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
         auto transition =
           ok ? [](cached_chunk* c) { static_cast<void>(c->state.mark_cached()); }
              : [](cached_chunk* c) { static_cast<void>(c->state.mark_load_failed()); };
-        std::for_each_n(chunks.begin() + n_in_use, chunks.size() - n_in_use, transition);
+        std::for_each(chunks.begin() + n_in_use, chunks.end(), transition);
 
         if (res.has_exception() || cuda_exception) {
           std::rethrow_exception(res.has_exception() ? std::move(res).exception() : cuda_exception);

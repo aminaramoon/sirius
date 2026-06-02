@@ -21,6 +21,7 @@
 #include "io/cache/prefetching_cache.hpp"
 
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -85,12 +86,16 @@ exec::semi_future<size_t> sirius_ioctx::device_read_async(const sirius_io_object
 {
   if (uses_prefetching_cache()) {
     try {
-      return _cache
-        ->device_read_async(obj, offset, size, reinterpret_cast<std::byte*>(dst), stream.value())
-        .defer([size](exec::try_t<bool>&& status) -> size_t {
+      auto semi = _cache->device_read_async(
+        obj, offset, size, reinterpret_cast<std::byte*>(dst), stream.value());
+      if (semi.is_ready()) {
+        if (std::move(semi).get()) { return size; }
+      } else {
+        return std::move(semi).defer([size](exec::try_t<bool>&& status) -> size_t {
           if (status.has_exception()) { std::rethrow_exception(std::move(status).exception()); }
           return status.value() ? size : 0;
         });
+      }
     } catch (...) {
       return exec::make_semi_future<size_t>(std::current_exception());
     }
