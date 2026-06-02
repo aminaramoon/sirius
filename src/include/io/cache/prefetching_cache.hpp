@@ -66,6 +66,8 @@ class prefetching_cache {
   friend class prefetching_handle;
 
  public:
+  using byte_range = cudf::io::text::byte_range_info;
+
   prefetching_cache(buffer_pool* pool, sirius_ioctx* io_ctx, size_t inflight_budget_chunks);
   ~prefetching_cache();
 
@@ -90,8 +92,8 @@ class prefetching_cache {
   void prepare_for_query() noexcept;
 
  private:
-  [[nodiscard]] prefetching_handle insert(
-    const sirius_io_object& obj, const std::vector<cudf::io::text::byte_range_info>& ranges);
+  [[nodiscard]] prefetching_handle insert(const sirius_io_object& obj,
+                                          std::span<const byte_range> ranges);
 
   struct file_entry {
     std::vector<cached_chunk*> update_and_get_chunks(std::span<size_t> incoming, uint32_t ticker);
@@ -132,7 +134,7 @@ class prefetching_cache {
 
     [[nodiscard]] bool is_cancelled() const noexcept { return !alive->load(); }
 
-    std::shared_ptr<const std::atomic<bool>> state() const noexcept { return alive; }
+    [[nodiscard]] std::shared_ptr<const std::atomic<bool>> state() const noexcept { return alive; }
 
     file_entry* file;
     std::vector<cached_chunk*> chunks;

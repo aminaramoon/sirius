@@ -41,19 +41,28 @@ namespace sirius::io::uring {
 class request_manager {
  public:
   using error_type = std::variant<std::exception_ptr, cudaError_t, std::error_code>;
-  explicit request_manager(std::size_t total_bytes) : total_bytes(total_bytes) {}
+  explicit request_manager(std::size_t total_bytes, std::size_t total_chunks)
+    : total_bytes(total_bytes), total_chunks(total_chunks)
+  {
+  }
+
   ~request_manager()
   {
     if (has_error()) {
       promise.set_exception(first_exception);
     } else {
-      promise.set_value(bytes_read.load(std::memory_order_acquire));
+      assert(bytes_read >= total_bytes &&
+             "All chunks completed but total bytes read does not match expected");
+      assert(chunks_completed == total_chunks &&
+             "All chunks completed but total chunks completed does not match expected");
+      promise.set_value(total_bytes);
     }
   }
 
   void chunk_complete(std::size_t byted_read)
   {
-    auto completed = bytes_read.fetch_add(byted_read, std::memory_order_acq_rel) + byted_read;
+    bytes_read.fetch_add(byted_read, std::memory_order_acq_rel);
+    chunks_completed.fetch_add(1, std::memory_order_acq_rel);
   }
 
   void report_error(const error_type& e, std::source_location loc = std::source_location::current())
@@ -74,6 +83,7 @@ class request_manager {
   }
 
   const std::size_t total_bytes;
+  const std::size_t total_chunks;
 
  private:
   [[nodiscard]] std::exception_ptr to_exception_ptr(const error_type& e,
@@ -95,6 +105,7 @@ class request_manager {
   }
 
   std::atomic<std::size_t> bytes_read{0};
+  std::atomic<std::size_t> chunks_completed{0};
   std::atomic<bool> error_reported{false};
   std::exception_ptr first_exception{nullptr};
   exec::promise<size_t> promise;

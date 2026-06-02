@@ -86,15 +86,15 @@ struct io_slot {
   }
 
   void on_request(chunk_io_request_type_ptr r,
-                  slot_token pool_token,
+                  slot_token token,
                   cucascade::cuda::cuda_event* cu_event = nullptr)
   {
     req                 = std::move(r);
     use_internal_buffer = req->chunk.data() == nullptr;
     if (use_internal_buffer) { req->chunk.set_data(internal_buffer, true); }
-    bytes_read = 0;
-    pool_token = std::move(pool_token);
-    event      = cu_event;
+    bytes_read       = 0;
+    this->pool_token = std::move(token);
+    event            = cu_event;
   }
 
   void on_error(const typename request_manager::error_type& error,
@@ -284,8 +284,8 @@ uring_reactor::uring_reactor(cucascade::memory::fixed_size_host_memory_resource&
   : _config{mr.get_block_size()}, _bounce_slot_size(mr.get_block_size())
 {
   _bounce_storage = mr.allocate_multiple_blocks(NUM_CHUNKS * _bounce_slot_size);
-  _worker =
-    std::jthread([this](std::stop_token stop_token) { worker_loop(std::move(stop_token)); });
+  _worker = std::jthread([this](std::stop_token stop_token) { worker_loop(std::move(stop_token)); },
+                         _stop_source.get_token());
   if (!tname.empty()) {
     std::string full_name = std::string(tname) + "_worker";
     pthread_setname_np(_worker.native_handle(), full_name.c_str());
@@ -337,9 +337,9 @@ request_type_ptr uring_reactor::prep_host_rx_request(const reactor_config_type& 
            "is_device_accessible is set");
   }
 
-  auto manager = std::make_shared<request_manager>(segment.size);
+  auto manager = std::make_shared<request_manager>(segment.size, 1);
 
-  int const fd = segment.is_device_accessible() ? file.odirect_handle() : file.buffered_handle();
+  int const fd = segment.is_odirect_compatible() ? file.odirect_handle() : file.buffered_handle();
 
   // The read lands directly in the caller's buffer (no bounce, no H2D copy), so
   // a single request covers the whole range — no chunking needed.
@@ -363,15 +363,16 @@ request_type_ptr uring_reactor::prep_device_rx_request(const reactor_config_type
 {
   if (size == 0) { return rx_request::create({}); }
 
-  auto manager = std::make_shared<request_manager>(/*total_chunks=*/0);
-
   int const fd = file.odirect_handle();
   // align_to_physical aligns the offset down and the end up to IO_BLOCK_SIZE
   // (clamped to the file), giving an O_DIRECT-compliant span.
   auto const phys =
     align_to_physical({static_cast<int64_t>(offset), static_cast<int64_t>(size)}, file.size());
-  auto const a_start = static_cast<size_t>(phys.offset());
-  auto const a_end   = a_start + static_cast<size_t>(phys.size());
+  auto const a_start  = static_cast<size_t>(phys.offset());
+  auto const a_end    = a_start + static_cast<size_t>(phys.size());
+  size_t alinged_size = phys.size();
+  auto manager =
+    std::make_shared<request_manager>(size, (alinged_size + cfg.bounce_size - 1) / cfg.bounce_size);
 
   std::vector<chunk_io_request_type_ptr> chunks;
   for (size_t w = a_start; w < a_end; w += cfg.bounce_size) {
@@ -400,7 +401,8 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
   // or skip it entirely.
   if (size == 0 || segments.empty()) { return rx_request::create({}); }
 
-  auto manager = std::make_shared<request_manager>(segments.size());
+  auto manager =
+    std::make_shared<request_manager>(segments.size() * cfg.bounce_size, segments.size());
 
   int const fd         = file.odirect_handle();
   size_t const req_end = offset + size;
@@ -436,7 +438,8 @@ request_type_ptr uring_reactor::prep_host_rxv_request(const reactor_config_type&
          "create_host_rx_request: ranges and destination spans must be 1:1");
 
   bool is_device_accessible = segments.front().is_device_accessible();
-  auto manager              = std::make_shared<request_manager>(segments.size());
+  auto manager =
+    std::make_shared<request_manager>(segments.size() * cfg.bounce_size, segments.size());
 
   int const fd = is_device_accessible ? file.odirect_handle() : file.buffered_handle();
 
@@ -570,7 +573,11 @@ void uring_reactor::worker_loop(std::stop_token stop_token)
   auto n_devices = rmm::get_num_cuda_devices();
   for (int device_id = 0; device_id < n_devices; ++device_id) {
     rmm::cuda_set_device_raii device_guard(rmm::cuda_device_id{device_id});
-    per_device_copy_events.emplace(device_id, std::vector<cucascade::cuda::cuda_event>{NUM_CHUNKS});
+    auto& events = per_device_copy_events[device_id];
+    events.reserve(NUM_CHUNKS);
+    std::generate_n(std::back_inserter(events), NUM_CHUNKS, []() {
+      return cucascade::cuda::cuda_event{cudaEventDisableTiming};
+    });
   }
 
   int inflight = 0;
@@ -614,6 +621,7 @@ void uring_reactor::worker_loop(std::stop_token stop_token)
           dr.reset(nullptr);
           continue;
         }
+        break;
       }
       if (dr == nullptr) {
         break;  // queue empty
@@ -690,9 +698,9 @@ void uring_reactor::worker_loop(std::stop_token stop_token)
       incomplete_requests.pop_back();
       s.register_sqe(sqe);
       ++inflight;
-      any_added++;
+      ++any_added;
     }
-    if (any_added > 0) ring.submit(any_added);
+    if (any_added > 0) { ring.submit(any_added); }
   };
 
   auto clean_up_and_shutdown = [&]() {

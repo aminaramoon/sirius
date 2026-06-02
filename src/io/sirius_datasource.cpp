@@ -93,7 +93,6 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
   size_t offset, size_t size, rmm::cuda_stream_view stream)
 {
   rmm::device_buffer buf(size, stream);
-  stream.synchronize();
   size_t n =
     _io_ctx->device_read_async(*_io_object, offset, size, static_cast<uint8_t*>(buf.data()), stream)
       .get();
@@ -173,8 +172,7 @@ void sirius_datasource::fadvise(cache::prefetching_mode site,
   // Hand the ranges to the cache.  insert() returns an empty handle when
   // it didn't enqueue any new work (dormant cache, every range coalesced
   // with an existing entry); we only stash a real handle.
-  std::vector<cudf::io::text::byte_range_info> owned_ranges(ranges.begin(), ranges.end());
-  auto handle = cache->insert(*_io_object, owned_ranges);
+  auto handle = cache->insert(*_io_object, ranges);
   if (handle) { _prefetch_handle = std::move(handle); }
 }
 

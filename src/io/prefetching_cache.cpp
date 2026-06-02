@@ -31,6 +31,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstddef>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -293,9 +295,12 @@ prefetching_cache::prefetching_cache(buffer_pool* pool,
                                      size_t inflight_budget_chunks)
   : _pool(pool), _io_ctx(io_ctx), _armed(true), _rate_limiter(inflight_budget_chunks)
 {
-  _preparation_thread = std::jthread([this](std::stop_token st) { prepare_loop(std::move(st)); });
-  _prefetch_thread    = std::jthread([this](std::stop_token st) { prefetch_loop(std::move(st)); });
-  _evictor_thread     = std::jthread([this](std::stop_token st) { evict_loop(std::move(st)); });
+  _preparation_thread = std::jthread([this](std::stop_token st) { prepare_loop(std::move(st)); },
+                                     _preparation_stop_source.get_token());
+  _prefetch_thread    = std::jthread([this](std::stop_token st) { prefetch_loop(std::move(st)); },
+                                  _prefetch_stop_source.get_token());
+  _evictor_thread     = std::jthread([this](std::stop_token st) { evict_loop(std::move(st)); },
+                                 _evictor_stop_source.get_token());
 }
 
 prefetching_cache::~prefetching_cache()
@@ -330,8 +335,8 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
   return *it->second;
 }
 
-prefetching_handle prefetching_cache::insert(
-  const sirius_io_object& obj, const std::vector<cudf::io::text::byte_range_info>& ranges)
+prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
+                                             std::span<const byte_range> ranges)
 {
   const auto& key = obj.raw_file_cache_id();
   auto& file      = get_or_create_file_entry(obj);
@@ -410,39 +415,38 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
                                                              std::byte* dst,
                                                              rmm::cuda_stream_view stream)
 {
-  if (size == 0 || dst == nullptr) return true;
+  if (size == 0 || dst == nullptr) { return true; }
 
   file_entry* file = nullptr;
   {
     std::shared_lock lk(_map_mtx);
     auto it = _file_cache.find(obj.raw_file_cache_id());
-    if (it == _file_cache.end()) { return false; }
-    file = it->second.get();
+    if (it != _file_cache.end()) { file = it->second.get(); }
   }
+
+  if (file == nullptr) { return false; }
 
   auto chunks = file->fetch_chunks(offset, size);
   if (chunks.empty()) { return false; }  // full-miss
 
   // check marks that are cached, or in-use for reuse
-  auto partition_point = std::partition(
+  auto cached_pnt = std::stable_partition(
     chunks.begin(), chunks.end(), [](cached_chunk* c) { return c->state.acquire_read(); });
 
-  if (!_io_ctx->supports_host_to_device_read() && partition_point != chunks.end()) {
-    std::for_each(
-      chunks.begin(), partition_point, [](cached_chunk* c) { c->state.release_read(); });
+  if (!_io_ctx->supports_host_to_device_read() && cached_pnt != chunks.end()) {
+    std::for_each(chunks.begin(), cached_pnt, [](cached_chunk* c) { c->state.release_read(); });
     return false;
   }
 
   // check if any chunks is allocated but not yet loaded, which means we can reuse it for the
   // current read and skip waiting for the prefetch to complete.
   auto last_loading_pnt = std::find_if(
-    partition_point, chunks.end(), [](cached_chunk* c) { return !c->state.mark_loading(); });
+    cached_pnt, chunks.end(), [](cached_chunk* c) { return !c->state.mark_loading(); });
 
   // we are not waiting for currently loading one
   if (last_loading_pnt != chunks.end()) {
-    std::for_each(
-      chunks.begin(), partition_point, [](cached_chunk* c) { c->state.release_read(); });
-    std::for_each(partition_point, last_loading_pnt, [](cached_chunk* c) {
+    std::for_each(chunks.begin(), cached_pnt, [](cached_chunk* c) { c->state.release_read(); });
+    std::for_each(cached_pnt, last_loading_pnt, [](cached_chunk* c) {
       static_cast<void>(c->state.mark_load_failed());
     });
     return false;
@@ -450,11 +454,11 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
 
   // copy cached chunks to destination buffer asynchronously
   std::optional<cucascade::cuda::cuda_event> copy_evnt;
-  if (partition_point != chunks.begin()) {
+  if (cached_pnt != chunks.begin()) {
     copy_evnt.emplace();
     size_t chunk_bytes = _pool->chunk_bytes();
     size_t dst_off     = 0;
-    for (cached_chunk* c : std::span(chunks.begin(), partition_point)) {
+    for (cached_chunk* c : std::span(chunks.begin(), cached_pnt)) {
       size_t chunk_start = c->offset;
       size_t copy_start  = std::max(chunk_start, offset);
       size_t copy_end    = std::min(chunk_start + chunk_bytes, offset + size);
@@ -466,39 +470,80 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
     copy_evnt->record(stream);
   }
 
-  if (partition_point != chunks.end()) {
+  // populate the cache for the missing chunks through prefetching, and we can read from the cache
+  // once the prefetching is done,
+  if (cached_pnt != chunks.end()) {
     std::vector<io::io_object_segment> segments;
-    segments.reserve(std::distance(partition_point, chunks.end()));
-    for (cached_chunk* c : std::span(partition_point, chunks.end())) {
-      size_t chunk_start = c->offset;
-      size_t copy_start  = std::max(chunk_start, offset);
-      size_t copy_end    = std::min(chunk_start + _pool->chunk_bytes(), offset + size);
-      size_t copy_size   = copy_end - copy_start;
-      segments.emplace_back(copy_start, copy_size, c->data + (copy_start - chunk_start), true);
+    segments.reserve(std::distance(cached_pnt, chunks.end()));
+    for (cached_chunk* c : std::span(cached_pnt, chunks.end())) {
+      assert(c->data != nullptr);
+      segments.emplace_back(c->offset, _pool->chunk_bytes(), c->data, true);
     }
     auto io_fut = _io_ctx->host_to_device_read_async_io(
       obj, segments, offset, size, reinterpret_cast<uint8_t*>(dst), stream);
 
+    // Number of leading chunks that were already cached and pinned (in_use)
+    // for the H2D copy above; the remainder ([n_in_use, end)) are the chunks
+    // we just flipped to `loading` and handed to the IO.
+    auto const n_in_use = static_cast<size_t>(cached_pnt - chunks.begin());
+
     // Return a future that, when awaited, first waits for the prefetch IO to
-    // complete and then synchronizes on the H2D copy event for the chunks that
-    // were already cached.  The event is moved into the closure so it outlives
-    // this call.  A failed IO is surfaced as an exception (not a false result):
-    // reaching this path means we attempted the read, so callers must not retry
-    // it through a different code path.
+    // complete (the IO future resolves once the H2D copies are *enqueued*),
+    // then synchronizes the stream so every enqueued H2D copy — both the
+    // already-cached chunks and the freshly-loaded ones — has actually
+    // drained.  Only THEN do we mutate chunk state: releasing a read pin or
+    // publishing loading -> cached makes the chunk evictable, so doing it
+    // before the copy finishes would let the evictor reclaim a bounce buffer
+    // mid-copy.  A failed IO is surfaced as an exception (not a false result):
+    // reaching this path means we attempted the read, so callers must not
+    // retry it through a different code path.
     return std::move(io_fut).defer(
-      [copy_evnt = std::move(copy_evnt)](exec::try_t<size_t>&& res) mutable -> bool {
-        if (copy_evnt) { copy_evnt->synchronize(); }
-        if (res.has_exception()) { std::rethrow_exception(std::move(res).exception()); }
+      [stream, n_in_use, chunks = std::move(chunks)](exec::try_t<size_t>&& res) mutable -> bool {
+        bool ok = !res.has_exception();
+
+        std::exception_ptr cuda_exception = nullptr;
+        try {
+          stream.synchronize();
+        } catch (...) {
+          cuda_exception = std::current_exception();
+          ok             = false;
+        }
+
+        // Already-cached chunks: drop the read pin we took for the copy.
+        std::for_each_n(chunks.begin(), n_in_use, [](cached_chunk* c) { c->state.release_read(); });
+
+        // Freshly-loaded chunks: on success publish loading -> cached; on
+        // failure revert loading -> allocated so a later read can retry with
+        // the chunks still attached.
+        auto transition =
+          ok ? [](cached_chunk* c) { static_cast<void>(c->state.mark_cached()); }
+             : [](cached_chunk* c) { static_cast<void>(c->state.mark_load_failed()); };
+        std::for_each_n(chunks.begin() + n_in_use, chunks.size() - n_in_use, transition);
+
+        if (res.has_exception() || cuda_exception) {
+          std::rethrow_exception(res.has_exception() ? std::move(res).exception() : cuda_exception);
+        }
         return true;
       });
   }
 
   // All requested chunks were already cached: return a future that, when
-  // awaited, synchronizes on the H2D copy event.
+  // awaited, synchronizes on the H2D copy event and only then drops the read
+  // pins.  Releasing a pin makes the chunk evictable, so it must wait until
+  // the copy that reads the chunk has actually completed.
   return exec::make_semi_future(true).defer(
     [copy_evnt = std::move(copy_evnt),
      chunks    = std::move(chunks)](exec::try_t<bool>&& status) mutable -> bool {
-      if (copy_evnt) { copy_evnt->synchronize(); }
+      std::exception_ptr copy_exception = nullptr;
+      try {
+        if (copy_evnt) { copy_evnt->synchronize(); }
+      } catch (...) {
+        copy_exception = std::current_exception();
+      }
+      std::ranges::for_each(chunks, [](cached_chunk* c) { c->state.release_read(); });
+      if (copy_exception || status.has_exception()) {
+        std::rethrow_exception(copy_exception ? copy_exception : status.exception());
+      }
       return true;
     });
 }
@@ -552,7 +597,7 @@ void prefetching_cache::prepare_loop(std::stop_token st)
     }
 
     if (!_io_ctx->supports_vector_host_read() ||
-        _io_ctx->preferred_prefetching_mode() == prefetching_mode::disposable) {
+        _io_ctx->preferred_prefetching_mode() == prefetching_mode::immediate) {
       // either the backend doesn't support scatter-gather reads or it prefers not to reuse
       // buffers for multiple reads.  In either case, we can skip the prefetching step and let the
       // read() path handle the IO directly into the caller's buffer.
@@ -601,6 +646,7 @@ void prefetching_cache::prefetch_loop(std::stop_token st)
       continue;
     }
 
+    // todo(amin): mark the cache_entries
     _io_ctx->host_read_ranges_async_io(*io_obj, segments)
       .via(&_io_cb_dispatcher)
       .then_try([chunks = std::move(allocated_chunks)](exec::try_t<size_t>&& res) mutable {

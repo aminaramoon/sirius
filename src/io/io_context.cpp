@@ -71,7 +71,6 @@ exec::semi_future<size_t> sirius_ioctx::host_read_async(const sirius_io_object& 
     try {
       if (_cache->host_read(obj, offset, size, reinterpret_cast<std::byte*>(dst))) { return size; }
     } catch (...) {
-      // Attempted-but-failed: surface through the future, never retry via IO.
       return exec::make_semi_future<size_t>(std::current_exception());
     }
   }
