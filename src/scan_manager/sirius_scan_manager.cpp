@@ -83,7 +83,8 @@ sirius_scan_manager::sirius_scan_manager(
         "[sirius_scan_manager] use_sirius_datasource is true but the reservation "
         "manager has no HOST-tier fixed_size_host_memory_resource");
     }
-    _io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(_config.uring_n_reactors, *host_mr);
+    _io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(
+      _config.uring_n_reactors, *host_mr, _config.use_odirect);
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
                      _config.uring_n_reactors);
   } else {

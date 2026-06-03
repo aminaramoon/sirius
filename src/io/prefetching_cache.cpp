@@ -305,9 +305,7 @@ prefetching_cache::~prefetching_cache()
 {
   _shutting_down.store(true, std::memory_order_release);
   _preparation_stop_source.request_stop();
-  _preparation_queue.enqueue(nullptr);
   _prefetch_stop_source.request_stop();
-  _prefetch_queue.enqueue(nullptr);
   _evictor_stop_source.request_stop();
 }
 
@@ -369,7 +367,7 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
 bool prefetching_cache::host_read(const sirius_io_object& obj,
                                   size_t offset,
                                   size_t size,
-                                  std::byte* dst)
+                                  uint8_t* dst)
 {
   if (size == 0 || dst == nullptr) return true;
 
@@ -412,7 +410,7 @@ bool prefetching_cache::host_read(const sirius_io_object& obj,
 exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_object& obj,
                                                              size_t offset,
                                                              size_t size,
-                                                             std::byte* dst,
+                                                             uint8_t* dst,
                                                              rmm::cuda_stream_view stream)
 {
   if (size == 0 || dst == nullptr) { return true; }
@@ -558,6 +556,11 @@ void prefetching_cache::prepare_for_query() noexcept
 
 void prefetching_cache::prepare_loop(std::stop_token st)
 {
+  std::stop_callback cb(st, [this]() {
+    spdlog::trace("prefetching_cache: prepare_loop received stop request, unblocking queue");
+    _preparation_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
+  });
+
   while (!_shutting_down && !st.stop_requested()) {
     preparation_request req = nullptr;
     _preparation_queue.wait_dequeue(req);
@@ -614,6 +617,10 @@ void prefetching_cache::prepare_loop(std::stop_token st)
 
 void prefetching_cache::prefetch_loop(std::stop_token st)
 {
+  std::stop_callback cb(st, [this]() {
+    spdlog::trace("prefetching_cache: prefetch_loop received stop request, unblocking queue");
+    _prefetch_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
+  });
   constexpr bool device_accessible = true;
   while (!_shutting_down && !st.stop_requested()) {
     prefetch_request req = nullptr;

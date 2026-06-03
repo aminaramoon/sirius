@@ -120,6 +120,10 @@ class uring_reactor {
  public:
   struct config {
     std::size_t bounce_size{1UL << 20};
+    /// When false, every prep path except the BYO-device-buffer read
+    /// (prep_device_rx_request) reads through the buffered (page-cache) file
+    /// handle instead of the O_DIRECT one.  Defaults to O_DIRECT.
+    bool use_odirect{true};
   };
 
   using native_handle_type        = int;

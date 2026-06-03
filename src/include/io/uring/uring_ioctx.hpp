@@ -33,8 +33,12 @@ class uring_ioctx : public templated_ioctx<uring_reactor> {
  public:
   /// Each @c uring_reactor in the pool allocates its bounce slots from
   /// @p mr; @p mr must outlive this ioctx.  The bounce-slot size is taken
-  /// from @c mr.get_block_size().
-  uring_ioctx(size_t n_reactors, cucascade::memory::fixed_size_host_memory_resource& mr);
+  /// from @c mr.get_block_size().  When @p use_odirect is false, every read
+  /// path except the BYO-device-buffer read goes through the buffered (page
+  /// cache) file handle instead of O_DIRECT.
+  uring_ioctx(size_t n_reactors,
+              cucascade::memory::fixed_size_host_memory_resource& mr,
+              bool use_odirect = true);
 };
 
 }  // namespace sirius::io::uring

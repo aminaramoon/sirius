@@ -412,7 +412,7 @@ class prefetching_handle {
   /// move-out), not on cancel.
   void cancel() noexcept;
 
-  /// True iff this handle is bound to a real prefetch request (i.e. came
+  /// True if this handle is bound to a real prefetch request (i.e. came
   /// from an @c insert that scheduled work).
   explicit operator bool() const noexcept { return _alive != nullptr; }
 

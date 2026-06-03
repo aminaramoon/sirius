@@ -79,12 +79,12 @@ class prefetching_cache {
   [[nodiscard]] bool host_read(const sirius_io_object& obj,
                                size_t offset,
                                size_t size,
-                               std::byte* dst);
+                               uint8_t* dst);
 
   [[nodiscard]] exec::semi_future<bool> device_read_async(const sirius_io_object& obj,
                                                           size_t offset,
                                                           size_t size,
-                                                          std::byte* device_ptr,
+                                                          uint8_t* device_ptr,
                                                           rmm::cuda_stream_view stream);
 
   [[nodiscard]] std::string summary() const;

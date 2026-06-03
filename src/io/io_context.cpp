@@ -58,7 +58,7 @@ size_t sirius_ioctx::host_read_sync(const sirius_io_object& obj,
                                     uint8_t* dst)
 {
   if (uses_prefetching_cache()) {
-    if (_cache->host_read(obj, offset, size, reinterpret_cast<std::byte*>(dst))) { return size; }
+    if (_cache->host_read(obj, offset, size, dst)) { return size; }
   }
   return host_read_io(obj, offset, size, dst);
 }
@@ -70,7 +70,7 @@ exec::semi_future<size_t> sirius_ioctx::host_read_async(const sirius_io_object& 
 {
   if (uses_prefetching_cache()) {
     try {
-      if (_cache->host_read(obj, offset, size, reinterpret_cast<std::byte*>(dst))) { return size; }
+      if (_cache->host_read(obj, offset, size, dst)) { return size; }
     } catch (...) {
       return exec::make_semi_future<size_t>(std::current_exception());
     }
@@ -86,8 +86,7 @@ exec::semi_future<size_t> sirius_ioctx::device_read_async(const sirius_io_object
 {
   if (uses_prefetching_cache()) {
     try {
-      auto semi = _cache->device_read_async(
-        obj, offset, size, reinterpret_cast<std::byte*>(dst), stream.value());
+      auto semi = _cache->device_read_async(obj, offset, size, dst, stream.value());
       if (semi.is_ready()) {
         if (std::move(semi).get()) { return size; }
       } else {

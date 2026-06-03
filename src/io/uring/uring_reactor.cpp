@@ -357,7 +357,8 @@ request_type_ptr uring_reactor::prep_host_rx_request(const reactor_config_type& 
 
   auto manager = std::make_shared<request_manager>(segment.size, 1);
 
-  int const fd = segment.is_odirect_compatible() ? file.odirect_handle() : file.buffered_handle();
+  int const fd = (cfg.use_odirect && segment.is_odirect_compatible()) ? file.odirect_handle()
+                                                                      : file.buffered_handle();
 
   // The read lands directly in the caller's buffer (no bounce, no H2D copy), so
   // a single request covers the whole range — no chunking needed.
@@ -382,7 +383,7 @@ request_type_ptr uring_reactor::prep_device_rx_request(const reactor_config_type
 {
   if (size == 0) { return rx_request::create({}); }
 
-  int const fd = file.odirect_handle();
+  int const fd = cfg.use_odirect ? file.odirect_handle() : file.buffered_handle();
   // align_to_physical aligns the offset down and the end up to IO_BLOCK_SIZE
   // (clamped to the file), giving an O_DIRECT-compliant span.
   auto const phys =
@@ -427,7 +428,7 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
   // overlaps the request into dst.
   if (size == 0 || segments.empty()) { return rx_request::create({}); }
 
-  int const fd         = file.odirect_handle();
+  int const fd         = cfg.use_odirect ? file.odirect_handle() : file.buffered_handle();
   size_t const req_end = offset + size;
 
   // Every segment must overlap the device destination window [offset, req_end).
@@ -501,7 +502,8 @@ request_type_ptr uring_reactor::prep_host_rxv_request(const reactor_config_type&
   chunks.reserve(segments.size());
   for (auto& s : segments) {
     auto req       = std::make_unique<chunked_rx_request>();
-    req->fd        = s.is_odirect_compatible() ? file.odirect_handle() : file.buffered_handle();
+    req->fd        = (cfg.use_odirect && s.is_odirect_compatible()) ? file.odirect_handle()
+                                                                    : file.buffered_handle();
     req->chunk     = s;
     req->file_size = file.size();
     req->manager   = manager;
@@ -516,7 +518,6 @@ void uring_reactor::shutdown()
 {
   if (_worker.joinable()) {
     _stop_source.request_stop();
-    interrupt();
     _worker.join();
   }
 }
@@ -791,23 +792,29 @@ void uring_reactor::worker_loop(std::stop_token stop_token)
 
   // The main loop: drain the request queue and submit new SQEs, wait for completions and reap
   {
+    std::cerr << "uring_reactor worker_loop: exception " << std::endl;
+
     auto cleanup = absl::MakeCleanup([&]() { clean_up_and_shutdown(); });
 
-    while (!stop_token.stop_requested()) {
-      drain_and_submit();
+    try {
+      while (!stop_token.stop_requested()) {
+        drain_and_submit();
 
-      if (inflight > 0) {
-        auto s = ring.wait_for(SHUTDOWN_POLL_MS);
-        if (s) {
-          spdlog::error("uring_reactor: io_uring_wait_cqe_timeout failed: {}", strerror(s));
-          break;
+        if (inflight > 0) {
+          auto s = ring.wait_for(SHUTDOWN_POLL_MS);
+          if (s) {
+            spdlog::error("uring_reactor: io_uring_wait_cqe_timeout failed: {}", strerror(s));
+            break;
+          }
+          reap_cqes();
         }
-        reap_cqes();
+
+        resubmit_incomplete_requests();
+
+        poll_copy_completions();
       }
-
-      resubmit_incomplete_requests();
-
-      poll_copy_completions();
+    } catch (const std::exception& e) {
+      spdlog::error("uring_reactor: exception: {}", e.what());
     }
   }
 }

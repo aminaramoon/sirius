@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <exception>
 #include <memory>

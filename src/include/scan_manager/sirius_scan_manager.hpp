@@ -78,6 +78,10 @@ struct scan_manager_config {
   /// Number of @c uring_reactor instances in the ioctx pool.  Ignored when
   /// @c use_sirius_datasource is false.
   std::size_t uring_n_reactors{4};
+  /// When false, the uring backend reads through the buffered (page-cache)
+  /// file handle instead of O_DIRECT for every path except the
+  /// BYO-device-buffer read.  Ignored when @c use_sirius_datasource is false.
+  bool use_odirect{true};
   /// io_uring submission/completion queue depth per reactor.  Ignored when
   /// @c use_sirius_datasource is false.
   unsigned uring_ring_entries{64};
