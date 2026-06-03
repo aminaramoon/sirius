@@ -422,36 +422,35 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
   int device_id)
 {
   // Device read staged through caller-supplied pinned host buffers.  The
-  // provider hands back one chunk-aligned segment per buffer it owns that
-  // overlaps the request; those buffers may not cover the whole range.  For a
-  // covered chunk we read straight into the provider's buffer; for a gap we
-  // either read through an internal bounce slot (use_internal_buffer == true)
-  // or skip it entirely.
+  // provider hands back one chunk-aligned segment per buffer it owns; the
+  // reactor reads each chunk into that buffer and H2D-copies only the part that
+  // overlaps the request into dst.
   if (size == 0 || segments.empty()) { return rx_request::create({}); }
 
   int const fd         = file.odirect_handle();
   size_t const req_end = offset + size;
 
-  // Keep only the segments whose chunk range actually overlaps the destination
-  // window [offset, req_end).  Each surviving segment becomes exactly one chunk
-  // whose device_cpy_request copies just the overlapping bytes; a segment that
-  // covers no part of the destination is dropped so it can neither underflow
-  // make_device_chunk's copy size nor inflate the request_manager's chunk count
-  // past the chunks we actually create (which would let the future resolve
-  // while a dst region is still unwritten).
-  std::vector<io_object_segment> covering;
-  covering.reserve(segments.size());
-  std::copy_if(segments.begin(),
-               segments.end(),
-               std::back_inserter(covering),
-               [&](io_object_segment const& s) {
-                 return std::max(offset, s.offset) < std::min(req_end, s.offset + s.size);
-               });
-  if (covering.empty()) { return rx_request::create({}); }
+  // Every segment must overlap the device destination window [offset, req_end).
+  // A segment that covers no part of it is a caller error: it would read into a
+  // host buffer whose bytes never land in dst, and it would inflate the
+  // request_manager's chunk count past the copies that actually fill dst.  Sum
+  // the device-buffer bytes each segment contributes — that covered total (not
+  // the chunk-aligned host read size, which over-reads whole O_DIRECT blocks)
+  // is what the future reports back to the caller.
+  size_t bytes_covered = 0;
+  for (auto const& s : segments) {
+    size_t const lo = std::max(offset, s.offset);
+    size_t const hi = std::min(req_end, s.offset + s.size);
+    if (lo >= hi) {
+      throw std::runtime_error("prep_host_to_device_rx_request: segment [" +
+                               std::to_string(s.offset) + ", " + std::to_string(s.offset + s.size) +
+                               ") does not overlap the requested device range [" +
+                               std::to_string(offset) + ", " + std::to_string(req_end) + ")");
+    }
+    bytes_covered += hi - lo;
+  }
 
-  // The future hands back the caller-requested byte count, not the
-  // chunk-aligned amount actually read (O_DIRECT over-reads whole chunks).
-  auto manager = std::make_shared<request_manager>(size, covering.size());
+  auto manager = std::make_shared<request_manager>(bytes_covered, segments.size());
 
   // O_DIRECT requires the read length to stay block-aligned, so the per-chunk
   // read is clamped to the block-rounded file end rather than the raw file
@@ -464,8 +463,8 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
     (file.size() + IO_BLOCK_SIZE - 1) & ~(static_cast<size_t>(IO_BLOCK_SIZE) - 1);
 
   std::vector<chunk_io_request_type_ptr> chunks;
-  chunks.reserve(covering.size());
-  for (auto const& s : covering) {
+  chunks.reserve(segments.size());
+  for (auto const& s : segments) {
     size_t const read_size = std::min(s.size, file_end_aligned - s.offset);
     chunks.push_back(make_device_chunk(fd,
                                        s.offset,
@@ -488,8 +487,6 @@ request_type_ptr uring_reactor::prep_host_rxv_request(const reactor_config_type&
 {
   if (segments.size() == 0) { return rx_request::create(std::vector<chunk_io_request_type_ptr>{}); }
 
-  bool is_device_accessible = segments.front().is_device_accessible();
-
   // Requested bytes = sum of the per-segment request sizes, clamped to the file
   // end (a segment at the tail reads fewer bytes than its chunk-aligned size).
   // This is what the future returns, never the chunk-aligned amount read.
@@ -500,19 +497,11 @@ request_type_ptr uring_reactor::prep_host_rxv_request(const reactor_config_type&
   }
   auto manager = std::make_shared<request_manager>(bytes_requested, segments.size());
 
-  int const fd = is_device_accessible ? file.odirect_handle() : file.buffered_handle();
-
   std::vector<chunk_io_request_type_ptr> chunks;
   chunks.reserve(segments.size());
   for (auto& s : segments) {
-    if (is_device_accessible) {
-      assert(s.is_odirect_compatible() &&
-             "create_host_rx_request: all segments must be O_DIRECT compatible when "
-             "align_for_device is set");
-    }
-
     auto req       = std::make_unique<chunked_rx_request>();
-    req->fd        = fd;
+    req->fd        = s.is_odirect_compatible() ? file.odirect_handle() : file.buffered_handle();
     req->chunk     = s;
     req->file_size = file.size();
     req->manager   = manager;

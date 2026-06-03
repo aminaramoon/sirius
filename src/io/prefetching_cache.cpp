@@ -596,7 +596,7 @@ void prefetching_cache::prepare_loop(std::stop_token st)
     }
 
     if (!_io_ctx->supports_vector_host_read() ||
-        _io_ctx->preferred_prefetching_mode() == prefetching_mode::immediate) {
+        _io_ctx->preferred_prefetching_mode() == prefetching_mode::disposable) {
       // either the backend doesn't support scatter-gather reads or it prefers not to reuse
       // buffers for multiple reads.  In either case, we can skip the prefetching step and let the
       // read() path handle the IO directly into the caller's buffer.

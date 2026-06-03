@@ -219,9 +219,14 @@ struct rx_request {
   exec::semi_future<size_t> get_future() noexcept
   {
     if (requests.empty()) {
+      // Nothing to read (e.g. all segments were already in flight): hand back a
+      // ready, zero-byte future.  The semi_future must be retrieved BEFORE the
+      // promise is satisfied — set_value() releases the shared core, after which
+      // get_semi_future() would throw promise_already_satisfied.
       exec::promise<size_t> promise;
+      auto fut = promise.get_semi_future();
       promise.set_value(0);
-      return promise.get_semi_future();
+      return fut;
     }
     return requests.front()->manager->get_future();
   }
