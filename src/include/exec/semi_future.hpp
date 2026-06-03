@@ -104,6 +104,19 @@ class future;
 
 namespace detail {
 
+// Detect std::unique_ptr specializations.  Used to keep the semi_future
+// value-constructor from hijacking the internal `unique_ptr<state<T>>`
+// constructor: when value_t is constructible from a pointer (e.g. bool, via
+// unique_ptr's explicit operator bool), the forwarding-reference value
+// constructor is an exact match and would otherwise win over the state
+// constructor, silently collapsing a deferred chain into a ready_state.
+template <class t>
+struct is_unique_ptr : std::false_type {};
+template <class t, class d>
+struct is_unique_ptr<std::unique_ptr<t, d>> : std::true_type {};
+template <class t>
+inline constexpr bool is_unique_ptr_v = is_unique_ptr<t>::value;
+
 template <class value_t>
 struct is_semi_future : std::false_type {};
 template <class value_t>
@@ -503,7 +516,8 @@ class semi_future {
   template <class upstream_t      = value_t,
             std::enable_if_t<!std::is_void_v<upstream_t> &&
                                std::is_constructible_v<value_t, upstream_t&&> &&
-                               !std::is_same_v<std::decay_t<upstream_t>, semi_future<value_t>>,
+                               !std::is_same_v<std::decay_t<upstream_t>, semi_future<value_t>> &&
+                               !detail::is_unique_ptr_v<std::decay_t<upstream_t>>,
                              int> = 0>
   /* implicit */ semi_future(upstream_t&& v)
     : _state(

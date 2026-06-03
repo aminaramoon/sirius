@@ -36,9 +36,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <random>
 #include <shared_mutex>
-#include <stdexcept>
 #include <utility>
 
 namespace sirius::io::cache {
@@ -307,7 +305,9 @@ prefetching_cache::~prefetching_cache()
 {
   _shutting_down.store(true, std::memory_order_release);
   _preparation_stop_source.request_stop();
+  _preparation_queue.enqueue(nullptr);
   _prefetch_stop_source.request_stop();
+  _prefetch_queue.enqueue(nullptr);
   _evictor_stop_source.request_stop();
 }
 
@@ -415,8 +415,6 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
                                                              std::byte* dst,
                                                              rmm::cuda_stream_view stream)
 {
-  std::cerr << "device_read_async: offset=" << offset << ", size=" << size << std::endl;
-
   if (size == 0 || dst == nullptr) { return true; }
 
   file_entry* file = nullptr;
@@ -469,21 +467,11 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
       cudaMemcpyAsync(dst + dst_off, c->data + src_off, copy_size, cudaMemcpyHostToDevice, stream);
     }
     copy_evnt->record(stream);
-
-    std::cerr << fmt::format("enqueued H2D copy for {} {}",
-                             std::distance(chunks.begin(), cached_pnt),
-                             (cached_pnt == chunks.end() ? "full copying" : "copy_and_caching"))
-              << std::endl;
   }
 
   // populate the cache for the missing chunks through prefetching, and we can read from the cache
   // once the prefetching is done,
   if (cached_pnt != chunks.end()) {
-    std::cerr << fmt::format("read from host to device {} cached chunks. {}",
-                             std::distance(cached_pnt, chunks.end()),
-                             (cached_pnt == chunks.begin() ? "full caching" : "copy_and_caching"))
-              << std::endl;
-
     std::vector<io::io_object_segment> segments;
     segments.reserve(std::distance(cached_pnt, chunks.end()));
     for (cached_chunk* c : std::span(cached_pnt, chunks.end())) {
