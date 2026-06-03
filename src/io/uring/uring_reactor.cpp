@@ -58,6 +58,14 @@ namespace {
 }
 
 struct io_slot {
+  enum class h2d_sync_hint {
+    h2d_failed,       // no host-to-device copy needed for this request
+    h2d_not_needed,   // host-to-device copy has been issued and is in-flight
+    h2d_detached,     // host-to-device copy has completed, slot can be released
+    h2d_event_based,  // host-to-device copy is in-flight and should be synchronized through the
+                      // event
+  };
+
   using slot_token = slot_pool<NUM_CHUNKS>::token;
   explicit io_slot(int slot_index, uint8_t* internal_buffer)
     : slot_index(slot_index), internal_buffer(internal_buffer)
@@ -111,10 +119,14 @@ struct io_slot {
     reset();
   }
 
-  cudaError_t copy_h2d_async()
+  h2d_sync_hint copy_h2d_async(cudaError_t& err)
   {
+    err = cudaSuccess;
+    if (!req->cpy_req) { return h2d_sync_hint::h2d_not_needed; }
     cudaEvent_t copy_event = event ? (use_internal_buffer ? event->get() : nullptr) : nullptr;
-    return req->copy_h2d_async(copy_event);
+    err                    = req->copy_h2d_async(copy_event);
+    if (err != cudaSuccess) { return h2d_sync_hint::h2d_failed; }
+    return event ? h2d_sync_hint::h2d_event_based : h2d_sync_hint::h2d_detached;
   }
 
   void reset()
@@ -155,6 +167,7 @@ struct io_slot {
                                                           uint8_t* dst,
                                                           rmm::cuda_stream_view stream,
                                                           int device_id,
+                                                          size_t file_size,
                                                           std::shared_ptr<request_manager> manager)
 {
   size_t const req_end = req_offset + req_size;
@@ -164,9 +177,10 @@ struct io_slot {
          "make_device_chunk: window does not overlap the request — caller must filter "
          "non-overlapping segments before building a device copy");
 
-  auto req   = std::make_unique<chunked_rx_request>();
-  req->fd    = fd;
-  req->chunk = io_object_segment{window_off, read_size, host_buf};
+  auto req       = std::make_unique<chunked_rx_request>();
+  req->fd        = fd;
+  req->chunk     = io_object_segment{window_off, read_size, host_buf};
+  req->file_size = file_size;
 
   auto cpy       = std::make_unique<device_cpy_request>();
   cpy->dst       = dst + (data_lo - req_offset);  // where this window lands in dst
@@ -347,10 +361,11 @@ request_type_ptr uring_reactor::prep_host_rx_request(const reactor_config_type& 
 
   // The read lands directly in the caller's buffer (no bounce, no H2D copy), so
   // a single request covers the whole range — no chunking needed.
-  auto req     = std::make_unique<chunked_rx_request>();
-  req->fd      = fd;
-  req->chunk   = segment;
-  req->manager = std::move(manager);
+  auto req       = std::make_unique<chunked_rx_request>();
+  req->fd        = fd;
+  req->chunk     = segment;
+  req->file_size = file.size();
+  req->manager   = std::move(manager);
 
   std::vector<chunk_io_request_type_ptr> chunks;
   chunks.push_back(std::move(req));
@@ -381,8 +396,17 @@ request_type_ptr uring_reactor::prep_device_rx_request(const reactor_config_type
   std::vector<chunk_io_request_type_ptr> chunks;
   for (size_t w = a_start; w < a_end; w += cfg.bounce_size) {
     size_t const read_size = std::min<size_t>(cfg.bounce_size, a_end - w);
-    chunks.push_back(make_device_chunk(
-      fd, w, read_size, /*host_buf=*/nullptr, offset, size, dst, stream, device_id, manager));
+    chunks.push_back(make_device_chunk(fd,
+                                       w,
+                                       read_size,
+                                       /*host_buf=*/nullptr,
+                                       offset,
+                                       size,
+                                       dst,
+                                       stream,
+                                       device_id,
+                                       file.size(),
+                                       manager));
   }
   return rx_request::create(std::move(chunks));
 }
@@ -425,8 +449,9 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
                });
   if (covering.empty()) { return rx_request::create({}); }
 
-  auto manager =
-    std::make_shared<request_manager>(covering.size() * cfg.bounce_size, covering.size());
+  // The future hands back the caller-requested byte count, not the
+  // chunk-aligned amount actually read (O_DIRECT over-reads whole chunks).
+  auto manager = std::make_shared<request_manager>(size, covering.size());
 
   // O_DIRECT requires the read length to stay block-aligned, so the per-chunk
   // read is clamped to the block-rounded file end rather than the raw file
@@ -442,8 +467,17 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
   chunks.reserve(covering.size());
   for (auto const& s : covering) {
     size_t const read_size = std::min(s.size, file_end_aligned - s.offset);
-    chunks.push_back(make_device_chunk(
-      fd, s.offset, read_size, s.data(), offset, size, dst, stream, device_id, manager));
+    chunks.push_back(make_device_chunk(fd,
+                                       s.offset,
+                                       read_size,
+                                       s.data(),
+                                       offset,
+                                       size,
+                                       dst,
+                                       stream,
+                                       device_id,
+                                       file.size(),
+                                       manager));
   }
   return rx_request::create(std::move(chunks));
 }
@@ -454,12 +488,17 @@ request_type_ptr uring_reactor::prep_host_rxv_request(const reactor_config_type&
 {
   if (segments.size() == 0) { return rx_request::create(std::vector<chunk_io_request_type_ptr>{}); }
 
-  assert(segments.size() == dst.size() &&
-         "create_host_rx_request: ranges and destination spans must be 1:1");
-
   bool is_device_accessible = segments.front().is_device_accessible();
-  auto manager =
-    std::make_shared<request_manager>(segments.size() * cfg.bounce_size, segments.size());
+
+  // Requested bytes = sum of the per-segment request sizes, clamped to the file
+  // end (a segment at the tail reads fewer bytes than its chunk-aligned size).
+  // This is what the future returns, never the chunk-aligned amount read.
+  size_t const fsize     = file.size();
+  size_t bytes_requested = 0;
+  for (auto const& s : segments) {
+    bytes_requested += s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
+  }
+  auto manager = std::make_shared<request_manager>(bytes_requested, segments.size());
 
   int const fd = is_device_accessible ? file.odirect_handle() : file.buffered_handle();
 
@@ -472,10 +511,11 @@ request_type_ptr uring_reactor::prep_host_rxv_request(const reactor_config_type&
              "align_for_device is set");
     }
 
-    auto req     = std::make_unique<chunked_rx_request>();
-    req->fd      = fd;
-    req->chunk   = s;
-    req->manager = manager;
+    auto req       = std::make_unique<chunked_rx_request>();
+    req->fd        = fd;
+    req->chunk     = s;
+    req->file_size = file.size();
+    req->manager   = manager;
     chunks.push_back(std::move(req));
   }
   return rx_request::create(std::move(chunks));
@@ -683,21 +723,20 @@ void uring_reactor::worker_loop(std::stop_token stop_token)
 
       s.bytes_read += static_cast<size_t>(bytes_read);
       bool const fully_read = s.bytes_read >= s.req->chunk.size;
-      bool const eof        = (bytes_read == 0);
+      bool const eof = bytes_read == 0 || s.req->chunk.offset + s.bytes_read >= s.req->file_size;
 
       if (!fully_read && !eof) {
         incomplete_requests.push_back(si);
         continue;
       }
 
-      if (s.req->cpy_req) {
-        // todo(amin): should we even handle cuda errors.
-        auto err = s.copy_h2d_async();
-        if (err != cudaSuccess) {
-          s.on_error(err);
-          continue;
-        }
-        if (s.use_internal_buffer) { copying_slots.push_back(s.release_slot()); }
+      cudaError_t err = cudaSuccess;
+      auto hint       = s.copy_h2d_async(err);
+      if (hint == io_slot::h2d_sync_hint::h2d_failed) {
+        s.on_error(err);
+        continue;
+      } else if (hint == io_slot::h2d_sync_hint::h2d_event_based) {
+        copying_slots.push_back(s.release_slot());
       }
       s.on_complete(s.bytes_read);
     }

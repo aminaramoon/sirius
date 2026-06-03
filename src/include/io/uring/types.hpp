@@ -41,8 +41,13 @@ namespace sirius::io::uring {
 class request_manager {
  public:
   using error_type = std::variant<std::exception_ptr, cudaError_t, std::error_code>;
-  explicit request_manager(std::size_t total_bytes, std::size_t total_chunks)
-    : total_bytes(total_bytes), total_chunks(total_chunks)
+  // @p bytes_requested is the number of bytes the *caller* asked for; it is the
+  // value handed back through the future.  The reactor frequently reads more
+  // than that (O_DIRECT/chunk alignment over-reads whole blocks), so the
+  // physically-read total tracked in @c bytes_read is only used to assert that
+  // the request was fully covered — it is never returned to the caller.
+  explicit request_manager(std::size_t bytes_requested, std::size_t total_chunks)
+    : bytes_requested(bytes_requested), total_chunks(total_chunks)
   {
   }
 
@@ -51,11 +56,11 @@ class request_manager {
     if (has_error()) {
       promise.set_exception(first_exception);
     } else {
-      assert(bytes_read >= total_bytes &&
-             "All chunks completed but total bytes read does not match expected");
+      assert(bytes_read >= bytes_requested &&
+             "All chunks completed but fewer bytes were read than requested");
       assert(chunks_completed == total_chunks &&
              "All chunks completed but total chunks completed does not match expected");
-      promise.set_value(total_bytes);
+      promise.set_value(bytes_requested);
     }
   }
 
@@ -82,7 +87,7 @@ class request_manager {
     return promise.get_semi_future();
   }
 
-  const std::size_t total_bytes;
+  const std::size_t bytes_requested;
   const std::size_t total_chunks;
 
  private:
@@ -136,6 +141,11 @@ struct device_cpy_request {
 struct chunked_rx_request {
   int fd;
   io_object_segment chunk;
+  // Size of the underlying file.  Used by the worker loop to distinguish a
+  // genuine short read (must be re-submitted to read the rest) from a partial
+  // read that simply reached EOF (already complete — re-submitting would read
+  // at offset == file_size, or a non-block-aligned tail under O_DIRECT).
+  size_t file_size{0};
 
   [[nodiscard]] io_object_segment get_remaining_chunk(size_t offset) const noexcept
   {
