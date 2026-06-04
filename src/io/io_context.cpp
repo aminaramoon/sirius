@@ -55,7 +55,7 @@ void sirius_ioctx::shutdown_cache() noexcept { _cache.reset(); }
 size_t sirius_ioctx::host_read_sync(const sirius_io_object& obj,
                                     size_t offset,
                                     size_t size,
-                                    uint8_t* dst)
+                                    std::byte* dst)
 {
   if (uses_prefetching_cache()) {
     if (_cache->host_read(obj, offset, size, dst)) { return size; }
@@ -66,7 +66,7 @@ size_t sirius_ioctx::host_read_sync(const sirius_io_object& obj,
 exec::semi_future<size_t> sirius_ioctx::host_read_async(const sirius_io_object& obj,
                                                         size_t offset,
                                                         size_t size,
-                                                        uint8_t* dst) noexcept
+                                                        std::byte* dst) noexcept
 {
   if (uses_prefetching_cache()) {
     try {
@@ -81,7 +81,7 @@ exec::semi_future<size_t> sirius_ioctx::host_read_async(const sirius_io_object& 
 exec::semi_future<size_t> sirius_ioctx::device_read_async(const sirius_io_object& obj,
                                                           size_t offset,
                                                           size_t size,
-                                                          uint8_t* dst,
+                                                          std::byte* dst,
                                                           rmm::cuda_stream_view stream) noexcept
 {
   if (uses_prefetching_cache()) {

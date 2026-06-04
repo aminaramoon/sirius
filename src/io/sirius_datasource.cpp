@@ -16,6 +16,8 @@
 
 #include "io/sirius_datasource.hpp"
 
+#include "exec/semi_future.hpp"
+#include "exec/try.hpp"
 #include "io/cache/prefetching_cache.hpp"
 
 #include <rmm/device_buffer.hpp>
@@ -31,6 +33,29 @@
 #include <vector>
 
 namespace sirius::io {
+
+namespace {
+
+// Bridge a semi_future into a real (promise-backed) std::future.  The result is
+// pushed in via install_callback when the IO settles, so the std::future
+// reports readiness normally (wait_for never returns `deferred`) and the
+// completion bookkeeping runs on the IO callback thread rather than being
+// pulled onto the caller's thread the way std::async(deferred) would.
+std::future<size_t> bridge_semi_to_std(exec::semi_future<size_t>&& sf)
+{
+  auto p   = std::make_shared<std::promise<size_t>>();
+  auto fut = p->get_future();
+  std::move(sf).install_callback([p = std::move(p)](exec::try_t<size_t>&& t) mutable {
+    if (t.has_exception()) {
+      p->set_exception(std::move(t).exception());
+    } else {
+      p->set_value(std::move(t).value());
+    }
+  });
+  return fut;
+}
+
+}  // namespace
 
 sirius_datasource::sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
                                      std::shared_ptr<sirius_io_object> io_object)
@@ -56,22 +81,21 @@ bool sirius_datasource::is_device_read_preferred(size_t) const
 
 size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
-  return _io_ctx->host_read_sync(*_io_object, offset, size, dst);
+  return _io_ctx->host_read_sync(*_io_object, offset, size, reinterpret_cast<std::byte*>(dst));
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_t offset,
                                                                            size_t size)
 {
   std::vector<uint8_t> buf(size);
-  _io_ctx->host_read_sync(*_io_object, offset, size, buf.data());
+  _io_ctx->host_read_sync(*_io_object, offset, size, reinterpret_cast<std::byte*>(buf.data()));
   return cudf::io::datasource::buffer::create(std::move(buf));
 }
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  auto semi = _io_ctx->host_read_async(*_io_object, offset, size, dst);
-  return std::async(std::launch::deferred,
-                    [semi = std::move(semi)]() mutable { return std::move(semi).get(); });
+  return bridge_semi_to_std(
+    _io_ctx->host_read_async(*_io_object, offset, size, reinterpret_cast<std::byte*>(dst)));
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
@@ -80,7 +104,8 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
   auto file_size = _io_object->size();
   size           = std::min(size, file_size > offset ? file_size - offset : size_t{0});
   auto buf       = std::vector<uint8_t>(size);
-  auto semi      = _io_ctx->host_read_async(*_io_object, offset, size, buf.data());
+  auto semi =
+    _io_ctx->host_read_async(*_io_object, offset, size, reinterpret_cast<std::byte*>(buf.data()));
   return std::async(std::launch::deferred,
                     [buffer = std::move(buf), semi = std::move(semi)]() mutable {
                       auto n = std::move(semi).get();
@@ -94,7 +119,8 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
 {
   rmm::device_buffer buf(size, stream);
   size_t n =
-    _io_ctx->device_read_async(*_io_object, offset, size, static_cast<uint8_t*>(buf.data()), stream)
+    _io_ctx
+      ->device_read_async(*_io_object, offset, size, static_cast<std::byte*>(buf.data()), stream)
       .get();
   buf.resize(n, stream);
   stream.synchronize();
@@ -106,7 +132,9 @@ size_t sirius_datasource::device_read(size_t offset,
                                       uint8_t* dst,
                                       rmm::cuda_stream_view stream)
 {
-  return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream).get();
+  return _io_ctx
+    ->device_read_async(*_io_object, offset, size, reinterpret_cast<std::byte*>(dst), stream)
+    .get();
 }
 
 std::future<size_t> sirius_datasource::device_read_async(size_t offset,
@@ -114,9 +142,8 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          rmm::cuda_stream_view stream)
 {
-  auto semi = _io_ctx->device_read_async(*_io_object, offset, size, dst, stream);
-  return std::async(std::launch::deferred,
-                    [semi = std::move(semi)]() mutable { return std::move(semi).get(); });
+  return bridge_semi_to_std(_io_ctx->device_read_async(
+    *_io_object, offset, size, reinterpret_cast<std::byte*>(dst), stream));
 }
 
 std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const

@@ -79,12 +79,12 @@ class prefetching_cache {
   [[nodiscard]] bool host_read(const sirius_io_object& obj,
                                size_t offset,
                                size_t size,
-                               uint8_t* dst);
+                               std::byte* dst);
 
   [[nodiscard]] exec::semi_future<bool> device_read_async(const sirius_io_object& obj,
                                                           size_t offset,
                                                           size_t size,
-                                                          uint8_t* device_ptr,
+                                                          std::byte* device_ptr,
                                                           rmm::cuda_stream_view stream);
 
   [[nodiscard]] std::string summary() const;
@@ -106,9 +106,9 @@ class prefetching_cache {
     size_t file_size{0};
   };
 
-  void prepare_loop(std::stop_token st);
-  void prefetch_loop(std::stop_token st);
-  void evict_loop(std::stop_token st);
+  void prepare_loop(const std::stop_token& st);
+  void prefetch_loop(const std::stop_token& st);
+  void evict_loop(const std::stop_token& st);
 
   file_entry& get_or_create_file_entry(const sirius_io_object& obj);
 

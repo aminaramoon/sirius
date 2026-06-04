@@ -121,17 +121,17 @@ class kvikio_context final : public sirius_ioctx {
   size_t host_read_sync(const sirius_io_object& obj,
                         size_t offset,
                         size_t size,
-                        uint8_t* dst) final;
+                        std::byte* dst) final;
 
   exec::semi_future<size_t> host_read_async(const sirius_io_object& obj,
                                             size_t offset,
                                             size_t size,
-                                            uint8_t* dst) noexcept final;
+                                            std::byte* dst) noexcept final;
 
   exec::semi_future<size_t> device_read_async(const sirius_io_object& obj,
                                               size_t offset,
                                               size_t size,
-                                              uint8_t* dst,
+                                              std::byte* dst,
                                               rmm::cuda_stream_view stream) noexcept final;
 
   /// kvikio handles its own alignment internally; pass the logical range
@@ -150,17 +150,20 @@ class kvikio_context final : public sirius_ioctx {
   // instantiable; any future caller that bypasses the public API will see
   // a clear failure rather than silent misbehaviour.
 
-  size_t host_read_io(const sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
+  size_t host_read_io(const sirius_io_object& obj,
+                      size_t offset,
+                      size_t size,
+                      std::byte* dst) final;
 
   exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
                                                size_t offset,
                                                size_t size,
-                                               uint8_t* dst) noexcept final;
+                                               std::byte* dst) noexcept final;
 
   exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
                                                  size_t offset,
                                                  size_t size,
-                                                 uint8_t* dst,
+                                                 std::byte* dst,
                                                  rmm::cuda_stream_view stream) noexcept final;
 
   exec::semi_future<size_t> host_to_device_read_async_io(
@@ -168,7 +171,7 @@ class kvikio_context final : public sirius_ioctx {
     std::span<io_object_segment> slices,
     size_t offset,
     size_t size,
-    uint8_t* device_dst,
+    std::byte* device_dst,
     rmm::cuda_stream_view stream) noexcept final;
 
   exec::semi_future<size_t> host_read_ranges_async_io(

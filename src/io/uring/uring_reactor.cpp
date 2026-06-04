@@ -67,7 +67,7 @@ struct io_slot {
   };
 
   using slot_token = slot_pool<NUM_CHUNKS>::token;
-  explicit io_slot(int slot_index, uint8_t* internal_buffer)
+  explicit io_slot(int slot_index, std::byte* internal_buffer)
     : slot_index(slot_index), internal_buffer(internal_buffer)
   {
     assert(internal_buffer && "io_slot: internal_buffer must not be null");
@@ -100,7 +100,7 @@ struct io_slot {
   {
     req                 = std::move(r);
     use_internal_buffer = req->chunk.data() == nullptr;
-    if (use_internal_buffer) { req->chunk.set_data(internal_buffer, true); }
+    if (use_internal_buffer) { req->chunk.set_data(internal_buffer); }
     bytes_read       = 0;
     this->pool_token = std::move(token);
     event            = cu_event;
@@ -139,7 +139,7 @@ struct io_slot {
   slot_token release_slot() noexcept { return std::exchange(pool_token, {}); }
 
   int slot_index;
-  uint8_t* const internal_buffer;
+  std::byte* const internal_buffer;
   std::unique_ptr<chunked_rx_request> req;
   bool use_internal_buffer{false};
   size_t bytes_read{0};
@@ -161,10 +161,10 @@ struct io_slot {
 [[nodiscard]] chunk_io_request_type_ptr make_device_chunk(int fd,
                                                           size_t window_off,
                                                           size_t read_size,
-                                                          uint8_t* host_buf,
+                                                          std::byte* host_buf,
                                                           size_t req_offset,
                                                           size_t req_size,
-                                                          uint8_t* dst,
+                                                          std::byte* dst,
                                                           rmm::cuda_stream_view stream,
                                                           int device_id,
                                                           size_t file_size,
@@ -302,7 +302,7 @@ uring_reactor::uring_reactor(cucascade::memory::fixed_size_host_memory_resource&
   : _config{mr.get_block_size()}, _bounce_slot_size(mr.get_block_size())
 {
   _bounce_storage = mr.allocate_multiple_blocks(NUM_CHUNKS * _bounce_slot_size);
-  _worker = std::jthread([this](std::stop_token stop_token) { worker_loop(std::move(stop_token)); },
+  _worker = std::jthread([this](const std::stop_token& stop_token) { worker_loop(stop_token); },
                          _stop_source.get_token());
   if (!tname.empty()) {
     std::string full_name = std::string(tname) + "_worker";
@@ -346,15 +346,6 @@ request_type_ptr uring_reactor::prep_host_rx_request(const reactor_config_type& 
 {
   if (segment.size == 0) { return rx_request::create({}); }
 
-  // Buffered host read straight into the caller's destination buffer (no H2D
-  // copy).  When align_for_device is set the read goes through the O_DIRECT fd,
-  // so the destination, offset and size must all be page-aligned.
-  if (segment.is_device_accessible()) {
-    assert(segment.is_odirect_compatible() &&
-           "create_host_rx_request: segment must be O_DIRECT compatible when "
-           "is_device_accessible is set");
-  }
-
   auto manager = std::make_shared<request_manager>(segment.size, 1);
 
   int const fd = (cfg.use_odirect && segment.is_odirect_compatible()) ? file.odirect_handle()
@@ -375,7 +366,7 @@ request_type_ptr uring_reactor::prep_host_rx_request(const reactor_config_type& 
 
 request_type_ptr uring_reactor::prep_device_rx_request(const reactor_config_type& cfg,
                                                        const io_object_type& file,
-                                                       uint8_t* dst,
+                                                       std::byte* dst,
                                                        size_t offset,
                                                        size_t size,
                                                        rmm::cuda_stream_view stream,
@@ -416,7 +407,7 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
   const reactor_config_type& cfg,
   const io_object_type& file,
   std::span<io_object_segment> segments,
-  uint8_t* dst,
+  std::byte* dst,
   size_t offset,
   size_t size,
   rmm::cuda_stream_view stream,
@@ -543,7 +534,7 @@ bool uring_reactor::supports(std::string_view path)
 size_t uring_reactor::host_read(const io_object_type& file,
                                 size_t offset,
                                 size_t size,
-                                uint8_t* dst)
+                                std::byte* dst)
 {
   if (size == 0) return 0;
   // Loop until either the full requested size is read, EOF (n == 0), or a
@@ -586,7 +577,7 @@ void uring_reactor::enqueue_chunk(chunk_io_request_type_ptr request)
   }
 }
 
-void uring_reactor::worker_loop(std::stop_token stop_token)
+void uring_reactor::worker_loop(const std::stop_token& stop_token)
 {
   static constexpr std::chrono::milliseconds SHUTDOWN_POLL_MS{100};
 
@@ -611,7 +602,7 @@ void uring_reactor::worker_loop(std::stop_token stop_token)
   std::vector<io_slot> slots;
   slots.reserve(NUM_CHUNKS);
   std::ranges::transform(iovecs, std::back_inserter(slots), [i = 0](auto& b) mutable {
-    return io_slot(i++, reinterpret_cast<uint8_t*>(b.iov_base));
+    return io_slot(i++, reinterpret_cast<std::byte*>(b.iov_base));
   });
 
   std::array<io_uring_cqe*, NUM_CHUNKS> cqes;

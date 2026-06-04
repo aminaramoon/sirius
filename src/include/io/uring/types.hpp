@@ -118,7 +118,7 @@ class request_manager {
 };
 
 struct device_cpy_request {
-  cudaError_t copy_async(uint8_t* host_buffer,
+  cudaError_t copy_async(std::byte* host_buffer,
                          [[maybe_unused]] size_t bytes,
                          cudaEvent_t event = nullptr) noexcept
   {
@@ -132,7 +132,7 @@ struct device_cpy_request {
     return err;
   }
 
-  uint8_t* dst{nullptr};
+  std::byte* dst{nullptr};
   size_t offset{0};
   size_t size{0};
   rmm::cuda_stream_view stream;

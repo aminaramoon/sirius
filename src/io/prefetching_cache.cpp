@@ -293,11 +293,11 @@ prefetching_cache::prefetching_cache(buffer_pool* pool,
                                      size_t inflight_budget_chunks)
   : _pool(pool), _io_ctx(io_ctx), _armed(true), _rate_limiter(inflight_budget_chunks)
 {
-  _preparation_thread = std::jthread([this](std::stop_token st) { prepare_loop(std::move(st)); },
+  _preparation_thread = std::jthread([this](const std::stop_token& st) { prepare_loop(st); },
                                      _preparation_stop_source.get_token());
-  _prefetch_thread    = std::jthread([this](std::stop_token st) { prefetch_loop(std::move(st)); },
+  _prefetch_thread    = std::jthread([this](const std::stop_token& st) { prefetch_loop(st); },
                                   _prefetch_stop_source.get_token());
-  _evictor_thread     = std::jthread([this](std::stop_token st) { evict_loop(std::move(st)); },
+  _evictor_thread     = std::jthread([this](const std::stop_token& st) { evict_loop(st); },
                                  _evictor_stop_source.get_token());
 }
 
@@ -367,7 +367,7 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
 bool prefetching_cache::host_read(const sirius_io_object& obj,
                                   size_t offset,
                                   size_t size,
-                                  uint8_t* dst)
+                                  std::byte* dst)
 {
   if (size == 0 || dst == nullptr) return true;
 
@@ -410,7 +410,7 @@ bool prefetching_cache::host_read(const sirius_io_object& obj,
 exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_object& obj,
                                                              size_t offset,
                                                              size_t size,
-                                                             uint8_t* dst,
+                                                             std::byte* dst,
                                                              rmm::cuda_stream_view stream)
 {
   if (size == 0 || dst == nullptr) { return true; }
@@ -474,10 +474,9 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
     segments.reserve(std::distance(cached_pnt, chunks.end()));
     for (cached_chunk* c : std::span(cached_pnt, chunks.end())) {
       assert(c->data != nullptr);
-      segments.emplace_back(c->offset, _pool->chunk_bytes(), c->data, true);
+      segments.emplace_back(c->offset, _pool->chunk_bytes(), c->data);
     }
-    auto io_fut = _io_ctx->host_to_device_read_async_io(
-      obj, segments, offset, size, reinterpret_cast<uint8_t*>(dst), stream);
+    auto io_fut = _io_ctx->host_to_device_read_async_io(obj, segments, offset, size, dst, stream);
 
     // Number of leading chunks that were already cached and pinned (in_use)
     // for the H2D copy above; the remainder ([n_in_use, end)) are the chunks
@@ -494,8 +493,14 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
     // mid-copy.  A failed IO is surfaced as an exception (not a false result):
     // reaching this path means we attempted the read, so callers must not
     // retry it through a different code path.
-    return std::move(io_fut).defer(
-      [stream, n_in_use, chunks = std::move(chunks)](exec::try_t<size_t>&& res) mutable -> bool {
+    // Run the continuation on the IO callback pool rather than inline on the
+    // thread that completes the IO (the reactor): it calls stream.synchronize()
+    // and must not block the reactor when a push-mode consumer (the datasource
+    // std::future bridge) drives this chain via set_callback.
+    return std::move(io_fut)
+      .via(&_io_cb_dispatcher)
+      .then_try([stream, n_in_use, chunks = std::move(chunks)](
+                  exec::try_t<size_t>&& res) mutable -> bool {
         bool ok = !res.has_exception();
 
         std::exception_ptr cuda_exception = nullptr;
@@ -521,7 +526,8 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
           std::rethrow_exception(res.has_exception() ? std::move(res).exception() : cuda_exception);
         }
         return true;
-      });
+      })
+      .semi();
   }
 
   // All requested chunks were already cached: return a future that, when
@@ -554,7 +560,7 @@ void prefetching_cache::prepare_for_query() noexcept
 
 // ===========================================================================
 
-void prefetching_cache::prepare_loop(std::stop_token st)
+void prefetching_cache::prepare_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
     spdlog::trace("prefetching_cache: prepare_loop received stop request, unblocking queue");
@@ -615,13 +621,12 @@ void prefetching_cache::prepare_loop(std::stop_token st)
   }
 }
 
-void prefetching_cache::prefetch_loop(std::stop_token st)
+void prefetching_cache::prefetch_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
     spdlog::trace("prefetching_cache: prefetch_loop received stop request, unblocking queue");
     _prefetch_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
   });
-  constexpr bool device_accessible = true;
   while (!_shutting_down && !st.stop_requested()) {
     prefetch_request req = nullptr;
     _prefetch_queue.wait_dequeue(req);
@@ -632,18 +637,17 @@ void prefetching_cache::prefetch_loop(std::stop_token st)
     std::vector<io::io_object_segment> segments;
 
     segments.reserve(allocated_chunks.size());
-    allocated_chunks.erase(
-      std::remove_if(allocated_chunks.begin(),
-                     allocated_chunks.end(),
-                     [&](cached_chunk* c) {
-                       if (c->state.mark_loading()) {
-                         segments.emplace_back(
-                           c->offset, _pool->chunk_bytes(), c->data, device_accessible);
-                         return false;
-                       }
-                       return true;
-                     }),
-      allocated_chunks.end());
+    allocated_chunks.erase(std::remove_if(allocated_chunks.begin(),
+                                          allocated_chunks.end(),
+                                          [&](cached_chunk* c) {
+                                            if (c->state.mark_loading()) {
+                                              segments.emplace_back(
+                                                c->offset, _pool->chunk_bytes(), c->data);
+                                              return false;
+                                            }
+                                            return true;
+                                          }),
+                           allocated_chunks.end());
 
     // request was cancelled
     if (req->is_cancelled()) {
@@ -664,7 +668,7 @@ void prefetching_cache::prefetch_loop(std::stop_token st)
   }
 }
 
-void prefetching_cache::evict_loop(std::stop_token st)
+void prefetching_cache::evict_loop(const std::stop_token& st)
 {
   while (!_shutting_down && !st.stop_requested()) {}
 }

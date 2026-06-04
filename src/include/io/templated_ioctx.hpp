@@ -82,7 +82,7 @@ concept io_reactor_c = requires(R r,
                                 typename R::reactor_config_type cfg,
                                 size_t offset,
                                 size_t size,
-                                uint8_t* dst,
+                                std::byte* dst,
                                 std::string_view path,
                                 std::string path_str) {
   typename R::io_object_type;
@@ -91,7 +91,7 @@ concept io_reactor_c = requires(R r,
   typename R::reactor_config_type;
 
   {
-    r.prep_host_rx_request(cfg, file, io_object_segment{offset, size, dst, false})
+    r.prep_host_rx_request(cfg, file, io_object_segment{offset, size, dst})
   } -> std::same_as<typename R::request_type_ptr>;
 
   { r.enqueue(std::move(rx_req)) };
@@ -123,7 +123,7 @@ template <class R>
 concept reactor_has_device_rx = requires(R r,
                                          typename R::io_object_type file,
                                          typename R::reactor_config_type cfg,
-                                         uint8_t* dst,
+                                         std::byte* dst,
                                          size_t offset,
                                          size_t size,
                                          rmm::cuda_stream_view stream) {
@@ -136,7 +136,7 @@ template <class R>
 concept reactor_has_host_to_device_rx = requires(R r,
                                                  typename R::io_object_type file,
                                                  typename R::reactor_config_type cfg,
-                                                 uint8_t* dst,
+                                                 std::byte* dst,
                                                  size_t offset,
                                                  size_t size,
                                                  rmm::cuda_stream_view stream,
@@ -293,7 +293,7 @@ class templated_ioctx : public sirius_ioctx {
   size_t host_read_io(const sirius_io_object& obj,
                       size_t offset,
                       size_t size,
-                      uint8_t* dst) override
+                      std::byte* dst) override
   {
     auto& tobj = as_typed(obj);
     size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
@@ -304,7 +304,7 @@ class templated_ioctx : public sirius_ioctx {
   exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
                                                size_t offset,
                                                size_t size,
-                                               uint8_t* dst) noexcept override
+                                               std::byte* dst) noexcept override
   {
     try {
       auto& tobj = as_typed(obj);
@@ -316,8 +316,7 @@ class templated_ioctx : public sirius_ioctx {
           std::make_exception_ptr(std::runtime_error("host_read_async_io: no available reactors")));
       }
 
-      auto req =
-        Reactor::prep_host_rx_request(_config, tobj, io_object_segment{offset, size, dst, false});
+      auto req = Reactor::prep_host_rx_request(_config, tobj, io_object_segment{offset, size, dst});
       auto semi = req->get_future();
       auto reqs = request_type::splits(std::move(req), reactors.size());
       assert(reqs.size() <= reactors.size());
@@ -335,7 +334,7 @@ class templated_ioctx : public sirius_ioctx {
   exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
                                                  size_t offset,
                                                  size_t size,
-                                                 uint8_t* dst,
+                                                 std::byte* dst,
                                                  rmm::cuda_stream_view stream) noexcept override
   {
     if constexpr (reactor_traits_t::supports_device_read) {
@@ -371,7 +370,7 @@ class templated_ioctx : public sirius_ioctx {
     std::span<io_object_segment> slices,
     size_t offset,
     size_t size,
-    uint8_t* dst,
+    std::byte* dst,
     rmm::cuda_stream_view stream) noexcept override
   {
     if constexpr (reactor_traits_t::supports_host_to_device_read) {

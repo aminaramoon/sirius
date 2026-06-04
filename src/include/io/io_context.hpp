@@ -163,17 +163,17 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   virtual size_t host_read_sync(const sirius_io_object& obj,
                                 size_t offset,
                                 size_t size,
-                                uint8_t* dst);
+                                std::byte* dst);
 
   virtual exec::semi_future<size_t> host_read_async(const sirius_io_object& obj,
                                                     size_t offset,
                                                     size_t size,
-                                                    uint8_t* dst) noexcept;
+                                                    std::byte* dst) noexcept;
 
   virtual exec::semi_future<size_t> device_read_async(const sirius_io_object& obj,
                                                       size_t offset,
                                                       size_t size,
-                                                      uint8_t* dst,
+                                                      std::byte* dst,
                                                       rmm::cuda_stream_view stream) noexcept;
 
   // -- Physical range alignment ------------------------------------------------
@@ -185,17 +185,17 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   virtual size_t host_read_io(const sirius_io_object& obj,
                               size_t offset,
                               size_t size,
-                              uint8_t* dst) = 0;
+                              std::byte* dst) = 0;
 
   virtual exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
                                                        size_t offset,
                                                        size_t size,
-                                                       uint8_t* dst) noexcept = 0;
+                                                       std::byte* dst) noexcept = 0;
 
   virtual exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
                                                          size_t offset,
                                                          size_t size,
-                                                         uint8_t* dst,
+                                                         std::byte* dst,
                                                          rmm::cuda_stream_view stream) noexcept = 0;
 
   virtual exec::semi_future<size_t> host_to_device_read_async_io(
@@ -203,7 +203,7 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
     std::span<io_object_segment> slices,
     size_t offset,
     size_t size,
-    uint8_t* device_dst,
+    std::byte* device_dst,
     rmm::cuda_stream_view stream) noexcept = 0;
 
   virtual exec::semi_future<size_t> host_read_ranges_async_io(

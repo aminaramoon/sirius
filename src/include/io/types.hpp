@@ -98,44 +98,29 @@ class io_object_segment {
  public:
   io_object_segment() = default;
 
-  io_object_segment(size_t offset, size_t size) : offset(offset), size(size) {}
+  io_object_segment(size_t offset, size_t size) : offset(offset), size(size), buffer(nullptr) {}
 
-  io_object_segment(size_t offset, size_t size, void* data, bool is_device_accessible = false)
-    : offset(offset),
-      size(size),
-      _data(static_cast<uint8_t*>(data)),
-      _is_device_accessible(is_device_accessible)
+  io_object_segment(size_t offset, size_t size, std::byte* buffer)
+    : offset(offset), size(size), buffer(buffer)
 
   {
   }
 
-  void set_data(uint8_t* data, bool is_device_accessible = false)
-  {
-    _data                 = data;
-    _is_device_accessible = is_device_accessible;
-  }
+  void set_data(std::byte* buffer) { this->buffer = buffer; }
 
-  [[nodiscard]] uint8_t* data() const noexcept { return _data; }
+  [[nodiscard]] std::byte* data() const noexcept { return buffer; }
 
-  [[nodiscard]] bool is_device_accessible() const noexcept { return _is_device_accessible; }
-
-  [[nodiscard]] bool is_buffer_allocated() const noexcept { return _data != nullptr; }
+  [[nodiscard]] bool is_buffer_allocated() const noexcept { return buffer != nullptr; }
 
   [[nodiscard]] bool is_odirect_compatible() const noexcept
   {
     return (offset % IO_BLOCK_SIZE == 0) && (size % IO_BLOCK_SIZE == 0) &&
-           (_data == nullptr || reinterpret_cast<uintptr_t>(_data) % IO_BLOCK_SIZE == 0);
+           (buffer == nullptr || reinterpret_cast<uintptr_t>(buffer) % IO_BLOCK_SIZE == 0);
   }
 
   size_t offset{0};
   size_t size{0};
-
- private:
-  uint8_t* _data{nullptr};  // null means the destination buffer is not yet allocated; non-null
-                            // means the caller has pre-allocated a buffer for this segment, doesn't
-                            // mean the buffer is populated with data yet
-  bool _is_device_accessible{
-    false};  // true if the caller intends to read directly into device memory
+  std::byte* buffer;
 };
 
 }  // namespace sirius::io

@@ -151,7 +151,7 @@ class uring_reactor {
 
   static request_type_ptr prep_device_rx_request(const reactor_config_type& cfg,
                                                  const io_object_type& file,
-                                                 uint8_t* dst,
+                                                 std::byte* dst,
                                                  size_t offset,
                                                  size_t size,
                                                  rmm::cuda_stream_view stream,
@@ -160,7 +160,7 @@ class uring_reactor {
   static request_type_ptr prep_host_to_device_rx_request(const reactor_config_type& cfg,
                                                          const io_object_type& file,
                                                          std::span<io_object_segment> bounce,
-                                                         uint8_t* dst,
+                                                         std::byte* dst,
                                                          size_t offset,
                                                          size_t size,
                                                          rmm::cuda_stream_view stream,
@@ -174,7 +174,7 @@ class uring_reactor {
   void shutdown();
 
   /// Synchronous buffered host read (pread on @p fd).  Blocks the caller.
-  size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
+  size_t host_read(const io_object_type& file, size_t offset, size_t size, std::byte* dst);
 
   void enqueue(request_type_ptr req);
 
@@ -230,7 +230,7 @@ class uring_reactor {
                                                            size_t file_size);
 
  private:
-  void worker_loop(std::stop_token stop_token);
+  void worker_loop(const std::stop_token& stop_token);
 
   // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
   // multiple_blocks_allocation destructor returns the blocks to the upstream
