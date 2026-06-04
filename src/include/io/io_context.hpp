@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include "exec/semi_future.hpp"
+#include "io/cache/metadata_store.hpp"
+#include "io/cache/types.hpp"
 #include "io/types.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -25,12 +28,16 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace sirius::io {
 
-class buffer_pool;
+namespace cache {
 class prefetching_cache;
+}
+
+// ---------------------------------------------------------------------------
+// prefetching_mode
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // sirius_ioctx
@@ -43,11 +50,18 @@ class prefetching_cache;
  * threads, ...). Extend this class to provide a concrete I/O backend.
  */
 class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
+  // prefetching_cache's worker_loop is the only caller of the protected
+  // host_read_ranges_async_io entry point through a sirius_ioctx* base
+  // pointer.  Friending the cache lets that single call site reach in
+  // without forcing the vector-read primitive (which most callers never
+  // touch) into the public API.
+  friend class cache::prefetching_cache;
+
  public:
   sirius_ioctx();
   virtual ~sirius_ioctx();
 
-  virtual void shutdown() = 0;
+  virtual void shutdown() noexcept = 0;
 
   /// Backend-specific factory: open native handles for @p path and
   /// return a populated io_object.  Throws on unsupported / unreachable
@@ -67,65 +81,143 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// Whether this backend can serve reads for @p path.  Backends should
   /// validate scheme/protocol support and any backend-specific
   /// preconditions (e.g. file existence for local-disk backends).
-  [[nodiscard]] virtual bool supports(std::string_view path) const = 0;
+  [[nodiscard]] virtual bool supports(std::string_view path) const noexcept = 0;
 
-  /// Construct the owned prefetching_cache.  Must be called before any
-  /// read that should consult the cache; until then device_read falls
-  /// through directly to device_read_io.
-  void initialize_cache(buffer_pool& pool, size_t inflight_budget_chunks = 2048);
+  // -- Backend capabilities ---------------------------------------------------
 
-  [[nodiscard]] prefetching_cache* cache() noexcept { return _cache.get(); }
+  /// Whether the backend can stream data directly into device memory
+  /// (e.g. via O_DIRECT + GDS).  Used by @c sirius_datasource to answer the
+  /// equivalent cudf::io::datasource queries.
+  [[nodiscard]] virtual bool supports_device_read() const noexcept = 0;
+
+  [[nodiscard]] virtual bool supports_host_to_device_read() const noexcept = 0;
+
+  /// Whether the backend can serve a batch of host reads in a single dispatch
+  /// (cf. @c host_read_ranges_async_io).  When false, the prefetching layer
+  /// cannot amortise per-request overhead and must fall back to
+  /// @c prefetching_mode::none.
+  [[nodiscard]] virtual bool supports_vector_host_read() const noexcept = 0;
+
+  /// Prefetching strategy the prefetching layer should use against this
+  /// backend.  Returns @c prefetching_mode::none whenever
+  /// @c supports_vector_host_read() is false; otherwise the backend picks
+  /// between eager prefill and on-demand read-ahead based on its IO
+  /// characteristics.
+  [[nodiscard]] virtual cache::prefetching_mode preferred_prefetching_mode() const noexcept = 0;
+
+  /// Build the prefetching cache.  One-shot — calling twice is a no-op
+  /// after the first successful build.  The cache holds a raw
+  /// back-pointer to this ioctx and stays alive until @ref
+  /// shutdown_cache is called (or this ioctx is destroyed).  @p pool
+  /// is non-owning; the caller (typically @c scan_manager) guarantees
+  /// it outlives the cache.
+  ///
+  /// The cache constructs itself in an "armed" or "unarmed" state
+  /// depending on @p pool and @c supports_vector_host_read(); the
+  /// ioctx is unaware of that distinction — it simply forwards lookups
+  /// through @c cache().
+  void initialize_cache(cache::buffer_pool* pool, size_t inflight_budget_chunks) noexcept;
+
+  /// Tear down the cache (drains background workers and any in-flight
+  /// IO via @c admission_control).  Idempotent.  The owner (scan
+  /// manager) calls this BEFORE releasing the @c buffer_pool the cache
+  /// was constructed with — otherwise workers may issue final IO
+  /// against a destroyed pool.
+  void shutdown_cache() noexcept;
+
+  /// Every concrete derived class MUST call this as the very first
+  /// statement in its destructor.  It drains the cache (so its workers
+  /// stop issuing IO) while the derived object's reactors / handles
+  /// are still alive.  Without this, the cache's defensive shutdown
+  /// in @c ~sirius_ioctx would run AFTER the derived part of the
+  /// object has been destroyed, and worker callbacks would reach
+  /// already-destroyed reactors.
+  ///
+  /// Idempotent — calling @c shutdown_cache directly before this is
+  /// fine.  Cheap when no cache was ever initialised.
+  void pre_destroy() noexcept { shutdown_cache(); }
+
+  [[nodiscard]] cache::prefetching_cache* cache() noexcept { return _cache.get(); }
+
+  /// True iff @c host_read / @c device_read should consult the cache
+  /// before falling through to the backend.  Computed live so it tracks
+  /// @ref initialize_cache / @ref shutdown_cache transitions.
+  [[nodiscard]] inline bool uses_prefetching_cache() const noexcept
+  {
+    return _cache != nullptr && supports_vector_host_read();
+  }
+
+  /// Per-file metadata cache that lives independently of the prefetching
+  /// cache.  Always available — callers that have parsed file metadata
+  /// (e.g. a parquet footer) park it here so a later scan of the same
+  /// path can skip the parse without depending on whether the
+  /// prefetching machinery has been wired up.
+  [[nodiscard]] cache::metadata_store& metadata_store() noexcept { return _metadata_store; }
+  [[nodiscard]] cache::metadata_store const& metadata_store() const noexcept
+  {
+    return _metadata_store;
+  }
 
   // -- Read API ---------------------------------------------------------------
 
-  size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst);
-
-  std::future<size_t> host_read_async(sirius_io_object& obj,
-                                      size_t offset,
-                                      size_t size,
-                                      uint8_t* dst);
-
-  size_t device_read(
-    sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
-
-  std::future<size_t> device_read_async(
-    sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
-
-  ///
-
-  virtual size_t host_read_io(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
-
-  virtual void host_read_async_io(sirius_io_object& obj,
-                                  size_t offset,
-                                  size_t size,
-                                  uint8_t* dst,
-                                  io_completion_handler handler) = 0;
-
-  virtual size_t device_read_io(sirius_io_object& obj,
+  virtual size_t host_read_sync(const sirius_io_object& obj,
                                 size_t offset,
                                 size_t size,
-                                uint8_t* dst,
-                                rmm::cuda_stream_view stream) = 0;
+                                std::byte* dst);
 
-  virtual void device_read_async_io(sirius_io_object& obj,
-                                    size_t offset,
-                                    size_t size,
-                                    uint8_t* dst,
-                                    rmm::cuda_stream_view stream,
-                                    io_completion_handler handler) = 0;
+  virtual exec::semi_future<size_t> host_read_async(const sirius_io_object& obj,
+                                                    size_t offset,
+                                                    size_t size,
+                                                    std::byte* dst) noexcept;
 
-  virtual void host_read_ranges_async_io(sirius_io_object& obj,
-                                         std::vector<cudf::io::text::byte_range_info> const& ranges,
-                                         std::span<cudf::host_span<std::byte>> dst,
-                                         io_completion_handler handler) = 0;
+  virtual exec::semi_future<size_t> device_read_async(const sirius_io_object& obj,
+                                                      size_t offset,
+                                                      size_t size,
+                                                      std::byte* dst,
+                                                      rmm::cuda_stream_view stream) noexcept;
 
   // -- Physical range alignment ------------------------------------------------
 
   virtual cudf::io::text::byte_range_info compute_physical_range(
-    cudf::io::text::byte_range_info logical, size_t file_size) const = 0;
+    cudf::io::text::byte_range_info logical, size_t file_size) const noexcept = 0;
 
  protected:
-  std::unique_ptr<prefetching_cache> _cache;
+  virtual size_t host_read_io(const sirius_io_object& obj,
+                              size_t offset,
+                              size_t size,
+                              std::byte* dst) = 0;
+
+  virtual exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
+                                                       size_t offset,
+                                                       size_t size,
+                                                       std::byte* dst) noexcept = 0;
+
+  virtual exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
+                                                         size_t offset,
+                                                         size_t size,
+                                                         std::byte* dst,
+                                                         rmm::cuda_stream_view stream) noexcept = 0;
+
+  virtual exec::semi_future<size_t> host_to_device_read_async_io(
+    const sirius_io_object& obj,
+    std::span<io_object_segment> slices,
+    size_t offset,
+    size_t size,
+    std::byte* device_dst,
+    rmm::cuda_stream_view stream) noexcept = 0;
+
+  virtual exec::semi_future<size_t> host_read_ranges_async_io(
+    const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept = 0;
+
+ protected:
+  /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed
+  /// by @ref shutdown_cache (or the ioctx destructor as a safety net,
+  /// though callers are expected to drive the lifecycle explicitly so
+  /// reactors stay alive while workers drain).
+  std::unique_ptr<cache::prefetching_cache> _cache;
+
+  /// Independent of the prefetching machinery — exposed via @c metadata().
+  cache::metadata_store _metadata_store;
 };
 
 }  // namespace sirius::io

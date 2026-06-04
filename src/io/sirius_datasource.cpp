@@ -16,7 +16,9 @@
 
 #include "io/sirius_datasource.hpp"
 
-#include "io/prefetching_cache.hpp"
+#include "exec/semi_future.hpp"
+#include "exec/try.hpp"
+#include "io/cache/prefetching_cache.hpp"
 
 #include <rmm/device_buffer.hpp>
 
@@ -32,6 +34,29 @@
 
 namespace sirius::io {
 
+namespace {
+
+// Bridge a semi_future into a real (promise-backed) std::future.  The result is
+// pushed in via install_callback when the IO settles, so the std::future
+// reports readiness normally (wait_for never returns `deferred`) and the
+// completion bookkeeping runs on the IO callback thread rather than being
+// pulled onto the caller's thread the way std::async(deferred) would.
+std::future<size_t> bridge_semi_to_std(exec::semi_future<size_t>&& sf)
+{
+  auto p   = std::make_shared<std::promise<size_t>>();
+  auto fut = p->get_future();
+  std::move(sf).install_callback([p = std::move(p)](exec::try_t<size_t>&& t) mutable {
+    if (t.has_exception()) {
+      p->set_exception(std::move(t).exception());
+    } else {
+      p->set_value(std::move(t).value());
+    }
+  });
+  return fut;
+}
+
+}  // namespace
+
 sirius_datasource::sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
                                      std::shared_ptr<sirius_io_object> io_object)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_object))
@@ -42,26 +67,35 @@ sirius_datasource::~sirius_datasource() {}
 
 size_t sirius_datasource::size() const { return _io_object->size(); }
 
-bool sirius_datasource::supports_device_read() const { return true; }
+bool sirius_datasource::supports_device_read() const { return _io_ctx->supports_device_read(); }
 
-bool sirius_datasource::is_device_read_preferred(size_t) const { return true; }
+bool sirius_datasource::supports_vector_host_read() const
+{
+  return _io_ctx->supports_vector_host_read();
+}
+
+bool sirius_datasource::is_device_read_preferred(size_t) const
+{
+  return _io_ctx->supports_device_read();
+}
 
 size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
-  return _io_ctx->host_read(*_io_object, offset, size, dst);
+  return _io_ctx->host_read_sync(*_io_object, offset, size, reinterpret_cast<std::byte*>(dst));
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_t offset,
                                                                            size_t size)
 {
   std::vector<uint8_t> buf(size);
-  _io_ctx->host_read(*_io_object, offset, size, buf.data());
+  _io_ctx->host_read_sync(*_io_object, offset, size, reinterpret_cast<std::byte*>(buf.data()));
   return cudf::io::datasource::buffer::create(std::move(buf));
 }
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  return _io_ctx->host_read_async(*_io_object, offset, size, dst);
+  return bridge_semi_to_std(
+    _io_ctx->host_read_async(*_io_object, offset, size, reinterpret_cast<std::byte*>(dst)));
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
@@ -69,14 +103,15 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
 {
   auto file_size = _io_object->size();
   size           = std::min(size, file_size > offset ? file_size - offset : size_t{0});
-  auto buf       = std::make_shared<std::vector<uint8_t>>(size);
-  auto inner_fut = std::make_shared<std::future<size_t>>(
-    _io_ctx->host_read_async(*_io_object, offset, size, buf->data()));
-  return std::async(std::launch::deferred, [buf, inner_fut]() mutable {
-    auto n = inner_fut->get();
-    buf->resize(n);
-    return datasource::buffer::create(std::move(*buf));
-  });
+  auto buf       = std::vector<uint8_t>(size);
+  auto semi =
+    _io_ctx->host_read_async(*_io_object, offset, size, reinterpret_cast<std::byte*>(buf.data()));
+  return std::async(std::launch::deferred,
+                    [buffer = std::move(buf), semi = std::move(semi)]() mutable {
+                      auto n = std::move(semi).get();
+                      buffer.resize(n);
+                      return datasource::buffer::create(std::move(buffer));
+                    });
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
@@ -84,8 +119,11 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
 {
   rmm::device_buffer buf(size, stream);
   size_t n =
-    _io_ctx->device_read(*_io_object, offset, size, static_cast<uint8_t*>(buf.data()), stream);
+    _io_ctx
+      ->device_read_async(*_io_object, offset, size, static_cast<std::byte*>(buf.data()), stream)
+      .get();
   buf.resize(n, stream);
+  stream.synchronize();
   return cudf::io::datasource::buffer::create(std::move(buf));
 }
 
@@ -94,7 +132,9 @@ size_t sirius_datasource::device_read(size_t offset,
                                       uint8_t* dst,
                                       rmm::cuda_stream_view stream)
 {
-  return _io_ctx->device_read(*_io_object, offset, size, dst, stream);
+  return _io_ctx
+    ->device_read_async(*_io_object, offset, size, reinterpret_cast<std::byte*>(dst), stream)
+    .get();
 }
 
 std::future<size_t> sirius_datasource::device_read_async(size_t offset,
@@ -102,7 +142,65 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          rmm::cuda_stream_view stream)
 {
-  return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream);
+  return bridge_semi_to_std(_io_ctx->device_read_async(
+    *_io_object, offset, size, reinterpret_cast<std::byte*>(dst), stream));
+}
+
+std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
+{
+  // Share the io_ctx and io_object — both are shared_ptr-managed and
+  // deliberately reused across splits of the same file.  The new
+  // datasource starts with a default-constructed prefetching_handle so
+  // its fadvise() calls can't accidentally cancel the original's work.
+  return std::make_unique<sirius_datasource>(_io_ctx, _io_object);
+}
+
+void sirius_datasource::fadvise(cache::prefetching_mode site,
+                                std::span<const cudf::io::text::byte_range_info> ranges)
+{
+  // Disposable is always honored, regardless of the backend's preferred
+  // mode.  Cancel the handle (flips alive=false so io_dispatch's
+  // cancellation gate skips loading) but DO NOT drop the handle.
+  // Dropping it would decrement the file's n_pending, and if that was
+  // the only handle keeping n_pending > 0 the evictor would immediately
+  // walk the wrapper and evict the allocated entries — defeating the
+  // purpose of the read-driven steal path.  The handle is released
+  // naturally when this datasource is destroyed (after the scan
+  // finishes reading).
+  if (site == cache::prefetching_mode::disposable) {
+    _prefetch_handle.cancel();
+    return;
+  }
+
+  // Speculative / immediate: only honored when the backend asked for this
+  // particular call site.  none falls through to no-op (the caller blindly
+  // calls fadvise at every tier and the backend's preference is what
+  // decides where the work actually lands).
+  auto const preferred = _io_ctx->preferred_prefetching_mode();
+  if (preferred == cache::prefetching_mode::none || site != preferred) { return; }
+
+  // The contract is "one scan, one datasource": a second
+  // speculative/immediate fadvise on a datasource that already carries a
+  // handle is a caller bug.  Warn loudly; cancel the stale handle so the
+  // worker drops the old request and we don't leak both into the cache.
+  if (_prefetch_handle) {
+    spdlog::warn(
+      "sirius_datasource::fadvise: a prefetching_handle was already stored on "
+      "this datasource (path={}); cancelling the stale request.  Each scan "
+      "should own a unique datasource.",
+      _io_object->object_path());
+    _prefetch_handle.cancel();
+    _prefetch_handle = {};
+  }
+
+  auto* cache = _io_ctx->cache();
+  if (cache == nullptr) { return; }
+
+  // Hand the ranges to the cache.  insert() returns an empty handle when
+  // it didn't enqueue any new work (dormant cache, every range coalesced
+  // with an existing entry); we only stash a real handle.
+  auto handle = cache->insert(*_io_object, ranges);
+  if (handle) { _prefetch_handle = std::move(handle); }
 }
 
 }  // namespace sirius::io

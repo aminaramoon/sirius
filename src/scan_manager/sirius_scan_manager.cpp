@@ -17,7 +17,8 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include "exec/thread_pool.hpp"
-#include "io/prefetching_cache.hpp"
+#include "io/cache/prefetching_cache.hpp"
+#include "io/kvikio/kvikio_context.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
@@ -29,10 +30,13 @@
 #include "planner/query.hpp"
 #include "scan_manager/cached_split_provider.hpp"
 #include "scan_manager/parquet_split_provider.hpp"
+#include "scan_manager/pipeline_ordered_prefetching_manager.hpp"
 #include "scan_manager/split_connector.hpp"
 #include "scan_manager/split_provider.hpp"
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <exception>
@@ -42,7 +46,7 @@
 namespace sirius::scan_manager {
 
 sirius_scan_manager::sirius_scan_manager(
-  scan_manager_config config, cucascade::memory::fixed_size_host_memory_resource* host_mr)
+  scan_manager_config config, cucascade::memory::memory_reservation_manager& reservation_manager)
   : _config(std::move(config)),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
@@ -50,68 +54,134 @@ sirius_scan_manager::sirius_scan_manager(
     _dispatcher(
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads))
 {
+  // Pull the host memory resource out of the reservation manager.  Both
+  // the uring backend's bounce-slot pool and the prefetching_cache's
+  // buffer pool need a fixed_size_host_memory_resource; we use the
+  // first HOST-tier space's resource for both.  Null is OK on the
+  // kvikio path — the cache falls back to metadata-only construction.
+  cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr;
+  {
+    auto host_spaces =
+      reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    if (!host_spaces.empty()) {
+      // get_memory_spaces_for_tier returns const memory_space*, but
+      // get_memory_resource_as is const so the cast through the public
+      // accessor is fine.
+      host_mr = host_spaces[0]
+                  ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+    }
+  }
+
+  // scan_manager always owns an io_ctx: sirius_datasource (uring) on the
+  // fast path, kvikio_context as the universal fallback so the rest of the
+  // scan path (parquet_split_provider, scan tasks) always has an ioctx to
+  // talk to.  kvikio_context wraps cudf::io::datasource so the read path
+  // is identical from the caller's point of view.
   if (_config.use_sirius_datasource) {
     if (host_mr == nullptr) {
       throw std::runtime_error(
-        "[sirius_scan_manager] use_sirius_datasource is true but no host "
-        "fixed_size_host_memory_resource was provided");
+        "[sirius_scan_manager] use_sirius_datasource is true but the reservation "
+        "manager has no HOST-tier fixed_size_host_memory_resource");
     }
-    _io_ctx = std::make_shared<sirius::io::uring_ioctx>(
-      _config.uring_n_reactors, _config.uring_ring_entries, *host_mr);
-    SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
-      _config.uring_n_reactors,
-      _config.uring_ring_entries);
-
-    if (_config.enable_prefetch_cache) {
-      // Slab size = CHUNKS_PER_SLAB blocks at the resource's block size.
-      // Round the byte budget up so the user gets at least what they asked for.
-      auto const slab_bytes = host_mr->get_block_size() *
-                              static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
-      auto const max_slabs =
-        static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-      _buffer_pool = std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs);
-      _io_ctx->initialize_cache(*_buffer_pool, _config.prefetch_inflight_budget_chunks);
-      SIRIUS_LOG_DEBUG(
-        "[sirius_scan_manager] prefetch cache enabled (slabs={} budget_bytes={} "
-        "inflight_chunks={})",
-        max_slabs,
-        max_slabs * slab_bytes,
-        _config.prefetch_inflight_budget_chunks);
-    }
+    _io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(
+      _config.uring_n_reactors, *host_mr, _config.use_odirect);
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
+                     _config.uring_n_reactors);
   } else {
+    // kvikio's cudf datasource doesn't model per-device file handles, so
+    // it only works correctly when there's a single active GPU.  Fail
+    // fast on multi-GPU rather than silently mis-routing IO.
+    auto gpu_spaces = reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    if (gpu_spaces.size() > 1) {
+      throw std::runtime_error(
+        "[sirius_scan_manager] kvikio_context fallback (use_sirius_datasource=false) "
+        "does not support multi-GPU; reservation_manager reports " +
+        std::to_string(gpu_spaces.size()) +
+        " GPU memory spaces.  Enable use_sirius_datasource for multi-GPU runs.");
+    }
+    _io_ctx = std::make_shared<sirius::io::kvikio_context>();
     SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] sirius_datasource disabled — falling back to "
-      "cudf::io::datasource::create");
+      "[sirius_scan_manager] sirius_datasource disabled — using kvikio_context fallback");
+  }
+
+  // The scan_manager owns the buffer pool and the cache.  The cache
+  // takes both as construction-time dependencies and is single-life: it
+  // arms itself iff (pool != nullptr && io_ctx->supports_vector_host_read()
+  // && budget > 0); otherwise it's a metadata-only store.
+  if (host_mr != nullptr) {
+    auto const slab_bytes =
+      host_mr->get_block_size() *
+      static_cast<std::size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB);
+    auto const max_slabs =
+      static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
+    _buffer_pool = std::make_unique<sirius::io::cache::buffer_pool>(
+      *host_mr, max_slabs, /*initial_slabs=*/max_slabs);
+  }
+
+  // Build the prefetching cache on the ioctx.  Budget=0 keeps the
+  // cache unarmed (no background threads); we pass that whenever the
+  // user has disabled prefetching so the construction is always
+  // unconditional and there's no "is the cache present" branch to
+  // worry about in callers.
+  if (_config.enable_prefetch_cache && _buffer_pool) {
+    _io_ctx->initialize_cache(_buffer_pool.get(), _config.prefetch_inflight_budget_chunks);
+  }
+
+  if (_io_ctx->cache() && _io_ctx->cache()->is_armed()) {
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] prefetch cache armed (inflight_chunks={})",
+                     _config.prefetch_inflight_budget_chunks);
+  } else {
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] prefetch cache unarmed");
   }
 }
 
 sirius_scan_manager::~sirius_scan_manager()
 {
-  if (_io_ctx && _io_ctx->cache() != nullptr) {
+  if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
   }
+  // Drain the dispatcher (and the worker pool) first so no in-flight
+  // metadata-scan / sequencer task can still be reaching into the
+  // cache via _io_ctx when we tear it down below.
   stop();
+  // Tear down the cache before releasing the buffer_pool — the cache's
+  // worker holds a raw _pool pointer, and its destructor drains
+  // in-flight IO before returning, so the pool stays alive long
+  // enough for callbacks to release their chunks safely.
+  if (_io_ctx) { _io_ctx->shutdown_cache(); }
+  _buffer_pool.reset();
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 {
   reset();
 
+  if (_io_ctx && _io_ctx->cache()) {
+    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
+    _io_ctx->cache()->prepare_for_query();
+  }
+
   // Advance the cache age so the evictor can score this query's inserts
   // against entries left over from prior queries.
-  if (_io_ctx && _io_ctx->cache()) { _io_ctx->cache()->refresh_cache(); }
+  // refresh_cache() removed — the cache no longer has a query-epoch
+  // notion.  Per-file aging in the eviction queue handles staleness
+  // without scan_manager involvement.
 
-  SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={}",
-                   query.get_pipelines().size());
+  SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] scan_operators={}",
+                   query.get_scan_operators().size());
 
-  for (auto const& pipeline : query.get_pipelines()) {
-    if (!pipeline) { continue; }
-    auto source = pipeline->get_source();
-    if (!source) { continue; }
-    if (source->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) { continue; }
+  // Build a fresh sequencer for this query.  Slots are added by
+  // create_provider_for() whenever it chooses the parquet path; the
+  // cached path skips slot allocation since there's no IO to prefetch.
+  // The sequencer task piggy-backs on the dispatcher's injected
+  // stop_token, so reset()/request_stop on the dispatcher tears it
+  // down without a side-channel stop_source.
+  _prefetch_manager = std::make_unique<pipeline_ordered_prefetching_manager>();
 
-    auto* op = &source->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
+  for (auto const& scan_op : query.get_scan_operators()) {
+    if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) { continue; }
+
+    auto* op = &scan_op->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
 
     auto provider = create_provider_for(op);
@@ -129,6 +199,13 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   }
 
   if (_scan_op_order.empty()) { return; }
+
+  // Spawn the sequencer task on the dispatcher.  Must happen after all
+  // slots have been added (create_provider_for allocates them above) so
+  // the task captures the full slot list in insertion order.  Safe to
+  // skip when no slots were added (purely-cached query) — the manager
+  // is fine with zero slots.
+  _prefetch_manager->register_ranges(*_dispatcher);
 
   start_metadata_processing();
 }
@@ -263,6 +340,19 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   } catch (...) {
     SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
   }
+  auto const pipeline    = op->get_pipeline();
+  auto const pipeline_id = pipeline ? pipeline->get_pipeline_id() : std::size_t{0};
+  // Allocate a sequencer slot for this pipeline so its opportunistic
+  // fadvise calls are serialised with the other parquet pipelines in
+  // this query.  Slots are gated on the cache being armed: a
+  // metadata-only cache (no buffer pool, or unarmed io_ctx) doesn't
+  // honor opportunistic fadvise, so a slot would only add unnecessary
+  // sequencer overhead.  Null slot keeps the provider on the legacy
+  // direct-fadvise path (also a no-op when the cache is unarmed).
+  pipeline_ordered_prefetching_manager::pipeline_slot* prefetch_slot = nullptr;
+  if (_prefetch_manager && _io_ctx && _io_ctx->cache() && _io_ctx->cache()->is_armed()) {
+    prefetch_slot = _prefetch_manager->add_pipeline_slot(pipeline_id);
+  }
   return std::make_unique<parquet_split_provider>(
     info->returned_types,
     info->file_paths,
@@ -274,7 +364,11 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
     info->partition_indices,
     info->approximate_batch_size,
     parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
-    _io_ctx);
+    _io_ctx,
+    op->get_name(),
+    op->get_operator_id(),
+    pipeline_id,
+    prefetch_slot);
 }
 
 void sirius_scan_manager::start_metadata_processing()
@@ -306,6 +400,7 @@ void sirius_scan_manager::reset()
   _dispatcher->wait_for_all();
   _scan_op_order.clear();
   _providers_by_op.clear();
+  _prefetch_manager.reset();
   _dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads);
 }

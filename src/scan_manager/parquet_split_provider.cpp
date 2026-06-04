@@ -18,7 +18,8 @@
 
 #include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "io/io_context.hpp"
-#include "io/prefetching_cache.hpp"
+#include "io/kvikio/kvikio_context.hpp"
+#include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
@@ -68,12 +69,23 @@ parquet_split_provider::parquet_split_provider(
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
   std::size_t max_file_processed,
-  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx)
+  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx,
+  std::string op_name,
+  std::size_t op_id,
+  std::size_t pipeline_id,
+  pipeline_ordered_prefetching_manager::pipeline_slot* prefetch_slot)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
     _total_files(file_paths.size()),
-    _io_ctx(std::move(io_ctx))
+    // Default to a kvikio_context when no ioctx is supplied — keeps test
+    // sites that construct the provider directly working without forcing
+    // each one to plumb an explicit ioctx.
+    _io_ctx(std::move(io_ctx)),
+    _op_name(std::move(op_name)),
+    _op_id(op_id),
+    _pipeline_id(pipeline_id),
+    _prefetch_slot(prefetch_slot)
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /
@@ -113,6 +125,14 @@ parquet_split_provider::parquet_split_provider(
                             _file_paths.begin() + static_cast<std::ptrdiff_t>(end));
     _batches.push_back(std::move(batch));
   }
+  // Seed the closure countdown so the last run_batch to finish (whichever
+  // worker that is) can push the sentinel onto the sequencer slot.  When
+  // there is no slot wired up, the counter is harmlessly decremented but
+  // no sentinel is ever pushed.
+  _batches_remaining.store(_batches.size(), std::memory_order_relaxed);
+  // Edge case: a provider over an empty file list still needs to close
+  // its slot so the sequencer can advance past it.
+  if (_prefetch_slot != nullptr && _batches.empty()) { _prefetch_slot->close(); }
 }
 
 parquet_split_provider::~parquet_split_provider() = default;
@@ -189,7 +209,10 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       reader_options,
       _duckdb_filter_expression,
       _plan,
-      accum.partition_values.value_or(std::vector<std::string>{})));
+      accum.partition_values.value_or(std::vector<std::string>{}),
+      _op_name,
+      _op_id,
+      _pipeline_id));
     accum.slices.clear();
     accum.total_uncompressed_bytes = 0;
   };
@@ -214,18 +237,15 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
 
     //===----------Read metadata footers----------===//
-    // When the manager exposes a sirius_ioctx, mint an io_object up-front and
-    // route the footer fetch through sirius_datasource so the same io_object
-    // can be threaded onto every emitted row_group_slice.  Falls through to
-    // cudf's path when the manager was configured with use_sirius_datasource=false.
-    std::shared_ptr<sirius::io::sirius_io_object> file_io_object;
-    std::unique_ptr<cudf::io::datasource> datasource;
-    if (_io_ctx != nullptr) {
-      file_io_object = _io_ctx->create_io_object(file_path);
-      datasource     = _io_ctx->make_datasource(file_io_object);
-    } else {
-      datasource = cudf::io::datasource::create(file_path);
-    }
+    // Mint a per-file master sirius_datasource.  scan_manager always supplies
+    // an io_ctx (sirius_datasource on the fast path, kvikio_context as
+    // fallback), so this works uniformly.  The master is used for the
+    // footer read here and the speculative fadvise below; each emitted
+    // slice gets its own duplicate so per-slice fadvise(immediate/
+    // disposable) calls don't share a handle with another scan.
+    auto file_io_object  = _io_ctx->create_io_object(file_path);
+    auto file_datasource = std::make_shared<sirius::io::sirius_datasource>(_io_ctx, file_io_object);
+    auto& datasource_ref = *file_datasource;
 
     //===----------Parse metadata (with prefetch-cache reuse)----------===//
     // If the prefetching cache already has a parquet_metadata entry for this
@@ -237,10 +257,8 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     std::size_t footer_byte_len = 0;
     std::unique_ptr<op::scan::hybrid_scan_reader> reader_ptr;
 
-    if (file_io_object && _io_ctx != nullptr && _io_ctx->cache() != nullptr) {
-      if (auto cached = _io_ctx->cache()->get_metadata(*file_io_object)) {
-        cached_parquet_metadata = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached));
-      }
+    if (auto cached = _io_ctx->metadata_store().get_metadata(*file_io_object)) {
+      cached_parquet_metadata = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached));
     }
 
     if (cached_parquet_metadata) {
@@ -248,7 +266,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       footer_byte_len = cached_parquet_metadata->footer_byte_len();
       reader_ptr = std::make_unique<op::scan::hybrid_scan_reader>(*file_metadata, *reader_options);
     } else {
-      auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
+      auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(datasource_ref);
       footer_byte_len    = footer_buffer->size();
       reader_ptr         = std::make_unique<op::scan::hybrid_scan_reader>(
         cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
@@ -306,16 +324,16 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       // clang-format on
     }
 
-    //===----------Prefetch cache prewarm----------===//
-    // When the ioctx has a cache, hand it the exact byte ranges scan_task
-    // will request: PAR1 header + (merged) column-chunk ranges for every
-    // surviving row group + footer/trailer.  insert() must use the same
-    // merged ranges scan_task computes — the cache only serves reads that
-    // are fully covered by an inserted range.
-    if (file_io_object && _io_ctx != nullptr && _io_ctx->cache() != nullptr &&
-        !row_group_indices.empty()) {
-      using range_t = cudf::io::text::byte_range_info;
-
+    //===----------Per-file byte ranges----------===//
+    // Compute the merged byte ranges this file's scan will read: PAR1
+    // header + (merged) column-chunk ranges for every surviving row group
+    // + footer/trailer.  The same merged set is used for:
+    //   - the speculative fadvise on the master (whole-file prewarm), and
+    //   - the per-slice ranges attached to each emitted row_group_slice
+    //     (used later for fadvise(immediate/disposable) at task time).
+    using range_t = cudf::io::text::byte_range_info;
+    std::vector<range_t> file_ranges;
+    if (!row_group_indices.empty()) {
       auto chunk_ranges = reader.all_column_chunks_byte_ranges(row_group_indices, *reader_options);
 
       // Inline merge: parquet_scan_task::detail::merge_byte_ranges is TU-local;
@@ -323,8 +341,8 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       std::sort(chunk_ranges.begin(), chunk_ranges.end(), [](auto const& a, auto const& b) {
         return a.offset() < b.offset();
       });
-      std::vector<range_t> merged;
-      merged.reserve(chunk_ranges.size());
+      // std::vector<range_t> merged;
+      // merged.reserve(chunk_ranges.size());
       if (!chunk_ranges.empty()) {
         auto cur_start = chunk_ranges[0].offset();
         auto cur_end   = cur_start + chunk_ranges[0].size();
@@ -334,12 +352,12 @@ void parquet_split_provider::run_batch(file_batch const& batch,
           if (rs <= cur_end) {
             cur_end = std::max(cur_end, re);
           } else {
-            merged.emplace_back(cur_start, cur_end - cur_start);
+            file_ranges.emplace_back(cur_start, cur_end - cur_start);
             cur_start = rs;
             cur_end   = re;
           }
         }
-        merged.emplace_back(cur_start, cur_end - cur_start);
+        file_ranges.emplace_back(cur_start, cur_end - cur_start);
       }
 
       // footer_offset / footer_size mirror parquet_scan_task's computation:
@@ -351,28 +369,51 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       auto const footer_off  = static_cast<int64_t>(file_size - FOOTER_TAIL_SIZE - footer_byte_len);
       auto const footer_size = static_cast<int64_t>(FOOTER_TAIL_SIZE + footer_byte_len);
 
-      std::vector<range_t> ranges;
-      ranges.reserve(merged.size() + 2);
-      ranges.emplace_back(0, 4);  // PAR1 header
-      ranges.insert(ranges.end(), merged.begin(), merged.end());
-      ranges.emplace_back(footer_off, footer_size);
-      // Cache requires sorted-by-offset.  Header is at 0, footer is at file end,
-      // and merged column chunks live in between — a defensive sort handles any
-      // pathological layout where a column chunk starts before the header.
-      std::sort(ranges.begin(), ranges.end(), [](auto const& a, auto const& b) {
-        return a.offset() < b.offset();
-      });
+      // file_ranges = merged;
+      //  file_ranges.emplace_back(0, 4);  // PAR1 header
+      //  file_ranges.insert(file_ranges.end(), merged.begin(), merged.end());
+      //  file_ranges.emplace_back(footer_off, footer_size);
+      //  Cache requires sorted-by-offset.  Header is at 0, footer is at file end,
+      //  and merged column chunks live in between — a defensive sort handles any
+      //  pathological layout where a column chunk starts before the header.
+      // std::sort(file_ranges.begin(), file_ranges.end(), [](auto const& a, auto const& b) {
+      //   return a.offset() < b.offset();
+      // });
+    }
 
-      // When the cache already had parquet_metadata for this file we reused it
-      // and don't need to re-store it; otherwise we just parsed the footer and
-      // hand the freshly-built parquet_metadata to the cache so the next scan
-      // of this file can skip the footer fetch.
-      std::shared_ptr<sirius::io::sirius_io_object_metadata> metadata_to_store =
-        cached_parquet_metadata
-          ? nullptr
-          : std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
-              std::make_shared<parquet_metadata>(file_metadata, footer_byte_len));
-      _io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), ranges);
+    // Stash freshly-parsed metadata so a subsequent scan of this file can
+    // skip the footer fetch.  Lives on the ioctx, independent of any
+    // prefetch work that fadvise schedules below.
+    if (!cached_parquet_metadata) {
+      _io_ctx->metadata_store().register_metadata(
+        *file_io_object,
+        std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
+          std::make_shared<parquet_metadata>(file_metadata, footer_byte_len)));
+    }
+
+    // Speculative prewarm.  When a sequencer slot is wired up, hand the
+    // (datasource, ranges) pair off to the
+    // pipeline_ordered_prefetching_manager so opportunistic fadvise calls
+    // get serialised in pipeline-id order across pipelines.  Without a
+    // slot — direct test sites, cached-split fast path — fall back to an
+    // immediate fadvise so behavior is unchanged.  Either way the cache
+    // discards the handle since the provider has no per-file cancel
+    // point: slice-level disposable cancels in-flight work.
+    if (!file_ranges.empty()) {
+      if (_prefetch_slot != nullptr) {
+        // Copy the ranges into the sequencer entry — file_ranges is also
+        // attached to each emitted row_group_slice below for the
+        // per-slice immediate/disposable fadvise calls, so we can't move
+        // out of it here.
+        SIRIUS_LOG_INFO(
+          "[fadvise opportunistic enqueue] op='{}' op_id={} pipeline_id={} file='{}' ranges={}",
+          _op_name,
+          _op_id,
+          _pipeline_id,
+          file_path,
+          file_ranges.size());
+        _prefetch_slot->push({file_datasource, file_ranges});
+      }
     }
 
     std::vector<cudf::size_type> cur_rgs;
@@ -381,13 +422,22 @@ void parquet_split_provider::run_batch(file_batch const& batch,
 
     auto seal_current_file = [&]() {
       if (cur_rgs.empty()) { return; }
+      // Each slice gets its own datasource via duplicate() so per-slice
+      // fadvise(immediate/disposable) calls can't cancel one another's
+      // work.  Ranges are copied from the file-level set — every slice's
+      // task will read the same byte ranges (the cudf parquet reader
+      // touches header + footer in addition to its row groups), so for
+      // now we just hand each slice the file's full range list.  A
+      // per-slice subset (column chunks for the slice's row groups + the
+      // header / footer) would be tighter but requires reaching back into
+      // the reader; the current set is a correct superset.
       accum.slices.emplace_back(file_metadata,
                                 file_path,
                                 std::move(cur_rgs),
                                 cur_uncompressed_bytes,
                                 cur_compressed_bytes,
-                                _io_ctx,
-                                file_io_object);
+                                file_datasource->duplicate(),
+                                file_ranges);
       // Promote the just-sealed slice's uncompressed bytes into the cross-file accumulator.
       accum.total_uncompressed_bytes += cur_uncompressed_bytes;
       cur_rgs.clear();
@@ -441,6 +491,15 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     seal_current_file();
   }
   flush();
+
+  // Last batch to finish closes the sequencer slot so the manager's
+  // sequencer task can advance to the next pipeline.  Use the batch
+  // counter for this — next_split_provider only counts claims, not
+  // completions, and several workers can run batches concurrently.
+  if (_prefetch_slot != nullptr) {
+    auto const prev = _batches_remaining.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev == 1) { _prefetch_slot->close(); }
+  }
 }
 
 }  // namespace sirius::scan_manager

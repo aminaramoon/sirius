@@ -48,3 +48,4 @@ telemetry_data/
 log/
 
 .planning/
+*.local.md

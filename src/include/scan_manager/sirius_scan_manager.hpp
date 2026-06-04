@@ -37,14 +37,24 @@ class fixed_size_host_memory_resource;
 #include <unordered_map>
 #include <vector>
 
+namespace cucascade::memory {
+class memory_reservation_manager;
+}  // namespace cucascade::memory
+
 namespace sirius::io {
 class sirius_ioctx;
+namespace cache {
 class buffer_pool;
+}  // namespace cache
 }  // namespace sirius::io
 
 namespace sirius::op::scan {
 class sirius_gpu_parquet_scan_operator;
 }  // namespace sirius::op::scan
+
+namespace sirius::scan_manager {
+class pipeline_ordered_prefetching_manager;
+}  // namespace sirius::scan_manager
 
 namespace sirius::planner {
 class query;
@@ -55,10 +65,12 @@ namespace sirius::scan_manager {
 /**
  * @brief Configuration for the scan_manager.
  *
- * @c use_sirius_datasource controls whether the manager builds a
- * @c sirius_ioctx and routes parquet reads through @c sirius_datasource.
- * Set to @c false to fall back to @c cudf::io::datasource::create() at
- * every read site (e.g. when the sirius IO path is misbehaving).
+ * @c use_sirius_datasource controls which @c sirius_ioctx backs parquet
+ * reads.  When @c true, the manager builds a @c uring_ioctx that goes
+ * through the prefetch-capable sirius IO path.  When @c false, the
+ * manager falls back to a @c kvikio_context — same @c sirius_ioctx
+ * interface, but reads forward to cudf's default datasource so callers
+ * have a single uniform IO entry point regardless of the backend.
  */
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
@@ -66,6 +78,10 @@ struct scan_manager_config {
   /// Number of @c uring_reactor instances in the ioctx pool.  Ignored when
   /// @c use_sirius_datasource is false.
   std::size_t uring_n_reactors{4};
+  /// When false, the uring backend reads through the buffered (page-cache)
+  /// file handle instead of O_DIRECT for every path except the
+  /// BYO-device-buffer read.  Ignored when @c use_sirius_datasource is false.
+  bool use_odirect{true};
   /// io_uring submission/completion queue depth per reactor.  Ignored when
   /// @c use_sirius_datasource is false.
   unsigned uring_ring_entries{64};
@@ -127,12 +143,19 @@ class sirius_scan_manager {
    * @brief Construct a new source manager.
    *
    * @param config Scan-manager configuration (thread pool + sirius_datasource toggle).
-   * @param host_mr Host memory resource backing the prefetch buffer_pool.  Required
-   *        when @c config.enable_prefetch_cache is true; ignored otherwise.
+   * @param reservation_manager The active memory reservation manager.  The
+   *        scan manager pulls the HOST-tier
+   *        @c fixed_size_host_memory_resource from it to back the prefetch
+   *        buffer pool, and counts GPU-tier memory spaces to enforce the
+   *        kvikio fallback's single-GPU requirement.
+   *
+   * @throws std::runtime_error when the kvikio fallback would be selected
+   *         (i.e. @c config.use_sirius_datasource is false) on a system
+   *         that exposes more than one GPU memory space — kvikio's
+   *         datasource doesn't support multi-GPU.
    */
-  explicit sirius_scan_manager(
-    scan_manager_config config,
-    cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr);
+  explicit sirius_scan_manager(scan_manager_config config,
+                               cucascade::memory::memory_reservation_manager& reservation_manager);
 
   ~sirius_scan_manager();
 
@@ -233,18 +256,28 @@ class sirius_scan_manager {
   void start_metadata_processing();
 
   scan_manager_config _config;
-  /// Pinned-host buffer pool backing the ioctx's prefetching cache.
-  /// Constructed only when @c _config.enable_prefetch_cache is set.
-  /// MUST be declared before @c _io_ctx so the ioctx (and its cache,
-  /// which references the pool) is destroyed first.
-  std::unique_ptr<sirius::io::buffer_pool> _buffer_pool;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
+  /// Buffer pool owned by the scan_manager (not the cache).  Constructed
+  /// when a HOST-tier @c fixed_size_host_memory_resource is available;
+  /// null otherwise.  The cache (owned by @c _io_ctx) holds the pool
+  /// by raw pointer, so the destructor MUST call
+  /// @c _io_ctx->shutdown_cache() before resetting this pool.
+  std::unique_ptr<sirius::io::cache::buffer_pool> _buffer_pool;
   std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+
+  /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
+  /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached
+  /// parquet scan (allocated by @ref create_provider_for when it builds
+  /// a parquet_split_provider).  The sequencer task is enqueued on the
+  /// per-query @c _dispatcher, which injects its own stop_token; the
+  /// dispatcher's @c request_stop() in @ref reset() therefore tears the
+  /// sequencer down without an extra side-channel.
+  std::unique_ptr<pipeline_ordered_prefetching_manager> _prefetch_manager;
 };
 
 }  // namespace sirius::scan_manager

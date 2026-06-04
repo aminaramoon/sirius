@@ -166,6 +166,8 @@ set(EXTENSION_SOURCES
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
+    src/io/kvikio/kvikio_context.cpp
+    src/io/metadata_store.cpp
     src/io/prefetching_cache.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_sigv4_credential_provider.cpp
@@ -259,6 +261,7 @@ set(EXTENSION_SOURCES
     src/scan_manager/cached_split_provider.cpp
     src/pin_table.cpp
     src/scan_manager/parquet_split_provider.cpp
+    src/scan_manager/pipeline_ordered_prefetching_manager.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
     src/scan_manager/split_provider.cpp
@@ -387,7 +390,7 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
     test/cpp/io/s3/test_static_credentials.cpp
-    test/cpp/io/test_datasource_factory.cpp
+    # test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp

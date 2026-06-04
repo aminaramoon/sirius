@@ -98,14 +98,36 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_i
 {
   auto next = _split_connector->get_next_split();
   if (!next.has_value()) { return nullptr; }
-  return std::move(*next);
+  auto data = std::move(*next);
+
+  // Fire fadvise(immediate) on each slice's per-scan datasource — "this
+  // task is being created; if your backend prefers immediate prefetch
+  // (fast local IO), kick off the work now."  Honored only when the
+  // ioctx's preferred_prefetching_mode is immediate; otherwise the call
+  // is a no-op (the provider's opportunistic fadvise already covered slow
+  // backends).  The matching disposable fires from prepare_for_processing.
+  if (auto* scan_data = dynamic_cast<parquet_scan_data*>(data.get())) {
+    auto const pipeline = get_pipeline();
+    auto const pid      = pipeline ? pipeline->get_pipeline_id() : std::size_t{0};
+    SIRIUS_LOG_INFO("[fadvise immediate] op='{}' op_id={} pipeline_id={} slices={}",
+                    get_name(),
+                    get_operator_id(),
+                    pid,
+                    scan_data->rg_slices.size());
+    for (auto& slice : scan_data->rg_slices) {
+      if (slice.datasource) {
+        slice.datasource->fadvise(sirius::io::cache::prefetching_mode::immediate, slice.ranges);
+      }
+    }
+  }
+  return data;
 }
 
 //===----------------------------------------------------------------------===//
 // read_table_from_metadata()
 //===----------------------------------------------------------------------===//
 std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_metadata(
-  const parquet_scan_data& scan_data, rmm::cuda_stream_view stream)
+  parquet_scan_data& scan_data, rmm::cuda_stream_view stream)
 {
   auto filter_expression = scan_data.filter_expression;
 
@@ -119,15 +141,13 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   metadatas.reserve(scan_data.rg_slices.size());
   rg_per_src.reserve(scan_data.rg_slices.size());
 
-  for (auto const& slice : scan_data.rg_slices) {
-    if (slice.io_ctx && slice.io_object) {
-      // sirius path: reuse the io_object minted by the split provider so the
-      // prefetching cache (if enabled) can serve these reads from pinned memory.
-      sources.push_back(slice.io_ctx->make_datasource(slice.io_object));
-    } else {
-      // Fallback when scan_manager was configured with use_sirius_datasource=false.
-      sources.push_back(cudf::io::datasource::create(slice.file_path));
-    }
+  for (auto& slice : scan_data.rg_slices) {
+    // Move the per-slice sirius_datasource out into the cudf sources
+    // vector.  The split_provider always attached a datasource (either
+    // sirius-backed or kvikio-fallback through the same interface); after
+    // this point the slice no longer owns it, but no other call site
+    // touches slice.datasource after execute() begins.
+    sources.push_back(std::move(slice.datasource));
     metadatas.push_back(*slice.file_metadata);  // copy unavoidable: cudf takes by value
     rg_per_src.push_back(slice.row_group_indices);
   }
@@ -208,8 +228,14 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
         "[sirius_gpu_parquet_scan_operator] execute() called with null gpu_memory_space in "
         "input_data.");
     }
-    table     = read_table_from_metadata(*scan_data, stream);
-    mem_space = scan_data->gpu_memory_space;
+    // The base-class execute signature is `const operator_data&`, but the
+    // scan operator is a source: it consumes its input_data exactly once
+    // and there are no other readers.  read_table_from_metadata needs a
+    // mutable reference so it can move each slice's owning
+    // sirius_datasource into cudf's sources vector.
+    auto& mutable_scan_data = const_cast<parquet_scan_data&>(*scan_data);
+    table                   = read_table_from_metadata(mutable_scan_data, stream);
+    mem_space               = scan_data->gpu_memory_space;
   } else if (auto const* cached = dynamic_cast<const scan_cached_operator_data*>(&input_data)) {
     auto ro_batch    = cached->batch->to_read_only();
     auto& gpu_rep    = ro_batch.get_data()->cast<cucascade::gpu_table_representation>();
