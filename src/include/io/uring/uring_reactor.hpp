@@ -124,6 +124,8 @@ class uring_reactor {
     /// (prep_device_rx_request) reads through the buffered (page-cache) file
     /// handle instead of the O_DIRECT one.  Defaults to O_DIRECT.
     bool use_odirect{true};
+
+    std::size_t max_n_chunks{16};
   };
 
   using native_handle_type        = int;
@@ -166,6 +168,14 @@ class uring_reactor {
                                                          rmm::cuda_stream_view stream,
                                                          int device_id);
 
+  /// Build a host-read request that fuses runs of contiguous segments sharing
+  /// the same backing fd into vectored (readv) submissions of at most
+  /// @c cfg.max_n_chunks buffers each; non-contiguous boundaries / fd changes
+  /// start a new group.  A 1-buffer group degrades to a plain read.
+  ///
+  /// request_manager::total_chunks is set to the number of emitted GROUPS (each
+  /// group calls chunk_complete exactly once); bytes_requested is the clamped
+  /// sum over input segments.
   static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
                                                 const io_object_type& file,
                                                 std::span<io_object_segment> segments);

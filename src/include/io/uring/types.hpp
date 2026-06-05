@@ -27,15 +27,19 @@
 
 #include <cuda_runtime.h>
 
+#include <sys/uio.h>
+
 #include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <exception>
 #include <memory>
 #include <source_location>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace sirius::io::uring {
 
@@ -65,9 +69,9 @@ class request_manager {
     }
   }
 
-  void chunk_complete(std::size_t byted_read)
+  void chunk_complete(std::size_t n_bytes)
   {
-    bytes_read.fetch_add(byted_read, std::memory_order_acq_rel);
+    bytes_read.fetch_add(n_bytes, std::memory_order_acq_rel);
     chunks_completed.fetch_add(1, std::memory_order_acq_rel);
   }
 
@@ -118,29 +122,52 @@ class request_manager {
 };
 
 struct device_cpy_request {
+  // One host→device copy.  @c src is resolved as @c host_buffer + @c src_off
+  // when @c src is null (the bounce-slot path assigns its host buffer late,
+  // once a slot is acquired); otherwise @c src is an absolute caller-owned host
+  // pointer (the multi-buffer readv path, whose buffers are separate host
+  // allocations and so cannot share one base).
+  struct copy {
+    std::byte* dst{nullptr};
+    std::byte* src{nullptr};
+    size_t src_off{0};
+    size_t size{0};
+  };
+
+  // Issue every copy on @p stream (a batch when there is more than one), then
+  // record @p event once after the last so a single wait covers them all.
   cudaError_t copy_async(std::byte* host_buffer,
                          [[maybe_unused]] size_t bytes,
                          cudaEvent_t event = nullptr) noexcept
   {
-    assert(dst != nullptr && "Caller must provide a valid device destination buffer for the copy.");
     assert(host_buffer != nullptr && "Caller must provide a valid host buffer for the copy.");
-    assert(bytes > offset + size && "Caller must ensure the copy fits in the host buffer.");
     rmm::cuda_set_device_raii device_guard(rmm::cuda_device_id{device_id});
-    auto* src_ptr   = host_buffer + offset;
-    cudaError_t err = cudaMemcpyAsync(dst, src_ptr, size, cudaMemcpyHostToDevice, stream);
-    if (err == cudaSuccess && event != nullptr) { err = cudaEventRecord(event, stream); }
+    cudaError_t err = cudaSuccess;
+    for (auto const& c : copies) {
+      assert(c.dst != nullptr &&
+             "Caller must provide a valid device destination buffer for the copy.");
+      assert((c.src != nullptr || c.src_off + c.size <= bytes) &&
+             "Caller must ensure the copy fits in the host buffer.");
+      std::byte* src_ptr = c.src != nullptr ? c.src : host_buffer + c.src_off;
+      err                = cudaMemcpyAsync(c.dst, src_ptr, c.size, cudaMemcpyHostToDevice, stream);
+      if (err != cudaSuccess) { return err; }
+    }
+    if (event != nullptr) { err = cudaEventRecord(event, stream); }
     return err;
   }
 
-  std::byte* dst{nullptr};
-  size_t offset{0};
-  size_t size{0};
+  std::vector<copy> copies;
   rmm::cuda_stream_view stream;
   int device_id{-1};
 };
 
 struct chunked_rx_request {
   int fd;
+  // The read to perform.  @c chunk.buffers holds the destination iovec(s):
+  // one buffer => a plain read, more than one => a vectored (readv) read whose
+  // iovecs cover [chunk.offset, chunk.offset + chunk.size) contiguously in the
+  // file.  The worker's EOF/short-read math uses chunk.offset/chunk.size for
+  // both modes.
   io_object_segment chunk;
   // Size of the underlying file.  Used by the worker loop to distinguish a
   // genuine short read (must be re-submitted to read the rest) from a partial
@@ -148,10 +175,23 @@ struct chunked_rx_request {
   // at offset == file_size, or a non-block-aligned tail under O_DIRECT).
   size_t file_size{0};
 
+  /// @return true iff this request must be submitted via io_uring_prep_readv.
+  [[nodiscard]] bool is_vectored() const noexcept { return chunk.is_vectored(); }
+
+  /// Remaining single-buffer range to read after @p offset bytes have landed
+  /// (plain-read resume path).
   [[nodiscard]] io_object_segment get_remaining_chunk(size_t offset) const noexcept
   {
     if (offset >= chunk.size) return io_object_segment{0, 0};
     return io_object_segment{chunk.offset + offset, chunk.size - offset, chunk.data() + offset};
+  }
+
+  /// Rebuild the iovec list for resuming a short readv after @p skip bytes were
+  /// already read (vectored-read resume path).  Fills @p out in place, reusing
+  /// its capacity across resubmissions; @c chunk.buffers is untouched.
+  void fill_remaining_iovecs(size_t skip, std::vector<iovec>& out) const
+  {
+    chunk.fill_remaining_buffers(skip, out);
   }
 
   cudaError_t copy_h2d_async(cudaEvent_t event = nullptr) noexcept

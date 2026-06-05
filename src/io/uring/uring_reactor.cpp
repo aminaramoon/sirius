@@ -76,20 +76,34 @@ struct io_slot {
   void register_sqe(io_uring_sqe* sqe)
   {
     assert(sqe);
-    auto segment = req->get_remaining_chunk(bytes_read);
-    if (use_internal_buffer) {
-      io_uring_prep_read_fixed(sqe,
-                               req->fd,
-                               segment.data(),
-                               static_cast<unsigned>(segment.size),
-                               static_cast<__u64>(segment.offset),
-                               slot_index);
+    if (req->is_vectored()) {
+      // Rebuild the remaining iovec list from the running byte cursor so a
+      // resubmitted short read picks up where it left off.  resume_iov is a
+      // slot member so the array outlives the SQE until its CQE is reaped, and
+      // is filled in place to reuse its capacity across resubmissions.
+      req->fill_remaining_iovecs(bytes_read, resume_iov);
+      assert(!resume_iov.empty() && "vectored resume produced an empty iovec list");
+      io_uring_prep_readv(sqe,
+                          req->fd,
+                          resume_iov.data(),
+                          static_cast<unsigned>(resume_iov.size()),
+                          static_cast<__u64>(req->chunk.offset + bytes_read));
     } else {
-      io_uring_prep_read(sqe,
-                         req->fd,
-                         segment.data(),
-                         static_cast<unsigned>(segment.size),
-                         static_cast<__u64>(segment.offset));
+      auto segment = req->get_remaining_chunk(bytes_read);
+      if (use_internal_buffer) {
+        io_uring_prep_read_fixed(sqe,
+                                 req->fd,
+                                 segment.data(),
+                                 static_cast<unsigned>(segment.size),
+                                 static_cast<__u64>(segment.offset),
+                                 slot_index);
+      } else {
+        io_uring_prep_read(sqe,
+                           req->fd,
+                           segment.data(),
+                           static_cast<unsigned>(segment.size),
+                           static_cast<__u64>(segment.offset));
+      }
     }
     io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(slot_index));
   }
@@ -98,12 +112,17 @@ struct io_slot {
                   slot_token token,
                   cucascade::cuda::cuda_event* cu_event = nullptr)
   {
-    req                 = std::move(r);
-    use_internal_buffer = req->chunk.data() == nullptr;
+    req = std::move(r);
+    // Vectored (readv) requests always carry caller-owned buffers, so they
+    // never borrow the internal bounce slot and never use the fixed-buffer path.
+    use_internal_buffer = !req->is_vectored() && req->chunk.data() == nullptr;
+    assert(!(req->is_vectored() && req->chunk.data() == nullptr) &&
+           "vectored request must carry caller-owned buffers");
     if (use_internal_buffer) { req->chunk.set_data(internal_buffer); }
     bytes_read       = 0;
     this->pool_token = std::move(token);
     event            = cu_event;
+    resume_iov.clear();
   }
 
   void on_error(const typename request_manager::error_type& error,
@@ -145,6 +164,10 @@ struct io_slot {
   size_t bytes_read{0};
   cucascade::cuda::cuda_event* event;
   slot_token pool_token;
+  // Scratch iovec list backing an in-flight readv SQE.  Rebuilt by
+  // register_sqe from the byte cursor; must outlive the SQE until its CQE is
+  // reaped.  Empty for non-vectored requests.
+  std::vector<iovec> resume_iov;
 };
 
 /// Build one device-read chunk for the O_DIRECT-aligned file window
@@ -183,15 +206,104 @@ struct io_slot {
   req->file_size = file_size;
 
   auto cpy       = std::make_unique<device_cpy_request>();
-  cpy->dst       = dst + (data_lo - req_offset);  // where this window lands in dst
-  cpy->offset    = data_lo - window_off;          // offset of the wanted data within host_buf
-  cpy->size      = data_hi - data_lo;
   cpy->stream    = stream;
   cpy->device_id = device_id;
-  req->cpy_req   = std::move(cpy);
+  cpy->copies.push_back(device_cpy_request::copy{
+    /*dst=*/dst + (data_lo - req_offset),  // where this window lands in dst
+    /*src=*/nullptr,                       // resolved late to the (bounce or caller) host buffer
+    /*src_off=*/data_lo - window_off,      // offset of the wanted data within host_buf
+    /*size=*/data_hi - data_lo});
+  req->cpy_req = std::move(cpy);
 
   req->manager = std::move(manager);
   return req;
+}
+
+/// Build one device-read chunk for a merged group of contiguous caller-owned
+/// host buffers (@p seg, whose buffer lengths are already O_DIRECT-clamped to
+/// the file end).  The whole group is read in a single readv (or a plain read
+/// when it carries one buffer), then each buffer's overlap with the request
+/// [@p req_offset, @p req_offset + @p req_size) is H2D-copied into @p dst at its
+/// position within that request — a batch of copies issued together.  Buffers
+/// are separate host allocations, so each copy carries an absolute src pointer.
+[[nodiscard]] chunk_io_request_type_ptr make_device_chunk_vectored(
+  int fd,
+  io_object_segment seg,
+  size_t req_offset,
+  size_t req_size,
+  std::byte* dst,
+  rmm::cuda_stream_view stream,
+  int device_id,
+  size_t file_size,
+  std::shared_ptr<request_manager> manager)
+{
+  size_t const req_end = req_offset + req_size;
+
+  auto cpy       = std::make_unique<device_cpy_request>();
+  cpy->stream    = stream;
+  cpy->device_id = device_id;
+  cpy->copies.reserve(seg.n_chunks());
+
+  // Walk the buffers in file order, accumulating each buffer's file range from
+  // the segment base so the request-overlap clip can be computed per buffer.
+  size_t file_lo = seg.offset;
+  for (auto const& b : seg.buffers) {
+    size_t const file_hi = file_lo + b.iov_len;
+    size_t const data_lo = std::max(req_offset, file_lo);
+    size_t const data_hi = std::min(req_end, file_hi);
+    assert(data_lo < data_hi &&
+           "make_device_chunk_vectored: buffer does not overlap the request — caller must filter "
+           "non-overlapping segments before building a device copy");
+    cpy->copies.push_back(device_cpy_request::copy{
+      /*dst=*/dst + (data_lo - req_offset),  // where this buffer lands in dst
+      /*src=*/static_cast<std::byte*>(b.iov_base) + (data_lo - file_lo),  // wanted data in buffer
+      /*src_off=*/0,
+      /*size=*/data_hi - data_lo});
+    file_lo = file_hi;
+  }
+
+  auto req       = std::make_unique<chunked_rx_request>();
+  req->fd        = fd;
+  req->chunk     = std::move(seg);
+  req->file_size = file_size;
+  req->cpy_req   = std::move(cpy);
+  req->manager   = std::move(manager);
+  return req;
+}
+
+/// A merged read range paired with the backing fd it must be submitted on.
+struct merged_segment {
+  io_object_segment seg;
+  int fd;
+};
+
+/// Fuse neighboring segments into vectored reads during request preparation.
+/// A group extends while the next segment is contiguous in the file, shares the
+/// same backing fd (@p fd_for), and the fused buffer count stays within
+/// @p max_n_chunks.  Each group becomes one merged segment whose @c buffers are
+/// the concatenated destination iovecs; a 1-buffer group is a plain read, a
+/// multi-buffer group is a readv.  Input @p segments are consumed by move.
+template <typename FdFor>
+[[nodiscard]] std::vector<merged_segment> merge_contiguous(std::span<io_object_segment> segments,
+                                                           size_t max_n_chunks,
+                                                           FdFor&& fd_for)
+{
+  std::vector<merged_segment> merged;
+  for (size_t i = 0; i < segments.size();) {
+    int const group_fd = fd_for(segments[i]);
+    io_object_segment seg{std::move(segments[i])};
+    size_t j = i + 1;
+    while (j < segments.size() && seg.n_chunks() + segments[j].n_chunks() <= max_n_chunks &&
+           contiguous(segments[j - 1], segments[j]) && fd_for(segments[j]) == group_fd) {
+      for (auto const& b : segments[j].buffers) {
+        seg.append(b);
+      }
+      ++j;
+    }
+    merged.push_back({std::move(seg), group_fd});
+    i = j;
+  }
+  return merged;
 }
 
 /**
@@ -442,33 +554,35 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
     bytes_covered += hi - lo;
   }
 
-  auto manager = std::make_shared<request_manager>(bytes_covered, segments.size());
-
-  // O_DIRECT requires the read length to stay block-aligned, so the per-chunk
+  // O_DIRECT requires the read length to stay block-aligned, so each buffer's
   // read is clamped to the block-rounded file end rather than the raw file
   // size: the file's final partial block is read in full and the bytes past
   // EOF are simply never copied into dst (the copy is clipped to the request,
   // which never exceeds file_size).  Without this clamp a chunk at the tail of
   // the file short-reads and the worker resubmits the remainder at a
-  // non-block-aligned offset, which O_DIRECT rejects with EINVAL.
+  // non-block-aligned offset, which O_DIRECT rejects with EINVAL.  Only the
+  // segment straddling the file end is clamped, and it is necessarily the last
+  // one, so clamping in place before merging cannot break contiguity.
   size_t const file_end_aligned =
     (file.size() + IO_BLOCK_SIZE - 1) & ~(static_cast<size_t>(IO_BLOCK_SIZE) - 1);
+  for (auto& s : segments) {
+    size_t const read_size = std::min(s.size, file_end_aligned - s.offset);
+    s                      = io_object_segment{s.offset, read_size, s.data()};
+  }
+
+  // Fuse contiguous bounce buffers into one readv per group (1 buffer => plain
+  // read), capped at cfg.max_n_chunks; every group becomes one device chunk
+  // that batch-copies its buffers' request-overlaps into dst.  All segments
+  // share the same backing fd, so fd_for is constant.
+  auto merged =
+    merge_contiguous(segments, cfg.max_n_chunks, [fd](const io_object_segment&) { return fd; });
+  auto manager = std::make_shared<request_manager>(bytes_covered, merged.size());
 
   std::vector<chunk_io_request_type_ptr> chunks;
-  chunks.reserve(segments.size());
-  for (auto const& s : segments) {
-    size_t const read_size = std::min(s.size, file_end_aligned - s.offset);
-    chunks.push_back(make_device_chunk(fd,
-                                       s.offset,
-                                       read_size,
-                                       s.data(),
-                                       offset,
-                                       size,
-                                       dst,
-                                       stream,
-                                       device_id,
-                                       file.size(),
-                                       manager));
+  chunks.reserve(merged.size());
+  for (auto& m : merged) {
+    chunks.push_back(make_device_chunk_vectored(
+      fd, std::move(m.seg), offset, size, dst, stream, device_id, file.size(), manager));
   }
   return rx_request::create(std::move(chunks));
 }
@@ -477,26 +591,38 @@ request_type_ptr uring_reactor::prep_host_rxv_request(const reactor_config_type&
                                                       const io_object_type& file,
                                                       std::span<io_object_segment> segments)
 {
-  if (segments.size() == 0) { return rx_request::create(std::vector<chunk_io_request_type_ptr>{}); }
+  if (segments.empty()) { return rx_request::create({}); }
 
-  // Requested bytes = sum of the per-segment request sizes, clamped to the file
-  // end (a segment at the tail reads fewer bytes than its chunk-aligned size).
-  // This is what the future returns, never the chunk-aligned amount read.
-  size_t const fsize     = file.size();
+  size_t const fsize = file.size();
+
+  // Per-segment backing fd: O_DIRECT when enabled and the segment is aligned,
+  // buffered otherwise.  Segments only fuse into one readv if they share an fd.
+  auto fd_for = [&](const io_object_segment& s) {
+    return (cfg.use_odirect && s.is_odirect_compatible()) ? file.odirect_handle()
+                                                          : file.buffered_handle();
+  };
+
+  // Requested bytes = sum of per-segment sizes clamped to the file end (a
+  // segment at the tail reads fewer bytes than its size).  This is what the
+  // future returns, never the over-read amount.  Merging does not change it.
   size_t bytes_requested = 0;
   for (auto const& s : segments) {
     bytes_requested += s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
   }
-  auto manager = std::make_shared<request_manager>(bytes_requested, segments.size());
+
+  // Fuse contiguous, same-fd segments into vectored reads (1 buffer => plain
+  // read, >1 => readv).  total_chunks == number of merged segments: each emitted
+  // chunked_rx_request calls chunk_complete exactly once.
+  auto merged  = merge_contiguous(segments, cfg.max_n_chunks, fd_for);
+  auto manager = std::make_shared<request_manager>(bytes_requested, merged.size());
 
   std::vector<chunk_io_request_type_ptr> chunks;
-  chunks.reserve(segments.size());
-  for (auto& s : segments) {
+  chunks.reserve(merged.size());
+  for (auto& m : merged) {
     auto req       = std::make_unique<chunked_rx_request>();
-    req->fd        = (cfg.use_odirect && s.is_odirect_compatible()) ? file.odirect_handle()
-                                                                    : file.buffered_handle();
-    req->chunk     = s;
-    req->file_size = file.size();
+    req->fd        = m.fd;
+    req->chunk     = std::move(m.seg);
+    req->file_size = fsize;
     req->manager   = manager;
     chunks.push_back(std::move(req));
   }
@@ -689,22 +815,24 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
   auto reap_cqes = [&]() {
     unsigned n = ring.peek_cqe_batch(cqes);
     for (auto* cqe : std::span{cqes.data(), n}) {
-      uint64_t raw   = io_uring_cqe_get_data64(cqe);
-      int si         = static_cast<int>(raw);
-      int bytes_read = cqe->res;
+      uint64_t raw  = io_uring_cqe_get_data64(cqe);
+      int si        = static_cast<int>(raw);
+      int cqe_bytes = cqe->res;
       ring.mark_cqe_seen(cqe);
       --inflight;
 
       auto& s = slots[si];
 
-      if (bytes_read < 0) {
-        s.on_error(std::error_code(-bytes_read, std::generic_category()));
+      if (cqe_bytes < 0) {
+        s.on_error(std::error_code(-cqe_bytes, std::generic_category()));
         continue;
       }
 
-      s.bytes_read += static_cast<size_t>(bytes_read);
+      // For readv, cqe_bytes is the total read across all iovecs; the EOF/
+      // short-read arithmetic below is offset-based and works for both modes.
+      s.bytes_read += static_cast<size_t>(cqe_bytes);
       bool const fully_read = s.bytes_read >= s.req->chunk.size;
-      bool const eof = bytes_read == 0 || s.req->chunk.offset + s.bytes_read >= s.req->file_size;
+      bool const eof = cqe_bytes == 0 || s.req->chunk.offset + s.bytes_read >= s.req->file_size;
 
       if (!fully_read && !eof) {
         incomplete_requests.push_back(si);
@@ -783,8 +911,6 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
 
   // The main loop: drain the request queue and submit new SQEs, wait for completions and reap
   {
-    std::cerr << "uring_reactor worker_loop: exception " << std::endl;
-
     auto cleanup = absl::MakeCleanup([&]() { clean_up_and_shutdown(); });
 
     try {

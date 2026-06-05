@@ -21,9 +21,14 @@
 
 #include <cuda_runtime.h>
 
+#include <sys/uio.h>
+
+#include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace sirius::io {
 
@@ -94,33 +99,105 @@ class sirius_io_object_metadata {
   virtual ~sirius_io_object_metadata() = default;
 };
 
+/// A read of @c size bytes starting at file @c offset, scattered into one or
+/// more destination buffers (@c buffers, in file order).  A single-buffer
+/// segment is a plain read; a multi-buffer segment is a vectored (readv) read
+/// whose iovecs cover @c [offset, offset + size) contiguously in the file but
+/// may land in discontiguous host allocations.
+///
+/// Invariant: @c size == Σ buffers[i].iov_len.  The merge step that fuses
+/// neighboring segments during request preparation maintains this by routing
+/// every growth through @c append.
 class io_object_segment {
  public:
   io_object_segment() = default;
 
-  io_object_segment(size_t offset, size_t size) : offset(offset), size(size), buffer(nullptr) {}
-
-  io_object_segment(size_t offset, size_t size, std::byte* buffer)
-    : offset(offset), size(size), buffer(buffer)
-
+  io_object_segment(size_t offset, size_t size)
+    : offset(offset), size(size), buffers{iovec{nullptr, size}}
   {
   }
 
-  void set_data(std::byte* buffer) { this->buffer = buffer; }
+  io_object_segment(size_t offset, size_t size, std::byte* buffer)
+    : offset(offset), size(size), buffers{iovec{static_cast<void*>(buffer), size}}
+  {
+  }
 
-  [[nodiscard]] std::byte* data() const noexcept { return buffer; }
+  /// Set the destination of a single-buffer segment (the bounce-slot path
+  /// assigns the reactor's internal buffer late, once a slot is acquired).
+  void set_data(std::byte* buffer)
+  {
+    assert(buffers.size() == 1 && "set_data is only valid for a single-buffer segment");
+    buffers.front().iov_base = static_cast<void*>(buffer);
+  }
 
-  [[nodiscard]] bool is_buffer_allocated() const noexcept { return buffer != nullptr; }
+  [[nodiscard]] std::byte* data() const noexcept
+  {
+    return buffers.empty() ? nullptr : static_cast<std::byte*>(buffers.front().iov_base);
+  }
 
+  [[nodiscard]] bool is_buffer_allocated() const noexcept { return data() != nullptr; }
+
+  /// Number of destination buffers (== number of iovecs in a readv).
+  [[nodiscard]] size_t n_chunks() const noexcept { return buffers.size(); }
+
+  /// True iff this segment must be submitted via io_uring_prep_readv (rather
+  /// than a single io_uring_prep_read).
+  [[nodiscard]] bool is_vectored() const noexcept { return buffers.size() > 1; }
+
+  /// O_DIRECT requires the file offset, the total length, and every iovec base
+  /// and length to be block-aligned.
   [[nodiscard]] bool is_odirect_compatible() const noexcept
   {
-    return (offset % IO_BLOCK_SIZE == 0) && (size % IO_BLOCK_SIZE == 0) &&
-           (buffer == nullptr || reinterpret_cast<uintptr_t>(buffer) % IO_BLOCK_SIZE == 0);
+    if (offset % IO_BLOCK_SIZE != 0 || size % IO_BLOCK_SIZE != 0) { return false; }
+    for (auto const& b : buffers) {
+      if (b.iov_len % IO_BLOCK_SIZE != 0) { return false; }
+      if (b.iov_base != nullptr && reinterpret_cast<uintptr_t>(b.iov_base) % IO_BLOCK_SIZE != 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// Append a destination buffer, fusing a contiguous neighbor into this
+  /// segment.  Grows @c size by the buffer length to preserve the invariant.
+  void append(iovec iov) noexcept
+  {
+    buffers.push_back(iov);
+    size += iov.iov_len;
+  }
+
+  /// Rebuild the iovec list for resuming a short read after @p skip bytes were
+  /// already read: drops fully-consumed buffers and advances into the
+  /// straddling one.  Fills @p out in place (reusing its capacity across
+  /// resubmissions); @c buffers is untouched.
+  void fill_remaining_buffers(size_t skip, std::vector<iovec>& out) const
+  {
+    out.clear();
+    out.reserve(buffers.size());
+    for (auto const& iov : buffers) {
+      if (skip >= iov.iov_len) {
+        skip -= iov.iov_len;
+        continue;
+      }
+      out.push_back(iovec{static_cast<std::byte*>(iov.iov_base) + skip, iov.iov_len - skip});
+      skip = 0;
+    }
   }
 
   size_t offset{0};
   size_t size{0};
-  std::byte* buffer;
+  // Destination buffers in file order.  Owned here so the iovec array stays
+  // alive until the SQE referencing it is reaped.
+  std::vector<iovec> buffers;
 };
+
+/// True iff @p a immediately precedes @p b in the file (no gap, no overlap):
+/// a.offset + a.size == b.offset.  Used to decide whether two segments can be
+/// fused into a single vectored (readv) submission over one contiguous range.
+[[nodiscard]] inline bool contiguous(const io_object_segment& a,
+                                     const io_object_segment& b) noexcept
+{
+  return a.offset + a.size == b.offset;
+}
 
 }  // namespace sirius::io

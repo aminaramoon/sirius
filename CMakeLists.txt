@@ -392,6 +392,7 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_static_credentials.cpp
     # test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_uri_parser.cpp
+    test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_transparent_execution.cpp
