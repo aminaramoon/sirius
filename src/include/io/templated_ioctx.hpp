@@ -35,6 +35,7 @@
 #include <exception>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -147,12 +148,18 @@ concept reactor_has_host_to_device_rx = requires(R r,
 };
 
 template <class R>
-concept reactor_has_vector_host_rx = requires(R r,
-                                              typename R::io_object_type file,
-                                              typename R::reactor_config_type cfg,
-                                              std::span<io_object_segment> dsts) {
-  { r.prep_host_rxv_request(cfg, file, dsts) } -> std::same_as<typename R::request_type_ptr>;
-};
+concept reactor_has_vector_host_rx =
+  requires(R r,
+           typename R::io_object_type file,
+           typename R::reactor_config_type cfg,
+           std::span<io_object_segment> dsts,
+           std::span<const cudf::io::text::byte_range_info> ranges,
+           std::optional<size_t> alignment) {
+    { r.prep_host_rxv_request(cfg, file, dsts) } -> std::same_as<typename R::request_type_ptr>;
+    {
+      r.align_and_coalesce(ranges, alignment)
+    } -> std::same_as<std::vector<cudf::io::text::byte_range_info>>;
+  };
 
 template <class R>
 struct reactor_traits {
@@ -277,6 +284,19 @@ class templated_ioctx : public sirius_ioctx {
     cudf::io::text::byte_range_info logical, size_t file_size) const noexcept override
   {
     return Reactor::align_to_physical(logical, file_size);
+  }
+
+  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
+    std::span<const cudf::io::text::byte_range_info> ranges,
+    std::optional<size_t> alignment = std::nullopt) const noexcept override
+  {
+    if constexpr (reactor_traits_t::supports_vector_host_read) {
+      return Reactor::align_and_coalesce(ranges, alignment);
+    } else {
+      // Backends without vectored host reads impose no alignment of their own;
+      // pass the ranges through unchanged.
+      return {ranges.begin(), ranges.end()};
+    }
   }
 
   virtual std::vector<Reactor*> next_reactor([[maybe_unused]] const io_object_type& obj,

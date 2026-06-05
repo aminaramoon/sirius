@@ -25,9 +25,11 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace sirius::io {
 
@@ -180,6 +182,15 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   virtual cudf::io::text::byte_range_info compute_physical_range(
     cudf::io::text::byte_range_info logical, size_t file_size) const noexcept = 0;
+
+  /// Align each input range's ends outward to the backend's I/O alignment and
+  /// coalesce overlapping/adjacent results into a minimal set of aligned,
+  /// non-overlapping ranges (sorted by offset).  @p alignment is a lower bound:
+  /// when unset, or smaller than the backend's optimal alignment, the backend
+  /// uses its own alignment instead.
+  [[nodiscard]] virtual std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
+    std::span<const cudf::io::text::byte_range_info> ranges,
+    std::optional<size_t> alignment = std::nullopt) const noexcept = 0;
 
  protected:
   virtual size_t host_read_io(const sirius_io_object& obj,

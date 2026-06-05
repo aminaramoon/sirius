@@ -158,7 +158,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 
   if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
-    _io_ctx->cache()->prepare_for_query();
+    _io_ctx->cache()->prepare_for_query(query);
   }
 
   // Advance the cache age so the evictor can score this query's inserts

@@ -321,8 +321,8 @@ TEST_CASE("align_and_coalesce rounds ends out to the default O_DIRECT alignment"
   std::vector<byte_range_info> in{{100, 200}};  // [100, 300)
   auto out = uring_reactor::align_and_coalesce(in);
   REQUIRE(out.size() == 1);
-  CHECK(out[0].offset() == 0);     // 100 rounded down to 4 KiB
-  CHECK(out[0].size() == 4096);    // 300 rounded up to 4 KiB
+  CHECK(out[0].offset() == 0);   // 100 rounded down to 4 KiB
+  CHECK(out[0].size() == 4096);  // 300 rounded up to 4 KiB
 }
 
 TEST_CASE("align_and_coalesce fuses ranges that overlap after alignment", "[uring_readv]")

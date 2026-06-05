@@ -688,7 +688,7 @@ std::vector<cudf::io::text::byte_range_info> uring_reactor::align_and_coalesce(
     auto const cur_end    = cur_start + static_cast<size_t>(aligned[i].size());
     if (cur_start <= last_end) {  // overlap or adjacency (ends are aligned)
       size_t const new_end = std::max(last_end, cur_end);
-      last = {last.offset(), static_cast<int64_t>(new_end - last_start)};
+      last                 = {last.offset(), static_cast<int64_t>(new_end - last_start)};
     } else {
       coalesced.push_back(aligned[i]);
     }

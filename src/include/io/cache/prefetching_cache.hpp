@@ -22,6 +22,7 @@
 #include "exec/thread_pool.hpp"
 #include "io/cache/types.hpp"
 #include "io/details/admission_control.hpp"
+#include "planner/query.hpp"
 
 #include <concurrentqueue.h>
 
@@ -89,7 +90,7 @@ class prefetching_cache {
 
   [[nodiscard]] std::string summary() const;
 
-  void prepare_for_query() noexcept;
+  void prepare_for_query(const sirius::planner::query& query) noexcept;
 
  private:
   [[nodiscard]] prefetching_handle insert(const sirius_io_object& obj,

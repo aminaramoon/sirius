@@ -553,7 +553,7 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
 
 std::string prefetching_cache::summary() const { return ""; }
 
-void prefetching_cache::prepare_for_query() noexcept
+void prefetching_cache::prepare_for_query(const sirius::planner::query& query) noexcept
 {
   _ticker.fetch_add(1, std::memory_order_relaxed);
 }

@@ -22,9 +22,11 @@
 #include <cudf/io/datasource.hpp>
 
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace sirius::io {
 
@@ -138,6 +140,12 @@ class kvikio_context final : public sirius_ioctx {
   /// through unchanged.
   cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
                                                          size_t file_size) const noexcept final;
+
+  /// kvikio handles its own alignment internally and does not do vectored host
+  /// reads; pass the ranges through unchanged (no alignment, no coalescing).
+  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
+    std::span<const cudf::io::text::byte_range_info> ranges,
+    std::optional<size_t> alignment = std::nullopt) const noexcept final;
 
  protected:
   // -- Protected _io primitives -------------------------------------------
