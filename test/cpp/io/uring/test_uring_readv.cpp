@@ -312,6 +312,67 @@ TEST_CASE("prep_host_rxv_request on empty input yields a ready zero-byte request
   CHECK(req->size() == 0);
 }
 
+// --- align_and_coalesce -----------------------------------------------------
+
+using cudf::io::text::byte_range_info;
+
+TEST_CASE("align_and_coalesce rounds ends out to the default O_DIRECT alignment", "[uring_readv]")
+{
+  std::vector<byte_range_info> in{{100, 200}};  // [100, 300)
+  auto out = uring_reactor::align_and_coalesce(in);
+  REQUIRE(out.size() == 1);
+  CHECK(out[0].offset() == 0);     // 100 rounded down to 4 KiB
+  CHECK(out[0].size() == 4096);    // 300 rounded up to 4 KiB
+}
+
+TEST_CASE("align_and_coalesce fuses ranges that overlap after alignment", "[uring_readv]")
+{
+  // [0,100) and [4000,4100): both touch the first 4 KiB block; the second also
+  // spills into the second block, so they coalesce into [0, 8192).
+  std::vector<byte_range_info> in{{0, 100}, {4000, 100}};
+  auto out = uring_reactor::align_and_coalesce(in);
+  REQUIRE(out.size() == 1);
+  CHECK(out[0].offset() == 0);
+  CHECK(out[0].size() == 8192);
+}
+
+TEST_CASE("align_and_coalesce keeps disjoint aligned ranges separate and sorted", "[uring_readv]")
+{
+  // Provided out of order; [0,4k) and [16k,20k) do not touch after alignment.
+  std::vector<byte_range_info> in{{16384, 100}, {0, 100}};
+  auto out = uring_reactor::align_and_coalesce(in);
+  REQUIRE(out.size() == 2);
+  CHECK(out[0].offset() == 0);
+  CHECK(out[0].size() == 4096);
+  CHECK(out[1].offset() == 16384);
+  CHECK(out[1].size() == 4096);
+}
+
+TEST_CASE("align_and_coalesce honors a larger caller alignment", "[uring_readv]")
+{
+  std::vector<byte_range_info> in{{0, 100}};
+  auto out = uring_reactor::align_and_coalesce(in, /*alignment=*/1 << 16);  // 64 KiB
+  REQUIRE(out.size() == 1);
+  CHECK(out[0].offset() == 0);
+  CHECK(out[0].size() == (1 << 16));
+}
+
+TEST_CASE("align_and_coalesce ignores an alignment smaller than the reactor's", "[uring_readv]")
+{
+  std::vector<byte_range_info> in{{100, 50}};
+  auto out = uring_reactor::align_and_coalesce(in, /*alignment=*/512);  // < IO_BLOCK_SIZE
+  REQUIRE(out.size() == 1);
+  CHECK(out[0].offset() == 0);
+  CHECK(out[0].size() == 4096);  // still the 4 KiB default, not 512
+}
+
+TEST_CASE("align_and_coalesce drops empty ranges and handles empty input", "[uring_readv]")
+{
+  CHECK(uring_reactor::align_and_coalesce(std::vector<byte_range_info>{}).empty());
+  std::vector<byte_range_info> in{{0, 0}, {4096, 0}};
+  CHECK(uring_reactor::align_and_coalesce(in).empty());
+}
+
 // --- host-to-device (vectored bounce reads + batched H2D copy) --------------
 
 TEST_CASE("prep_host_to_device fuses contiguous bounce buffers into one readv with a batched copy",

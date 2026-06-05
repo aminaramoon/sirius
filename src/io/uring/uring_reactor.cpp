@@ -38,6 +38,7 @@
 #include <filesystem>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -648,6 +649,51 @@ cudf::io::text::byte_range_info uring_reactor::align_to_physical(
   size_t a_end   = std::min((offset + size + IO_BLOCK_SIZE - 1) & ~(IO_BLOCK_SIZE - 1),
                           (file_size + IO_BLOCK_SIZE - 1) & ~(IO_BLOCK_SIZE - 1));
   return {static_cast<int64_t>(a_start), static_cast<int64_t>(a_end - a_start)};
+}
+
+std::vector<cudf::io::text::byte_range_info> uring_reactor::align_and_coalesce(
+  std::span<const cudf::io::text::byte_range_info> ranges, std::optional<size_t> alignment)
+{
+  // O_DIRECT mandates IO_BLOCK_SIZE alignment, so it is the floor: honor a
+  // larger caller request, ignore anything smaller (including an unset value).
+  size_t const align = std::max<size_t>(alignment.value_or(IO_BLOCK_SIZE), IO_BLOCK_SIZE);
+
+  // Round each range's ends outward to `align`; drop empty ranges.  Integer
+  // (not bitmask) rounding so a non-power-of-two caller alignment still works.
+  std::vector<cudf::io::text::byte_range_info> aligned;
+  aligned.reserve(ranges.size());
+  for (auto const& r : ranges) {
+    if (r.size() <= 0) { continue; }
+    auto const offset  = static_cast<size_t>(r.offset());
+    auto const end     = offset + static_cast<size_t>(r.size());
+    size_t const start = (offset / align) * align;
+    size_t const stop  = ((end + align - 1) / align) * align;
+    aligned.emplace_back(static_cast<int64_t>(start), static_cast<int64_t>(stop - start));
+  }
+  if (aligned.empty()) { return aligned; }
+
+  // Sort by offset so one forward pass can fuse overlapping/adjacent ranges.
+  std::sort(aligned.begin(), aligned.end(), [](auto const& a, auto const& b) {
+    return a.offset() < b.offset();
+  });
+
+  std::vector<cudf::io::text::byte_range_info> coalesced;
+  coalesced.reserve(aligned.size());
+  coalesced.push_back(aligned.front());
+  for (size_t i = 1; i < aligned.size(); ++i) {
+    auto& last            = coalesced.back();
+    auto const last_start = static_cast<size_t>(last.offset());
+    auto const last_end   = last_start + static_cast<size_t>(last.size());
+    auto const cur_start  = static_cast<size_t>(aligned[i].offset());
+    auto const cur_end    = cur_start + static_cast<size_t>(aligned[i].size());
+    if (cur_start <= last_end) {  // overlap or adjacency (ends are aligned)
+      size_t const new_end = std::max(last_end, cur_end);
+      last = {last.offset(), static_cast<int64_t>(new_end - last_start)};
+    } else {
+      coalesced.push_back(aligned[i]);
+    }
+  }
+  return coalesced;
 }
 
 bool uring_reactor::supports(std::string_view path)

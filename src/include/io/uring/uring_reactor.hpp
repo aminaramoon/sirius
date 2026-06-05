@@ -32,11 +32,13 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace {
 inline void cuda_check(cudaError_t e, char const* file, int line)
@@ -238,6 +240,18 @@ class uring_reactor {
   /// O_DIRECT requires 4 KiB alignment of both file offset and length.
   static cudf::io::text::byte_range_info align_to_physical(cudf::io::text::byte_range_info logical,
                                                            size_t file_size);
+
+  /// Align every input range's ends outward to the effective alignment, then
+  /// coalesce overlapping or adjacent results into a minimal set of aligned,
+  /// non-overlapping ranges (sorted by offset).
+  ///
+  /// The reactor reads through O_DIRECT, so @c IO_BLOCK_SIZE is the minimum
+  /// viable alignment and is used when @p alignment is unset.  A caller-supplied
+  /// alignment is honored only when it is at least @c IO_BLOCK_SIZE; a smaller
+  /// value is ignored in favor of the reactor's own alignment.
+  static std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
+    std::span<const cudf::io::text::byte_range_info> ranges,
+    std::optional<size_t> alignment = std::nullopt);
 
  private:
   void worker_loop(const std::stop_token& stop_token);
