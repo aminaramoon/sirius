@@ -38,7 +38,7 @@ class prefetching_cache;
 }
 
 // ---------------------------------------------------------------------------
-// prefetching_mode
+// prefetching_stage
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -97,15 +97,15 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// Whether the backend can serve a batch of host reads in a single dispatch
   /// (cf. @c host_read_ranges_async_io).  When false, the prefetching layer
   /// cannot amortise per-request overhead and must fall back to
-  /// @c prefetching_mode::none.
+  /// @c prefetching_stage::none.
   [[nodiscard]] virtual bool supports_vector_host_read() const noexcept = 0;
 
   /// Prefetching strategy the prefetching layer should use against this
-  /// backend.  Returns @c prefetching_mode::none whenever
+  /// backend.  Returns @c prefetching_stage::none whenever
   /// @c supports_vector_host_read() is false; otherwise the backend picks
   /// between eager prefill and on-demand read-ahead based on its IO
   /// characteristics.
-  [[nodiscard]] virtual cache::prefetching_mode preferred_prefetching_mode() const noexcept = 0;
+  [[nodiscard]] virtual cache::prefetching_stage preferred_prefetching_stage() const noexcept = 0;
 
   /// Build the prefetching cache.  One-shot — calling twice is a no-op
   /// after the first successful build.  The cache holds a raw
@@ -160,28 +160,7 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
     return _metadata_store;
   }
 
-  // -- Read API ---------------------------------------------------------------
-
-  virtual size_t host_read_sync(const sirius_io_object& obj,
-                                size_t offset,
-                                size_t size,
-                                std::byte* dst);
-
-  virtual exec::semi_future<size_t> host_read_async(const sirius_io_object& obj,
-                                                    size_t offset,
-                                                    size_t size,
-                                                    std::byte* dst) noexcept;
-
-  virtual exec::semi_future<size_t> device_read_async(const sirius_io_object& obj,
-                                                      size_t offset,
-                                                      size_t size,
-                                                      std::byte* dst,
-                                                      rmm::cuda_stream_view stream) noexcept;
-
   // -- Physical range alignment ------------------------------------------------
-
-  virtual cudf::io::text::byte_range_info compute_physical_range(
-    cudf::io::text::byte_range_info logical, size_t file_size) const noexcept = 0;
 
   /// Align each input range's ends outward to the backend's I/O alignment and
   /// coalesce overlapping/adjacent results into a minimal set of aligned,
@@ -192,7 +171,6 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
     std::span<const cudf::io::text::byte_range_info> ranges,
     std::optional<size_t> alignment = std::nullopt) const noexcept = 0;
 
- protected:
   virtual size_t host_read_io(const sirius_io_object& obj,
                               size_t offset,
                               size_t size,

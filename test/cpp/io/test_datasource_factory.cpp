@@ -60,9 +60,9 @@ class mock_ioctx : public sirius_ioctx {
 
   [[nodiscard]] bool supports_device_read() const override { return true; }
   [[nodiscard]] bool supports_vector_host_read() const override { return true; }
-  [[nodiscard]] prefetching_mode preferred_prefetching_mode() const override
+  [[nodiscard]] prefetching_stage preferred_prefetching_stage() const override
   {
-    return prefetching_mode::none;
+    return prefetching_stage::none;
   }
 
   size_t host_read_io(sirius_io_object&, size_t, size_t, uint8_t*) override

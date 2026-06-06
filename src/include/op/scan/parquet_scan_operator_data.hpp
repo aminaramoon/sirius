@@ -192,9 +192,7 @@ class parquet_scan_data : public op::operator_data {
                     pipeline_id,
                     rg_slices.size());
     for (auto& slice : rg_slices) {
-      if (slice.datasource) {
-        slice.datasource->fadvise(sirius::io::cache::prefetching_mode::disposable, {});
-      }
+      if (slice.datasource) { slice.datasource->prefetch(io::cache::prefetching_stage::immediate); }
     }
   };
 

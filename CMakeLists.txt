@@ -167,8 +167,8 @@ set(EXTENSION_SOURCES
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
     src/io/kvikio/kvikio_context.cpp
-    src/io/metadata_store.cpp
-    src/io/prefetching_cache.cpp
+    src/io/cache/metadata_store.cpp
+    src/io/cache/prefetching_cache.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_sigv4_credential_provider.cpp
     src/io/sirius_datasource.cpp

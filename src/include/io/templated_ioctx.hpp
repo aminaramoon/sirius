@@ -107,7 +107,7 @@ concept io_reactor_c = requires(R r,
 
   // -- capabilities --------------------------------------------------------
   { R::supports(path) } -> std::same_as<bool>;
-  { R::preferred_prefetching_mode() } -> std::same_as<cache::prefetching_mode>;
+  { R::preferred_prefetching_stage() } -> std::same_as<cache::prefetching_stage>;
 };
 
 // ---------------------------------------------------------------------------
@@ -272,18 +272,12 @@ class templated_ioctx : public sirius_ioctx {
     return reactor_traits_t::supports_vector_host_read;
   }
 
-  [[nodiscard]] cache::prefetching_mode preferred_prefetching_mode() const noexcept override
+  [[nodiscard]] cache::prefetching_stage preferred_prefetching_stage() const noexcept override
   {
     // Vector host read is the cheap dispatch path the prefetcher relies on.
     // Without it, force prefetching off regardless of the reactor's preference.
-    if (!reactor_traits_t::supports_vector_host_read) { return cache::prefetching_mode::none; }
-    return Reactor::preferred_prefetching_mode();
-  }
-
-  [[nodiscard]] cudf::io::text::byte_range_info compute_physical_range(
-    cudf::io::text::byte_range_info logical, size_t file_size) const noexcept override
-  {
-    return Reactor::align_to_physical(logical, file_size);
+    if (!reactor_traits_t::supports_vector_host_read) { return cache::prefetching_stage::none; }
+    return Reactor::preferred_prefetching_stage();
   }
 
   [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(

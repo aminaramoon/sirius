@@ -105,7 +105,7 @@ class sirius_datasource : public cudf::io::datasource {
   /// soon.
   ///
   /// The behaviour depends on @p site and the io_ctx's
-  /// @c preferred_prefetching_mode:
+  /// @c preferred_prefetching_stage:
   ///   - @c speculative / @c immediate: only honored when @p site matches
   ///     the ioctx's preferred mode.  Hands @p ranges to the prefetching
   ///     cache and stashes the returned @c prefetching_handle on this
@@ -120,10 +120,13 @@ class sirius_datasource : public cudf::io::datasource {
   /// already stored emits a warning: the datasource lifecycle expects one
   /// speculative-or-immediate insert per scan, with a single
   /// @c disposable call at consume time.
-  void fadvise(cache::prefetching_mode site,
-               std::span<const cudf::io::text::byte_range_info> ranges);
+  void fadvise(std::span<const cudf::io::text::byte_range_info> ranges);
+
+  void prefetch(cache::prefetching_stage site);
 
  private:
+  [[nodiscard]] bool uses_prefetching_cache();
+
   std::shared_ptr<sirius_ioctx> _io_ctx;
   std::shared_ptr<sirius_io_object> _io_object;
   /// Handle of the most recent speculative/immediate insert into the

@@ -55,7 +55,9 @@ void pipeline_ordered_prefetching_manager::run_sequencer(std::stop_token const& 
 
       SIRIUS_LOG_INFO(
         "[fadvise opportunistic] pipeline_id={} ranges={}", slot.pipeline_id, entry.ranges.size());
-      entry.datasource->fadvise(sirius::io::cache::prefetching_mode::opportunistic, entry.ranges);
+
+      entry.datasource->fadvise(entry.ranges);
+      entry.datasource->prefetch(sirius::io::cache::prefetching_stage::opportunistic);
     }
     if (stop.stop_requested()) break;
   }

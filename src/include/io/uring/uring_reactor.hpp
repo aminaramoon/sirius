@@ -214,9 +214,9 @@ class uring_reactor {
   // the corresponding create_*_rx_request overloads (both of which this
   // reactor provides).
 
-  static constexpr cache::prefetching_mode preferred_prefetching_mode() noexcept
+  static constexpr cache::prefetching_stage preferred_prefetching_stage() noexcept
   {
-    return cache::prefetching_mode::immediate;
+    return cache::prefetching_stage::immediate;
   }
 
  private:

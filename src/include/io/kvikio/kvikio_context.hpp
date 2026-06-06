@@ -83,7 +83,7 @@ class kvikio_io_object final : public sirius_io_object {
  *   - @c supports_device_read: true (cudf's datasource supports it where the
  *     platform allows, e.g. GDS).
  *   - @c supports_vector_host_read: false — no batched dispatch path.
- *   - @c preferred_prefetching_mode: @c none.
+ *   - @c preferred_prefetching_stage: @c none.
  */
 class kvikio_context final : public sirius_ioctx {
  public:
@@ -107,47 +107,15 @@ class kvikio_context final : public sirius_ioctx {
   [[nodiscard]] bool supports_device_read() const noexcept override { return true; }
   [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
   [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
-  [[nodiscard]] cache::prefetching_mode preferred_prefetching_mode() const noexcept override
+  [[nodiscard]] cache::prefetching_stage preferred_prefetching_stage() const noexcept override
   {
-    return cache::prefetching_mode::none;
+    return cache::prefetching_stage::none;
   }
 
-  // -- Public read API (override the base virtuals directly) ----------------
-  //
-  // Each forwards to the cudf datasource held on the io_object.  The cache
-  // (if @c initialize_cache was ever called on this ioctx) is intentionally
-  // NOT consulted here: kvikio_context reports
-  // @c supports_vector_host_read == false, so @c uses_prefetching_cache()
-  // is also false on the base class read path.
-
-  size_t host_read_sync(const sirius_io_object& obj,
-                        size_t offset,
-                        size_t size,
-                        std::byte* dst) final;
-
-  exec::semi_future<size_t> host_read_async(const sirius_io_object& obj,
-                                            size_t offset,
-                                            size_t size,
-                                            std::byte* dst) noexcept final;
-
-  exec::semi_future<size_t> device_read_async(const sirius_io_object& obj,
-                                              size_t offset,
-                                              size_t size,
-                                              std::byte* dst,
-                                              rmm::cuda_stream_view stream) noexcept final;
-
-  /// kvikio handles its own alignment internally; pass the logical range
-  /// through unchanged.
-  cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
-                                                         size_t file_size) const noexcept final;
-
-  /// kvikio handles its own alignment internally and does not do vectored host
-  /// reads; pass the ranges through unchanged (no alignment, no coalescing).
-  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
+  std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
     std::span<const cudf::io::text::byte_range_info> ranges,
-    std::optional<size_t> alignment = std::nullopt) const noexcept final;
+    std::optional<size_t> /*alignment*/) const noexcept override;
 
- protected:
   // -- Protected _io primitives -------------------------------------------
   //
   // The base class's default read implementations route through these on a

@@ -46,6 +46,64 @@ class sirius_datasource;
 
 namespace sirius::io::cache {
 
+enum class prefetching_handle_state { idle, active, cancelled };
+
+struct prefetch_request_context {
+  explicit prefetch_request_context(const sirius_io_object& file, std::uint64_t ts) noexcept
+    : timestamp(ts),
+      obj(file.shared_from_this()),
+      state(std::make_shared<entry_state>()),
+      user_state(
+        std::make_shared<std::atomic<prefetching_handle_state>>(prefetching_handle_state::idle))
+  {
+  }
+
+  [[nodiscard]] bool is_active() const noexcept
+  {
+    return user_state &&
+           user_state->load(std::memory_order_acquire) == prefetching_handle_state::active;
+  }
+
+  [[nodiscard]] bool is_cancelled() const noexcept
+  {
+    return !user_state ||
+           user_state->load(std::memory_order_acquire) == prefetching_handle_state::cancelled;
+  }
+
+  const std::uint64_t timestamp;
+  const std::shared_ptr<const sirius_io_object> obj;
+  std::shared_ptr<entry_state> state;
+  std::shared_ptr<std::atomic<prefetching_handle_state>> user_state;
+  std::vector<cached_chunk*> chunks;
+};
+
+class prefetching_handle {
+ public:
+  prefetching_handle() noexcept;
+  ~prefetching_handle();
+  prefetching_handle(prefetching_handle const&)            = delete;
+  prefetching_handle& operator=(prefetching_handle const&) = delete;
+
+  prefetching_handle(prefetching_handle&& o) noexcept;
+  prefetching_handle& operator=(prefetching_handle&& o) noexcept;
+
+  void activate() noexcept;
+
+  void cancel() noexcept;
+
+  [[nodiscard]] bool is_active() const noexcept;
+
+  explicit operator bool() const noexcept;
+
+ private:
+  friend class prefetching_cache;
+  struct prefetch_lifecycle_manager;
+
+  prefetching_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept;
+
+  std::unique_ptr<prefetch_lifecycle_manager> _state;
+};
+
 // ---------------------------------------------------------------------------
 // prefetching_cache
 // ---------------------------------------------------------------------------
@@ -67,7 +125,9 @@ class prefetching_cache {
   friend class prefetching_handle;
 
  public:
-  using byte_range = cudf::io::text::byte_range_info;
+  using byte_range         = cudf::io::text::byte_range_info;
+  using prefetch_request   = std::shared_ptr<prefetch_request_context>;
+  using request_queue_type = duckdb_moodycamel::BlockingConcurrentQueue<prefetch_request>;
 
   prefetching_cache(buffer_pool* pool, sirius_ioctx* io_ctx, size_t inflight_budget_chunks);
   ~prefetching_cache();
@@ -80,13 +140,15 @@ class prefetching_cache {
   [[nodiscard]] bool host_read(const sirius_io_object& obj,
                                size_t offset,
                                size_t size,
-                               std::byte* dst);
+                               std::byte* dst,
+                               prefetching_handle* out_handle = nullptr);
 
   [[nodiscard]] exec::semi_future<bool> device_read_async(const sirius_io_object& obj,
                                                           size_t offset,
                                                           size_t size,
                                                           std::byte* device_ptr,
-                                                          rmm::cuda_stream_view stream);
+                                                          rmm::cuda_stream_view stream,
+                                                          prefetching_handle* out_handle = nullptr);
 
   [[nodiscard]] std::string summary() const;
 
@@ -121,64 +183,19 @@ class prefetching_cache {
 
   std::atomic<bool> _shutting_down{false};
 
-  std::atomic<uint32_t> _ticker{0};  // see prefetch_stats::snapshot for layout
-
-  struct preparation_work_item {
-    static std::pair<std::unique_ptr<preparation_work_item>, prefetching_handle> create(
-      file_entry& file, std::vector<cached_chunk*> ranges)
-    {
-      auto handle = prefetching_handle();
-      return std::make_pair(std::unique_ptr<preparation_work_item>(new preparation_work_item{
-                              std::addressof(file), std::move(ranges), handle.state()}),
-                            std::move(handle));
-    }
-
-    [[nodiscard]] bool is_cancelled() const noexcept { return !alive->load(); }
-
-    [[nodiscard]] std::shared_ptr<const std::atomic<bool>> state() const noexcept { return alive; }
-
-    file_entry* file;
-    std::vector<cached_chunk*> chunks;
-
-   private:
-    preparation_work_item(file_entry* file,
-                          std::vector<cached_chunk*> ranges,
-                          std::shared_ptr<const std::atomic<bool>> alive) noexcept
-      : file(file), chunks(std::move(ranges)), alive(std::move(alive))
-    {
-    }
-
-    std::shared_ptr<const std::atomic<bool>> alive;
-  };
-
-  using preparation_request = std::unique_ptr<preparation_work_item>;
+  std::atomic<uint64_t> _ticker{0};  // see prefetch_stats::snapshot for layout
 
   std::jthread _preparation_thread;
-  duckdb_moodycamel::BlockingConcurrentQueue<preparation_request> _preparation_queue;
+  request_queue_type _preparation_queue;
   std::stop_source _preparation_stop_source;
-
-  struct prefetch_work_item {
-    file_entry* file;
-    std::vector<cached_chunk*> chunks;
-
-    [[nodiscard]] bool is_cancelled() const noexcept { return !alive->load(); }
-
-    std::shared_ptr<const std::atomic<bool>> alive;
-  };
-  using prefetch_request = std::unique_ptr<prefetch_work_item>;
 
   std::jthread _prefetch_thread;
   io::admission_control _rate_limiter;
-  duckdb_moodycamel::BlockingConcurrentQueue<prefetch_request> _prefetch_queue;
+  request_queue_type _prefetch_queue;
   std::stop_source _prefetch_stop_source;
 
-  struct eviction_work_item {
-    file_entry* file;
-    std::vector<cached_chunk*> chunks;
-  };
-  using eviction_request = std::unique_ptr<eviction_work_item>;
   std::jthread _evictor_thread;
-  duckdb_moodycamel::BlockingConcurrentQueue<eviction_request> _eviction_queue;
+  request_queue_type _eviction_queue;
   std::stop_source _evictor_stop_source;
 
   mutable std::shared_mutex _map_mtx;

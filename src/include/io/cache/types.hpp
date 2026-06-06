@@ -31,6 +31,8 @@
 #include <atomic>
 #include <cassert>
 #include <cstddef>
+#include <list>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -47,7 +49,7 @@ namespace sirius::io::cache {
  *   consumer read.
  * - @c disposable: prefetching is temporary and can be discarded when no longer needed.
  */
-enum class prefetching_mode { none, immediate, opportunistic, disposable };
+enum class prefetching_stage { none, opportunistic, immediate, just_in_time, disposable };
 
 // ---------------------------------------------------------------------------
 // buffer_pool — growable pool of pinned chunks
@@ -358,72 +360,6 @@ class entry_state {
   static constexpr uint32_t unpack_pins(uint32_t v) noexcept { return v >> PIN_SHIFT; }
 
   std::atomic<uint32_t> _packed{pack(empty, 0)};
-};
-
-/**
- * @brief Cancellation token returned from @c prefetching_cache::insert.
- *
- * The cache and the caller jointly hold a @c shared_ptr<atomic<bool>>.  The
- * caller flips the flag to false (via @c cancel) when the consumer no longer
- * needs the prefetched data; the cache's pipeline checks the flag before
- * doing work on the corresponding @c work_item and skips when cancelled.
- *
- * When @c cancel is called the handle also signals the cache's evictor so
- * it can immediately reclaim any memory that was already allocated for this
- * request but has not yet been dispatched to IO.
- *
- * Lifetime:
- *   - The handle returned by @c insert outlives the @c work_item it
- *     references (both hold the same @c shared_ptr).  Either side dropping
- *     does not invalidate the other.
- *   - A default-constructed handle is "empty": @c cancel is a no-op and
- *     @c operator bool() returns false.  Returned by @c insert when the
- *     cache is dormant or no new prefetch work was scheduled.
- */
-class prefetching_handle {
- public:
-  prefetching_handle() noexcept : _alive(std::make_shared<std::atomic<bool>>(true)) {}
-
-  ~prefetching_handle() { cancel(); }
-
-  prefetching_handle(prefetching_handle const&)            = delete;
-  prefetching_handle& operator=(prefetching_handle const&) = delete;
-
-  prefetching_handle(prefetching_handle&& o) noexcept : _alive(std::move(o._alive)) {}
-
-  prefetching_handle& operator=(prefetching_handle&& o) noexcept
-  {
-    if (this != &o) {
-      cancel();
-      _alive = std::move(o._alive);
-    }
-    return *this;
-  }
-
-  /// Mark the prefetch as no longer wanted.  Idempotent; safe on an empty
-  /// handle.  Thread-safe with respect to the pipeline's cancellation checks:
-  /// concurrent calls to @c cancel() on the same handle from multiple threads
-  /// are safe (the alive flag is an atomic).  However, @c cancel() is NOT safe
-  /// concurrent with move-construction or move-assignment on the same handle
-  /// instance — handles are scoped per-caller and are not moved while in use.
-  /// Flips the alive flag and signals the cache's evictor so it can reclaim
-  /// any pre-allocated memory for this request immediately.
-  /// Note: the per-file n_request counter is decremented on destruction (or
-  /// move-out), not on cancel.
-  void cancel() noexcept;
-
-  /// True if this handle is bound to a real prefetch request (i.e. came
-  /// from an @c insert that scheduled work).
-  explicit operator bool() const noexcept { return _alive != nullptr; }
-
-  [[nodiscard]] std::shared_ptr<const std::atomic<bool>> state() const noexcept { return _alive; }
-
- private:
-  friend class prefetching_cache;
-
-  /// Shared with the corresponding @c work_item / @c prefetch_request.
-  /// true == still wanted; false == cancelled, worker / evictor should drop.
-  std::shared_ptr<std::atomic<bool>> _alive;
 };
 
 struct alignas(64) chunk_lifecycle {

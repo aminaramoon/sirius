@@ -19,6 +19,7 @@
 #include "cucascade/cuda/event.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/try.hpp"
+#include "io/cache/types.hpp"
 #include "io/io_context.hpp"
 #include "io/types.hpp"
 
@@ -40,6 +41,79 @@
 #include <utility>
 
 namespace sirius::io::cache {
+
+class prefetching_handle::prefetch_lifecycle_manager {
+ public:
+  explicit prefetch_lifecycle_manager(
+    prefetching_cache::prefetch_request ctx,
+    prefetching_cache::request_queue_type& eviction_queue,
+    prefetching_cache::request_queue_type& prefetch_queue) noexcept
+    : _eviction_queue(eviction_queue), _prefetch_queue(prefetch_queue)
+  {
+    if (ctx) {
+      _user_state        = ctx->user_state;
+      _prefetching_state = ctx->state;
+      _ctx               = std::move(ctx);
+    }
+  }
+
+  ~prefetch_lifecycle_manager() noexcept { evict(); }
+
+  void activate() noexcept
+  {
+    prefetching_handle_state expected = prefetching_handle_state::idle;
+    if (_user_state->compare_exchange_strong(expected, prefetching_handle_state::active)) {
+      auto ctx = _ctx.lock();
+      if (ctx and _prefetching_state->mark_loading()) { _prefetch_queue.enqueue(std::move(ctx)); }
+    }
+  }
+
+  void cancel() noexcept { _user_state->store(prefetching_handle_state::cancelled); }
+
+  [[nodiscard]] bool is_active() const noexcept
+  {
+    return _user_state->load(std::memory_order_acquire) == prefetching_handle_state::active;
+  }
+
+  void evict() noexcept
+  {
+    cancel();
+    auto ctx = _ctx.lock();
+    if (ctx) { _eviction_queue.enqueue(std::move(ctx)); }
+  }
+
+ private:
+  std::weak_ptr<prefetch_request_context> _ctx;
+  std::shared_ptr<std::atomic<prefetching_handle_state>> _user_state;
+  std::shared_ptr<entry_state> _prefetching_state;
+  prefetching_cache::request_queue_type& _eviction_queue;
+  prefetching_cache::request_queue_type& _prefetch_queue;
+};
+
+prefetching_handle::prefetching_handle() noexcept = default;
+prefetching_handle::~prefetching_handle()         = default;
+
+prefetching_handle::prefetching_handle(prefetching_handle&& o) noexcept            = default;
+prefetching_handle& prefetching_handle::operator=(prefetching_handle&& o) noexcept = default;
+
+void prefetching_handle::activate() noexcept
+{
+  if (_state) { _state->activate(); }
+}
+
+void prefetching_handle::cancel() noexcept
+{
+  if (_state) { _state->cancel(); }
+}
+
+bool prefetching_handle::is_active() const noexcept { return _state && _state->is_active(); }
+
+prefetching_handle::prefetching_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept
+  : _state(std::move(mgr))
+{
+}
+
+prefetching_handle::operator bool() const noexcept { return _state != nullptr; }
 
 // ===========================================================================
 // buffer_pool
@@ -336,29 +410,23 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
 prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
                                              std::span<const byte_range> ranges)
 {
+  if (!_armed) { return prefetching_handle(nullptr); }
+
   const auto& key = obj.raw_file_cache_id();
   auto& file      = get_or_create_file_entry(obj);
 
   std::vector<size_t> chunk_offsets;  // sorted
   std::size_t last_offset = 0;
-  std::ranges::for_each(ranges, [&](auto const& r) {
-    auto const off         = static_cast<size_t>(r.offset());
-    auto const sz          = static_cast<size_t>(r.size());
-    auto const chunk_bytes = _pool->chunk_bytes();
-    auto const aligned_off = (r.offset() / chunk_bytes) * chunk_bytes;
-    auto const aligned_sz =
-      ((off + sz + chunk_bytes - 1) / chunk_bytes) * chunk_bytes - aligned_off;
-    for (size_t o = aligned_off; o < aligned_off + aligned_sz; o += chunk_bytes) {
-      if (o < last_offset) continue;  // already covered by a previous range, overlapping ranges
-      last_offset = o;
-      chunk_offsets.push_back(o);
-    }
-  });
+  auto coalesged_ranges   = _io_ctx->align_and_coalesce(ranges, _pool->chunk_bytes());
 
   auto chunks_to_fetch =
     file.update_and_get_chunks(chunk_offsets, _ticker.load(std::memory_order_relaxed));
 
-  auto [work, handle] = preparation_work_item::create(file, std::move(chunks_to_fetch));
+  auto work    = std::make_shared<prefetch_request_context>(obj, _ticker.load());
+  work->chunks = std::move(chunks_to_fetch);
+
+  prefetching_handle handle(std::make_unique<prefetching_handle::prefetch_lifecycle_manager>(
+    work, _eviction_queue, _prefetch_queue));
   _preparation_queue.enqueue(std::move(work));
 
   return std::move(handle);
@@ -367,7 +435,8 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
 bool prefetching_cache::host_read(const sirius_io_object& obj,
                                   size_t offset,
                                   size_t size,
-                                  std::byte* dst)
+                                  std::byte* dst,
+                                  prefetching_handle* out_handle)
 {
   if (size == 0 || dst == nullptr) return true;
 
@@ -411,9 +480,12 @@ exec::semi_future<bool> prefetching_cache::device_read_async(const sirius_io_obj
                                                              size_t offset,
                                                              size_t size,
                                                              std::byte* dst,
-                                                             rmm::cuda_stream_view stream)
+                                                             rmm::cuda_stream_view stream,
+                                                             prefetching_handle* out_handle)
 {
   if (size == 0 || dst == nullptr) { return true; }
+
+  if (out_handle && *out_handle) { out_handle->cancel(); }
 
   file_entry* file = nullptr;
   {
@@ -568,7 +640,7 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
   });
 
   while (!_shutting_down && !st.stop_requested()) {
-    preparation_request req = nullptr;
+    prefetch_request req = nullptr;
     _preparation_queue.wait_dequeue(req);
     if (req == nullptr) { continue; }  // spurious wakeup or shutdown
 
@@ -604,20 +676,17 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
       }
     }
 
+    std::ignore = req->state->mark_allocated();
+
     if (!_io_ctx->supports_vector_host_read() ||
-        _io_ctx->preferred_prefetching_mode() == prefetching_mode::disposable) {
+        _io_ctx->preferred_prefetching_stage() == prefetching_stage::disposable) {
       // either the backend doesn't support scatter-gather reads or it prefers not to reuse
       // buffers for multiple reads.  In either case, we can skip the prefetching step and let the
       // read() path handle the IO directly into the caller's buffer.
       continue;
     }
 
-    auto prefetch_req    = std::make_unique<prefetch_work_item>();
-    prefetch_req->file   = req->file;
-    prefetch_req->chunks = std::move(chunks);
-    prefetch_req->alive  = req->state();
-
-    if (!st.stop_requested()) { _prefetch_queue.enqueue(std::move(prefetch_req)); }
+    if (req->is_active() && !st.stop_requested()) { _prefetch_queue.enqueue(std::move(req)); }
   }
 }
 
@@ -633,7 +702,7 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
     if (req == nullptr || req->is_cancelled()) { continue; }
 
     auto& allocated_chunks = req->chunks;
-    auto& io_obj           = req->file->io_obj;
+    auto& io_obj           = req->obj;
     std::vector<io::io_object_segment> segments;
 
     segments.reserve(allocated_chunks.size());
@@ -649,12 +718,7 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
                                           }),
                            allocated_chunks.end());
 
-    // request was cancelled
-    if (req->is_cancelled()) {
-      std::ranges::for_each(
-        allocated_chunks, [&](cached_chunk* c) { static_cast<void>(c->state.mark_load_failed()); });
-      continue;
-    }
+    std::ignore = req->state->mark_loading();
 
     // todo(amin): mark the cache_entries
     _io_ctx->host_read_ranges_async_io(*io_obj, segments)
@@ -671,19 +735,6 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
 void prefetching_cache::evict_loop(const std::stop_token& st)
 {
   while (!_shutting_down && !st.stop_requested()) {}
-}
-
-// ===========================================================================
-// prefetching_handle
-// ===========================================================================
-
-void prefetching_handle::cancel() noexcept
-{
-  if (!_alive) return;
-  // Flip the shared alive flag to false.  The cache's preparation / prefetch
-  // workers read this through work_item::is_cancelled() and drop still-pending
-  // entries.  Idempotent and thread-safe (the flag is atomic).
-  _alive->store(false, std::memory_order_release);
 }
 
 }  // namespace sirius::io::cache
