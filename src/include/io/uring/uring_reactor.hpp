@@ -155,7 +155,7 @@ class uring_reactor {
 
   static request_type_ptr prep_device_rx_request(const reactor_config_type& cfg,
                                                  const io_object_type& file,
-                                                 std::byte* dst,
+                                                 uint8_t* dst,
                                                  size_t offset,
                                                  size_t size,
                                                  rmm::cuda_stream_view stream,
@@ -164,7 +164,7 @@ class uring_reactor {
   static request_type_ptr prep_host_to_device_rx_request(const reactor_config_type& cfg,
                                                          const io_object_type& file,
                                                          std::span<io_object_segment> bounce,
-                                                         std::byte* dst,
+                                                         uint8_t* dst,
                                                          size_t offset,
                                                          size_t size,
                                                          rmm::cuda_stream_view stream,
@@ -186,7 +186,7 @@ class uring_reactor {
   void shutdown();
 
   /// Synchronous buffered host read (pread on @p fd).  Blocks the caller.
-  size_t host_read(const io_object_type& file, size_t offset, size_t size, std::byte* dst);
+  size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
   void enqueue(request_type_ptr req);
 

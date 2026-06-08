@@ -47,7 +47,7 @@ namespace {
 
 // A fake buffer base used only so io_object_segment::data() is non-null; the
 // pure grouping/iovec logic never dereferences it.
-std::byte* fake_ptr(uintptr_t v) { return reinterpret_cast<std::byte*>(v); }
+uint8_t* fake_ptr(uintptr_t v) { return reinterpret_cast<uint8_t*>(v); }
 
 // Build a local_io_object over a real temp file (two distinct O_RDONLY fds so
 // odirect_handle() != buffered_handle()).  O_DIRECT is intentionally avoided so
@@ -295,10 +295,10 @@ TEST_CASE("prep_host_rxv_request does not fuse segments with different fds", "[u
   // segments are contiguous, so only the differing fd prevents fusion.
   void* aligned = std::aligned_alloc(sirius::io::IO_BLOCK_SIZE, sirius::io::IO_BLOCK_SIZE);
   REQUIRE(aligned != nullptr);
-  auto* misaligned = reinterpret_cast<std::byte*>(aligned) + 1;
+  auto* misaligned = reinterpret_cast<uint8_t*>(aligned) + 1;
 
   std::vector<io_object_segment> segs{
-    {0, sirius::io::IO_BLOCK_SIZE, reinterpret_cast<std::byte*>(aligned)},
+    {0, sirius::io::IO_BLOCK_SIZE, reinterpret_cast<uint8_t*>(aligned)},
     {sirius::io::IO_BLOCK_SIZE, sirius::io::IO_BLOCK_SIZE, misaligned}};
   REQUIRE(segs[0].is_odirect_compatible());
   REQUIRE_FALSE(segs[1].is_odirect_compatible());

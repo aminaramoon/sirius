@@ -68,7 +68,7 @@ struct io_slot {
   };
 
   using slot_token = slot_pool<NUM_CHUNKS>::token;
-  explicit io_slot(int slot_index, std::byte* internal_buffer)
+  explicit io_slot(int slot_index, uint8_t* internal_buffer)
     : slot_index(slot_index), internal_buffer(internal_buffer)
   {
     assert(internal_buffer && "io_slot: internal_buffer must not be null");
@@ -159,7 +159,7 @@ struct io_slot {
   slot_token release_slot() noexcept { return std::exchange(pool_token, {}); }
 
   int slot_index;
-  std::byte* const internal_buffer;
+  uint8_t* const internal_buffer;
   std::unique_ptr<chunked_rx_request> req;
   bool use_internal_buffer{false};
   size_t bytes_read{0};
@@ -185,10 +185,10 @@ struct io_slot {
 [[nodiscard]] chunk_io_request_type_ptr make_device_chunk(int fd,
                                                           size_t window_off,
                                                           size_t read_size,
-                                                          std::byte* host_buf,
+                                                          uint8_t* host_buf,
                                                           size_t req_offset,
                                                           size_t req_size,
-                                                          std::byte* dst,
+                                                          uint8_t* dst,
                                                           rmm::cuda_stream_view stream,
                                                           int device_id,
                                                           size_t file_size,
@@ -232,7 +232,7 @@ struct io_slot {
   io_object_segment seg,
   size_t req_offset,
   size_t req_size,
-  std::byte* dst,
+  uint8_t* dst,
   rmm::cuda_stream_view stream,
   int device_id,
   size_t file_size,
@@ -257,7 +257,7 @@ struct io_slot {
            "non-overlapping segments before building a device copy");
     cpy->copies.push_back(device_cpy_request::copy{
       /*dst=*/dst + (data_lo - req_offset),  // where this buffer lands in dst
-      /*src=*/static_cast<std::byte*>(b.iov_base) + (data_lo - file_lo),  // wanted data in buffer
+      /*src=*/static_cast<uint8_t*>(b.iov_base) + (data_lo - file_lo),  // wanted data in buffer
       /*src_off=*/0,
       /*size=*/data_hi - data_lo});
     file_lo = file_hi;
@@ -493,7 +493,7 @@ request_type_ptr uring_reactor::prep_host_rx_request(const reactor_config_type& 
 
 request_type_ptr uring_reactor::prep_device_rx_request(const reactor_config_type& cfg,
                                                        const io_object_type& file,
-                                                       std::byte* dst,
+                                                       uint8_t* dst,
                                                        size_t offset,
                                                        size_t size,
                                                        rmm::cuda_stream_view stream,
@@ -534,7 +534,7 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
   const reactor_config_type& cfg,
   const io_object_type& file,
   std::span<io_object_segment> segments,
-  std::byte* dst,
+  uint8_t* dst,
   size_t offset,
   size_t size,
   rmm::cuda_stream_view stream,
@@ -720,7 +720,7 @@ bool uring_reactor::supports(std::string_view path)
 size_t uring_reactor::host_read(const io_object_type& file,
                                 size_t offset,
                                 size_t size,
-                                std::byte* dst)
+                                uint8_t* dst)
 {
   if (size == 0) return 0;
   // Loop until either the full requested size is read, EOF (n == 0), or a
@@ -788,7 +788,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
   std::vector<io_slot> slots;
   slots.reserve(NUM_CHUNKS);
   std::ranges::transform(iovecs, std::back_inserter(slots), [i = 0](auto& b) mutable {
-    return io_slot(i++, reinterpret_cast<std::byte*>(b.iov_base));
+    return io_slot(i++, reinterpret_cast<uint8_t*>(b.iov_base));
   });
 
   std::array<io_uring_cqe*, NUM_CHUNKS> cqes;

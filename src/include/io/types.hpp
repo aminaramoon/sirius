@@ -117,22 +117,22 @@ class io_object_segment {
   {
   }
 
-  io_object_segment(size_t offset, size_t size, std::byte* buffer)
+  io_object_segment(size_t offset, size_t size, uint8_t* buffer)
     : offset(offset), size(size), buffers{iovec{static_cast<void*>(buffer), size}}
   {
   }
 
   /// Set the destination of a single-buffer segment (the bounce-slot path
   /// assigns the reactor's internal buffer late, once a slot is acquired).
-  void set_data(std::byte* buffer)
+  void set_data(uint8_t* buffer)
   {
     assert(buffers.size() == 1 && "set_data is only valid for a single-buffer segment");
     buffers.front().iov_base = static_cast<void*>(buffer);
   }
 
-  [[nodiscard]] std::byte* data() const noexcept
+  [[nodiscard]] uint8_t* data() const noexcept
   {
-    return buffers.empty() ? nullptr : static_cast<std::byte*>(buffers.front().iov_base);
+    return buffers.empty() ? nullptr : static_cast<uint8_t*>(buffers.front().iov_base);
   }
 
   [[nodiscard]] bool is_buffer_allocated() const noexcept { return data() != nullptr; }
@@ -179,7 +179,7 @@ class io_object_segment {
         skip -= iov.iov_len;
         continue;
       }
-      out.push_back(iovec{static_cast<std::byte*>(iov.iov_base) + skip, iov.iov_len - skip});
+      out.push_back(iovec{static_cast<uint8_t*>(iov.iov_base) + skip, iov.iov_len - skip});
       skip = 0;
     }
   }

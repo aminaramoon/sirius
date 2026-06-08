@@ -83,7 +83,7 @@ concept io_reactor_c = requires(R r,
                                 typename R::reactor_config_type cfg,
                                 size_t offset,
                                 size_t size,
-                                std::byte* dst,
+                                uint8_t* dst,
                                 std::string_view path,
                                 std::string path_str) {
   typename R::io_object_type;
@@ -124,7 +124,7 @@ template <class R>
 concept reactor_has_device_rx = requires(R r,
                                          typename R::io_object_type file,
                                          typename R::reactor_config_type cfg,
-                                         std::byte* dst,
+                                         uint8_t* dst,
                                          size_t offset,
                                          size_t size,
                                          rmm::cuda_stream_view stream) {
@@ -137,7 +137,7 @@ template <class R>
 concept reactor_has_host_to_device_rx = requires(R r,
                                                  typename R::io_object_type file,
                                                  typename R::reactor_config_type cfg,
-                                                 std::byte* dst,
+                                                 uint8_t* dst,
                                                  size_t offset,
                                                  size_t size,
                                                  rmm::cuda_stream_view stream,
@@ -168,7 +168,6 @@ struct reactor_traits {
   static constexpr bool supports_device_read = reactor_has_device_rx<R>;
 
   /// Device reads staged through a caller-supplied pinned host bounce buffer
-  /// (a cache::bounce_buffer_provider).
   static constexpr bool supports_host_to_device_read = reactor_has_host_to_device_rx<R>;
 
   /// Batched (vectored) host reads dispatched in a single call.
@@ -307,7 +306,7 @@ class templated_ioctx : public sirius_ioctx {
   size_t host_read_io(const sirius_io_object& obj,
                       size_t offset,
                       size_t size,
-                      std::byte* dst) override
+                      uint8_t* dst) override
   {
     auto& tobj = as_typed(obj);
     size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
@@ -318,7 +317,7 @@ class templated_ioctx : public sirius_ioctx {
   exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
                                                size_t offset,
                                                size_t size,
-                                               std::byte* dst) noexcept override
+                                               uint8_t* dst) noexcept override
   {
     try {
       auto& tobj = as_typed(obj);
@@ -348,7 +347,7 @@ class templated_ioctx : public sirius_ioctx {
   exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
                                                  size_t offset,
                                                  size_t size,
-                                                 std::byte* dst,
+                                                 uint8_t* dst,
                                                  rmm::cuda_stream_view stream) noexcept override
   {
     if constexpr (reactor_traits_t::supports_device_read) {
@@ -384,7 +383,7 @@ class templated_ioctx : public sirius_ioctx {
     std::span<io_object_segment> slices,
     size_t offset,
     size_t size,
-    std::byte* dst,
+    uint8_t* dst,
     rmm::cuda_stream_view stream) noexcept override
   {
     if constexpr (reactor_traits_t::supports_host_to_device_read) {

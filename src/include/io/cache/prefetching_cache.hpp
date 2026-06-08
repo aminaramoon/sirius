@@ -49,7 +49,7 @@ namespace sirius::io::cache {
 enum class prefetching_handle_state { idle, active, cancelled };
 
 struct prefetch_request_context {
-  explicit prefetch_request_context(const sirius_io_object& file, std::uint64_t ts) noexcept
+  explicit prefetch_request_context(const sirius_io_object& file, std::uint32_t ts) noexcept
     : timestamp(ts),
       obj(file.shared_from_this()),
       state(std::make_shared<entry_state>()),
@@ -70,7 +70,7 @@ struct prefetch_request_context {
            user_state->load(std::memory_order_acquire) == prefetching_handle_state::cancelled;
   }
 
-  const std::uint64_t timestamp;
+  const std::uint32_t timestamp;
   const std::shared_ptr<const sirius_io_object> obj;
   std::shared_ptr<entry_state> state;
   std::shared_ptr<std::atomic<prefetching_handle_state>> user_state;
@@ -92,6 +92,8 @@ class prefetching_handle {
   void cancel() noexcept;
 
   [[nodiscard]] bool is_active() const noexcept;
+
+  [[nodiscard]] std::shared_ptr<prefetch_request_context> get_context() const noexcept;
 
   explicit operator bool() const noexcept;
 
@@ -129,7 +131,10 @@ class prefetching_cache {
   using prefetch_request   = std::shared_ptr<prefetch_request_context>;
   using request_queue_type = duckdb_moodycamel::BlockingConcurrentQueue<prefetch_request>;
 
-  prefetching_cache(buffer_pool* pool, sirius_ioctx* io_ctx, size_t inflight_budget_chunks);
+  prefetching_cache(buffer_pool* pool,
+                    sirius_ioctx* io_ctx,
+                    size_t inflight_budget_chunks,
+                    bool dispose_after_use = false);
   ~prefetching_cache();
 
   prefetching_cache(prefetching_cache const&)            = delete;
@@ -137,18 +142,26 @@ class prefetching_cache {
 
   [[nodiscard]] bool is_armed() const noexcept { return _armed; }
 
-  [[nodiscard]] bool host_read(const sirius_io_object& obj,
-                               size_t offset,
-                               size_t size,
-                               std::byte* dst,
-                               prefetching_handle* out_handle = nullptr);
+  [[nodiscard]] std::size_t host_read(const sirius_io_object& obj,
+                                      size_t offset,
+                                      size_t size,
+                                      uint8_t* dst,
+                                      prefetching_handle* out_handle = nullptr);
 
-  [[nodiscard]] exec::semi_future<bool> device_read_async(const sirius_io_object& obj,
-                                                          size_t offset,
-                                                          size_t size,
-                                                          std::byte* device_ptr,
-                                                          rmm::cuda_stream_view stream,
-                                                          prefetching_handle* out_handle = nullptr);
+  [[nodiscard]] exec::semi_future<std::size_t> host_read_async(
+    const sirius_io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    prefetching_handle* out_handle = nullptr);
+
+  [[nodiscard]] exec::semi_future<std::size_t> device_read_async(
+    const sirius_io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* device_ptr,
+    rmm::cuda_stream_view stream,
+    prefetching_handle* out_handle = nullptr);
 
   [[nodiscard]] std::string summary() const;
 
@@ -161,7 +174,9 @@ class prefetching_cache {
   struct file_entry {
     std::vector<cached_chunk*> update_and_get_chunks(std::span<size_t> incoming, uint32_t ticker);
 
-    std::vector<cached_chunk*> fetch_chunks(std::size_t offset, std::size_t size) const;
+    std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
+                                            std::size_t size,
+                                            coverage_policy policy) const;
 
     mutable std::shared_mutex mtx;
     std::shared_ptr<const sirius_io_object> io_obj;
@@ -183,7 +198,28 @@ class prefetching_cache {
 
   std::atomic<bool> _shutting_down{false};
 
-  std::atomic<uint64_t> _ticker{0};  // see prefetch_stats::snapshot for layout
+  std::atomic<uint32_t> _ticker{0};  // see prefetch_stats::snapshot for layout
+
+  // ---- Telemetry counters --------------------------------------------------
+  // Global cumulative counts.  @c _last_reported snapshots them on every cache
+  // refresh (prepare_for_query) so summary() can also report per-cycle deltas.
+  struct counters {
+    std::atomic<uint64_t> n_reads{0};    // device read requests served by the cache
+    std::atomic<uint64_t> hits{0};       // chunks served from cache (read pin acquired, in_use)
+    std::atomic<uint64_t> h2d{0};        // chunks (re)loaded via host->device IO (mark_loading)
+    std::atomic<uint64_t> misses{0};     // chunks read fresh (missing / not yet usable)
+    std::atomic<uint64_t> evictions{0};  // chunks evicted back to the pool
+  };
+  struct counters_snapshot {
+    uint64_t n_reads{0};
+    uint64_t hits{0};
+    uint64_t h2d{0};
+    uint64_t misses{0};
+    uint64_t evictions{0};
+  };
+
+  counters _counters;
+  counters_snapshot _last_reported;
 
   std::jthread _preparation_thread;
   request_queue_type _preparation_queue;
@@ -197,6 +233,7 @@ class prefetching_cache {
   std::jthread _evictor_thread;
   request_queue_type _eviction_queue;
   std::stop_source _evictor_stop_source;
+  bool _dispose_after_use{false};
 
   mutable std::shared_mutex _map_mtx;
   std::unordered_map<std::string, std::unique_ptr<file_entry>> _file_cache;

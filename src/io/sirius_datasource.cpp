@@ -85,16 +85,9 @@ size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
-    try {
-      if (cache->host_read(
-            *_io_object, offset, size, reinterpret_cast<std::byte*>(dst), &_prefetch_handle)) {
-        return size;
-      }
-    } catch (...) {
-      throw;
-    }
+    return cache->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
   }
-  return _io_ctx->host_read_io(*_io_object, offset, size, reinterpret_cast<std::byte*>(dst));
+  return _io_ctx->host_read_io(*_io_object, offset, size, dst);
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_t offset,
@@ -108,19 +101,13 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
+  exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
-    try {
-      if (cache->host_read(
-            *_io_object, offset, size, reinterpret_cast<std::byte*>(dst), &_prefetch_handle)) {
-        return std::async(std::launch::deferred, [size]() { return size; });
-      }
-    } catch (...) {
-      throw;
-    }
+    semi        = cache->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle);
+  } else {
+    semi = _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
   }
-  auto semi =
-    _io_ctx->host_read_async_io(*_io_object, offset, size, reinterpret_cast<std::byte*>(dst));
   return std::async(std::launch::deferred,
                     [size, s = std::move(semi)]() mutable { return std::move(s).get(); });
 }
@@ -130,26 +117,13 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
 {
   auto file_size = _io_object->size();
   size           = std::min(size, file_size > offset ? file_size - offset : size_t{0});
-  auto buf       = std::vector<std::byte>(size);
-  if (uses_prefetching_cache()) {
-    auto* cache = _io_ctx->cache();
-    try {
-      if (cache && cache->host_read(*_io_object, offset, size, buf.data(), &_prefetch_handle)) {
-        return std::async(std::launch::deferred, [size, b = std::move(buf)]() mutable {
-          return datasource::buffer::create(std::move(b));
-        });
-      }
-    } catch (...) {
-      throw;
-    }
-  }
-  auto semi = _io_ctx->host_read_async_io(*_io_object, offset, size, buf.data());
-  return std::async(std::launch::deferred,
-                    [buffer = std::move(buf), semi = std::move(semi)]() mutable {
-                      auto n = std::move(semi).get();
-                      buffer.resize(n);
-                      return datasource::buffer::create(std::move(buffer));
-                    });
+  auto buf       = std::vector<uint8_t>(size);
+  auto fut       = host_read_async(offset, size, buf.data());
+  return std::async(std::launch::deferred, [s = std::move(fut), buf = std::move(buf)]() mutable {
+    auto n = s.get();
+    buf.resize(n);
+    return cudf::io::datasource::buffer::create(std::move(buf));
+  });
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
@@ -176,27 +150,14 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          rmm::cuda_stream_view stream)
 {
+  exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
-    try {
-      auto semi = cache->device_read_async(
-        *_io_object, offset, size, reinterpret_cast<std::byte*>(dst), stream, &_prefetch_handle);
-      if (semi.is_ready()) {
-        if (std::move(semi).get()) {
-          return std::async(std::launch::deferred, [size]() { return size; });
-        }
-      } else {
-        return std::async(std::launch::deferred, [size, s = std::move(semi)]() mutable {
-          return std::move(s).get() ? size : 0;
-        });
-      }
-    } catch (...) {
-      throw;
-    }
+    semi = cache->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle);
+  } else {
+    semi = _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
   }
-
-  return bridge_semi_to_std(_io_ctx->device_read_async_io(
-    *_io_object, offset, size, reinterpret_cast<std::byte*>(dst), stream));
+  return bridge_semi_to_std(std::move(semi));
 }
 
 std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const

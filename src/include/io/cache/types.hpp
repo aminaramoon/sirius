@@ -28,12 +28,18 @@
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <concepts>
 #include <cstddef>
+#include <iterator>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <ranges>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace sirius::io::cache {
@@ -81,17 +87,17 @@ class buffer_pool {
 
   /// Allocate a single chunk.  Returns nullptr when the pool is exhausted
   /// and the upstream resource cannot supply a fresh slab.
-  std::byte* allocate();
+  uint8_t* allocate();
 
   /// Bulk-allocate up to @p n chunks, appending pointers to @p out.
   /// Returns the number actually allocated (may be < n if the pool is
   /// exhausted and cannot grow).
-  size_t allocate_bulk(size_t n, std::vector<std::byte*>& out);
+  size_t allocate_bulk(size_t n, std::vector<uint8_t*>& out);
 
-  void deallocate_bulk(std::vector<std::byte*>& out) noexcept;
+  void deallocate_bulk(std::vector<uint8_t*>& out) noexcept;
 
   /// Return a chunk to the pool.
-  void deallocate(std::byte* p);
+  void deallocate(uint8_t* p);
 
   /// Restore the free list to "all chunks free".  Caller must guarantee
   /// every previously-handed-out chunk is no longer in use — the pool
@@ -138,7 +144,7 @@ class buffer_pool {
   // the multiple_blocks_allocation destructor is what returns blocks to
   // the resource, so we never drop these until the pool is destroyed.
   std::vector<cucascade::memory::fixed_multiple_blocks_allocation> _allocations;
-  std::vector<std::byte*> _free_list;
+  std::vector<uint8_t*> _free_list;
 
   std::atomic<uint32_t> _total_free{0};
   std::atomic<uint32_t> _total_chunks{0};
@@ -249,11 +255,6 @@ class entry_state {
     return ok;
   }
 
-  /// loading → in_use(pin_count = 1).  Returns false on precondition mismatch.
-  /// Used by @c cached_bounce_buffer_provider to finish a direct-device read while
-  /// keeping the entry pinned across the caller's H2D copy: a subsequent
-  /// stream callback drops the pin (in_use → cached) once the stream
-  /// completes.  Wakes any threads parked in @c wait_while_pending().
   [[nodiscard]] bool mark_loading_in_use() noexcept
   {
     auto expected = pack(loading, 0);
@@ -370,6 +371,7 @@ struct alignas(64) chunk_lifecycle {
   static constexpr uint64_t READ_MASK   = 0xFFFFull << READ_SHIFT;
   static constexpr uint64_t TICK_SHIFT  = 32;
   static constexpr uint64_t TICK_MASK   = 0xFFFFFFFFull << TICK_SHIFT;
+  static constexpr uint64_t FRESH_SCORE = 4;
 
   static constexpr uint64_t pack(uint32_t tick, uint16_t reads, uint16_t inserts) noexcept
   {
@@ -424,7 +426,12 @@ struct alignas(64) chunk_lifecycle {
     uint16_t reads;
     uint16_t inserts;
 
-    [[nodiscard]] uint16_t outstanding() const noexcept { return inserts - reads; }
+    [[nodiscard]] uint16_t eviction_tier(uint32_t query_tick) const noexcept
+    {
+      return query_tick > tick
+               ? 0
+               : (inserts > reads ? std::min<uint16_t>(inserts - reads, FRESH_SCORE) : 0);
+    }
   };
 
   [[nodiscard]] snapshot load() const noexcept
@@ -449,64 +456,97 @@ struct alignas(64) cached_chunk {
   explicit cached_chunk(size_t off) : offset(off) {}
 
   std::size_t offset;
-  std::byte* data;
+  uint8_t* data;
   entry_state state;
   chunk_lifecycle lifecycle;
 };
 
-// ---------------------------------------------------------------------------
-// cached_bounce_buffer_provider — pre-allocated bounce buffers for device reads
-// ---------------------------------------------------------------------------
-//
-// Vended by @c prefetching_cache::read() when the caller passes a non-null
-// out-pointer and the target entry is in the @c allocated state.
-// @c read() flips the entry to @c loading and transfers ownership to this
-// object; the caller then passes it to
-// @c sirius_ioctx::device_read_async_io_using() to issue file → bounce →
-// device IO using the chunks that are already allocated.
-//
-// Lifecycle:
-//   constructed → prepare_device_requests() called → IO dispatched
-//       → mark_cached() on success  (loading → cached)
-//       → mark_load_failed() on failure  (loading → empty, chunks freed)
-//   If destroyed before either mark is called (e.g. IO never dispatched),
-//   the destructor calls mark_load_failed() as a safety net.
-//
-// Thread safety: a single owner thread; mark_cached/mark_load_failed are
-// called from the reactor completion callback (same logical sequence).
-
-class bounce_buffer_provider {
- public:
-  bounce_buffer_provider() = default;
-
-  bounce_buffer_provider(std::span<cached_chunk*> chunks, size_t chunk_bytes) noexcept
-    : _entry(chunks.begin(), chunks.end()), _chunk_bytes(chunk_bytes)
-  {
-  }
-
-  // Return one io_object_segment per cached chunk whose range
-  // [chunk->offset, chunk->offset + chunk_bytes) overlaps the requested
-  // window [offset, offset + size).  The returned segments cover the full
-  // chunk range (not clipped to the request) so the caller can issue
-  // chunk-aligned file → bounce → device IO into the pre-allocated buffers.
-  [[nodiscard]] std::vector<io_object_segment> get_buffers(size_t offset, size_t size) const
-  {
-    std::vector<io_object_segment> segments;
-    segments.reserve(_entry.size());
-    size_t const req_end = offset + size;
-    for (cached_chunk* c : _entry) {
-      size_t const chunk_start = c->offset;
-      size_t const chunk_end   = chunk_start + _chunk_bytes;
-      if (chunk_start < req_end && chunk_end > offset) {
-        segments.emplace_back(chunk_start, _chunk_bytes, c->data);
-      }
-    }
-    return segments;
-  }
-
- private:
-  std::vector<cached_chunk*> _entry;
-  size_t _chunk_bytes{0};
+// Coverage requirement for find_entry.
+enum class coverage_policy {
+  full,     // return the chunks only when they fully cover [offset, offset + size); else none
+  partial,  // return every chunk overlapping [offset, offset + size), even if coverage is partial
 };
+
+// A pointer-like handle to a cached_chunk: a raw pointer or a smart pointer
+// (std::unique_ptr / std::shared_ptr), with or without const.  std::to_address
+// yields the underlying cached_chunk* (const-qualified iff the handle is to a
+// const cached_chunk).
+template <class P>
+concept cached_chunk_pointer = requires(const P& p) {
+  { std::to_address(p) } -> std::convertible_to<const cached_chunk*>;
+};
+
+// Find the cached chunks of @p chunks (sorted by offset, non-overlapping,
+// fixed-size) that serve the request [@p offset, @p offset + @p size).
+//
+// With coverage_policy::full the request must be wholly covered or an empty
+// vector is returned; with coverage_policy::partial every overlapping chunk is
+// returned regardless of gaps.  Pure lookup: it does not mutate the chunks
+// (callers apply lifecycle side effects on the result).  Accepts any contiguous
+// range (vector, span, array, …) of cached_chunk pointer handles (raw / shared /
+// unique, const or not); the returned pointers preserve the handle's constness.
+template <std::ranges::contiguous_range Chunks>
+  requires cached_chunk_pointer<std::ranges::range_value_t<Chunks>>
+[[nodiscard]] std::vector<
+  decltype(std::to_address(std::declval<const std::ranges::range_value_t<Chunks>&>()))>
+find_entry(const Chunks& chunks, std::size_t offset, std::size_t size, coverage_policy policy)
+{
+  using chunk_ptr_t =
+    decltype(std::to_address(std::declval<const std::ranges::range_value_t<Chunks>&>()));
+  constexpr std::size_t chunk_size = 1 << 20;  // must match buffer_pool's chunk size
+  if (size == 0) return {};
+
+  auto const first        = std::ranges::begin(chunks);
+  auto const last         = std::ranges::end(chunks);
+  const std::size_t count = std::ranges::size(chunks);
+
+  // Align the request to chunk boundaries.
+  const std::size_t first_chunk_off = (offset / chunk_size) * chunk_size;
+  const std::size_t end_off         = offset + size;
+  const std::size_t last_chunk_off  = ((end_off - 1) / chunk_size) * chunk_size;
+  const std::size_t expected_count  = (last_chunk_off - first_chunk_off) / chunk_size + 1;
+
+  // Find the first chunk at/after the aligned start (chunks are sorted).
+  auto first_it = std::lower_bound(first, last, first_chunk_off, [](const auto& c, std::size_t v) {
+    return std::to_address(c)->offset < v;
+  });
+
+  if (policy == coverage_policy::full) {
+    if (count < expected_count) return {};
+    if (first_it == last || std::to_address(*first_it)->offset != first_chunk_off) {
+      return {};  // first chunk missing
+    }
+
+    // Check the last chunk is at the expected position.
+    const auto first_idx       = static_cast<std::size_t>(std::distance(first, first_it));
+    const std::size_t last_idx = first_idx + expected_count - 1;
+
+    if (last_idx >= count) return {};
+    if (std::to_address(first[last_idx])->offset != last_chunk_off) return {};
+
+    // Coverage confirmed by the invariant: sorted + non-overlapping + fixed-size
+    // means consecutive chunks differ by exactly chunk_size, so the intermediates
+    // are forced once the first and last are at the expected positions.
+    std::vector<chunk_ptr_t> result;
+    result.reserve(expected_count);
+    for (std::size_t i = 0; i < expected_count; ++i) {
+      first[first_idx + i]
+        ->lifecycle.on_consume();  // side effect: count this chunk as consumed for eviction scoring
+      result.push_back(std::to_address(first[first_idx + i]));
+    }
+    return result;
+  }
+
+  // coverage_policy::partial: return every chunk overlapping the request range,
+  // even when some are missing (the invariant means offsets in
+  // [first_chunk_off, last_chunk_off] are exactly the overlapping chunks).
+  std::vector<chunk_ptr_t> result;
+  result.reserve(expected_count);
+  for (auto it = first_it; it != last && std::to_address(*it)->offset <= last_chunk_off; ++it) {
+    std::to_address(*it)->lifecycle.on_consume();
+    result.push_back(std::to_address(*it));
+  }
+  return result;
+}
 
 }  // namespace sirius::io::cache

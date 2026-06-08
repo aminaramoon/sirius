@@ -80,7 +80,7 @@ std::vector<cudf::io::text::byte_range_info> kvikio_context::align_and_coalesce(
 size_t kvikio_context::host_read_io(const sirius_io_object& obj,
                                     size_t offset,
                                     size_t size,
-                                    std::byte* dst)
+                                    uint8_t* dst)
 {
   return as_kvikio(obj).datasource().host_read(offset, size, reinterpret_cast<uint8_t*>(dst));
 }
@@ -88,7 +88,7 @@ size_t kvikio_context::host_read_io(const sirius_io_object& obj,
 exec::semi_future<size_t> kvikio_context::host_read_async_io(const sirius_io_object& obj,
                                                              size_t offset,
                                                              size_t size,
-                                                             std::byte* dst) noexcept
+                                                             uint8_t* dst) noexcept
 {
   auto fut =
     as_kvikio(obj).datasource().host_read_async(offset, size, reinterpret_cast<uint8_t*>(dst));
@@ -99,7 +99,7 @@ exec::semi_future<size_t> kvikio_context::device_read_async_io(
   const sirius_io_object& obj,
   size_t offset,
   size_t size,
-  std::byte* dst,
+  uint8_t* dst,
   rmm::cuda_stream_view stream) noexcept
 {
   auto fut = as_kvikio(obj).datasource().device_read_async(
@@ -112,7 +112,7 @@ exec::semi_future<size_t> kvikio_context::host_to_device_read_async_io(
   std::span<io_object_segment> slices,
   size_t offset,
   size_t size,
-  std::byte* device_dst,
+  uint8_t* device_dst,
   rmm::cuda_stream_view stream) noexcept
 {
   return exec::make_semi_future<size_t>(std::make_exception_ptr(

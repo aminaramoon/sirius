@@ -128,15 +128,15 @@ struct device_cpy_request {
   // pointer (the multi-buffer readv path, whose buffers are separate host
   // allocations and so cannot share one base).
   struct copy {
-    std::byte* dst{nullptr};
-    std::byte* src{nullptr};
+    uint8_t* dst{nullptr};
+    uint8_t* src{nullptr};
     size_t src_off{0};
     size_t size{0};
   };
 
   // Issue every copy on @p stream (a batch when there is more than one), then
   // record @p event once after the last so a single wait covers them all.
-  cudaError_t copy_async(std::byte* host_buffer,
+  cudaError_t copy_async(uint8_t* host_buffer,
                          [[maybe_unused]] size_t bytes,
                          cudaEvent_t event = nullptr) noexcept
   {
@@ -148,8 +148,8 @@ struct device_cpy_request {
              "Caller must provide a valid device destination buffer for the copy.");
       assert((c.src != nullptr || c.src_off + c.size <= bytes) &&
              "Caller must ensure the copy fits in the host buffer.");
-      std::byte* src_ptr = c.src != nullptr ? c.src : host_buffer + c.src_off;
-      err                = cudaMemcpyAsync(c.dst, src_ptr, c.size, cudaMemcpyHostToDevice, stream);
+      uint8_t* src_ptr = c.src != nullptr ? c.src : host_buffer + c.src_off;
+      err              = cudaMemcpyAsync(c.dst, src_ptr, c.size, cudaMemcpyHostToDevice, stream);
       if (err != cudaSuccess) { return err; }
     }
     if (event != nullptr) { err = cudaEventRecord(event, stream); }
