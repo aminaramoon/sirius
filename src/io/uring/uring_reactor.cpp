@@ -284,6 +284,14 @@ struct merged_segment {
 /// @p max_n_chunks.  Each group becomes one merged segment whose @c buffers are
 /// the concatenated destination iovecs; a 1-buffer group is a plain read, a
 /// multi-buffer group is a readv.  Input @p segments are consumed by move.
+///
+/// Only segments whose destination buffer is already allocated can be fused: a
+/// null-buffer segment must read through one of the reactor's internal bounce
+/// slots (a fixed-buffer single read), which the readv path cannot serve, so it
+/// is always emitted as a standalone group and never fused into or onto a
+/// neighbor.  A run of contiguous segments split by a null-buffer segment in the
+/// middle therefore yields three groups: a vectored head, the single null
+/// segment, and a vectored tail.
 template <typename FdFor>
 [[nodiscard]] std::vector<merged_segment> merge_contiguous(std::span<io_object_segment> segments,
                                                            size_t max_n_chunks,
@@ -294,12 +302,18 @@ template <typename FdFor>
     int const group_fd = fd_for(segments[i]);
     io_object_segment seg{std::move(segments[i])};
     size_t j = i + 1;
-    while (j < segments.size() && seg.n_chunks() + segments[j].n_chunks() <= max_n_chunks &&
-           contiguous(segments[j - 1], segments[j]) && fd_for(segments[j]) == group_fd) {
-      for (auto const& b : segments[j].buffers) {
-        seg.append(b);
+    // A null-buffer segment needs an internal bounce slot and cannot be part of
+    // a readv, so only grow the group when this segment carries a real buffer
+    // and the next one does too.
+    if (seg.is_buffer_allocated()) {
+      while (j < segments.size() && segments[j].is_buffer_allocated() &&
+             seg.n_chunks() + segments[j].n_chunks() <= max_n_chunks &&
+             contiguous(segments[j - 1], segments[j]) && fd_for(segments[j]) == group_fd) {
+        for (auto const& b : segments[j].buffers) {
+          seg.append(b);
+        }
+        ++j;
       }
-      ++j;
     }
     merged.push_back({std::move(seg), group_fd});
     i = j;
