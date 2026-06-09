@@ -71,6 +71,7 @@ find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
+pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl)
 
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
 # as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
@@ -341,11 +342,17 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      OpenSSL::Crypto yaml-cpp::yaml-cpp absl::any_invocable)
+target_link_libraries(
+  sirius_extension
+  PkgConfig::NUMA
+  PkgConfig::LIBURING
+  PkgConfig::LIBCURL
+  OpenSSL::Crypto
+  yaml-cpp::yaml-cpp
+  absl::any_invocable)
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
-                      OpenSSL::Crypto)
+                      PkgConfig::LIBCURL OpenSSL::Crypto)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static / telemetry_bridge)
