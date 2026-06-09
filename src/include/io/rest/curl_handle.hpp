@@ -20,7 +20,6 @@
 
 #include <curl/curl.h>
 #include <curl/multi.h>
-
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
@@ -38,23 +37,23 @@ namespace sirius::io::rest {
 // ---------------------------------------------------------------------------
 
 /// Evaluate a libcurl easy-interface call and throw on a non-OK code.
-#define SIRIUS_CURL_CHECK(call)                                                              \
-  do {                                                                                       \
-    CURLcode _ec = (call);                                                                   \
-    if (_ec != CURLE_OK) {                                                                   \
-      throw std::runtime_error(std::string(__FILE__) + ":" + std::to_string(__LINE__) +      \
-                               " libcurl error: " + curl_easy_strerror(_ec));                \
-    }                                                                                        \
+#define SIRIUS_CURL_CHECK(call)                                                         \
+  do {                                                                                  \
+    CURLcode _ec = (call);                                                              \
+    if (_ec != CURLE_OK) {                                                              \
+      throw std::runtime_error(std::string(__FILE__) + ":" + std::to_string(__LINE__) + \
+                               " libcurl error: " + curl_easy_strerror(_ec));           \
+    }                                                                                   \
   } while (false)
 
 /// Evaluate a libcurl multi-interface call and throw on a non-OK code.
-#define SIRIUS_CURLM_CHECK(call)                                                             \
-  do {                                                                                       \
-    CURLMcode _mc = (call);                                                                  \
-    if (_mc != CURLM_OK) {                                                                   \
-      throw std::runtime_error(std::string(__FILE__) + ":" + std::to_string(__LINE__) +      \
-                               " libcurl-multi error: " + curl_multi_strerror(_mc));         \
-    }                                                                                        \
+#define SIRIUS_CURLM_CHECK(call)                                                        \
+  do {                                                                                  \
+    CURLMcode _mc = (call);                                                             \
+    if (_mc != CURLM_OK) {                                                              \
+      throw std::runtime_error(std::string(__FILE__) + ":" + std::to_string(__LINE__) + \
+                               " libcurl-multi error: " + curl_multi_strerror(_mc));    \
+    }                                                                                   \
   } while (false)
 
 // ---------------------------------------------------------------------------

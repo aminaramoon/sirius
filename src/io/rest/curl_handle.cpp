@@ -24,10 +24,10 @@ namespace {
 
 // Receive buffer handed to libcurl for each transfer; larger than the default
 // 16 KiB to cut write-callback round trips on multi-MiB ranged GETs.
-constexpr long kRecvBufferSize = 128L * 1024L;
-constexpr long kConnectTimeoutMs = 5'000L;
-constexpr long kTransferTimeoutMs = 30'000L;
-constexpr long kMaxConnAgeSec = 20L;
+constexpr long kRecvBufferSize     = 128L * 1024L;
+constexpr long kConnectTimeoutMs   = 5'000L;
+constexpr long kTransferTimeoutMs  = 30'000L;
+constexpr long kMaxConnAgeSec      = 20L;
 constexpr long kDnsCacheTimeoutSec = 600L;
 
 // curl_global_init must run exactly once per process, before any handle is
@@ -94,7 +94,9 @@ void configure_easy_handle(CURL* handle, CURLSH* share_handle)
   if (handle == nullptr) { throw std::runtime_error("rest: configure_easy_handle: null handle"); }
 
   // Connection reuse / sharing.
-  if (share_handle != nullptr) { SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_SHARE, share_handle)); }
+  if (share_handle != nullptr) {
+    SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_SHARE, share_handle));
+  }
   SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_MAXAGE_CONN, kMaxConnAgeSec));
   SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_DNS_CACHE_TIMEOUT, kDnsCacheTimeoutSec));
 
