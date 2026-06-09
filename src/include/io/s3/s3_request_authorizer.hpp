@@ -71,7 +71,7 @@ class s3_request_authorizer {
  public:
   virtual ~s3_request_authorizer() = default;
 
-  s3_request_authorizer()                                         = default;
+  s3_request_authorizer()                                        = default;
   s3_request_authorizer(s3_request_authorizer const&)            = delete;
   s3_request_authorizer& operator=(s3_request_authorizer const&) = delete;
 

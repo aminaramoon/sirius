@@ -37,9 +37,7 @@ namespace sirius::io::s3 {
  */
 class sirius_sigv4_authorizer_base : public s3_request_authorizer {
  public:
-  sirius_sigv4_authorizer_base(static_credentials creds,
-                               std::string region,
-                               std::string endpoint);
+  sirius_sigv4_authorizer_base(static_credentials creds, std::string region, std::string endpoint);
 
  protected:
   static_credentials _creds;
