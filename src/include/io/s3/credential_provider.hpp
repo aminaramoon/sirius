@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "io/s3/s3_object_ref.hpp"
+
 #include <cstdint>
 #include <string>
 
@@ -27,18 +29,6 @@ namespace sirius::io::s3 {
 /// SignatureDoesNotMatch error from S3. Sirius needs only read-only S3
 /// operations; PUT / DELETE etc. are intentionally absent.
 enum class presign_method : std::uint8_t { GET, HEAD };
-
-/**
- * @brief Object reference passed to @c credential_provider::get_presigned_url.
- *
- * @c bucket carries the object-store bucket name (no scheme, no trailing
- * slashes). @c key carries the object key, RFC3986-decoded — the provider
- * re-encodes for canonical URI construction.
- */
-struct s3_object_ref {
-  std::string bucket;
-  std::string key;
-};
 
 /**
  * @brief Pluggable source of presigned object URLs (credential / signer seam).
