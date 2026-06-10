@@ -17,7 +17,6 @@
 #include "io/rest/rest_reactor.hpp"
 
 #include "cucascade/cuda/event.hpp"
-#include "io/details/slot_pool.hpp"
 #include "io/rest/curl_handle.hpp"
 #include "io/uri_parser.hpp"
 
@@ -47,11 +46,6 @@
 namespace sirius::io::rest {
 
 namespace {
-
-// Number of pinned bounce slots for reactor-staged device reads (and the
-// upper bound on concurrent device transfers).  Easy-handle concurrency is
-// bounded separately by config.max_connections.
-constexpr std::size_t NUM_BOUNCE_SLOTS = 64;
 
 // ---- libcurl callbacks -----------------------------------------------------
 
@@ -259,7 +253,7 @@ std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_seg
       uint8_t* base = s.data();
       for (size_t pos = 0; pos < s.size; pos += cs) {
         size_t const piece = std::min(cs, s.size - pos);
-        out.push_back(io_object_segment{s.offset + pos, piece, base + pos});
+        out.emplace_back(s.offset + pos, piece, base + pos);
       }
       ++i;
       continue;
@@ -300,9 +294,11 @@ rest_reactor::rest_reactor(config cfg, std::string_view tname) : _config(std::mo
   (void)global_curl_context::instance();
 
   if (_config.host_memory_resource != nullptr) {
+    // One pinned bounce buffer per slot (1:1 with the easy-handle pool), since a
+    // slot stages at most one device read at a time.
     _bounce_slot_size = _config.host_memory_resource->get_block_size();
-    _bounce_storage =
-      _config.host_memory_resource->allocate_multiple_blocks(NUM_BOUNCE_SLOTS * _bounce_slot_size);
+    _bounce_storage   = _config.host_memory_resource->allocate_multiple_blocks(
+      _config.max_connections * _bounce_slot_size);
   }
 
   _wakeup_fd = make_event_fd();
@@ -396,7 +392,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
   for (auto const& s : segments) {
     size_t const c = s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
     if (c == 0) { continue; }
-    clamped.push_back(io_object_segment{s.offset, c, s.data()});
+    clamped.emplace_back(s.offset, c, s.data());
     bytes_requested += c;
   }
   if (clamped.empty()) { return rest_rx_request::create({}); }
@@ -760,24 +756,27 @@ std::vector<cudf::io::text::byte_range_info> rest_reactor::align_and_coalesce(
 
 namespace {
 
-/// One in-flight ranged GET on a borrowed easy handle.  Owns everything whose
-/// address curl references for the duration of the transfer (the URL string,
-/// the header list, the write/header targets), so the transfer object must
-/// outlive its handle's membership in the multi.
-struct transfer {
+/// One reusable I/O slot — the unit of concurrency, mirroring uring_reactor's
+/// io_slot.  Owns its persistent easy handle and its dedicated pinned bounce
+/// buffer (1:1 with the slot; null when no host memory resource was given), and
+/// carries the per-request state whose address curl references for the duration
+/// of a transfer (the URL string, header list, write/header targets).  The
+/// free-slot list doubles as the bounce-buffer allocator, so there is no
+/// separate bounce pool.
+struct io_slot {
+  // Persistent slot resources (set once at pool creation, never reset):
+  curl_easy_ptr easy;
+  uint8_t* bounce{nullptr};
+
+  // Per-request state (cleared by reset() between requests):
   std::unique_ptr<rest_chunked_rx_request> req;
   std::string url;  // backs CURLOPT_URL
   curl_slist_ptr headers;
   buf_sink sink;
   header_capture hc;
-  // Held only for reactor-staged device reads (null-buffer chunks): the pinned
-  // bounce slot the body lands in.  Released after the H2D copy off it
-  // completes (tracked via a CUDA event), not when the transfer finishes.
-  slot_pool::token bounce_token;
 
-  /// Clear all per-attempt state so the slot can be reused.  Releases the
-  /// bounce slot if still held — a no-op when it was already moved into
-  /// `copying` for an event-tracked H2D copy.
+  /// Clear the per-request state so the slot can serve the next request.  The
+  /// handle and bounce buffer persist.
   void reset() noexcept
   {
     req.reset();
@@ -785,7 +784,6 @@ struct transfer {
     headers.reset();
     sink = buf_sink{};
     hc.reset();
-    bounce_token = {};
   }
 };
 
@@ -896,21 +894,29 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       ::timerfd_settime(upkeep_timer_fd.get(), 0, &its, nullptr);
     }
 
-    // Easy-handle pool: max_connections handles configured once with the static
-    // performance + TLS/timeout options; per-request options are set at submit
-    // time.  The connection cache is shared here via a worker-local curl_share
-    // so idle connections survive across handles and are reachable by
-    // curl_easy_upkeep — safe because only this worker thread touches it.
+    // Slot pool: max_connections reusable io_slots, each owning its easy handle
+    // (configured once with the static performance + TLS/timeout options) and,
+    // when device staging is enabled, its dedicated pinned bounce buffer.  The
+    // connection cache is shared via a worker-local curl_share so idle
+    // connections survive across handles and are reachable by curl_easy_upkeep
+    // — safe because only this worker thread touches it.  Each handle carries
+    // its slot index in CURLOPT_PRIVATE, so a completion maps back to its slot
+    // in O(1) with no per-request allocation or hashing.  free_slots is the only
+    // free-list: a free slot also owns a free bounce buffer.
     curl_share worker_share{/*share_connections=*/true};
-    std::vector<curl_easy_ptr> handle_storage;
-    // Per-attempt transfer state, one slot per pooled handle (parallel arrays:
-    // slots[i] belongs to handle_storage[i]).  Each handle carries its slot
-    // index in CURLOPT_PRIVATE, so a completion maps back to its slot in O(1)
-    // with no per-request allocation or hashing.  free_slots is the free list.
-    std::vector<transfer> slots(_config.max_connections);
+    std::vector<io_slot> slots(_config.max_connections);
     std::vector<int> free_slots;
-    handle_storage.reserve(_config.max_connections);
     free_slots.reserve(_config.max_connections);
+
+    std::vector<uint8_t*> bounce_bufs;  // one per slot when device staging is on
+    if (_bounce_storage) {
+      auto blocks = _bounce_storage->get_blocks();
+      bounce_bufs.reserve(blocks.size());
+      for (auto* b : blocks) {
+        bounce_bufs.push_back(reinterpret_cast<uint8_t*>(b));
+      }
+    }
+
     for (std::size_t i = 0; i < _config.max_connections; ++i) {
       curl_easy_ptr h{curl_easy_init()};
       if (!h) { throw std::runtime_error("rest_reactor: curl_easy_init failed"); }
@@ -921,8 +927,9 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       // requests this handle serves.
       SIRIUS_CURL_CHECK(curl_easy_setopt(
         h.get(), CURLOPT_PRIVATE, reinterpret_cast<void*>(static_cast<intptr_t>(i))));
+      slots[i].easy   = std::move(h);
+      slots[i].bounce = i < bounce_bufs.size() ? bounce_bufs[i] : nullptr;
       free_slots.push_back(static_cast<int>(i));
-      handle_storage.push_back(std::move(h));
     }
 
     int running = 0;
@@ -939,32 +946,22 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     auto const retry_cmp = [](const retry_entry& a, const retry_entry& b) { return a.due > b.due; };
     std::vector<retry_entry> retry_heap;
     std::deque<std::unique_ptr<rest_chunked_rx_request>> ready;
-    // Device chunks dequeued but blocked on a free bounce slot wait here and are
-    // submitted ahead of everything else once a slot frees.
-    std::deque<std::unique_ptr<rest_chunked_rx_request>> stalled;
 
     // -- device staging ----------------------------------------------------
-    // Reactor-staged device reads (null-buffer chunks) land in a pinned bounce
-    // slot, then an async H2D copy moves the bytes to the device.  The slot is
-    // held until that copy's CUDA event completes; `copying` tracks the
-    // (slot, event) pairs polled each loop.  Only set up when a host memory
-    // resource was provided.
-    std::vector<uint8_t*> bounce_bufs;
-    slot_pool bounce_pool{NUM_BOUNCE_SLOTS};
+    // A reactor-staged device read (null-buffer chunk) lands in its slot's
+    // bounce buffer, then an async H2D copy moves the bytes to the device.  The
+    // slot is held (kept out of free_slots) until that copy's CUDA event
+    // completes; `copying` tracks the (slot index, event) pairs polled each
+    // loop.  Events are pooled per device, indexed by slot.
     std::unordered_map<int, std::vector<cucascade::cuda::cuda_event>> copy_events;
-    std::vector<std::pair<slot_pool::token, cucascade::cuda::cuda_event*>> copying;
+    std::vector<std::pair<int, cucascade::cuda::cuda_event*>> copying;
     if (_bounce_storage) {
-      auto blocks = _bounce_storage->get_blocks();
-      bounce_bufs.reserve(blocks.size());
-      for (auto* b : blocks) {
-        bounce_bufs.push_back(reinterpret_cast<uint8_t*>(b));
-      }
       int const n_dev = rmm::get_num_cuda_devices();
       for (int d = 0; d < n_dev; ++d) {
         rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{d}};
         auto& evs = copy_events[d];
-        evs.reserve(NUM_BOUNCE_SLOTS);
-        std::generate_n(std::back_inserter(evs), NUM_BOUNCE_SLOTS, [] {
+        evs.reserve(_config.max_connections);
+        std::generate_n(std::back_inserter(evs), _config.max_connections, [] {
           return cucascade::cuda::cuda_event{cudaEventDisableTiming};
         });
       }
@@ -974,10 +971,14 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       using query_status = cucascade::cuda::cuda_event::query_status;
       copying.erase(std::remove_if(copying.begin(),
                                    copying.end(),
-                                   [](auto const& pr) {
-                                     // Release the bounce slot once the copy off
-                                     // it is no longer in progress (done/error).
-                                     return pr.second->query() != query_status::in_progress;
+                                   [&](auto const& pr) {
+                                     // Recycle the slot once the H2D copy off its
+                                     // bounce buffer is no longer in progress.
+                                     if (pr.second->query() == query_status::in_progress) {
+                                       return false;
+                                     }
+                                     free_slots.push_back(pr.first);
+                                     return true;
                                    }),
                     copying.end());
     };
@@ -1011,35 +1012,33 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       arm_retry_timer();
     };
 
-    auto setup_easy = [&](CURL* h, transfer& t) {
-      auto authd = _config.authorizer->authorize(
-        t.req->object, s3::s3_request_method::GET, presign_ttl(_config));
-      t.url           = std::move(authd.url);
-      t.sink.buffers  = std::span<iovec>(t.req->chunk.buffers);
-      t.sink.capacity = t.req->chunk.size;
-      t.sink.reset();
-      t.hc.reset();
-      std::string const range = range_header(t.req->chunk.offset, t.req->chunk.size);
-      t.headers               = build_header_list(authd.headers, &range);
-      SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_URL, t.url.c_str()));
-      SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HTTPHEADER, t.headers.get()));
+    auto setup_easy = [&](io_slot& s) {
+      CURL* const h = s.easy.get();
+      auto authd    = _config.authorizer->authorize(
+        s.req->object, s3::s3_request_method::GET, presign_ttl(_config));
+      s.url           = std::move(authd.url);
+      s.sink.buffers  = std::span<iovec>(s.req->chunk.buffers);
+      s.sink.capacity = s.req->chunk.size;
+      s.sink.reset();
+      s.hc.reset();
+      std::string const range = range_header(s.req->chunk.offset, s.req->chunk.size);
+      s.headers               = build_header_list(authd.headers, &range);
+      SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_URL, s.url.c_str()));
+      SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HTTPHEADER, s.headers.get()));
       SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &write_to_sink));
-      SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_WRITEDATA, &t.sink));
+      SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_WRITEDATA, &s.sink));
       SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, &capture_header));
-      SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HEADERDATA, &t.hc));
+      SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HEADERDATA, &s.hc));
     };
 
     auto submit = [&]() {
-      // A free slot means we are under the max_connections cap.
+      // A free slot is under the max_connections cap and owns a free bounce
+      // buffer, so device chunks never need a separate slot/stall step.
       while (!free_slots.empty()) {
-        // Submission priority: chunks blocked on a bounce slot (stalled), then
-        // due retries (ready), then fresh inbound work — so neither a
-        // backed-off nor a slot-starved request is starved by new ones.
+        // Submission priority: due retries (ready) ahead of fresh inbound work
+        // so a backed-off request is not starved by new ones.
         std::unique_ptr<rest_chunked_rx_request> dr;
-        if (!stalled.empty()) {
-          dr = std::move(stalled.front());
-          stalled.pop_front();
-        } else if (!ready.empty()) {
+        if (!ready.empty()) {
           dr = std::move(ready.front());
           ready.pop_front();
         } else if (!_requests.try_dequeue(dr)) {
@@ -1051,65 +1050,63 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           continue;
         }
 
-        // A device chunk with a null destination is staged through a reactor
-        // bounce slot; host chunks (and caller-buffer device chunks) carry their
-        // own buffer.
+        int const i             = free_slots.back();
+        io_slot& s              = slots[static_cast<size_t>(i)];
         bool const needs_bounce = dr->is_device() && !dr->chunk.is_buffer_allocated();
-        slot_pool::token tok;
-        if (needs_bounce) {
-          if (bounce_bufs.empty()) {
-            dr->manager->report_error(std::make_exception_ptr(std::runtime_error(
-              "rest_reactor: device staging unavailable (no host memory resource)")));
-            dr.reset();
-            continue;
-          }
-          tok = bounce_pool.try_acquire_token();
-          if (!tok) {
-            // No slot right now — hold the chunk and stop submitting; a freed
-            // slot (poll_copy_completions) will wake the loop to retry.
-            stalled.push_front(std::move(dr));
-            break;
-          }
+        if (needs_bounce && s.bounce == nullptr) {
+          // Device staging requested but no host memory resource was configured.
+          dr->manager->report_error(std::make_exception_ptr(std::runtime_error(
+            "rest_reactor: device staging unavailable (no host memory resource)")));
+          dr.reset();
+          continue;  // slot stays free
         }
 
-        int const i = free_slots.back();
         free_slots.pop_back();
-        transfer& t = slots[i];
-        t.req       = std::move(dr);
-        if (needs_bounce) {
-          t.req->chunk.set_data(bounce_bufs[static_cast<size_t>(tok.slot_index())]);
-          t.bounce_token = std::move(tok);
-        }
-        CURL* const h = handle_storage[static_cast<size_t>(i)].get();
-        setup_easy(h, t);
-        curl_multi_add_handle(multi.get(), h);
+        s.req = std::move(dr);
+        if (needs_bounce) { s.req->chunk.set_data(s.bounce); }
+        setup_easy(s);
+        curl_multi_add_handle(multi.get(), s.easy.get());
       }
     };
 
-    auto finish = [&](transfer& t, CURLcode rc, long status) {
-      auto& req           = *t.req;
+    // Handle one completed transfer.  Returns true iff the slot was parked in
+    // `copying` (held until its H2D copy finishes); otherwise the caller
+    // recycles the slot immediately.
+    auto finish = [&](int i, CURLcode rc, long status) -> bool {
+      io_slot& s          = slots[static_cast<size_t>(i)];
+      auto& req           = *s.req;
       bool const ok_range = (status == 206) || (status == 200 && req.chunk.offset == 0);
-      if (rc == CURLE_OK && ok_range && t.sink.written >= req.chunk.size) {
+      if (rc == CURLE_OK && ok_range && s.sink.written >= req.chunk.size) {
         if (req.is_device()) {
           // Issue the async H2D copy.  Bounce-staged reads need a CUDA event so
-          // the slot is only reused once the copy off it completes; caller-
-          // buffer reads detach (the caller's stream orders the copy).
+          // the slot (its bounce buffer) is only reused once the copy off it
+          // completes; caller-buffer reads detach (the caller's stream orders
+          // the copy).
           bool const needs_event          = req.needs_event_for_synchronization();
           cucascade::cuda::cuda_event* ev = nullptr;
           cudaEvent_t cev                 = nullptr;
           if (needs_event) {
-            ev  = &copy_events[req.cpy_req->device_id][t.bounce_token.slot_index()];
+            ev  = &copy_events[req.cpy_req->device_id][static_cast<size_t>(i)];
             cev = ev->get();
           }
           cudaError_t const err = req.copy_h2d_async(cev);
           if (err != cudaSuccess) {
             req.manager->report_error(err);
-            return;
+            return false;
           }
-          if (needs_event) { copying.emplace_back(std::move(t.bounce_token), ev); }
+          req.manager->chunk_complete(s.sink.written);
+          if (needs_event) {
+            // Bounce buffer is still feeding the copy: park the slot (its
+            // per-request state is cleared now; the bounce buffer is freed when
+            // the event clears) so a shutdown cancel won't touch a done request.
+            s.reset();
+            copying.emplace_back(i, ev);
+            return true;
+          }
+          return false;
         }
-        req.manager->chunk_complete(t.sink.written);
-        return;
+        req.manager->chunk_complete(s.sink.written);
+        return false;
       }
       if (rc == CURLE_OK && status == 200 && req.chunk.offset != 0) {
         // Server ignored Range and returned the whole object: the bytes start
@@ -1117,24 +1114,25 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         req.manager->report_error(std::make_exception_ptr(
           std::runtime_error("rest_reactor: server ignored Range (HTTP 200) for " +
                              req.object.bucket + "/" + req.object.key)));
-        return;
+        return false;
       }
       // Error or truncated transfer.  A short read or a transient HTTP / curl
       // failure is retried (re-authorized and re-submitted after a backoff);
       // anything else is terminal.  Retry moves the chunk out of the slot into
       // the heap, so the slot/connection is freed for other work during backoff.
-      bool const short_read = rc == CURLE_OK && ok_range && t.sink.written < req.chunk.size;
+      bool const short_read = rc == CURLE_OK && ok_range && s.sink.written < req.chunk.size;
       bool const retriable  = short_read || (rc != CURLE_OK && is_retriable_curl(rc)) ||
                              (rc == CURLE_OK && is_retriable_status(status));
       if (retriable) {
-        schedule_retry(std::move(t.req), t.hc.retry_after);
-        return;
+        schedule_retry(std::move(s.req), s.hc.retry_after);
+        return false;
       }
       std::string const msg = rc != CURLE_OK
                                 ? std::string(curl_easy_strerror(rc))
                                 : (ok_range ? "short read" : "HTTP " + std::to_string(status));
       req.manager->report_error(std::make_exception_ptr(std::runtime_error(
         "rest_reactor: " + msg + " for " + req.object.bucket + "/" + req.object.key)));
+      return false;
     };
 
     auto process_completions = [&]() {
@@ -1151,10 +1149,12 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         curl_easy_getinfo(h, CURLINFO_PRIVATE, &priv);
         int const i = static_cast<int>(reinterpret_cast<intptr_t>(priv));
         curl_multi_remove_handle(multi.get(), h);
-        finish(slots[static_cast<size_t>(i)], rc, status);
-        // Disposition done (completed / retried / failed) — recycle the slot.
-        slots[static_cast<size_t>(i)].reset();
-        free_slots.push_back(i);
+        // A parked slot (device H2D in flight) is recycled by
+        // poll_copy_completions once its event clears.
+        if (!finish(i, rc, status)) {
+          slots[static_cast<size_t>(i)].reset();
+          free_slots.push_back(i);
+        }
       }
     };
 
@@ -1192,8 +1192,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           // in-flight transfer already keeps its connection active, and this
           // keeps upkeep off the hot path.  One call walks the worker's shared
           // connection cache, so any pooled handle covers all of them.
-          if (free_slots.size() == _config.max_connections && !handle_storage.empty()) {
-            curl_easy_upkeep(handle_storage.front().get());
+          if (free_slots.size() == _config.max_connections && !slots.empty()) {
+            curl_easy_upkeep(slots.front().easy.get());
           }
         } else {
           int ev_bitmask = 0;
@@ -1223,12 +1223,12 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     copying.clear();
 
     // Detach in-flight handles and cancel every outstanding request (in-flight,
-    // retry-scheduled, ready, stalled, queued) so no future is left unfulfilled.
-    for (std::size_t i = 0; i < slots.size(); ++i) {
-      if (slots[i].req) {
-        curl_multi_remove_handle(multi.get(), handle_storage[i].get());
-        slots[i].req->manager->report_error(std::make_error_code(std::errc::operation_canceled));
-        slots[i].reset();
+    // retry-scheduled, ready, queued) so no future is left unfulfilled.
+    for (auto& s : slots) {
+      if (s.req) {
+        curl_multi_remove_handle(multi.get(), s.easy.get());
+        s.req->manager->report_error(std::make_error_code(std::errc::operation_canceled));
+        s.reset();
       }
     }
     for (auto& e : retry_heap) {
@@ -1241,10 +1241,6 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       if (r) { r->manager->report_error(std::make_error_code(std::errc::operation_canceled)); }
     }
     ready.clear();
-    for (auto& r : stalled) {
-      if (r) { r->manager->report_error(std::make_error_code(std::errc::operation_canceled)); }
-    }
-    stalled.clear();
   } catch (const std::exception& e) {
     spdlog::error("rest_reactor worker_loop: {}", e.what());
   }
