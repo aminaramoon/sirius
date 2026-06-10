@@ -181,7 +181,7 @@ TEST_CASE("prep_host_rxv_request builds one chunk per non-empty segment", "[rest
   }
 }
 
-TEST_CASE("prep_host_rx_request splits a contiguous read by max_num_chunks", "[rest]")
+TEST_CASE("prep_host_rx_request splits a contiguous read by max_read_split", "[rest]")
 {
   constexpr size_t kMiB     = 1UL << 20;
   constexpr uintptr_t kBase = 0x10000;
@@ -190,17 +190,17 @@ TEST_CASE("prep_host_rx_request splits a contiguous read by max_num_chunks", "[r
   SECTION("a read below 2 MiB stays a single GET")
   {
     rest_reactor::config cfg;
-    cfg.max_num_chunks = 16;
+    cfg.max_read_split = 16;
     auto req           = rest_reactor::prep_host_rx_request(
       cfg, file, io_object_segment{0, kMiB + kMiB / 2, fake_ptr(kBase)});  // 1.5 MiB
     CHECK(req->size() == 1);
   }
 
-  SECTION("split count is capped by max_num_chunks")
+  SECTION("split count is capped by max_read_split")
   {
     rest_reactor::config cfg;
-    cfg.max_num_chunks = 4;
-    // 8 MiB / 1 MiB = 8 candidate pieces, but max_num_chunks caps it at 4.
+    cfg.max_read_split = 4;
+    // 8 MiB / 1 MiB = 8 candidate pieces, but max_read_split caps it at 4.
     auto req = rest_reactor::prep_host_rx_request(
       cfg, file, io_object_segment{0, 8 * kMiB, fake_ptr(kBase)});
     REQUIRE(req->size() == 4);
@@ -218,10 +218,10 @@ TEST_CASE("prep_host_rx_request splits a contiguous read by max_num_chunks", "[r
     CHECK(total == 8 * kMiB);  // pieces cover the whole range, contiguously
   }
 
-  SECTION("pieces stay at least 1 MiB when max_num_chunks exceeds size / 1 MiB")
+  SECTION("pieces stay at least 1 MiB when max_read_split exceeds size / 1 MiB")
   {
     rest_reactor::config cfg;
-    cfg.max_num_chunks = 16;
+    cfg.max_read_split = 16;
     // 5 MiB / 1 MiB = 5 pieces, fewer than the cap, so each piece is exactly 1 MiB.
     auto req = rest_reactor::prep_host_rx_request(
       cfg, file, io_object_segment{0, 5 * kMiB, fake_ptr(kBase)});
@@ -235,7 +235,7 @@ TEST_CASE("prep_host_rx_request splits a contiguous read by max_num_chunks", "[r
   SECTION("an uneven split spreads the remainder over the leading pieces")
   {
     rest_reactor::config cfg;
-    cfg.max_num_chunks = 4;
+    cfg.max_read_split = 4;
     size_t const size  = 8 * kMiB + 3;  // 3 leading pieces get one extra byte
     auto req =
       rest_reactor::prep_host_rx_request(cfg, file, io_object_segment{1000, size, fake_ptr(kBase)});

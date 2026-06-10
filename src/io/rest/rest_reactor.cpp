@@ -323,7 +323,7 @@ rest_reactor::rest_reactor(config cfg, std::string_view tname) : _config(std::mo
     throw std::invalid_argument("rest_reactor: max_connections must be > 0");
   }
   if (_config.max_retry_attempts == 0) { _config.max_retry_attempts = 1; }
-  if (_config.max_num_chunks == 0) { _config.max_num_chunks = 1; }
+  if (_config.max_read_split == 0) { _config.max_read_split = 1; }
 
   // Touch the process-wide curl context so global init + the shared cache are
   // ready before any handle is created (here or on the worker).
@@ -392,7 +392,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
 
   // Break a contiguous host read into N parallel single-buffer ranged GETs so
   // the connection pool fetches them concurrently.  N is the largest count
-  // <= max_num_chunks that keeps every piece at least min_chunk_size; a read
+  // <= max_read_split that keeps every piece at least min_chunk_size; a read
   // below single_request_threshold stays a single GET (the extra round-trips
   // would not pay off).  segment.size is distributed as evenly as possible,
   // spreading the remainder over the leading pieces so every byte is covered
@@ -402,7 +402,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
 
   size_t n_chunks = 1;
   if (segment.size >= single_request_threshold) {
-    n_chunks = std::min<size_t>(cfg.max_num_chunks, segment.size / min_chunk_size);
+    n_chunks = std::min<size_t>(cfg.max_read_split, segment.size / min_chunk_size);
     n_chunks = std::max<size_t>(n_chunks, 1);
   }
 
