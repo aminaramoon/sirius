@@ -774,7 +774,7 @@ struct transfer {
   // Held only for reactor-staged device reads (null-buffer chunks): the pinned
   // bounce slot the body lands in.  Released after the H2D copy off it
   // completes (tracked via a CUDA event), not when the transfer finishes.
-  slot_pool<NUM_BOUNCE_SLOTS>::token bounce_token;
+  slot_pool::token bounce_token;
 };
 
 /// Worker-loop state reachable from curl's C socket/timer callbacks.
@@ -930,10 +930,9 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     // (slot, event) pairs polled each loop.  Only set up when a host memory
     // resource was provided.
     std::vector<uint8_t*> bounce_bufs;
-    slot_pool<NUM_BOUNCE_SLOTS> bounce_pool;
+    slot_pool bounce_pool{NUM_BOUNCE_SLOTS};
     std::unordered_map<int, std::vector<cucascade::cuda::cuda_event>> copy_events;
-    std::vector<std::pair<slot_pool<NUM_BOUNCE_SLOTS>::token, cucascade::cuda::cuda_event*>>
-      copying;
+    std::vector<std::pair<slot_pool::token, cucascade::cuda::cuda_event*>> copying;
     if (_bounce_storage) {
       auto blocks = _bounce_storage->get_blocks();
       bounce_bufs.reserve(blocks.size());
@@ -1037,7 +1036,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         // bounce slot; host chunks (and caller-buffer device chunks) carry their
         // own buffer.
         bool const needs_bounce = dr->is_device() && !dr->chunk.is_buffer_allocated();
-        slot_pool<NUM_BOUNCE_SLOTS>::token tok;
+        slot_pool::token tok;
         if (needs_bounce) {
           if (bounce_bufs.empty()) {
             dr->manager->report_error(std::make_exception_ptr(std::runtime_error(

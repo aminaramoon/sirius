@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-// Lock-free fixed-size slot allocator using atomic bitmasks.
+// Lock-free slot allocator using atomic bitmasks.  Capacity is fixed at
+// construction (runtime `n`); see the note on the class below.
 //
 // Design:
 //   * 1 bit per slot: 1 = free, 0 = in use.
-//   * Backed by std::array<std::atomic<uint64_t>, num_words>, one word per 64
+//   * Backed by a std::vector<std::atomic<uint64_t>>, one word per 64
 //     slots, each word on its own cache line.
 //   * Acquire = TZCNT + CAS on one 64-bit word — no linear scan over slots.
 //   * Release = single fetch_or (distinct bits never race, no CAS loop needed).
@@ -32,28 +33,30 @@
 
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace sirius::io {
 
-template <std::size_t N>
+// Slot count is fixed at construction (runtime `n`), not at compile time.  A
+// microbenchmark of the single-threaded acquire/release churn that the reactor
+// event loops actually exercise showed this is performance-identical to the
+// former `template <std::size_t N>` version (the per-op cost is dominated by
+// the atomic CAS; the only added work is a one-time heap allocation plus a
+// pointer indirection, both negligible next to the I/O each slot gates).
 class slot_pool {
-  static_assert(N >= 1, "slot_pool needs at least one slot");
-
   using word_t                               = std::uint64_t;
   static constexpr std::size_t bits_per_word = 64;
-  static constexpr std::size_t num_words     = (N + bits_per_word - 1) / bits_per_word;
 
   // Mask of valid bits within word w.  All but possibly the last word are
-  // fully populated; the tail word masks off bits beyond N.
-  static constexpr word_t full_mask(std::size_t w) noexcept
+  // fully populated; the tail word masks off bits beyond the capacity.
+  [[nodiscard]] word_t full_mask(std::size_t w) const noexcept
   {
-    const std::size_t n = (w + 1 == num_words) ? (N - w * bits_per_word) : bits_per_word;
+    const std::size_t n = (w + 1 == _num_words) ? (_capacity - w * bits_per_word) : bits_per_word;
     return (n == 64) ? ~word_t{0} : ((word_t{1} << n) - 1);
   }
 
@@ -64,8 +67,7 @@ class slot_pool {
   };
 
  public:
-  static constexpr std::size_t capacity = N;
-  static constexpr int no_slot          = -1;
+  static constexpr int no_slot = -1;
 
   // RAII handle for an acquired slot.  Move-only; releases the slot back to
   // its owning pool on destruction (or on move-assignment over a valid token).
@@ -122,9 +124,12 @@ class slot_pool {
     int _slot        = no_slot;
   };
 
-  slot_pool() noexcept
+  explicit slot_pool(std::size_t n)
+    : _capacity(n), _num_words((n + bits_per_word - 1) / bits_per_word)
   {
-    for (std::size_t w = 0; w < num_words; ++w) {
+    assert(n >= 1 && "slot_pool needs at least one slot");
+    _words = std::vector<word_storage>(_num_words);
+    for (std::size_t w = 0; w < _num_words; ++w) {
       _words[w].bits.store(full_mask(w), std::memory_order_relaxed);
       assert(_words[w].bits.is_lock_free());
     }
@@ -133,14 +138,17 @@ class slot_pool {
   slot_pool(const slot_pool&)            = delete;
   slot_pool& operator=(const slot_pool&) = delete;
 
-  // Returns a free slot index in [0, N), or no_slot if the pool is exhausted.
-  // `hint` biases which word is probed first to spread CAS contention across
-  // cache lines; correctness is independent of the hint.
+  [[nodiscard]] std::size_t capacity() const noexcept { return _capacity; }
+
+  // Returns a free slot index in [0, capacity), or no_slot if the pool is
+  // exhausted.  `hint` biases which word is probed first to spread CAS
+  // contention across cache lines; correctness is independent of the hint.
   int try_acquire(unsigned hint = 0) noexcept
   {
-    const std::size_t start = (num_words == 1) ? 0 : (hint % num_words);
-    for (std::size_t i = 0; i < num_words; ++i) {
-      const int idx = acquire_from_word((start + i) % num_words);
+    const std::size_t start = (_num_words == 1) ? 0 : (hint % _num_words);
+    for (std::size_t i = 0; i < _num_words; ++i) {
+      const std::size_t w = (_num_words == 1) ? 0 : ((start + i) % _num_words);
+      const int idx       = acquire_from_word(w);
       if (idx != no_slot) return idx;
     }
     return no_slot;
@@ -180,7 +188,7 @@ class slot_pool {
   // this slot via try_acquire() or acquire().
   void release(int idx) noexcept
   {
-    assert(idx >= 0 && static_cast<std::size_t>(idx) < N);
+    assert(idx >= 0 && static_cast<std::size_t>(idx) < _capacity);
     const std::size_t w        = static_cast<std::size_t>(idx) / bits_per_word;
     const std::size_t b        = static_cast<std::size_t>(idx) % bits_per_word;
     const word_t bit           = word_t{1} << b;
@@ -200,14 +208,14 @@ class slot_pool {
   [[nodiscard]] std::size_t approx_free() const noexcept
   {
     std::size_t n = 0;
-    for (std::size_t w = 0; w < num_words; ++w)
+    for (std::size_t w = 0; w < _num_words; ++w)
       n += static_cast<std::size_t>(std::popcount(_words[w].bits.load(std::memory_order_relaxed)));
     return n;
   }
 
   [[nodiscard]] bool any_free() const noexcept
   {
-    for (std::size_t w = 0; w < num_words; ++w)
+    for (std::size_t w = 0; w < _num_words; ++w)
       if (_words[w].bits.load(std::memory_order_relaxed) != 0) return true;
     return false;
   }
@@ -226,7 +234,9 @@ class slot_pool {
     return no_slot;
   }
 
-  std::array<word_storage, num_words> _words{};
+  std::size_t _capacity;
+  std::size_t _num_words;
+  std::vector<word_storage> _words;
 
   // Shared release-generation counter for the seq-wait pattern in
   // acquire().  Kept on its own cache line so release()'s fetch_add

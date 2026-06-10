@@ -67,7 +67,7 @@ struct io_slot {
                       // event
   };
 
-  using slot_token = slot_pool<NUM_CHUNKS>::token;
+  using slot_token = slot_pool::token;
   explicit io_slot(int slot_index, uint8_t* internal_buffer)
     : slot_index(slot_index), internal_buffer(internal_buffer)
   {
@@ -772,7 +772,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
     _requests.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queue
   });
 
-  using slot_token = slot_pool<NUM_CHUNKS>::token;
+  using slot_token = slot_pool::token;
 
   unique_ring ring(2 * NUM_CHUNKS);
 
@@ -784,7 +784,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
       return iovec{.iov_base = b, .iov_len = len};
     });
 
-  slot_pool<NUM_CHUNKS> slot_pool;
+  slot_pool slot_pool{NUM_CHUNKS};
   std::vector<io_slot> slots;
   slots.reserve(NUM_CHUNKS);
   std::ranges::transform(iovecs, std::back_inserter(slots), [i = 0](auto& b) mutable {
