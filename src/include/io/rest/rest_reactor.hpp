@@ -120,6 +120,21 @@ class rest_reactor {
     /// reactor-staged device path.  Bounce-slot size is its block size.
     cucascade::memory::fixed_size_host_memory_resource* host_memory_resource{nullptr};
 
+    /// Idle-connection keepalive.  While the reactor is idle, every
+    /// @c upkeep_interval the worker calls @c curl_easy_upkeep on its pooled
+    /// connections, which sends an HTTP/2 PING on any connection idle at least
+    /// this long — keeping the endpoint from idle-closing it (and detecting
+    /// dead ones).  No effect on HTTP/1.1 (TCP keepalive covers that).  Zero
+    /// disables upkeep.
+    std::chrono::milliseconds upkeep_interval{std::chrono::seconds{15}};
+
+    /// How long curl may reuse a pooled connection before discarding it
+    /// (CURLOPT_MAXAGE_CONN).  Pairs with @c upkeep_interval: upkeep keeps idle
+    /// connections warm, so keep this within the endpoint's idle timeout so a
+    /// reused connection is not one the server already closed.  Zero leaves
+    /// curl's default.
+    std::chrono::seconds conn_max_age{std::chrono::seconds{20}};
+
     // -- retry policy ------------------------------------------------------
     std::size_t max_retry_attempts{10};
     std::chrono::milliseconds retry_backoff_base{50};

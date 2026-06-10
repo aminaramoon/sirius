@@ -27,7 +27,6 @@ namespace {
 constexpr long kRecvBufferSize     = 128L * 1024L;
 constexpr long kConnectTimeoutMs   = 5'000L;
 constexpr long kTransferTimeoutMs  = 30'000L;
-constexpr long kMaxConnAgeSec      = 20L;
 constexpr long kDnsCacheTimeoutSec = 600L;
 
 // curl_global_init must run exactly once per process, before any handle is
@@ -46,50 +45,59 @@ void global_init_once()
 
 }  // namespace
 
+curl_share::curl_share(bool share_connections)
+{
+  CURLSH* sh = curl_share_init();
+  if (sh == nullptr) { throw std::runtime_error("rest: curl_share_init failed"); }
+  _share.reset(sh);
+
+  // Each setopt can fail (e.g. unsupported build), so check.
+  auto share_set = [sh](CURLSHoption opt, auto value) {
+    if (curl_share_setopt(sh, opt, value) != CURLSHE_OK) {
+      throw std::runtime_error("rest: curl_share_setopt failed");
+    }
+  };
+  share_set(CURLSHOPT_LOCKFUNC, &curl_share::lock_cb);
+  share_set(CURLSHOPT_UNLOCKFUNC, &curl_share::unlock_cb);
+  share_set(CURLSHOPT_USERDATA, this);
+  share_set(CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+  share_set(CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+  share_set(CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
+  if (share_connections) {
+    // Pool idle connections so they survive across handles and are reachable by
+    // curl_easy_upkeep.  Caller guarantees single-thread use of this share.
+    share_set(CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+  }
+}
+
+void curl_share::lock_cb(CURL* /*handle*/,
+                         curl_lock_data /*data*/,
+                         curl_lock_access /*access*/,
+                         void* userp)
+{
+  // Coarse single-mutex serialization across all shared data classes.
+  static_cast<curl_share*>(userp)->_mtx.lock();
+}
+
+void curl_share::unlock_cb(CURL* /*handle*/, curl_lock_data /*data*/, void* userp)
+{
+  static_cast<curl_share*>(userp)->_mtx.unlock();
+}
+
+global_curl_context::global_init_guard::global_init_guard() { global_init_once(); }
+
 global_curl_context& global_curl_context::instance()
 {
   static global_curl_context ctx;
   return ctx;
 }
 
-global_curl_context::global_curl_context()
-{
-  global_init_once();
+global_curl_context::global_curl_context() = default;
 
-  CURLSH* sh = curl_share_init();
-  if (sh == nullptr) { throw std::runtime_error("rest: curl_share_init failed"); }
-  _share.reset(sh);
-
-  // Share DNS, TLS sessions, and cookies across every easy handle in the
-  // process.  Each setopt can fail (e.g. unsupported build), so check.
-  auto share_set = [sh](CURLSHoption opt, auto value) {
-    if (curl_share_setopt(sh, opt, value) != CURLSHE_OK) {
-      throw std::runtime_error("rest: curl_share_setopt failed");
-    }
-  };
-  share_set(CURLSHOPT_LOCKFUNC, &global_curl_context::lock_cb);
-  share_set(CURLSHOPT_UNLOCKFUNC, &global_curl_context::unlock_cb);
-  share_set(CURLSHOPT_USERDATA, this);
-  share_set(CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
-  share_set(CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
-  share_set(CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
-}
-
-void global_curl_context::lock_cb(CURL* /*handle*/,
-                                  curl_lock_data /*data*/,
-                                  curl_lock_access /*access*/,
-                                  void* userp)
-{
-  // Coarse single-mutex serialization across all shared data classes.
-  static_cast<global_curl_context*>(userp)->_share_mtx.lock();
-}
-
-void global_curl_context::unlock_cb(CURL* /*handle*/, curl_lock_data /*data*/, void* userp)
-{
-  static_cast<global_curl_context*>(userp)->_share_mtx.unlock();
-}
-
-void configure_easy_handle(CURL* handle, CURLSH* share_handle)
+void configure_easy_handle(CURL* handle,
+                           CURLSH* share_handle,
+                           long upkeep_interval_ms,
+                           long conn_max_age_s)
 {
   if (handle == nullptr) { throw std::runtime_error("rest: configure_easy_handle: null handle"); }
 
@@ -97,7 +105,9 @@ void configure_easy_handle(CURL* handle, CURLSH* share_handle)
   if (share_handle != nullptr) {
     SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_SHARE, share_handle));
   }
-  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_MAXAGE_CONN, kMaxConnAgeSec));
+  if (conn_max_age_s > 0) {
+    SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_MAXAGE_CONN, conn_max_age_s));
+  }
   SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_DNS_CACHE_TIMEOUT, kDnsCacheTimeoutSec));
 
   // TCP tuning.
@@ -116,6 +126,12 @@ void configure_easy_handle(CURL* handle, CURLSH* share_handle)
   // request based on its configuration.
   SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, kConnectTimeoutMs));
   SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, kTransferTimeoutMs));
+
+  // Minimum gap between curl_easy_upkeep PINGs per connection (the reactor
+  // drives the actual upkeep calls on an idle timer).
+  if (upkeep_interval_ms > 0) {
+    SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_UPKEEP_INTERVAL_MS, upkeep_interval_ms));
+  }
 }
 
 }  // namespace sirius::io::rest

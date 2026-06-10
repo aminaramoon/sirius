@@ -138,23 +138,56 @@ using curl_share_ptr = std::unique_ptr<CURLSH, curl_share_deleter>;
 }
 
 // ---------------------------------------------------------------------------
+// curl_share
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief A @c CURLSH cache shared across a set of easy handles.
+ *
+ * Always shares DNS resolutions, TLS session tickets, and cookies (avoiding
+ * repeated lookups / full handshakes).  When @c share_connections is true it
+ * also pools the connection cache (@c CURL_LOCK_DATA_CONNECT), so idle
+ * connections survive across handles and are reachable by @c curl_easy_upkeep.
+ *
+ * @warning A connection-sharing @c curl_share must be confined to a single
+ *          thread.  Connection checkout and @c curl_easy_upkeep walk the cache
+ *          and do socket I/O on its connections; two threads sharing one
+ *          connection cache would race on that I/O (the lock only guards the
+ *          cache structure, not the per-connection traffic).  The DNS/TLS/cookie
+ *          caches are safe to share across threads (the lock fully guards them).
+ */
+class curl_share {
+ public:
+  explicit curl_share(bool share_connections);
+
+  [[nodiscard]] CURLSH* get() const noexcept { return _share.get(); }
+
+  curl_share(curl_share const&)            = delete;
+  curl_share& operator=(curl_share const&) = delete;
+
+ private:
+  static void lock_cb(CURL* handle, curl_lock_data data, curl_lock_access access, void* userp);
+  static void unlock_cb(CURL* handle, curl_lock_data data, void* userp);
+
+  std::mutex _mtx;
+  curl_share_ptr _share;
+};
+
+// ---------------------------------------------------------------------------
 // global_curl_context
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Process-wide libcurl initialization + shared cache handle.
+ * @brief Process-wide libcurl initialization + a thread-safe DNS/TLS/cookie
+ *        share (no connection sharing).
  *
  * Performs @c curl_global_init exactly once (and deliberately never calls
  * @c curl_global_cleanup — it races with late static destructors in
- * third-party libraries; the bounded one-time leak is the accepted trade-off)
- * and owns a @c CURLSH share handle that pools DNS resolutions, TLS session
- * tickets, and cookies across every easy handle in the process.  Sharing these
- * avoids repeated DNS lookups and full TLS handshakes — a major throughput win
- * for many short ranged GETs against the same endpoint.
- *
- * The share handle's lock/unlock callbacks serialize access through a single
- * coarse mutex held here; that is sufficient for correctness and matches the
- * reference design.
+ * third-party libraries; the bounded one-time leak is the accepted trade-off).
+ * Its share pools DNS, TLS sessions, and cookies across every handle in the
+ * process; it intentionally does NOT pool connections (that must stay
+ * single-threaded — see @c curl_share).  Used by the reactor's synchronous,
+ * one-shot easy handles (host_read / head_object_size).
  */
 class global_curl_context {
  public:
@@ -169,11 +202,13 @@ class global_curl_context {
  private:
   global_curl_context();
 
-  static void lock_cb(CURL* handle, curl_lock_data data, curl_lock_access access, void* userp);
-  static void unlock_cb(CURL* handle, curl_lock_data data, void* userp);
-
-  std::mutex _share_mtx;
-  curl_share_ptr _share;
+  // Runs curl_global_init before the share below is constructed (member init
+  // order = declaration order).
+  struct global_init_guard {
+    global_init_guard();
+  };
+  global_init_guard _init;
+  curl_share _share{/*share_connections=*/false};
 };
 
 // ---------------------------------------------------------------------------
@@ -183,15 +218,25 @@ class global_curl_context {
 /**
  * @brief Apply the standard high-performance options to a fresh easy handle.
  *
- * Sets HTTP/2, the shared DNS/TLS/cookie cache, TCP tuning (NODELAY,
- * keepalive), @c NOSIGNAL (required for multithreaded use), receive buffer
- * size, connect/transfer timeouts, redirect following, connection max-age, and
- * DNS cache timeout.  Per-request options (URL, Range, write/header callbacks,
- * private pointer, TLS verification) are set by the reactor at submit time.
+ * Sets HTTP/2, the shared DNS/TLS/cookie (and optionally connection) cache, TCP
+ * tuning (NODELAY, keepalive), @c NOSIGNAL (required for multithreaded use),
+ * receive buffer size, connect/transfer timeouts, redirect following,
+ * connection max-age, DNS cache timeout, and the @c curl_easy_upkeep interval.
+ * Per-request options (URL, Range, write/header callbacks, TLS verification)
+ * are set by the reactor at submit time.
  *
- * @param handle        the easy handle to configure.
- * @param share_handle  the process-wide @c CURLSH (DNS/TLS/cookie sharing).
+ * @param handle            the easy handle to configure.
+ * @param share_handle      the @c CURLSH to attach (DNS/TLS/cookie [+ connect]).
+ * @param upkeep_interval_ms minimum gap between @c curl_easy_upkeep PINGs per
+ *                           connection; 0 leaves the curl default and means the
+ *                           caller does not drive upkeep on this handle.
+ * @param conn_max_age_s    @c CURLOPT_MAXAGE_CONN — max age (seconds) of a
+ *                           pooled connection still eligible for reuse; 0 leaves
+ *                           the curl default.
  */
-void configure_easy_handle(CURL* handle, CURLSH* share_handle);
+void configure_easy_handle(CURL* handle,
+                           CURLSH* share_handle,
+                           long upkeep_interval_ms = 0,
+                           long conn_max_age_s     = 20);
 
 }  // namespace sirius::io::rest

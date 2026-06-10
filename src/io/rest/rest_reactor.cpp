@@ -842,9 +842,10 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     curl_multi_ptr multi{curl_multi_init()};
     if (!multi) { throw std::runtime_error("rest_reactor: curl_multi_init failed"); }
 
-    file_descriptor epoll_fd       = make_epoll_fd();
-    file_descriptor curl_timer_fd  = make_timer_fd();
-    file_descriptor retry_timer_fd = make_timer_fd();
+    file_descriptor epoll_fd        = make_epoll_fd();
+    file_descriptor curl_timer_fd   = make_timer_fd();
+    file_descriptor retry_timer_fd  = make_timer_fd();
+    file_descriptor upkeep_timer_fd = make_timer_fd();
     worker_state ws{multi.get(), epoll_fd.get(), curl_timer_fd.get()};
 
     SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_SOCKETFUNCTION, &rest_socket_cb));
@@ -870,11 +871,25 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     epoll_add(_wakeup_fd.get(), EPOLLIN);
     epoll_add(curl_timer_fd.get(), EPOLLIN);
     epoll_add(retry_timer_fd.get(), EPOLLIN);
+    epoll_add(upkeep_timer_fd.get(), EPOLLIN);
 
-    // Easy-handle pool: max_connections handles configured once with the
-    // static performance + TLS/timeout options; per-request options are set at
-    // submit time.  Worker-thread-local, so no locking.
-    CURLSH* const share = global_curl_context::instance().share_handle();
+    // Idle-connection keepalive: fire the upkeep timer periodically so idle
+    // pooled connections get an HTTP/2 PING (gated per-connection by
+    // CURLOPT_UPKEEP_INTERVAL_MS).  Disabled when upkeep_interval is zero.
+    long const upkeep_ms = static_cast<long>(_config.upkeep_interval.count());
+    if (upkeep_ms > 0) {
+      itimerspec its{};
+      its.it_value.tv_sec = its.it_interval.tv_sec = upkeep_ms / 1000;
+      its.it_value.tv_nsec = its.it_interval.tv_nsec = (upkeep_ms % 1000) * 1'000'000L;
+      ::timerfd_settime(upkeep_timer_fd.get(), 0, &its, nullptr);
+    }
+
+    // Easy-handle pool: max_connections handles configured once with the static
+    // performance + TLS/timeout options; per-request options are set at submit
+    // time.  The connection cache is shared here via a worker-local curl_share
+    // so idle connections survive across handles and are reachable by
+    // curl_easy_upkeep — safe because only this worker thread touches it.
+    curl_share worker_share{/*share_connections=*/true};
     std::vector<curl_easy_ptr> handle_storage;
     std::vector<CURL*> free_handles;
     handle_storage.reserve(_config.max_connections);
@@ -882,7 +897,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     for (std::size_t i = 0; i < _config.max_connections; ++i) {
       curl_easy_ptr h{curl_easy_init()};
       if (!h) { throw std::runtime_error("rest_reactor: curl_easy_init failed"); }
-      configure_easy_handle(h.get(), share);
+      configure_easy_handle(
+        h.get(), worker_share.get(), upkeep_ms, static_cast<long>(_config.conn_max_age.count()));
       apply_request_opts(h.get(), _config);
       free_handles.push_back(h.get());
       handle_storage.push_back(std::move(h));
@@ -1150,6 +1166,15 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
             retry_heap.pop_back();
           }
           arm_retry_timer();
+        } else if (fd == upkeep_timer_fd.get()) {
+          drain_fd(upkeep_timer_fd.get());
+          // Keep idle pooled connections warm.  Only when fully idle — an
+          // in-flight transfer already keeps its connection active, and this
+          // keeps upkeep off the hot path.  One call walks the worker's shared
+          // connection cache, so any pooled handle covers all of them.
+          if (inflight_map.empty() && !handle_storage.empty()) {
+            curl_easy_upkeep(handle_storage.front().get());
+          }
         } else {
           int ev_bitmask = 0;
           if (events[i].events & EPOLLIN) { ev_bitmask |= CURL_CSELECT_IN; }
