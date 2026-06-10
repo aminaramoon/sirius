@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -639,8 +640,9 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     curl_multi_ptr multi{curl_multi_init()};
     if (!multi) { throw std::runtime_error("rest_reactor: curl_multi_init failed"); }
 
-    file_descriptor epoll_fd      = make_epoll_fd();
-    file_descriptor curl_timer_fd = make_timer_fd();
+    file_descriptor epoll_fd       = make_epoll_fd();
+    file_descriptor curl_timer_fd  = make_timer_fd();
+    file_descriptor retry_timer_fd = make_timer_fd();
     worker_state ws{multi.get(), epoll_fd.get(), curl_timer_fd.get()};
 
     SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_SOCKETFUNCTION, &rest_socket_cb));
@@ -665,6 +667,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     };
     epoll_add(_wakeup_fd.get(), EPOLLIN);
     epoll_add(curl_timer_fd.get(), EPOLLIN);
+    epoll_add(retry_timer_fd.get(), EPOLLIN);
 
     // Easy-handle pool: max_connections handles configured once with the
     // static performance + TLS/timeout options; per-request options are set at
@@ -686,6 +689,48 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     std::unordered_map<CURL*, std::unique_ptr<transfer>> inflight_map;
     int running = 0;
 
+    // -- retry scheduling --------------------------------------------------
+    // A min-heap of chunks keyed by their due time.  When retry_timer_fd fires,
+    // every chunk whose due time has passed moves into `ready`, which submit()
+    // drains ahead of the inbound queue.  The timer is always armed to the
+    // earliest due time in the heap.
+    struct retry_entry {
+      std::chrono::steady_clock::time_point due;
+      std::unique_ptr<rest_chunked_rx_request> req;
+    };
+    auto const retry_cmp = [](const retry_entry& a, const retry_entry& b) { return a.due > b.due; };
+    std::vector<retry_entry> retry_heap;
+    std::deque<std::unique_ptr<rest_chunked_rx_request>> ready;
+
+    auto arm_retry_timer = [&]() {
+      itimerspec its{};  // all-zero => disarm
+      if (!retry_heap.empty()) {
+        auto const now = std::chrono::steady_clock::now();
+        auto const due = retry_heap.front().due;
+        auto ns        = due > now
+                           ? std::chrono::duration_cast<std::chrono::nanoseconds>(due - now).count()
+                           : std::int64_t{1};
+        if (ns <= 0) { ns = 1; }
+        its.it_value.tv_sec  = ns / 1'000'000'000;
+        its.it_value.tv_nsec = ns % 1'000'000'000;
+      }
+      ::timerfd_settime(retry_timer_fd.get(), 0, &its, nullptr);
+    };
+
+    auto schedule_retry = [&](std::unique_ptr<rest_chunked_rx_request> req,
+                              std::string const& retry_after) {
+      if (req->attempt + 1 >= _config.max_retry_attempts) {
+        req->manager->report_error(std::make_exception_ptr(std::runtime_error(
+          "rest_reactor: exhausted retries for " + req->object.bucket + "/" + req->object.key)));
+        return;
+      }
+      auto const delay = compute_backoff(req->attempt, retry_after, _config);
+      req->attempt += 1;
+      retry_heap.push_back(retry_entry{std::chrono::steady_clock::now() + delay, std::move(req)});
+      std::push_heap(retry_heap.begin(), retry_heap.end(), retry_cmp);
+      arm_retry_timer();
+    };
+
     auto setup_easy = [&](transfer& t) {
       auto authd = _config.authorizer->authorize(
         t.req->object, s3::s3_request_method::GET, presign_ttl(_config));
@@ -706,8 +751,15 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     auto submit = [&]() {
       while (static_cast<std::size_t>(inflight_map.size()) < _config.max_connections &&
              !free_handles.empty()) {
+        // Retried chunks (due and moved into `ready`) take priority over new
+        // inbound work so a backed-off request is not starved by fresh ones.
         std::unique_ptr<rest_chunked_rx_request> dr;
-        if (!_requests.try_dequeue(dr)) { break; }
+        if (!ready.empty()) {
+          dr = std::move(ready.front());
+          ready.pop_front();
+        } else if (!_requests.try_dequeue(dr)) {
+          break;
+        }
         if (!dr) { continue; }
         if (dr->manager->has_error()) {
           dr.reset();
@@ -742,8 +794,16 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
                              req.object.bucket + "/" + req.object.key)));
         return;
       }
-      // Error or truncated transfer.  Retry scheduling lands in Step 7; for now
-      // a failure is terminal.
+      // Error or truncated transfer.  A short read or a transient HTTP / curl
+      // failure is retried (re-authorized and re-submitted after a backoff);
+      // anything else is terminal.
+      bool const short_read = rc == CURLE_OK && ok_range && t->sink.written < req.chunk.size;
+      bool const retriable  = short_read || (rc != CURLE_OK && is_retriable_curl(rc)) ||
+                             (rc == CURLE_OK && is_retriable_status(status));
+      if (retriable) {
+        schedule_retry(std::move(t->req), t->hc.retry_after);
+        return;
+      }
       std::string const msg = rc != CURLE_OK
                                 ? std::string(curl_easy_strerror(rc))
                                 : (ok_range ? "short read" : "HTTP " + std::to_string(status));
@@ -786,6 +846,15 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         } else if (fd == curl_timer_fd.get()) {
           drain_fd(curl_timer_fd.get());
           curl_multi_socket_action(multi.get(), CURL_SOCKET_TIMEOUT, 0, &running);
+        } else if (fd == retry_timer_fd.get()) {
+          drain_fd(retry_timer_fd.get());
+          auto const now = std::chrono::steady_clock::now();
+          while (!retry_heap.empty() && retry_heap.front().due <= now) {
+            std::pop_heap(retry_heap.begin(), retry_heap.end(), retry_cmp);
+            ready.push_back(std::move(retry_heap.back().req));
+            retry_heap.pop_back();
+          }
+          arm_retry_timer();
         } else {
           int ev_bitmask = 0;
           if (events[i].events & EPOLLIN) { ev_bitmask |= CURL_CSELECT_IN; }
@@ -805,6 +874,16 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       if (t) { t->req->manager->report_error(std::make_error_code(std::errc::operation_canceled)); }
     }
     inflight_map.clear();
+    for (auto& e : retry_heap) {
+      if (e.req) {
+        e.req->manager->report_error(std::make_error_code(std::errc::operation_canceled));
+      }
+    }
+    retry_heap.clear();
+    for (auto& r : ready) {
+      if (r) { r->manager->report_error(std::make_error_code(std::errc::operation_canceled)); }
+    }
+    ready.clear();
   } catch (const std::exception& e) {
     spdlog::error("rest_reactor worker_loop: {}", e.what());
   }
