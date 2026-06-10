@@ -870,8 +870,14 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_SOCKETDATA, &ws));
     SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_TIMERFUNCTION, &rest_timer_cb));
     SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_TIMERDATA, &ws));
+    // Parallel TCP streams rather than HTTP/2 multiplexing: with multiplexing
+    // off, curl opens a separate connection per concurrent transfer (up to
+    // MAX_HOST_CONNECTIONS == max_connections) instead of funneling every GET
+    // over one h2 connection bounded by the server's stream limit.  Against S3,
+    // independent connections give better aggregate throughput on large ranged
+    // reads, and the slot pool's "N connections" model then actually holds.
     SIRIUS_CURLM_CHECK(
-      curl_multi_setopt(multi.get(), CURLMOPT_PIPELINING, static_cast<long>(CURLPIPE_MULTIPLEX)));
+      curl_multi_setopt(multi.get(), CURLMOPT_PIPELINING, static_cast<long>(CURLPIPE_NOTHING)));
     SIRIUS_CURLM_CHECK(curl_multi_setopt(
       multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS, static_cast<long>(_config.max_connections)));
     SIRIUS_CURLM_CHECK(curl_multi_setopt(
