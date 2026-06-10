@@ -83,7 +83,8 @@ struct rest_chunked_rx_request {
   s3::s3_object_ref object;
   io_object_segment chunk;
   std::size_t file_size{0};
-  std::size_t attempt{0};
+  std::size_t attempt{0};       // transient (5xx / curl / short-read) retries
+  std::size_t auth_attempt{0};  // bounded HTTP 403 (re-presign) retries
   std::unique_ptr<device_cpy_request> cpy_req;
   std::shared_ptr<request_manager> manager;
 

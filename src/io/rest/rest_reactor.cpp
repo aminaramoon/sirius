@@ -127,10 +127,15 @@ size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
 
 // ---- retry classification --------------------------------------------------
 
-/// HTTP status codes worth retrying (transient server / throttling).
+/// HTTP status codes worth retrying (transient server / throttling).  Only the
+/// transient 5xx are included: 500 Internal Error, 502 Bad Gateway, 503 Slow
+/// Down / Service Unavailable, 504 Gateway Timeout.  Permanent 5xx (501 Not
+/// Implemented, 505 HTTP Version Not Supported, ...) are NOT retried — they
+/// would only burn the full retry budget on an error that cannot succeed.
 bool is_retriable_status(long status) noexcept
 {
-  return status == 408 || status == 429 || (status >= 500 && status < 600);
+  return status == 408 || status == 429 || status == 500 || status == 502 || status == 503 ||
+         status == 504;
 }
 
 /// libcurl error codes worth retrying (transient transport failures).
@@ -952,15 +957,25 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       ::timerfd_settime(retry_timer_fd.get(), 0, &its, nullptr);
     };
 
+    // Re-enqueue a chunk for a later attempt after a backoff.  @p is_auth picks
+    // the bounded HTTP-403 (re-presign) budget instead of the transient-error
+    // budget, so a stale presigned URL gets a few fresh-signature retries while
+    // a genuine AccessDenied still fails fast.
     auto schedule_retry = [&](std::unique_ptr<rest_chunked_rx_request> req,
-                              std::string const& retry_after) {
-      if (req->attempt + 1 >= _config.max_retry_attempts) {
+                              std::string const& retry_after,
+                              bool is_auth) {
+      std::size_t& counter = is_auth ? req->auth_attempt : req->attempt;
+      std::size_t const max_attempts =
+        is_auth ? _config.max_auth_retry_attempts : _config.max_retry_attempts;
+      if (counter + 1 >= max_attempts) {
         req->manager->report_error(std::make_exception_ptr(std::runtime_error(
           "rest_reactor: exhausted retries for " + req->object.bucket + "/" + req->object.key)));
         return;
       }
+      // Backoff tracks the transient-attempt count; an auth retry re-presigns
+      // and reuses the current step without inflating it.
       auto const delay = compute_backoff(req->attempt, retry_after, _config);
-      req->attempt += 1;
+      counter += 1;
       retry_heap.push_back(retry_entry{std::chrono::steady_clock::now() + delay, std::move(req)});
       std::push_heap(retry_heap.begin(), retry_heap.end(), retry_cmp);
       arm_retry_timer();
@@ -1084,8 +1099,12 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       bool const short_read = rc == CURLE_OK && ok_range && s.sink.written < req.chunk.size;
       bool const retriable  = short_read || (rc != CURLE_OK && is_retriable_curl(rc)) ||
                              (rc == CURLE_OK && is_retriable_status(status));
-      if (retriable) {
-        schedule_retry(std::move(s.req), s.hc.retry_after);
+      // A 403 is most often a presigned URL that expired while queued; re-issue
+      // with a fresh signature a bounded number of times before giving up.
+      bool const auth_retriable = rc == CURLE_OK && status == 403;
+      if (retriable || auth_retriable) {
+        schedule_retry(
+          std::move(s.req), s.hc.retry_after, /*is_auth=*/auth_retriable && !retriable);
         return false;
       }
       std::string const msg = rc != CURLE_OK

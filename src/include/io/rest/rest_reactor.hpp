@@ -137,6 +137,11 @@ class rest_reactor {
 
     // -- retry policy ------------------------------------------------------
     std::size_t max_retry_attempts{10};
+    /// Bounded retries for an HTTP 403.  A presigned URL that expired while the
+    /// request waited in the queue comes back as 403; since every attempt
+    /// re-authorizes (a fresh presigned URL), a small number of retries can
+    /// recover from expiry.  Kept low so a genuine AccessDenied fails fast.
+    std::size_t max_auth_retry_attempts{3};
     std::chrono::milliseconds retry_backoff_base{50};
     std::chrono::milliseconds retry_jitter{50};
     bool honor_retry_after{true};
