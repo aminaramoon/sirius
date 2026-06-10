@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -199,6 +200,34 @@ curl_slist_ptr build_header_list(std::vector<std::pair<std::string, std::string>
 std::string range_header(size_t offset, size_t size)
 {
   return fmt::format("Range: bytes={}-{}", offset, offset + size - 1);
+}
+
+/// Parse the first-byte position out of a Content-Range value of the form
+/// "bytes <first>-<last>/<total>" (the trimmed value captured by the header
+/// callback).  Returns nullopt for any value that does not start with a
+/// well-formed "bytes <first>-" so the caller can reject an unverifiable 206.
+std::optional<size_t> content_range_start(std::string const& cr)
+{
+  constexpr std::string_view kUnit = "bytes";
+  std::string_view sv{cr};
+  if (sv.size() < kUnit.size()) { return std::nullopt; }
+  for (size_t i = 0; i < kUnit.size(); ++i) {
+    if (ascii_lower(sv[i]) != kUnit[i]) { return std::nullopt; }
+  }
+  sv.remove_prefix(kUnit.size());
+  while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t')) {
+    sv.remove_prefix(1);
+  }
+  if (sv.empty() || sv.front() < '0' || sv.front() > '9') { return std::nullopt; }
+  size_t value = 0;
+  size_t i     = 0;
+  for (; i < sv.size() && sv[i] >= '0' && sv[i] <= '9'; ++i) {
+    value = value * 10 + static_cast<size_t>(sv[i] - '0');
+  }
+  // A valid first-byte position is immediately followed by '-' (the range
+  // separator); anything else ("*", end of string, ...) is not parseable.
+  if (i >= sv.size() || sv[i] != '-') { return std::nullopt; }
+  return value;
 }
 
 /// Backoff before the next attempt: honor a numeric Retry-After (seconds,
@@ -1071,6 +1100,24 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       io_slot& s          = slots[static_cast<size_t>(i)];
       auto& req           = *s.req;
       bool const ok_range = (status == 206) || (status == 200 && req.chunk.offset == 0);
+      // A 206 must report, via Content-Range, that it delivered the exact range
+      // we asked for.  The write callback scatters the body in arrival order
+      // with no idea what file offset it covers, so a 206 whose body is a
+      // *different* range than requested (a misbehaving proxy/CDN/cache, or a
+      // multipart/byteranges response curl does not parse) would otherwise be
+      // accepted as correct data — silent corruption.  Validate the start
+      // offset before trusting any 206 body; a mismatch (or an unparsable /
+      // missing Content-Range) is a terminal error, not a transient one.
+      if (rc == CURLE_OK && status == 206) {
+        auto const start = content_range_start(s.hc.content_range);
+        if (!start || *start != req.chunk.offset) {
+          req.manager->report_error(std::make_exception_ptr(std::runtime_error(
+            "rest_reactor: 206 Content-Range mismatch (got '" + s.hc.content_range +
+            "', requested offset " + std::to_string(req.chunk.offset) + ") for " +
+            req.object.bucket + "/" + req.object.key)));
+          return false;
+        }
+      }
       if (rc == CURLE_OK && ok_range && s.sink.written >= req.chunk.size) {
         if (req.is_device()) {
           // Issue the async H2D copy.  Bounce-staged reads need a CUDA event so
