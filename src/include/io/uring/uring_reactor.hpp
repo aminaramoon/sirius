@@ -130,6 +130,30 @@ class uring_reactor {
     std::size_t max_n_chunks{16};
   };
 
+  /// Shared, immutable services for a pool of reactors.  One instance is built
+  /// by @c uring_ioctx and shared (via shared_ptr) across every reactor in the
+  /// pool — the natural home for things shared rather than per-reactor: the
+  /// pinned bounce-staging resource (and, in future, GDS-registered buffers, a
+  /// shared submission/poll thread, etc.).  Carries the primitive @c config too.
+  class reactor_context {
+   public:
+    reactor_context(config cfg, cucascade::memory::fixed_size_host_memory_resource* mr)
+      : _config(cfg), _mr(mr)
+    {
+    }
+
+    [[nodiscard]] const config& cfg() const noexcept { return _config; }
+    [[nodiscard]] cucascade::memory::fixed_size_host_memory_resource* host_memory_resource()
+      const noexcept
+    {
+      return _mr;
+    }
+
+   private:
+    config _config;
+    cucascade::memory::fixed_size_host_memory_resource* _mr{nullptr};
+  };
+
   using native_handle_type        = int;
   using io_object_type            = local_io_object;
   using request_type              = rx_request;
@@ -137,11 +161,14 @@ class uring_reactor {
   using chunk_io_request_type     = chunked_rx_request;
   using chunk_io_request_type_ptr = std::unique_ptr<chunked_rx_request>;
   using reactor_config_type       = config;
+  using reactor_context_type      = reactor_context;
 
-  /// Bounce slots are allocated from @p mr; their size is taken from
-  /// @c mr.get_block_size().  The reactor keeps the @c multiple_blocks_allocation
-  /// alive for its lifetime — blocks return to the resource on destruction.
-  explicit uring_reactor(cucascade::memory::fixed_size_host_memory_resource& mr,
+  /// Bounce slots are allocated from the context's host_memory_resource (which
+  /// must be non-null); their size is taken from its @c get_block_size().  The
+  /// reactor keeps the @c multiple_blocks_allocation alive for its lifetime —
+  /// blocks return to the resource on destruction — and holds the shared
+  /// @p ctx so it (and the resource) outlive the reactor.
+  explicit uring_reactor(std::shared_ptr<reactor_context> ctx,
                          std::string_view tname = "uring_reactor");
 
   ~uring_reactor();
@@ -255,6 +282,10 @@ class uring_reactor {
 
  private:
   void worker_loop(const std::stop_token& stop_token);
+
+  // Shared services + tunables for the whole reactor pool, kept alive for this
+  // reactor's lifetime (so the bounce-staging resource outlives _bounce_storage).
+  std::shared_ptr<reactor_context> _ctx;
 
   // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
   // multiple_blocks_allocation destructor returns the blocks to the upstream

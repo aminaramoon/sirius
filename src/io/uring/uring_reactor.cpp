@@ -424,11 +424,17 @@ struct unique_ring {
 // uring_reactor
 // ---------------------------------------------------------------------------
 
-uring_reactor::uring_reactor(cucascade::memory::fixed_size_host_memory_resource& mr,
-                             std::string_view tname)
-  : _config{mr.get_block_size()}, _bounce_slot_size(mr.get_block_size())
+uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
+  : _ctx(std::move(ctx))
 {
-  _bounce_storage = mr.allocate_multiple_blocks(NUM_CHUNKS * _bounce_slot_size);
+  if (!_ctx) { throw std::invalid_argument("uring_reactor: reactor_context must be non-null"); }
+  if (_ctx->host_memory_resource() == nullptr) {
+    throw std::invalid_argument("uring_reactor: context host_memory_resource must be non-null");
+  }
+  _config           = _ctx->cfg();
+  _bounce_slot_size = _ctx->host_memory_resource()->get_block_size();
+  _bounce_storage =
+    _ctx->host_memory_resource()->allocate_multiple_blocks(NUM_CHUNKS * _bounce_slot_size);
   _worker = std::jthread([this](const std::stop_token& stop_token) { worker_loop(stop_token); },
                          _stop_source.get_token());
   if (!tname.empty()) {

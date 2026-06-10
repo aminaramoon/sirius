@@ -39,6 +39,12 @@ class uring_ioctx : public templated_ioctx<uring_reactor> {
   uring_ioctx(size_t n_reactors,
               cucascade::memory::fixed_size_host_memory_resource& mr,
               bool use_odirect = true);
+
+ private:
+  /// Delegated-to target: build the reactor pool from a shared context (one
+  /// context shared across all reactors).  The public constructor assembles the
+  /// context from its arguments and forwards here.
+  uring_ioctx(const std::shared_ptr<uring_reactor::reactor_context>& ctx, size_t n_reactors);
 };
 
 }  // namespace sirius::io::uring
