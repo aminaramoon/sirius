@@ -106,15 +106,22 @@ class rest_reactor {
     /// Max concurrent in-flight easy handles per reactor.
     std::size_t max_connections{16};
 
-    /// Target maximum bytes per ranged GET.  A larger contiguous read is split
-    /// into ceil(size / chunk_size) GETs that run in parallel across the
-    /// connection pool; smaller file-adjacent segments are fused into one
-    /// scatter GET up to this size.
+    /// Target maximum bytes per ranged GET for the vector / device-staging
+    /// paths: file-adjacent segments are fused into one scatter GET up to this
+    /// size, and an oversized segment is split into ceil(size / chunk_size)
+    /// pieces.  A single contiguous host read instead splits by
+    /// @c max_num_chunks (see prep_host_rx_request).
     std::size_t chunk_size{8UL << 20};
 
     /// Cap on destination buffers fused into a single scatter GET (i.e. how
     /// many file-adjacent segments may merge into one request).
     std::size_t max_n_chunks{16};
+
+    /// How many parallel ranged GETs a single contiguous host read is broken
+    /// into (@c prep_host_rx_request).  The split picks the largest chunk count
+    /// <= max_num_chunks that keeps every piece at least 1 MiB; a read smaller
+    /// than 2 MiB stays a single GET.
+    std::size_t max_num_chunks{16};
 
     /// Pinned host resource for device-read staging; null disables the
     /// reactor-staged device path.  Bounce-slot size is its block size.

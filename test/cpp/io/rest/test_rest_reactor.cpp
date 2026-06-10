@@ -181,31 +181,78 @@ TEST_CASE("prep_host_rxv_request builds one chunk per non-empty segment", "[rest
   }
 }
 
-TEST_CASE("prep_host_rx_request splits a large range into chunk_size pieces", "[rest]")
+TEST_CASE("prep_host_rx_request splits a contiguous read by max_num_chunks", "[rest]")
 {
-  rest_reactor::config cfg;
-  cfg.chunk_size   = 4096;
-  cfg.max_n_chunks = 16;
-  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
-
-  // 8 * chunk_size laid out contiguously -> 8 single-buffer chunks.
+  constexpr size_t kMiB     = 1UL << 20;
   constexpr uintptr_t kBase = 0x10000;
-  auto req =
-    rest_reactor::prep_host_rx_request(cfg, file, io_object_segment{0, 8 * 4096, fake_ptr(kBase)});
-  REQUIRE(req->size() == 8);
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/256 * kMiB);
 
-  auto chunks = req->get_all_chunks();
-  REQUIRE(chunks.size() == 8);
-  size_t total = 0;
-  for (size_t i = 0; i < chunks.size(); ++i) {
-    auto const& c = chunks[i]->chunk;
-    CHECK(c.offset == i * 4096);
-    CHECK(c.size == 4096);
-    CHECK(c.n_chunks() == 1);  // a split piece is a plain single-buffer GET
-    CHECK(reinterpret_cast<uintptr_t>(c.data()) == kBase + i * 4096);
-    total += c.size;
+  SECTION("a read below 2 MiB stays a single GET")
+  {
+    rest_reactor::config cfg;
+    cfg.max_num_chunks = 16;
+    auto req           = rest_reactor::prep_host_rx_request(
+      cfg, file, io_object_segment{0, kMiB + kMiB / 2, fake_ptr(kBase)});  // 1.5 MiB
+    CHECK(req->size() == 1);
   }
-  CHECK(total == 8 * 4096);  // pieces cover the whole range, contiguously
+
+  SECTION("split count is capped by max_num_chunks")
+  {
+    rest_reactor::config cfg;
+    cfg.max_num_chunks = 4;
+    // 8 MiB / 1 MiB = 8 candidate pieces, but max_num_chunks caps it at 4.
+    auto req = rest_reactor::prep_host_rx_request(
+      cfg, file, io_object_segment{0, 8 * kMiB, fake_ptr(kBase)});
+    REQUIRE(req->size() == 4);
+    auto chunks  = req->get_all_chunks();
+    size_t total = 0;
+    size_t pos   = 0;
+    for (auto const& c : chunks) {
+      CHECK(c->chunk.offset == pos);
+      CHECK(c->chunk.size == 2 * kMiB);
+      CHECK(c->chunk.n_chunks() == 1);  // each piece is a plain single-buffer GET
+      CHECK(reinterpret_cast<uintptr_t>(c->chunk.data()) == kBase + pos);
+      pos += c->chunk.size;
+      total += c->chunk.size;
+    }
+    CHECK(total == 8 * kMiB);  // pieces cover the whole range, contiguously
+  }
+
+  SECTION("pieces stay at least 1 MiB when max_num_chunks exceeds size / 1 MiB")
+  {
+    rest_reactor::config cfg;
+    cfg.max_num_chunks = 16;
+    // 5 MiB / 1 MiB = 5 pieces, fewer than the cap, so each piece is exactly 1 MiB.
+    auto req = rest_reactor::prep_host_rx_request(
+      cfg, file, io_object_segment{0, 5 * kMiB, fake_ptr(kBase)});
+    REQUIRE(req->size() == 5);
+    auto chunks = req->get_all_chunks();
+    for (auto const& c : chunks) {
+      CHECK(c->chunk.size == kMiB);
+    }
+  }
+
+  SECTION("an uneven split spreads the remainder over the leading pieces")
+  {
+    rest_reactor::config cfg;
+    cfg.max_num_chunks = 4;
+    size_t const size  = 8 * kMiB + 3;  // 3 leading pieces get one extra byte
+    auto req =
+      rest_reactor::prep_host_rx_request(cfg, file, io_object_segment{1000, size, fake_ptr(kBase)});
+    REQUIRE(req->size() == 4);
+    auto chunks  = req->get_all_chunks();
+    size_t total = 0;
+    size_t pos   = 0;
+    for (auto const& c : chunks) {
+      CHECK(c->chunk.offset == 1000 + pos);
+      CHECK(reinterpret_cast<uintptr_t>(c->chunk.data()) == kBase + pos);
+      pos += c->chunk.size;
+      total += c->chunk.size;
+    }
+    CHECK(total == size);                               // every byte covered exactly once
+    CHECK(chunks.front()->chunk.size == 2 * kMiB + 1);  // leading piece took a remainder byte
+    CHECK(chunks.back()->chunk.size == 2 * kMiB);       // trailing piece did not
+  }
 }
 
 TEST_CASE("prep_host_rxv_request fuses file-adjacent segments into a scatter GET", "[rest]")

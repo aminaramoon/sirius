@@ -323,6 +323,7 @@ rest_reactor::rest_reactor(config cfg, std::string_view tname) : _config(std::mo
     throw std::invalid_argument("rest_reactor: max_connections must be > 0");
   }
   if (_config.max_retry_attempts == 0) { _config.max_retry_attempts = 1; }
+  if (_config.max_num_chunks == 0) { _config.max_num_chunks = 1; }
 
   // Touch the process-wide curl context so global init + the shared cache are
   // ready before any handle is created (here or on the worker).
@@ -389,25 +390,42 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
 {
   if (segment.size == 0) { return rest_rx_request::create({}); }
 
-  // Split a large contiguous read into chunk_size pieces that run in parallel
-  // across the connection pool; a small read stays a single chunk.
-  std::array<io_object_segment, 1> const one{segment};
-  auto groups = chunk_host_segments(
-    std::span<const io_object_segment>(one.data(), one.size()), cfg.chunk_size, cfg.max_n_chunks);
+  // Break a contiguous host read into N parallel single-buffer ranged GETs so
+  // the connection pool fetches them concurrently.  N is the largest count
+  // <= max_num_chunks that keeps every piece at least min_chunk_size; a read
+  // below single_request_threshold stays a single GET (the extra round-trips
+  // would not pay off).  segment.size is distributed as evenly as possible,
+  // spreading the remainder over the leading pieces so every byte is covered
+  // exactly once.
+  constexpr size_t min_chunk_size           = 1UL << 20;  // 1 MiB
+  constexpr size_t single_request_threshold = 2UL << 20;  // 2 MiB
 
-  auto manager       = std::make_shared<request_manager>(segment.size, groups.size());
+  size_t n_chunks = 1;
+  if (segment.size >= single_request_threshold) {
+    n_chunks = std::min<size_t>(cfg.max_num_chunks, segment.size / min_chunk_size);
+    n_chunks = std::max<size_t>(n_chunks, 1);
+  }
+
+  auto manager       = std::make_shared<request_manager>(segment.size, n_chunks);
   auto const obj     = file.object_ref();
   size_t const fsize = file.size();
+  uint8_t* const dst = segment.data();
+
+  size_t const base = segment.size / n_chunks;
+  size_t const rem  = segment.size % n_chunks;
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
-  chunks.reserve(groups.size());
-  for (auto& g : groups) {
-    auto req       = std::make_unique<rest_chunked_rx_request>();
-    req->object    = obj;
-    req->chunk     = std::move(g);
-    req->file_size = fsize;
-    req->manager   = manager;
+  chunks.reserve(n_chunks);
+  size_t pos = 0;  // byte offset within the segment
+  for (size_t c = 0; c < n_chunks; ++c) {
+    size_t const piece = base + (c < rem ? 1 : 0);
+    auto req           = std::make_unique<rest_chunked_rx_request>();
+    req->object        = obj;
+    req->chunk         = io_object_segment{segment.offset + pos, piece, dst + pos};
+    req->file_size     = fsize;
+    req->manager       = manager;
     chunks.push_back(std::move(req));
+    pos += piece;
   }
   return rest_rx_request::create(std::move(chunks));
 }
