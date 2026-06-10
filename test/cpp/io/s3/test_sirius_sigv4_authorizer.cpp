@@ -15,7 +15,6 @@
  */
 
 #include <catch.hpp>
-
 #include <io/io_errors.hpp>
 #include <io/s3/sirius_sigv4_authorizer.hpp>
 #include <io/s3/static_credentials.hpp>
@@ -77,8 +76,8 @@ TEST_CASE("presigned authorizer falls back to the default TTL", "[s3][authorizer
     test_creds(), "us-east-1", "https://s3.us-east-1.amazonaws.com", std::chrono::seconds{900});
 
   // Non-positive per-call timeout => construction-time default TTL.
-  s3_authorized_request const req = auth.authorize(
-    s3_object_ref{"b", "k"}, s3_request_method::HEAD, std::chrono::seconds{0});
+  s3_authorized_request const req =
+    auth.authorize(s3_object_ref{"b", "k"}, s3_request_method::HEAD, std::chrono::seconds{0});
   CHECK(contains(req.url, "X-Amz-Expires=900"));
 }
 
@@ -87,8 +86,8 @@ TEST_CASE("header authorizer signs into the Authorization header", "[s3][authori
   sirius_sigv4_header_authorizer auth(
     test_creds(), "us-west-2", "https://s3.us-west-2.amazonaws.com");
 
-  s3_authorized_request const req =
-    auth.authorize(s3_object_ref{"bucket", "key"}, s3_request_method::GET, std::chrono::seconds{60});
+  s3_authorized_request const req = auth.authorize(
+    s3_object_ref{"bucket", "key"}, s3_request_method::GET, std::chrono::seconds{60});
 
   // Plain URL (no presign query) + signed headers.
   CHECK(req.url == "https://s3.us-west-2.amazonaws.com/bucket/key");
@@ -117,9 +116,8 @@ TEST_CASE("authorizer construction validates its inputs", "[s3][authorizer]")
   }
   SECTION("empty region")
   {
-    CHECK_THROWS_AS(
-      sirius_sigv4_presigned_authorizer(test_creds(), "", "https://s3.amazonaws.com"),
-      credential_error);
+    CHECK_THROWS_AS(sirius_sigv4_presigned_authorizer(test_creds(), "", "https://s3.amazonaws.com"),
+                    credential_error);
   }
   SECTION("endpoint with a path")
   {
@@ -129,13 +127,15 @@ TEST_CASE("authorizer construction validates its inputs", "[s3][authorizer]")
   }
   SECTION("endpoint without a scheme")
   {
-    CHECK_THROWS_AS(sirius_sigv4_presigned_authorizer(test_creds(), "us-east-1", "s3.amazonaws.com"),
-                    credential_error);
+    CHECK_THROWS_AS(
+      sirius_sigv4_presigned_authorizer(test_creds(), "us-east-1", "s3.amazonaws.com"),
+      credential_error);
   }
   SECTION("non-positive default TTL")
   {
-    CHECK_THROWS_AS(sirius_sigv4_presigned_authorizer(
-                      test_creds(), "us-east-1", "https://s3.amazonaws.com", std::chrono::seconds{0}),
-                    credential_error);
+    CHECK_THROWS_AS(
+      sirius_sigv4_presigned_authorizer(
+        test_creds(), "us-east-1", "https://s3.amazonaws.com", std::chrono::seconds{0}),
+      credential_error);
   }
 }

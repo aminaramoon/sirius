@@ -14,10 +14,9 @@
  * limitations under the License.
  */
 
-#include <catch.hpp>
-
 #include <cudf/io/text/byte_range_info.hpp>
 
+#include <catch.hpp>
 #include <io/rest/rest_reactor.hpp>
 #include <io/rest/types.hpp>
 #include <io/types.hpp>
@@ -60,10 +59,7 @@ TEST_CASE("rest_reactor::supports only accepts s3 URLs", "[rest]")
 
 TEST_CASE("align_and_coalesce coalesces without alignment by default", "[rest]")
 {
-  SECTION("empty input")
-  {
-    CHECK(coalesce({}).empty());
-  }
+  SECTION("empty input") { CHECK(coalesce({}).empty()); }
   SECTION("zero-size ranges dropped")
   {
     auto out = coalesce({byte_range_info{100, 0}});
@@ -132,7 +128,8 @@ TEST_CASE("prep_host_rx_request builds a single chunk for the segment", "[rest]"
   }
   SECTION("zero-size segment yields no chunks")
   {
-    auto req = rest_reactor::prep_host_rx_request(cfg, file, io_object_segment{0, 0, fake_ptr(0x1)});
+    auto req =
+      rest_reactor::prep_host_rx_request(cfg, file, io_object_segment{0, 0, fake_ptr(0x1)});
     CHECK(req->size() == 0);
   }
 }
