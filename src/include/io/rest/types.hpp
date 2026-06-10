@@ -25,25 +25,32 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 
 namespace sirius::io::rest {
 
 /// Write-callback target for one in-flight transfer.  libcurl hands the
-/// response body to the reactor in arbitrarily-sized pieces; @c buf_sink copies
-/// them into @c dst at a running @c written cursor and ALWAYS reports the full
-/// incoming size back to curl (never a short count, which would abort the
-/// transfer with CURLE_WRITE_ERROR).  Bytes beyond @c capacity are counted in
-/// @c total_received but not stored, so the reactor can detect a server that
-/// ignored the Range header (e.g. returned the whole object) after the fact.
+/// response body to the reactor in arbitrarily-sized pieces; @c buf_sink
+/// scatters them across @c buffers (the chunk's destination iovecs, in file
+/// order) at a running cursor — so a single contiguous ranged GET that fuses
+/// several adjacent segments lands each segment in its own buffer — and ALWAYS
+/// reports the full incoming size back to curl (never a short count, which
+/// would abort the transfer with CURLE_WRITE_ERROR).  Bytes beyond @c capacity
+/// are counted in @c total_received but not stored, so the reactor can detect a
+/// server that ignored the Range header (e.g. returned the whole object).
 struct buf_sink {
-  std::uint8_t* dst{nullptr};
-  std::size_t capacity{0};
-  std::size_t written{0};
+  std::span<iovec> buffers;  // destination buffers, in file order
+  std::size_t capacity{0};   // Σ buffers[i].iov_len
+  std::size_t active{0};     // index of the buffer currently being filled
+  std::size_t cursor{0};     // bytes written into buffers[active]
+  std::size_t written{0};    // total bytes written across all buffers
   std::size_t total_received{0};
 
   void reset() noexcept
   {
+    active         = 0;
+    cursor         = 0;
     written        = 0;
     total_received = 0;
   }

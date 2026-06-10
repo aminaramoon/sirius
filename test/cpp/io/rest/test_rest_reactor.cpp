@@ -177,3 +177,90 @@ TEST_CASE("prep_host_rxv_request builds one chunk per non-empty segment", "[rest
     CHECK(req->size() == 0);
   }
 }
+
+TEST_CASE("prep_host_rx_request splits a large range into chunk_size pieces", "[rest]")
+{
+  rest_reactor::config cfg;
+  cfg.chunk_size   = 4096;
+  cfg.max_n_chunks = 16;
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+
+  // 8 * chunk_size laid out contiguously -> 8 single-buffer chunks.
+  constexpr uintptr_t kBase = 0x10000;
+  auto req =
+    rest_reactor::prep_host_rx_request(cfg, file, io_object_segment{0, 8 * 4096, fake_ptr(kBase)});
+  REQUIRE(req->size() == 8);
+
+  auto chunks = req->get_all_chunks();
+  REQUIRE(chunks.size() == 8);
+  size_t total = 0;
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    auto const& c = chunks[i]->chunk;
+    CHECK(c.offset == i * 4096);
+    CHECK(c.size == 4096);
+    CHECK(c.n_chunks() == 1);  // a split piece is a plain single-buffer GET
+    CHECK(reinterpret_cast<uintptr_t>(c.data()) == kBase + i * 4096);
+    total += c.size;
+  }
+  CHECK(total == 8 * 4096);  // pieces cover the whole range, contiguously
+}
+
+TEST_CASE("prep_host_rxv_request fuses file-adjacent segments into a scatter GET", "[rest]")
+{
+  rest_reactor::config cfg;
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+
+  SECTION("three contiguous segments, separate buffers -> one multi-buffer chunk")
+  {
+    cfg.chunk_size   = 1 << 20;  // big enough to fit all three
+    cfg.max_n_chunks = 16;
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
+                                        io_object_segment{100, 100, fake_ptr(0xB00)},
+                                        io_object_segment{200, 100, fake_ptr(0xC00)}};
+    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
+    REQUIRE(req->size() == 1);
+    auto chunks = req->get_all_chunks();
+    REQUIRE(chunks.size() == 1);
+    CHECK(chunks[0]->chunk.offset == 0);
+    CHECK(chunks[0]->chunk.size == 300);      // one contiguous range
+    CHECK(chunks[0]->chunk.n_chunks() == 3);  // scattered across 3 buffers
+    CHECK(chunks[0]->chunk.is_vectored());
+  }
+  SECTION("max_n_chunks caps the fusion")
+  {
+    cfg.chunk_size   = 1 << 20;
+    cfg.max_n_chunks = 2;  // at most 2 buffers per request
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
+                                        io_object_segment{100, 100, fake_ptr(0xB00)},
+                                        io_object_segment{200, 100, fake_ptr(0xC00)}};
+    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
+    REQUIRE(req->size() == 2);  // [0,200) over 2 buffers, then [200,300)
+  }
+  SECTION("chunk_size caps the fused span")
+  {
+    cfg.chunk_size   = 250;  // two 100B segments fit, the third spills over
+    cfg.max_n_chunks = 16;
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
+                                        io_object_segment{100, 100, fake_ptr(0xB00)},
+                                        io_object_segment{200, 100, fake_ptr(0xC00)}};
+    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
+    REQUIRE(req->size() == 2);  // [0,200) then [200,300)
+  }
+  SECTION("non-contiguous segments stay separate")
+  {
+    cfg.chunk_size   = 1 << 20;
+    cfg.max_n_chunks = 16;
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
+                                        io_object_segment{500, 100, fake_ptr(0xB00)}};
+    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
+    REQUIRE(req->size() == 2);
+  }
+  SECTION("a large segment in the vector is split")
+  {
+    cfg.chunk_size   = 4096;
+    cfg.max_n_chunks = 16;
+    std::vector<io_object_segment> segs{io_object_segment{0, 3 * 4096, fake_ptr(0xA00)}};
+    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
+    REQUIRE(req->size() == 3);
+  }
+}

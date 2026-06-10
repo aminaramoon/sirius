@@ -23,6 +23,7 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <spdlog/fmt/bundled/core.h>
 #include <spdlog/spdlog.h>
 #include <sys/epoll.h>
 #include <unistd.h>
@@ -64,11 +65,24 @@ size_t write_to_sink(char* ptr, size_t size, size_t nmemb, void* userdata)
   auto* sink         = static_cast<buf_sink*>(userdata);
   size_t const bytes = size * nmemb;
   sink->total_received += bytes;
-  if (sink->dst != nullptr && sink->written < sink->capacity) {
-    size_t const room = sink->capacity - sink->written;
-    size_t const n    = std::min(room, bytes);
-    std::memcpy(sink->dst + sink->written, ptr, n);
+  size_t remaining = bytes;
+  auto const* src  = reinterpret_cast<uint8_t const*>(ptr);
+  // Scatter across the destination buffers in file order; a fused contiguous
+  // GET spills from one buffer into the next as each fills.
+  while (remaining > 0 && sink->active < sink->buffers.size()) {
+    iovec& b = sink->buffers[sink->active];
+    if (b.iov_base == nullptr) { break; }
+    if (sink->cursor >= b.iov_len) {
+      ++sink->active;
+      sink->cursor = 0;
+      continue;
+    }
+    size_t const n = std::min(b.iov_len - sink->cursor, remaining);
+    std::memcpy(static_cast<uint8_t*>(b.iov_base) + sink->cursor, src, n);
+    sink->cursor += n;
     sink->written += n;
+    src += n;
+    remaining -= n;
   }
   return bytes;
 }
@@ -184,7 +198,7 @@ curl_slist_ptr build_header_list(std::vector<std::pair<std::string, std::string>
 /// "Range: bytes=<lo>-<hi>" (inclusive end) for [offset, offset+size).
 std::string range_header(size_t offset, size_t size)
 {
-  return "Range: bytes=" + std::to_string(offset) + "-" + std::to_string(offset + size - 1);
+  return fmt::format("Range: bytes={}-{}", offset, offset + size - 1);
 }
 
 /// Backoff before the next attempt: honor a numeric Retry-After (seconds,
@@ -213,6 +227,51 @@ std::chrono::milliseconds compute_backoff(std::size_t attempt,
     jitter = std::chrono::milliseconds{dist(rng)};
   }
   return base + jitter;
+}
+
+/// Group host destination segments into ranged-GET chunks.  Splits any single
+/// segment larger than @p chunk_size into chunk_size single-buffer pieces (each
+/// a parallel GET), and fuses runs of file-adjacent segments into one
+/// contiguous scatter GET capped at @p chunk_size bytes and @p max_n_chunks
+/// buffers.  Input segments must be in file order and carry non-null buffers;
+/// each output segment's @c size is the contiguous file span its buffers cover.
+std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_segment> segs,
+                                                   size_t chunk_size,
+                                                   size_t max_n_chunks)
+{
+  size_t const cs       = std::max<size_t>(chunk_size, 1);
+  size_t const max_bufs = std::max<size_t>(max_n_chunks, 1);
+  std::vector<io_object_segment> out;
+  out.reserve(segs.size());
+  for (size_t i = 0; i < segs.size();) {
+    auto const& s = segs[i];
+    if (s.size == 0) {
+      ++i;
+      continue;
+    }
+    if (s.size > cs) {
+      // Split an oversized contiguous segment into chunk_size pieces.
+      uint8_t* base = s.data();
+      for (size_t pos = 0; pos < s.size; pos += cs) {
+        size_t const piece = std::min(cs, s.size - pos);
+        out.push_back(io_object_segment{s.offset + pos, piece, base + pos});
+      }
+      ++i;
+      continue;
+    }
+    // Greedily fuse following file-adjacent segments into one scatter GET while
+    // the fused span and buffer count stay within their caps.
+    io_object_segment group{s.offset, s.size, s.data()};
+    size_t j = i + 1;
+    while (j < segs.size() && group.n_chunks() < max_bufs && segs[j].size > 0 &&
+           group.offset + group.size == segs[j].offset && group.size + segs[j].size <= cs) {
+      group.append(iovec{static_cast<void*>(segs[j].data()), segs[j].size});
+      ++j;
+    }
+    out.push_back(std::move(group));
+    i = j;
+  }
+  return out;
 }
 
 }  // namespace
@@ -288,54 +347,71 @@ void rest_reactor::enqueue_chunks(std::span<std::unique_ptr<rest_chunked_rx_requ
 // request preparation (host paths)
 // ---------------------------------------------------------------------------
 
-rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(
-  const reactor_config_type& /*cfg*/, const io_object_type& file, const io_object_segment& segment)
+rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_config_type& cfg,
+                                                                  const io_object_type& file,
+                                                                  const io_object_segment& segment)
 {
   if (segment.size == 0) { return rest_rx_request::create({}); }
 
-  auto manager   = std::make_shared<request_manager>(segment.size, 1);
-  auto req       = std::make_unique<rest_chunked_rx_request>();
-  req->object    = file.object_ref();
-  req->chunk     = segment;
-  req->file_size = file.size();
-  req->manager   = std::move(manager);
+  // Split a large contiguous read into chunk_size pieces that run in parallel
+  // across the connection pool; a small read stays a single chunk.
+  std::array<io_object_segment, 1> const one{segment};
+  auto groups = chunk_host_segments(
+    std::span<const io_object_segment>(one.data(), one.size()), cfg.chunk_size, cfg.max_n_chunks);
+
+  auto manager       = std::make_shared<request_manager>(segment.size, groups.size());
+  auto const obj     = file.object_ref();
+  size_t const fsize = file.size();
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
-  chunks.push_back(std::move(req));
+  chunks.reserve(groups.size());
+  for (auto& g : groups) {
+    auto req       = std::make_unique<rest_chunked_rx_request>();
+    req->object    = obj;
+    req->chunk     = std::move(g);
+    req->file_size = fsize;
+    req->manager   = manager;
+    chunks.push_back(std::move(req));
+  }
   return rest_rx_request::create(std::move(chunks));
 }
 
 rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
-  const reactor_config_type& /*cfg*/,
-  const io_object_type& file,
-  std::span<io_object_segment> segments)
+  const reactor_config_type& cfg, const io_object_type& file, std::span<io_object_segment> segments)
 {
   if (segments.empty()) { return rest_rx_request::create({}); }
 
   size_t const fsize = file.size();
 
-  // First pass: clamp each segment to the file end and total the requested
-  // bytes / count the non-empty segments (each becomes one ranged GET).
+  // Clamp each segment to the file end (dropping empties), preserving file
+  // order, and total the requested bytes (what the future reports).
+  std::vector<io_object_segment> clamped;
+  clamped.reserve(segments.size());
   size_t bytes_requested = 0;
-  size_t n_chunks        = 0;
   for (auto const& s : segments) {
-    size_t const clamped = s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
-    if (clamped == 0) { continue; }
-    bytes_requested += clamped;
-    ++n_chunks;
+    size_t const c = s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
+    if (c == 0) { continue; }
+    clamped.push_back(io_object_segment{s.offset, c, s.data()});
+    bytes_requested += c;
   }
-  if (n_chunks == 0) { return rest_rx_request::create({}); }
+  if (clamped.empty()) { return rest_rx_request::create({}); }
 
-  auto manager = std::make_shared<request_manager>(bytes_requested, n_chunks);
+  // Fuse file-adjacent segments into scatter GETs and split oversized ones;
+  // grouping never changes the covered byte total.
+  auto groups =
+    chunk_host_segments(std::span<const io_object_segment>(clamped.data(), clamped.size()),
+                        cfg.chunk_size,
+                        cfg.max_n_chunks);
+
+  auto manager   = std::make_shared<request_manager>(bytes_requested, groups.size());
+  auto const obj = file.object_ref();
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
-  chunks.reserve(n_chunks);
-  for (auto const& s : segments) {
-    size_t const clamped = s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
-    if (clamped == 0) { continue; }
+  chunks.reserve(groups.size());
+  for (auto& g : groups) {
     auto req       = std::make_unique<rest_chunked_rx_request>();
-    req->object    = file.object_ref();
-    req->chunk     = io_object_segment{s.offset, clamped, s.data()};
+    req->object    = obj;
+    req->chunk     = std::move(g);
     req->file_size = fsize;
     req->manager   = manager;
     chunks.push_back(std::move(req));
@@ -469,8 +545,11 @@ size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t
 
   auto const obj = file.object_ref();
   std::string last_error;
+  iovec dst_iov{static_cast<void*>(dst), size};
   for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
-    buf_sink sink{dst, size, 0, 0};
+    buf_sink sink;
+    sink.buffers  = std::span<iovec>(&dst_iov, 1);
+    sink.capacity = size;
     header_capture hc;
 
     auto const authd =
@@ -872,8 +951,10 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     auto setup_easy = [&](transfer& t) {
       auto authd = _config.authorizer->authorize(
         t.req->object, s3::s3_request_method::GET, presign_ttl(_config));
-      t.url  = std::move(authd.url);
-      t.sink = buf_sink{t.req->chunk.data(), t.req->chunk.size, 0, 0};
+      t.url           = std::move(authd.url);
+      t.sink.buffers  = std::span<iovec>(t.req->chunk.buffers);
+      t.sink.capacity = t.req->chunk.size;
+      t.sink.reset();
       t.hc.reset();
       std::string const range = range_header(t.req->chunk.offset, t.req->chunk.size);
       t.headers               = build_header_list(authd.headers, &range);
