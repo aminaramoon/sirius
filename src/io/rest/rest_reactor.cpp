@@ -766,7 +766,6 @@ namespace {
 /// outlive its handle's membership in the multi.
 struct transfer {
   std::unique_ptr<rest_chunked_rx_request> req;
-  CURL* easy{nullptr};
   std::string url;  // backs CURLOPT_URL
   curl_slist_ptr headers;
   buf_sink sink;
@@ -775,6 +774,19 @@ struct transfer {
   // bounce slot the body lands in.  Released after the H2D copy off it
   // completes (tracked via a CUDA event), not when the transfer finishes.
   slot_pool::token bounce_token;
+
+  /// Clear all per-attempt state so the slot can be reused.  Releases the
+  /// bounce slot if still held — a no-op when it was already moved into
+  /// `copying` for an event-tracked H2D copy.
+  void reset() noexcept
+  {
+    req.reset();
+    url.clear();
+    headers.reset();
+    sink = buf_sink{};
+    hc.reset();
+    bounce_token = {};
+  }
 };
 
 /// Worker-loop state reachable from curl's C socket/timer callbacks.
@@ -891,20 +903,28 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     // curl_easy_upkeep — safe because only this worker thread touches it.
     curl_share worker_share{/*share_connections=*/true};
     std::vector<curl_easy_ptr> handle_storage;
-    std::vector<CURL*> free_handles;
+    // Per-attempt transfer state, one slot per pooled handle (parallel arrays:
+    // slots[i] belongs to handle_storage[i]).  Each handle carries its slot
+    // index in CURLOPT_PRIVATE, so a completion maps back to its slot in O(1)
+    // with no per-request allocation or hashing.  free_slots is the free list.
+    std::vector<transfer> slots(_config.max_connections);
+    std::vector<int> free_slots;
     handle_storage.reserve(_config.max_connections);
-    free_handles.reserve(_config.max_connections);
+    free_slots.reserve(_config.max_connections);
     for (std::size_t i = 0; i < _config.max_connections; ++i) {
       curl_easy_ptr h{curl_easy_init()};
       if (!h) { throw std::runtime_error("rest_reactor: curl_easy_init failed"); }
       configure_easy_handle(
         h.get(), worker_share.get(), upkeep_ms, static_cast<long>(_config.conn_max_age.count()));
       apply_request_opts(h.get(), _config);
-      free_handles.push_back(h.get());
+      // Stable per-handle identity (the slot index); never changes across the
+      // requests this handle serves.
+      SIRIUS_CURL_CHECK(curl_easy_setopt(
+        h.get(), CURLOPT_PRIVATE, reinterpret_cast<void*>(static_cast<intptr_t>(i))));
+      free_slots.push_back(static_cast<int>(i));
       handle_storage.push_back(std::move(h));
     }
 
-    std::unordered_map<CURL*, std::unique_ptr<transfer>> inflight_map;
     int running = 0;
 
     // -- retry scheduling --------------------------------------------------
@@ -991,7 +1011,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       arm_retry_timer();
     };
 
-    auto setup_easy = [&](transfer& t) {
+    auto setup_easy = [&](CURL* h, transfer& t) {
       auto authd = _config.authorizer->authorize(
         t.req->object, s3::s3_request_method::GET, presign_ttl(_config));
       t.url           = std::move(authd.url);
@@ -1001,7 +1021,6 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       t.hc.reset();
       std::string const range = range_header(t.req->chunk.offset, t.req->chunk.size);
       t.headers               = build_header_list(authd.headers, &range);
-      CURL* const h           = t.easy;
       SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_URL, t.url.c_str()));
       SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HTTPHEADER, t.headers.get()));
       SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &write_to_sink));
@@ -1011,8 +1030,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     };
 
     auto submit = [&]() {
-      while (static_cast<std::size_t>(inflight_map.size()) < _config.max_connections &&
-             !free_handles.empty()) {
+      // A free slot means we are under the max_connections cap.
+      while (!free_slots.empty()) {
         // Submission priority: chunks blocked on a bounce slot (stalled), then
         // due retries (ready), then fresh inbound work — so neither a
         // backed-off nor a slot-starved request is starved by new ones.
@@ -1053,25 +1072,24 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           }
         }
 
-        CURL* const h = free_handles.back();
-        free_handles.pop_back();
-        auto t  = std::make_unique<transfer>();
-        t->req  = std::move(dr);
-        t->easy = h;
+        int const i = free_slots.back();
+        free_slots.pop_back();
+        transfer& t = slots[i];
+        t.req       = std::move(dr);
         if (needs_bounce) {
-          t->req->chunk.set_data(bounce_bufs[static_cast<size_t>(tok.slot_index())]);
-          t->bounce_token = std::move(tok);
+          t.req->chunk.set_data(bounce_bufs[static_cast<size_t>(tok.slot_index())]);
+          t.bounce_token = std::move(tok);
         }
-        setup_easy(*t);
+        CURL* const h = handle_storage[static_cast<size_t>(i)].get();
+        setup_easy(h, t);
         curl_multi_add_handle(multi.get(), h);
-        inflight_map.emplace(h, std::move(t));
       }
     };
 
-    auto finish = [&](std::unique_ptr<transfer> t, CURLcode rc, long status) {
-      auto& req           = *t->req;
+    auto finish = [&](transfer& t, CURLcode rc, long status) {
+      auto& req           = *t.req;
       bool const ok_range = (status == 206) || (status == 200 && req.chunk.offset == 0);
-      if (rc == CURLE_OK && ok_range && t->sink.written >= req.chunk.size) {
+      if (rc == CURLE_OK && ok_range && t.sink.written >= req.chunk.size) {
         if (req.is_device()) {
           // Issue the async H2D copy.  Bounce-staged reads need a CUDA event so
           // the slot is only reused once the copy off it completes; caller-
@@ -1080,7 +1098,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           cucascade::cuda::cuda_event* ev = nullptr;
           cudaEvent_t cev                 = nullptr;
           if (needs_event) {
-            ev  = &copy_events[req.cpy_req->device_id][t->bounce_token.slot_index()];
+            ev  = &copy_events[req.cpy_req->device_id][t.bounce_token.slot_index()];
             cev = ev->get();
           }
           cudaError_t const err = req.copy_h2d_async(cev);
@@ -1088,9 +1106,9 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
             req.manager->report_error(err);
             return;
           }
-          if (needs_event) { copying.emplace_back(std::move(t->bounce_token), ev); }
+          if (needs_event) { copying.emplace_back(std::move(t.bounce_token), ev); }
         }
-        req.manager->chunk_complete(t->sink.written);
+        req.manager->chunk_complete(t.sink.written);
         return;
       }
       if (rc == CURLE_OK && status == 200 && req.chunk.offset != 0) {
@@ -1103,12 +1121,13 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       }
       // Error or truncated transfer.  A short read or a transient HTTP / curl
       // failure is retried (re-authorized and re-submitted after a backoff);
-      // anything else is terminal.
-      bool const short_read = rc == CURLE_OK && ok_range && t->sink.written < req.chunk.size;
+      // anything else is terminal.  Retry moves the chunk out of the slot into
+      // the heap, so the slot/connection is freed for other work during backoff.
+      bool const short_read = rc == CURLE_OK && ok_range && t.sink.written < req.chunk.size;
       bool const retriable  = short_read || (rc != CURLE_OK && is_retriable_curl(rc)) ||
                              (rc == CURLE_OK && is_retriable_status(status));
       if (retriable) {
-        schedule_retry(std::move(t->req), t->hc.retry_after);
+        schedule_retry(std::move(t.req), t.hc.retry_after);
         return;
       }
       std::string const msg = rc != CURLE_OK
@@ -1127,13 +1146,15 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         CURLcode const rc = msg->data.result;
         long status       = 0;
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+        // Recover the slot index stashed in CURLOPT_PRIVATE at pool creation.
+        char* priv = nullptr;
+        curl_easy_getinfo(h, CURLINFO_PRIVATE, &priv);
+        int const i = static_cast<int>(reinterpret_cast<intptr_t>(priv));
         curl_multi_remove_handle(multi.get(), h);
-        auto it = inflight_map.find(h);
-        if (it == inflight_map.end()) { continue; }
-        std::unique_ptr<transfer> t = std::move(it->second);
-        inflight_map.erase(it);
-        free_handles.push_back(h);
-        finish(std::move(t), rc, status);
+        finish(slots[static_cast<size_t>(i)], rc, status);
+        // Disposition done (completed / retried / failed) — recycle the slot.
+        slots[static_cast<size_t>(i)].reset();
+        free_slots.push_back(i);
       }
     };
 
@@ -1171,7 +1192,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           // in-flight transfer already keeps its connection active, and this
           // keeps upkeep off the hot path.  One call walks the worker's shared
           // connection cache, so any pooled handle covers all of them.
-          if (inflight_map.empty() && !handle_storage.empty()) {
+          if (free_slots.size() == _config.max_connections && !handle_storage.empty()) {
             curl_easy_upkeep(handle_storage.front().get());
           }
         } else {
@@ -1203,11 +1224,13 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
 
     // Detach in-flight handles and cancel every outstanding request (in-flight,
     // retry-scheduled, ready, stalled, queued) so no future is left unfulfilled.
-    for (auto& [h, t] : inflight_map) {
-      curl_multi_remove_handle(multi.get(), h);
-      if (t) { t->req->manager->report_error(std::make_error_code(std::errc::operation_canceled)); }
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+      if (slots[i].req) {
+        curl_multi_remove_handle(multi.get(), handle_storage[i].get());
+        slots[i].req->manager->report_error(std::make_error_code(std::errc::operation_canceled));
+        slots[i].reset();
+      }
     }
-    inflight_map.clear();
     for (auto& e : retry_heap) {
       if (e.req) {
         e.req->manager->report_error(std::make_error_code(std::errc::operation_canceled));
