@@ -16,8 +16,12 @@
 
 #include "io/rest/rest_reactor.hpp"
 
+#include "cucascade/cuda/event.hpp"
+#include "io/details/slot_pool.hpp"
 #include "io/rest/curl_handle.hpp"
 #include "io/uri_parser.hpp"
+
+#include <rmm/cuda_device.hpp>
 
 #include <spdlog/spdlog.h>
 #include <sys/epoll.h>
@@ -233,8 +237,8 @@ rest_reactor::rest_reactor(config cfg, std::string_view tname) : _config(std::mo
 
   if (_config.host_memory_resource != nullptr) {
     _bounce_slot_size = _config.host_memory_resource->get_block_size();
-    _bounce_storage.emplace(
-      _config.host_memory_resource->allocate_multiple_blocks(NUM_BOUNCE_SLOTS * _bounce_slot_size));
+    _bounce_storage =
+      _config.host_memory_resource->allocate_multiple_blocks(NUM_BOUNCE_SLOTS * _bounce_slot_size);
   }
 
   _wakeup_fd = make_event_fd();
@@ -339,31 +343,118 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
   return rest_rx_request::create(std::move(chunks));
 }
 
-rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(
-  const reactor_config_type& /*cfg*/,
-  const io_object_type& /*file*/,
-  uint8_t* /*dst*/,
-  size_t /*offset*/,
-  size_t /*size*/,
-  rmm::cuda_stream_view /*stream*/,
-  int /*device_id*/)
+rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(const reactor_config_type& cfg,
+                                                                    const io_object_type& file,
+                                                                    uint8_t* dst,
+                                                                    size_t offset,
+                                                                    size_t size,
+                                                                    rmm::cuda_stream_view stream,
+                                                                    int device_id)
 {
-  // Implemented in Step 8 (device staging through bounce slots).
-  throw std::runtime_error("rest_reactor::prep_device_rx_request: not yet implemented");
+  if (size == 0) { return rest_rx_request::create({}); }
+  if (cfg.host_memory_resource == nullptr) {
+    throw std::runtime_error(
+      "rest_reactor::prep_device_rx_request: device reads require a host_memory_resource for "
+      "bounce staging");
+  }
+
+  // REST has no GPU-direct path, so the read is staged through reactor-owned
+  // pinned bounce slots and H2D-copied to dst.  No block alignment: split the
+  // requested range (clamped to the file end) into bounce-sized windows, one
+  // staged GET + one H2D copy each.
+  size_t const fsize = file.size();
+  size_t const end   = std::min(offset + size, fsize);
+  if (offset >= end) { return rest_rx_request::create({}); }
+  size_t const wanted = end - offset;
+  size_t const bounce = cfg.host_memory_resource->get_block_size();
+  size_t const n_win  = (wanted + bounce - 1) / bounce;
+
+  auto manager   = std::make_shared<request_manager>(wanted, n_win);
+  auto const obj = file.object_ref();
+
+  std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
+  chunks.reserve(n_win);
+  for (size_t w = offset; w < end; w += bounce) {
+    size_t const rs = std::min(bounce, end - w);
+    auto req        = std::make_unique<rest_chunked_rx_request>();
+    req->object     = obj;
+    req->chunk      = io_object_segment{w, rs};  // null buffer => reactor stages
+    req->file_size  = fsize;
+    auto cpy        = std::make_unique<device_cpy_request>();
+    cpy->stream     = stream;
+    cpy->device_id  = device_id;
+    cpy->copies.push_back(device_cpy_request::copy{/*dst=*/dst + (w - offset),
+                                                   /*src=*/nullptr,  // resolved to the bounce slot
+                                                   /*src_off=*/0,
+                                                   /*size=*/rs});
+    req->cpy_req = std::move(cpy);
+    req->manager = manager;
+    chunks.push_back(std::move(req));
+  }
+  return rest_rx_request::create(std::move(chunks));
 }
 
 rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
   const reactor_config_type& /*cfg*/,
-  const io_object_type& /*file*/,
-  std::span<io_object_segment> /*bounce*/,
-  uint8_t* /*dst*/,
-  size_t /*offset*/,
-  size_t /*size*/,
-  rmm::cuda_stream_view /*stream*/,
-  int /*device_id*/)
+  const io_object_type& file,
+  std::span<io_object_segment> segments,
+  uint8_t* dst,
+  size_t offset,
+  size_t size,
+  rmm::cuda_stream_view stream,
+  int device_id)
 {
-  // Implemented in Step 8 (caller-supplied pinned bounce staging).
-  throw std::runtime_error("rest_reactor::prep_host_to_device_rx_request: not yet implemented");
+  // Device read staged through caller-supplied pinned host buffers: read each
+  // segment's range into its buffer, then H2D-copy only the part overlapping
+  // the requested device window [offset, offset+size) into dst.  One ranged GET
+  // per segment (no readv coalescing for REST).
+  if (size == 0 || segments.empty()) { return rest_rx_request::create({}); }
+
+  size_t const fsize   = file.size();
+  size_t const req_end = offset + size;
+  auto const obj       = file.object_ref();
+
+  // Validate overlap and total the device-buffer bytes each segment fills (the
+  // value reported back to the caller — not the host read size, which may be
+  // larger).
+  size_t bytes_covered = 0;
+  for (auto const& s : segments) {
+    size_t const lo = std::max(offset, s.offset);
+    size_t const hi = std::min({req_end, s.offset + s.size, fsize});
+    if (lo >= hi) {
+      throw std::runtime_error(
+        "rest_reactor::prep_host_to_device_rx_request: segment does not overlap the requested "
+        "device range");
+    }
+    bytes_covered += hi - lo;
+  }
+
+  auto manager = std::make_shared<request_manager>(bytes_covered, segments.size());
+
+  std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
+  chunks.reserve(segments.size());
+  for (auto const& s : segments) {
+    size_t const lo        = std::max(offset, s.offset);
+    size_t const hi        = std::min({req_end, s.offset + s.size, fsize});
+    size_t const read_size = s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
+
+    auto req       = std::make_unique<rest_chunked_rx_request>();
+    req->object    = obj;
+    req->chunk     = io_object_segment{s.offset, read_size, s.data()};  // caller buffer
+    req->file_size = fsize;
+    auto cpy       = std::make_unique<device_cpy_request>();
+    cpy->stream    = stream;
+    cpy->device_id = device_id;
+    cpy->copies.push_back(device_cpy_request::copy{
+      /*dst=*/dst + (lo - offset),
+      /*src=*/static_cast<uint8_t*>(s.data()) + (lo - s.offset),  // separate host allocation
+      /*src_off=*/0,
+      /*size=*/hi - lo});
+    req->cpy_req = std::move(cpy);
+    req->manager = manager;
+    chunks.push_back(std::move(req));
+  }
+  return rest_rx_request::create(std::move(chunks));
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +664,10 @@ struct transfer {
   curl_slist_ptr headers;
   buf_sink sink;
   header_capture hc;
+  // Held only for reactor-staged device reads (null-buffer chunks): the pinned
+  // bounce slot the body lands in.  Released after the H2D copy off it
+  // completes (tracked via a CUDA event), not when the transfer finishes.
+  slot_pool<NUM_BOUNCE_SLOTS>::token bounce_token;
 };
 
 /// Worker-loop state reachable from curl's C socket/timer callbacks.
@@ -701,6 +796,49 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     auto const retry_cmp = [](const retry_entry& a, const retry_entry& b) { return a.due > b.due; };
     std::vector<retry_entry> retry_heap;
     std::deque<std::unique_ptr<rest_chunked_rx_request>> ready;
+    // Device chunks dequeued but blocked on a free bounce slot wait here and are
+    // submitted ahead of everything else once a slot frees.
+    std::deque<std::unique_ptr<rest_chunked_rx_request>> stalled;
+
+    // -- device staging ----------------------------------------------------
+    // Reactor-staged device reads (null-buffer chunks) land in a pinned bounce
+    // slot, then an async H2D copy moves the bytes to the device.  The slot is
+    // held until that copy's CUDA event completes; `copying` tracks the
+    // (slot, event) pairs polled each loop.  Only set up when a host memory
+    // resource was provided.
+    std::vector<uint8_t*> bounce_bufs;
+    slot_pool<NUM_BOUNCE_SLOTS> bounce_pool;
+    std::unordered_map<int, std::vector<cucascade::cuda::cuda_event>> copy_events;
+    std::vector<std::pair<slot_pool<NUM_BOUNCE_SLOTS>::token, cucascade::cuda::cuda_event*>>
+      copying;
+    if (_bounce_storage) {
+      auto blocks = _bounce_storage->get_blocks();
+      bounce_bufs.reserve(blocks.size());
+      for (auto* b : blocks) {
+        bounce_bufs.push_back(reinterpret_cast<uint8_t*>(b));
+      }
+      int const n_dev = rmm::get_num_cuda_devices();
+      for (int d = 0; d < n_dev; ++d) {
+        rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{d}};
+        auto& evs = copy_events[d];
+        evs.reserve(NUM_BOUNCE_SLOTS);
+        std::generate_n(std::back_inserter(evs), NUM_BOUNCE_SLOTS, [] {
+          return cucascade::cuda::cuda_event{cudaEventDisableTiming};
+        });
+      }
+    }
+
+    auto poll_copy_completions = [&]() {
+      using query_status = cucascade::cuda::cuda_event::query_status;
+      copying.erase(std::remove_if(copying.begin(),
+                                   copying.end(),
+                                   [](auto const& pr) {
+                                     // Release the bounce slot once the copy off
+                                     // it is no longer in progress (done/error).
+                                     return pr.second->query() != query_status::in_progress;
+                                   }),
+                    copying.end());
+    };
 
     auto arm_retry_timer = [&]() {
       itimerspec its{};  // all-zero => disarm
@@ -751,10 +889,14 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     auto submit = [&]() {
       while (static_cast<std::size_t>(inflight_map.size()) < _config.max_connections &&
              !free_handles.empty()) {
-        // Retried chunks (due and moved into `ready`) take priority over new
-        // inbound work so a backed-off request is not starved by fresh ones.
+        // Submission priority: chunks blocked on a bounce slot (stalled), then
+        // due retries (ready), then fresh inbound work — so neither a
+        // backed-off nor a slot-starved request is starved by new ones.
         std::unique_ptr<rest_chunked_rx_request> dr;
-        if (!ready.empty()) {
+        if (!stalled.empty()) {
+          dr = std::move(stalled.front());
+          stalled.pop_front();
+        } else if (!ready.empty()) {
           dr = std::move(ready.front());
           ready.pop_front();
         } else if (!_requests.try_dequeue(dr)) {
@@ -765,13 +907,37 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           dr.reset();
           continue;
         }
-        // Device chunks with a null destination need a bounce slot (Step 8);
-        // host chunks carry their own buffer.
+
+        // A device chunk with a null destination is staged through a reactor
+        // bounce slot; host chunks (and caller-buffer device chunks) carry their
+        // own buffer.
+        bool const needs_bounce = dr->is_device() && !dr->chunk.is_buffer_allocated();
+        slot_pool<NUM_BOUNCE_SLOTS>::token tok;
+        if (needs_bounce) {
+          if (bounce_bufs.empty()) {
+            dr->manager->report_error(std::make_exception_ptr(std::runtime_error(
+              "rest_reactor: device staging unavailable (no host memory resource)")));
+            dr.reset();
+            continue;
+          }
+          tok = bounce_pool.try_acquire_token();
+          if (!tok) {
+            // No slot right now — hold the chunk and stop submitting; a freed
+            // slot (poll_copy_completions) will wake the loop to retry.
+            stalled.push_front(std::move(dr));
+            break;
+          }
+        }
+
         CURL* const h = free_handles.back();
         free_handles.pop_back();
         auto t  = std::make_unique<transfer>();
         t->req  = std::move(dr);
         t->easy = h;
+        if (needs_bounce) {
+          t->req->chunk.set_data(bounce_bufs[static_cast<size_t>(tok.slot_index())]);
+          t->bounce_token = std::move(tok);
+        }
         setup_easy(*t);
         curl_multi_add_handle(multi.get(), h);
         inflight_map.emplace(h, std::move(t));
@@ -782,7 +948,24 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       auto& req           = *t->req;
       bool const ok_range = (status == 206) || (status == 200 && req.chunk.offset == 0);
       if (rc == CURLE_OK && ok_range && t->sink.written >= req.chunk.size) {
-        // Host success.  (Device H2D copy is wired up in Step 8.)
+        if (req.is_device()) {
+          // Issue the async H2D copy.  Bounce-staged reads need a CUDA event so
+          // the slot is only reused once the copy off it completes; caller-
+          // buffer reads detach (the caller's stream orders the copy).
+          bool const needs_event          = req.needs_event_for_synchronization();
+          cucascade::cuda::cuda_event* ev = nullptr;
+          cudaEvent_t cev                 = nullptr;
+          if (needs_event) {
+            ev  = &copy_events[req.cpy_req->device_id][t->bounce_token.slot_index()];
+            cev = ev->get();
+          }
+          cudaError_t const err = req.copy_h2d_async(cev);
+          if (err != cudaSuccess) {
+            req.manager->report_error(err);
+            return;
+          }
+          if (needs_event) { copying.emplace_back(std::move(t->bounce_token), ev); }
+        }
         req.manager->chunk_complete(t->sink.written);
         return;
       }
@@ -833,7 +1016,10 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     std::array<epoll_event, MAX_EVENTS> events{};
     submit();  // kickstart anything already queued
     while (!stop_token.stop_requested()) {
-      int const n = ::epoll_wait(epoll_fd.get(), events.data(), MAX_EVENTS, -1);
+      // Block indefinitely when idle; while H2D copies are outstanding, poll on
+      // a short timeout so completed copies release their bounce slots promptly.
+      int const timeout_ms = copying.empty() ? -1 : 1;
+      int const n          = ::epoll_wait(epoll_fd.get(), events.data(), MAX_EVENTS, timeout_ms);
       if (n < 0) {
         if (errno == EINTR) { continue; }
         throw std::runtime_error(std::string("rest_reactor: epoll_wait failed: ") +
@@ -864,11 +1050,26 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         }
       }
       process_completions();
+      poll_copy_completions();
       submit();
     }
 
-    // Drain on shutdown: detach in-flight handles and cancel their requests so
-    // no future is left unfulfilled, then cancel anything still queued.
+    // Drain on shutdown.  First wait for in-flight H2D copies to finish so the
+    // bounce storage is not freed (at reactor destruction) while a copy still
+    // reads from it.
+    for (auto& pr : copying) {
+      if (pr.second != nullptr) {
+        try {
+          pr.second->synchronize();
+        } catch (const std::exception& e) {
+          spdlog::error("rest_reactor: copy-event synchronize on shutdown failed: {}", e.what());
+        }
+      }
+    }
+    copying.clear();
+
+    // Detach in-flight handles and cancel every outstanding request (in-flight,
+    // retry-scheduled, ready, stalled, queued) so no future is left unfulfilled.
     for (auto& [h, t] : inflight_map) {
       curl_multi_remove_handle(multi.get(), h);
       if (t) { t->req->manager->report_error(std::make_error_code(std::errc::operation_canceled)); }
@@ -884,6 +1085,10 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       if (r) { r->manager->report_error(std::make_error_code(std::errc::operation_canceled)); }
     }
     ready.clear();
+    for (auto& r : stalled) {
+      if (r) { r->manager->report_error(std::make_error_code(std::errc::operation_canceled)); }
+    }
+    stalled.clear();
   } catch (const std::exception& e) {
     spdlog::error("rest_reactor worker_loop: {}", e.what());
   }

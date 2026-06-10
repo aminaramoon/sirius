@@ -55,10 +55,7 @@ namespace sirius::io::rest {
 class rest_io_object : public sirius_io_object {
  public:
   rest_io_object(std::string path, std::string bucket, std::string key, size_t size)
-    : _path(std::move(path)),
-      _bucket(std::move(bucket)),
-      _key(std::move(key)),
-      _file_size(size)
+    : _path(std::move(path)), _bucket(std::move(bucket)), _key(std::move(key)), _file_size(size)
   {
   }
 
@@ -204,9 +201,9 @@ class rest_reactor {
   std::size_t _bounce_slot_size{0};
 
   // Keeps the bounce-slot blocks alive for the reactor's lifetime; the
-  // allocation destructor returns the blocks to the upstream resource when the
-  // reactor is destroyed.  Null/empty when no host_memory_resource is set.
-  std::optional<cucascade::memory::fixed_multiple_blocks_allocation> _bounce_storage;
+  // allocation handle returns the blocks to the upstream resource when the
+  // reactor is destroyed.  Null when no host_memory_resource is set.
+  cucascade::memory::fixed_multiple_blocks_allocation _bounce_storage;
 
   // Cross-thread wakeup: written by enqueue()/interrupt() and the CUDA
   // copy-completion callback to break the worker out of epoll_wait.
