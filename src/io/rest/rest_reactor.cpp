@@ -568,71 +568,16 @@ size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t
   size = std::min(size, file.size() > offset ? file.size() - offset : size_t{0});
   if (size == 0) { return 0; }
 
-  auto const obj = file.object_ref();
-  std::string last_error;
-  iovec dst_iov{static_cast<void*>(dst), size};
-  for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
-    buf_sink sink;
-    sink.buffers  = std::span<iovec>(&dst_iov, 1);
-    sink.capacity = size;
-    header_capture hc;
-
-    auto const authd =
-      _config.authorizer->authorize(obj, s3::s3_request_method::GET, presign_ttl(_config));
-
-    curl_easy_ptr h{curl_easy_init()};
-    if (!h) { throw std::runtime_error("rest_reactor::host_read: curl_easy_init failed"); }
-    configure_easy_handle(h.get(), global_curl_context::instance().share_handle());
-    apply_request_opts(h.get(), _config);
-
-    std::string const range = range_header(offset, size);
-    curl_slist_ptr hdrs     = build_header_list(authd.headers, &range);
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_URL, authd.url.c_str()));
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPHEADER, hdrs.get()));
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, &write_to_sink));
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEDATA, &sink));
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &capture_header));
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &hc));
-
-    CURLcode const rc = curl_easy_perform(h.get());
-    long status       = 0;
-    curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
-
-    if (rc == CURLE_OK && (status == 206 || (status == 200 && offset == 0))) {
-      // A 206 must have delivered exactly the requested range; a 200 is only
-      // safe when we asked from offset 0 (the server ignored Range and sent the
-      // whole object, which still starts at our offset).  Either way reject a
-      // short delivery — feeding truncated bytes downstream would corrupt data.
-      if (sink.written < size) {
-        last_error =
-          "short read (" + std::to_string(sink.written) + "/" + std::to_string(size) + " bytes)";
-        // A truncated transfer is transient — retry.
-      } else {
-        return sink.written;
-      }
-    } else if (rc == CURLE_OK && status == 200 && offset != 0) {
-      // Server ignored the Range header and returned the whole object; the
-      // bytes we captured are from offset 0, not `offset` — non-retriable
-      // misconfiguration (would loop forever).
-      throw std::runtime_error("rest_reactor::host_read: server ignored Range (HTTP 200) for " +
-                               obj.bucket + "/" + obj.key);
-    } else {
-      last_error =
-        rc != CURLE_OK ? std::string(curl_easy_strerror(rc)) : ("HTTP " + std::to_string(status));
-      bool const retriable = (rc != CURLE_OK && is_retriable_curl(rc)) ||
-                             (rc == CURLE_OK && is_retriable_status(status));
-      if (!retriable) {
-        throw std::runtime_error("rest_reactor::host_read: " + last_error + " for " + obj.bucket +
-                                 "/" + obj.key);
-      }
-    }
-
-    if (attempt + 1 < _config.max_retry_attempts) {
-      std::this_thread::sleep_for(compute_backoff(attempt, hc.retry_after, _config));
-    }
-  }
-  throw std::runtime_error("rest_reactor::host_read: exhausted retries (" + last_error + ") for " +
-                           obj.bucket + "/" + obj.key);
+  // Drive the blocking read through the worker's async pipeline (pooled
+  // connections, parallel ranged GETs, the shared retry/backoff policy) and
+  // synchronize on its future — rather than a one-shot easy handle that pays a
+  // full TCP+TLS handshake per call and duplicates the retry logic.  Build the
+  // request, grab its future BEFORE enqueue (which moves the chunks out), then
+  // block: get() rethrows the first reported error or returns the byte count.
+  auto req = prep_host_rx_request(_config, file, io_object_segment{offset, size, dst});
+  auto fut = req->get_future();
+  enqueue(std::move(req));
+  return std::move(fut).get();
 }
 
 size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view key)
