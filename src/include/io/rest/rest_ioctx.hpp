@@ -61,18 +61,17 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
    * @param retry_jitter
    * @param honor_retry_after
    */
-  explicit rest_ioctx(
-    std::shared_ptr<s3::s3_request_authorizer> authorizer,
-    std::size_t n_reactors                                              = 2,
-    long request_timeout_s                                              = 30,
-    std::string ca_bundle_path                                         = "",
-    bool tls_verify                                                    = true,
-    std::size_t max_connections                                        = 16,
-    cucascade::memory::fixed_size_host_memory_resource* host_mr        = nullptr,
-    std::optional<std::size_t> max_retry_attempts                      = std::nullopt,
-    std::optional<std::chrono::milliseconds> retry_backoff_base        = std::nullopt,
-    std::optional<std::chrono::milliseconds> retry_jitter              = std::nullopt,
-    std::optional<bool> honor_retry_after                             = std::nullopt);
+  explicit rest_ioctx(std::shared_ptr<s3::s3_request_authorizer> authorizer,
+                      std::size_t n_reactors                                      = 2,
+                      long request_timeout_s                                      = 30,
+                      std::string ca_bundle_path                                  = "",
+                      bool tls_verify                                             = true,
+                      std::size_t max_connections                                 = 16,
+                      cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr,
+                      std::optional<std::size_t> max_retry_attempts               = std::nullopt,
+                      std::optional<std::chrono::milliseconds> retry_backoff_base = std::nullopt,
+                      std::optional<std::chrono::milliseconds> retry_jitter       = std::nullopt,
+                      std::optional<bool> honor_retry_after                       = std::nullopt);
 
   /// Parse @p path (s3://bucket/key), HEAD it for the size, and build a
   /// @c rest_io_object.  Throws on a non-s3 scheme or a failed HEAD.

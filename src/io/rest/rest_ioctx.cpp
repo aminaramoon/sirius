@@ -42,12 +42,12 @@ rest_reactor::config build_config(std::shared_ptr<s3::s3_request_authorizer> aut
                                   std::optional<bool> honor_retry_after)
 {
   rest_reactor::config cfg;
-  cfg.authorizer            = std::move(authorizer);
-  cfg.request_timeout_s     = request_timeout_s;
-  cfg.ca_bundle_path        = std::move(ca_bundle_path);
-  cfg.tls_verify            = tls_verify;
-  cfg.max_connections       = max_connections;
-  cfg.host_memory_resource  = host_mr;
+  cfg.authorizer           = std::move(authorizer);
+  cfg.request_timeout_s    = request_timeout_s;
+  cfg.ca_bundle_path       = std::move(ca_bundle_path);
+  cfg.tls_verify           = tls_verify;
+  cfg.max_connections      = max_connections;
+  cfg.host_memory_resource = host_mr;
   if (max_retry_attempts) { cfg.max_retry_attempts = *max_retry_attempts; }
   if (retry_backoff_base) { cfg.retry_backoff_base = *retry_backoff_base; }
   if (retry_jitter) { cfg.retry_jitter = *retry_jitter; }
@@ -68,21 +68,21 @@ rest_ioctx::rest_ioctx(std::shared_ptr<s3::s3_request_authorizer> authorizer,
                        std::optional<std::chrono::milliseconds> retry_backoff_base,
                        std::optional<std::chrono::milliseconds> retry_jitter,
                        std::optional<bool> honor_retry_after)
-  : templated_ioctx<rest_reactor>(
-      n_reactors,
-      build_config(std::move(authorizer),
-                   request_timeout_s,
-                   std::move(ca_bundle_path),
-                   tls_verify,
-                   max_connections,
-                   host_mr,
-                   max_retry_attempts,
-                   retry_backoff_base,
-                   retry_jitter,
-                   honor_retry_after),
-      [i = 0](const rest_reactor::config& cfg) mutable {
-        return std::make_unique<rest_reactor>(cfg, fmt::format("rest-{}", i++));
-      })
+  : templated_ioctx<rest_reactor>(n_reactors,
+                                  build_config(std::move(authorizer),
+                                               request_timeout_s,
+                                               std::move(ca_bundle_path),
+                                               tls_verify,
+                                               max_connections,
+                                               host_mr,
+                                               max_retry_attempts,
+                                               retry_backoff_base,
+                                               retry_jitter,
+                                               honor_retry_after),
+                                  [i = 0](const rest_reactor::config& cfg) mutable {
+                                    return std::make_unique<rest_reactor>(
+                                      cfg, fmt::format("rest-{}", i++));
+                                  })
 {
 }
 
@@ -93,9 +93,7 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path)
     throw std::invalid_argument("rest_ioctx::create_io_object: unsupported scheme '" +
                                 parsed.scheme + "'");
   }
-  if (_reactors.empty()) {
-    throw std::runtime_error("rest_ioctx::create_io_object: no reactors");
-  }
+  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::create_io_object: no reactors"); }
 
   // A blocking HEAD on the caller thread (a one-time metadata round-trip) via
   // any reactor's authorizer — head_object_size uses a local easy handle and

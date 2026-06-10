@@ -177,8 +177,7 @@ struct device_cpy_request {
 /// then @c splits it across the reactor pool and enqueues each split.
 template <class Chunk>
 struct rx_request_t {
-  static std::unique_ptr<rx_request_t> create(
-    std::vector<std::unique_ptr<Chunk>> reqs) noexcept
+  static std::unique_ptr<rx_request_t> create(std::vector<std::unique_ptr<Chunk>> reqs) noexcept
   {
     return std::unique_ptr<rx_request_t>(new rx_request_t(std::move(reqs)));
   }
