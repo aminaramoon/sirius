@@ -399,8 +399,10 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/io/s3/test_sigv4.cpp
+    test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
     test/cpp/io/s3/test_static_credentials.cpp
+    test/cpp/io/rest/test_rest_reactor.cpp
     # test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
