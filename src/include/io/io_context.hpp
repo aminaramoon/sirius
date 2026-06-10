@@ -37,6 +37,8 @@ namespace cache {
 class prefetching_cache;
 }
 
+class sirius_datasource;
+
 // ---------------------------------------------------------------------------
 // prefetching_stage
 // ---------------------------------------------------------------------------
@@ -65,20 +67,13 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   virtual void shutdown() noexcept = 0;
 
-  /// Backend-specific factory: open native handles for @p path and
-  /// return a populated io_object.  Throws on unsupported / unreachable
-  /// paths (callers that want a check-without-open should use
+  /// Open a datasource for @p path.  The backend creates the underlying
+  /// io_object internally (however is appropriate for the scheme — opening
+  /// local fds, issuing a HEAD for object stores, ...) and wraps it in a
+  /// @c sirius_datasource bound to this ioctx.  Throws on unsupported /
+  /// unreachable paths (callers that want a check-without-open should use
   /// @c supports()).
-  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path) = 0;
-
-  virtual std::unique_ptr<cudf::io::datasource> make_datasource(
-    std::shared_ptr<sirius_io_object> io_object) = 0;
-
-  /// Convenience: @c create_io_object + @c make_datasource in one shot.
-  std::unique_ptr<cudf::io::datasource> open_datasource(std::string path)
-  {
-    return make_datasource(create_io_object(std::move(path)));
-  }
+  [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path);
 
   /// Whether this backend can serve reads for @p path.  Backends should
   /// validate scheme/protocol support and any backend-specific
@@ -199,6 +194,12 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
     const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept = 0;
 
  protected:
+  /// Backend hook: open native handles / resolve metadata for @p path and
+  /// return a populated io_object.  Invoked by @c open_datasource; not part of
+  /// the public surface (callers receive a ready @c sirius_datasource).  Throws
+  /// on unsupported / unreachable paths.
+  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path) = 0;
+
   /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed
   /// by @ref shutdown_cache (or the ioctx destructor as a safety net,
   /// though callers are expected to drive the lifecycle explicitly so

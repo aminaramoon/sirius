@@ -98,11 +98,6 @@ class kvikio_context final : public sirius_ioctx {
 
   void shutdown() noexcept override {}
 
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
-
-  std::unique_ptr<cudf::io::datasource> make_datasource(
-    std::shared_ptr<sirius_io_object> io_object) override;
-
   [[nodiscard]] bool supports(std::string_view path) const noexcept override;
   [[nodiscard]] bool supports_device_read() const noexcept override { return true; }
   [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
@@ -149,6 +144,10 @@ class kvikio_context final : public sirius_ioctx {
 
   exec::semi_future<size_t> host_read_ranges_async_io(
     const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept final;
+
+ protected:
+  /// Backend hook invoked by @c sirius_ioctx::open_datasource.
+  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
 };
 
 }  // namespace sirius::io

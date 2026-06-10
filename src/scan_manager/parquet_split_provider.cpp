@@ -243,8 +243,11 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     // footer read here and the speculative fadvise below; each emitted
     // slice gets its own duplicate so per-slice fadvise(immediate/
     // disposable) calls don't share a handle with another scan.
-    auto file_io_object  = _io_ctx->create_io_object(file_path);
-    auto file_datasource = std::make_shared<sirius::io::sirius_datasource>(_io_ctx, file_io_object);
+    // The ioctx creates the backend-appropriate io_object internally and hands
+    // back a ready datasource; reach the io_object through it where needed
+    // (e.g. as the metadata-store key).
+    std::shared_ptr<sirius::io::sirius_datasource> file_datasource =
+      _io_ctx->open_datasource(file_path);
     auto& datasource_ref = *file_datasource;
 
     //===----------Parse metadata (with prefetch-cache reuse)----------===//
@@ -257,7 +260,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     std::size_t footer_byte_len = 0;
     std::unique_ptr<op::scan::hybrid_scan_reader> reader_ptr;
 
-    if (auto cached = _io_ctx->metadata_store().get_metadata(*file_io_object)) {
+    if (auto cached = _io_ctx->metadata_store().get_metadata(file_datasource->io_object())) {
       cached_parquet_metadata = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached));
     }
 
@@ -365,7 +368,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       // length (excluding the trailer) is recorded on parquet_metadata so we
       // don't need the original footer buffer to recompute the range.
       constexpr std::size_t FOOTER_TAIL_SIZE = 8;
-      auto const file_size                   = file_io_object->size();
+      auto const file_size                   = file_datasource->size();
       auto const footer_off  = static_cast<int64_t>(file_size - FOOTER_TAIL_SIZE - footer_byte_len);
       auto const footer_size = static_cast<int64_t>(FOOTER_TAIL_SIZE + footer_byte_len);
 
@@ -386,7 +389,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     // prefetch work that fadvise schedules below.
     if (!cached_parquet_metadata) {
       _io_ctx->metadata_store().register_metadata(
-        *file_io_object,
+        file_datasource->io_object(),
         std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
           std::make_shared<parquet_metadata>(file_metadata, footer_byte_len)));
     }

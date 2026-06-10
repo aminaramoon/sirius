@@ -307,8 +307,7 @@ int main(int argc, char** argv)
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
     sources.reserve(paths.size());
     for (auto const& path : paths) {
-      auto io_obj = io_ctx->create_io_object(path);
-      sources.push_back(std::make_unique<sirius::io::sirius_datasource>(io_ctx, io_obj));
+      sources.push_back(io_ctx->open_datasource(path));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
 

@@ -16,8 +16,6 @@
 
 #include "io/kvikio/kvikio_context.hpp"
 
-#include "io/sirius_datasource.hpp"
-
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -49,15 +47,6 @@ std::shared_ptr<sirius_io_object> kvikio_context::create_io_object(std::string p
   std::shared_ptr<cudf::io::datasource> ds = cudf::io::datasource::create(path);
   auto const file_size                     = ds->size();
   return std::make_shared<kvikio_io_object>(std::move(path), std::move(ds), file_size);
-}
-
-std::unique_ptr<cudf::io::datasource> kvikio_context::make_datasource(
-  std::shared_ptr<sirius_io_object> io_object)
-{
-  // Return a sirius_datasource so cudf sees a single datasource type across
-  // backends.  Its read methods call back into this ioctx via the public
-  // host_read / device_read overrides above.
-  return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
 }
 
 bool kvikio_context::supports(std::string_view /*path*/) const noexcept

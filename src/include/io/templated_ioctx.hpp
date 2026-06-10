@@ -20,7 +20,6 @@
 #include "io/cache/prefetching_cache.hpp"
 #include "io/cache/types.hpp"
 #include "io/io_context.hpp"
-#include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 
 #include <rmm/cuda_device.hpp>
@@ -238,17 +237,6 @@ class templated_ioctx : public sirius_ioctx {
     }
   }
 
-  std::unique_ptr<cudf::io::datasource> make_datasource(
-    std::shared_ptr<sirius_io_object> io_object) override
-  {
-    return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
-  }
-
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override
-  {
-    return std::shared_ptr<sirius_io_object>(Reactor::create_io_object(std::move(path)));
-  }
-
   [[nodiscard]] bool supports(std::string_view path) const noexcept final
   {
     return Reactor::supports(path);
@@ -447,6 +435,11 @@ class templated_ioctx : public sirius_ioctx {
   }
 
  protected:
+  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override
+  {
+    return std::shared_ptr<sirius_io_object>(Reactor::create_io_object(std::move(path)));
+  }
+
   reactor_config_type _config;
   std::vector<std::unique_ptr<Reactor>> _reactors;
   std::atomic<size_t> _next{0};

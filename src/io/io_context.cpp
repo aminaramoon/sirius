@@ -16,14 +16,12 @@
 
 #include "io/io_context.hpp"
 
-#include "exec/semi_future.hpp"
-#include "exec/try.hpp"
 #include "io/cache/prefetching_cache.hpp"
+#include "io/sirius_datasource.hpp"
 
 #include <cassert>
 #include <cmath>
 #include <cstddef>
-#include <cstdint>
 #include <exception>
 #include <memory>
 #include <utility>
@@ -51,5 +49,14 @@ void sirius_ioctx::initialize_cache(cache::buffer_pool* pool,
 }
 
 void sirius_ioctx::shutdown_cache() noexcept { _cache.reset(); }
+
+std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path)
+{
+  // Create the backend-appropriate io_object (local fds / object-store HEAD /
+  // ...) and wrap it in a sirius_datasource bound to this ioctx.  Datasource
+  // construction is uniform across backends, so it lives here rather than in a
+  // per-backend hook.
+  return std::make_unique<sirius_datasource>(shared_from_this(), create_io_object(std::move(path)));
+}
 
 }  // namespace sirius::io

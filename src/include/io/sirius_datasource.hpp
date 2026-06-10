@@ -56,6 +56,11 @@ class sirius_datasource : public cudf::io::datasource {
 
   [[nodiscard]] std::shared_ptr<sirius_ioctx> io_ctx() const { return _io_ctx; }
 
+  /// The underlying io_object this datasource reads through.  Exposed so
+  /// callers that received the datasource from @c sirius_ioctx::open_datasource
+  /// can still reach the io_object (e.g. as the metadata-store cache key).
+  [[nodiscard]] sirius_io_object& io_object() const noexcept { return *_io_object; }
+
   // ---- cudf::io::datasource overrides ---------------------------------------
 
   [[nodiscard]] size_t size() const override;

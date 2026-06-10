@@ -73,8 +73,10 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
                       std::optional<std::chrono::milliseconds> retry_jitter       = std::nullopt,
                       std::optional<bool> honor_retry_after                       = std::nullopt);
 
-  /// Parse @p path (s3://bucket/key), HEAD it for the size, and build a
-  /// @c rest_io_object.  Throws on a non-s3 scheme or a failed HEAD.
+ protected:
+  /// Backend hook invoked by @c sirius_ioctx::open_datasource: parse @p path
+  /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
+  /// Throws on a non-s3 scheme or a failed HEAD.
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
 };
 
