@@ -171,6 +171,7 @@ set(EXTENSION_SOURCES
     src/io/cache/metadata_store.cpp
     src/io/cache/prefetching_cache.cpp
     src/io/rest/curl_handle.cpp
+    src/io/rest/rest_reactor.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/s3/sirius_sigv4_credential_provider.cpp
