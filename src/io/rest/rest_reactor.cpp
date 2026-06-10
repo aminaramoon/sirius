@@ -913,11 +913,21 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     // -- device staging ----------------------------------------------------
     // A reactor-staged device read (null-buffer chunk) lands in its slot's
     // bounce buffer, then an async H2D copy moves the bytes to the device.  The
-    // slot's pool token is held in `copying` (paired with the copy's event)
-    // until that copy completes — so the slot, and its bounce buffer, are not
-    // reused meanwhile.  Events are pooled per device, indexed by slot.
+    // slot's pool token is held in `copying` (alongside the copy's event) until
+    // that copy completes — so the slot, and its bounce buffer, are not reused
+    // meanwhile.  Crucially, the chunk is NOT reported complete until the event
+    // is observed done: the bytes are not actually on the device until the copy
+    // off the bounce buffer finishes, so the manager (and the byte count to
+    // credit) ride along here and chunk_complete / report_error is deferred to
+    // poll_copy_completions.  Events are pooled per device, indexed by slot.
+    struct parked_copy {
+      slot_pool::token token;
+      cucascade::cuda::cuda_event* event{nullptr};
+      std::shared_ptr<request_manager> manager;
+      std::size_t bytes{0};
+    };
     std::unordered_map<int, std::vector<cucascade::cuda::cuda_event>> copy_events;
-    std::vector<std::pair<slot_pool::token, cucascade::cuda::cuda_event*>> copying;
+    std::vector<parked_copy> copying;
     if (_bounce_storage) {
       int const n_dev = rmm::get_num_cuda_devices();
       for (int d = 0; d < n_dev; ++d) {
@@ -932,14 +942,25 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
 
     auto poll_copy_completions = [&]() {
       using query_status = cucascade::cuda::cuda_event::query_status;
-      // Erasing an entry drops its token, returning the slot (and bounce buffer)
-      // to the pool — once the H2D copy off it is no longer in progress.
-      copying.erase(std::remove_if(copying.begin(),
-                                   copying.end(),
-                                   [](auto const& pr) {
-                                     return pr.second->query() != query_status::in_progress;
-                                   }),
-                    copying.end());
+      // Credit (or fail) each bounce-staged chunk only now that its H2D copy is
+      // actually done — the device bytes were not valid until this point.  On
+      // success report the chunk complete; on a copy error fail the request
+      // rather than silently dropping it.  Either way the entry is erased, which
+      // drops its token and returns the slot (and bounce buffer) to the pool.
+      for (auto it = copying.begin(); it != copying.end();) {
+        query_status const st = it->event->query();
+        if (st == query_status::in_progress) {
+          ++it;
+          continue;
+        }
+        if (st == query_status::success) {
+          it->manager->chunk_complete(it->bytes);
+        } else {
+          it->manager->report_error(
+            std::make_exception_ptr(std::runtime_error("rest_reactor: device H2D copy failed")));
+        }
+        it = copying.erase(it);
+      }
     };
 
     auto arm_retry_timer = [&]() {
@@ -1068,17 +1089,20 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
             req.manager->report_error(err);
             return false;
           }
-          req.manager->chunk_complete(s.sink.written);
           if (needs_event) {
             // Bounce buffer is still feeding the copy: hand the slot's token to
-            // `copying` (paired with the event) so the slot — and its bounce
-            // buffer — is only reused once the copy completes.  Clear the rest of
-            // the per-request state now so a shutdown cancel won't touch a done
-            // request.
-            copying.emplace_back(std::move(s.token), ev);
+            // `copying` (with the event, manager and byte count) so the slot —
+            // and its bounce buffer — is only reused once the copy completes,
+            // and the chunk is credited only then (the device bytes are not yet
+            // valid).  Clear the rest of the per-request state now so a shutdown
+            // cancel won't touch a done request.
+            copying.push_back(parked_copy{std::move(s.token), ev, req.manager, s.sink.written});
             s.reset();
             return true;
           }
+          // Caller-buffer device read: the caller's stream orders the copy, so
+          // it is safe to credit the chunk now and recycle the slot.
+          req.manager->chunk_complete(s.sink.written);
           return false;
         }
         req.manager->chunk_complete(s.sink.written);
@@ -1187,14 +1211,17 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
 
     // Drain on shutdown.  First wait for in-flight H2D copies to finish so the
     // bounce storage is not freed (at reactor destruction) while a copy still
-    // reads from it.
-    for (auto& pr : copying) {
-      if (pr.second != nullptr) {
-        try {
-          pr.second->synchronize();
-        } catch (const std::exception& e) {
-          spdlog::error("rest_reactor: copy-event synchronize on shutdown failed: {}", e.what());
-        }
+    // reads from it.  chunk_complete was deferred for these, so credit each one
+    // now that its copy has landed (or fail it if the copy errored) — otherwise
+    // the request_manager would never reach total_chunks.
+    for (auto& pc : copying) {
+      try {
+        pc.event->synchronize();
+        pc.manager->chunk_complete(pc.bytes);
+      } catch (const std::exception& e) {
+        spdlog::error("rest_reactor: copy-event synchronize on shutdown failed: {}", e.what());
+        pc.manager->report_error(std::make_exception_ptr(std::runtime_error(
+          std::string("rest_reactor: device H2D copy failed on shutdown: ") + e.what())));
       }
     }
     copying.clear();
