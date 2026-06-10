@@ -16,11 +16,14 @@
 
 #include <cudf/io/text/byte_range_info.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <catch.hpp>
 #include <io/rest/rest_reactor.hpp>
 #include <io/rest/types.hpp>
 #include <io/types.hpp>
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -262,5 +265,87 @@ TEST_CASE("prep_host_rxv_request fuses file-adjacent segments into a scatter GET
     std::vector<io_object_segment> segs{io_object_segment{0, 3 * 4096, fake_ptr(0xA00)}};
     auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
     REQUIRE(req->size() == 3);
+  }
+}
+
+TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk", "[rest]")
+{
+  rest_reactor::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+  constexpr uintptr_t kDst = 0x100000;
+  constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000, kB2 = 0xC000;
+
+  SECTION("three contiguous buffers, full overlap -> one chunk, three copies")
+  {
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
+                                        io_object_segment{100, 100, fake_ptr(kB1)},
+                                        io_object_segment{200, 100, fake_ptr(kB2)}};
+    auto req = rest_reactor::prep_host_to_device_rx_request(
+      cfg, file, segs, fake_ptr(kDst), /*offset=*/0, /*size=*/300, rmm::cuda_stream_view{}, 0);
+    REQUIRE(req->size() == 1);
+    auto chunks = req->get_all_chunks();
+    REQUIRE(chunks.size() == 1);
+    auto const& c = *chunks[0];
+    CHECK(c.is_device());
+    CHECK(c.chunk.offset == 0);
+    CHECK(c.chunk.size == 300);      // one contiguous scatter GET
+    CHECK(c.chunk.n_chunks() == 3);  // landing across three buffers
+    REQUIRE(c.cpy_req != nullptr);
+    REQUIRE(c.cpy_req->copies.size() == 3);  // one H2D copy per buffer
+    std::array<uintptr_t, 3> const bufs{kB0, kB1, kB2};
+    for (size_t i = 0; i < 3; ++i) {
+      auto const& cp = c.cpy_req->copies[i];
+      CHECK(reinterpret_cast<uintptr_t>(cp.dst) == kDst + i * 100);
+      CHECK(reinterpret_cast<uintptr_t>(cp.src) == bufs[i]);  // absolute per-buffer src
+      CHECK(cp.size == 100);
+    }
+  }
+  SECTION("partial device window clips each buffer's copy")
+  {
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
+                                        io_object_segment{100, 100, fake_ptr(kB1)},
+                                        io_object_segment{200, 100, fake_ptr(kB2)}};
+    // Device window [50, 250): clips the first and last buffers.
+    auto req = rest_reactor::prep_host_to_device_rx_request(
+      cfg, file, segs, fake_ptr(kDst), /*offset=*/50, /*size=*/200, rmm::cuda_stream_view{}, 0);
+    REQUIRE(req->size() == 1);
+    auto chunks   = req->get_all_chunks();
+    auto const& c = *chunks[0];
+    REQUIRE(c.cpy_req->copies.size() == 3);
+    // buffer0 file [0,100) ∩ [50,250) = [50,100)
+    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[0].src) == kB0 + 50);
+    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[0].dst) == kDst + 0);
+    CHECK(c.cpy_req->copies[0].size == 50);
+    // buffer1 file [100,200) fully inside -> [100,200)
+    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[1].src) == kB1);
+    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[1].dst) == kDst + 50);
+    CHECK(c.cpy_req->copies[1].size == 100);
+    // buffer2 file [200,300) ∩ [50,250) = [200,250)
+    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[2].src) == kB2);
+    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[2].dst) == kDst + 150);
+    CHECK(c.cpy_req->copies[2].size == 50);
+  }
+  SECTION("max_n_chunks caps the fused buffers per chunk")
+  {
+    cfg.max_n_chunks = 2;
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
+                                        io_object_segment{100, 100, fake_ptr(kB1)},
+                                        io_object_segment{200, 100, fake_ptr(kB2)}};
+    auto req = rest_reactor::prep_host_to_device_rx_request(
+      cfg, file, segs, fake_ptr(kDst), 0, 300, rmm::cuda_stream_view{}, 0);
+    REQUIRE(req->size() == 2);  // [0,200) over 2 buffers, then [200,300)
+  }
+  SECTION("non-contiguous buffers stay separate single-copy chunks")
+  {
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
+                                        io_object_segment{500, 100, fake_ptr(kB1)}};
+    auto req = rest_reactor::prep_host_to_device_rx_request(
+      cfg, file, segs, fake_ptr(kDst), 0, 600, rmm::cuda_stream_view{}, 0);
+    REQUIRE(req->size() == 2);
+    auto chunks = req->get_all_chunks();
+    for (auto const& cp : chunks) {
+      CHECK(cp->chunk.n_chunks() == 1);
+      REQUIRE(cp->cpy_req->copies.size() == 1);
+    }
   }
 }

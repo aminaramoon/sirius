@@ -229,15 +229,20 @@ std::chrono::milliseconds compute_backoff(std::size_t attempt,
   return base + jitter;
 }
 
-/// Group host destination segments into ranged-GET chunks.  Splits any single
-/// segment larger than @p chunk_size into chunk_size single-buffer pieces (each
-/// a parallel GET), and fuses runs of file-adjacent segments into one
-/// contiguous scatter GET capped at @p chunk_size bytes and @p max_n_chunks
-/// buffers.  Input segments must be in file order and carry non-null buffers;
-/// each output segment's @c size is the contiguous file span its buffers cover.
+/// Group destination segments into ranged-GET chunks.  Fuses runs of
+/// file-adjacent segments into one contiguous scatter GET capped at
+/// @p chunk_size bytes and @p max_n_chunks buffers.  When @p allow_split is
+/// true, a single segment larger than @p chunk_size is also split into
+/// chunk_size single-buffer pieces (each a parallel GET) — used by the pure
+/// host paths; device staging passes false so each caller buffer stays one
+/// buffer (its H2D copy maps 1:1 to that allocation), an oversized one simply
+/// becoming a standalone single-buffer GET.  Input segments must be in file
+/// order and carry non-null buffers; each output segment's @c size is the
+/// contiguous file span its buffers cover.
 std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_segment> segs,
                                                    size_t chunk_size,
-                                                   size_t max_n_chunks)
+                                                   size_t max_n_chunks,
+                                                   bool allow_split = true)
 {
   size_t const cs       = std::max<size_t>(chunk_size, 1);
   size_t const max_bufs = std::max<size_t>(max_n_chunks, 1);
@@ -249,7 +254,7 @@ std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_seg
       ++i;
       continue;
     }
-    if (s.size > cs) {
+    if (allow_split && s.size > cs) {
       // Split an oversized contiguous segment into chunk_size pieces.
       uint8_t* base = s.data();
       for (size_t pos = 0; pos < s.size; pos += cs) {
@@ -471,7 +476,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(const reacto
 }
 
 rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
-  const reactor_config_type& /*cfg*/,
+  const reactor_config_type& cfg,
   const io_object_type& file,
   std::span<io_object_segment> segments,
   uint8_t* dst,
@@ -480,20 +485,24 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
   rmm::cuda_stream_view stream,
   int device_id)
 {
-  // Device read staged through caller-supplied pinned host buffers: read each
-  // segment's range into its buffer, then H2D-copy only the part overlapping
-  // the requested device window [offset, offset+size) into dst.  One ranged GET
-  // per segment (no readv coalescing for REST).
+  // Device read staged through caller-supplied pinned host buffers.  File-
+  // adjacent segments are fused into one contiguous scatter GET (whose response
+  // lands across their buffers, like uring's readv); each fused buffer then
+  // H2D-copies only the part overlapping the device window [offset, req_end)
+  // into dst, as a batch of copies issued on one stream.
   if (size == 0 || segments.empty()) { return rest_rx_request::create({}); }
 
   size_t const fsize   = file.size();
   size_t const req_end = offset + size;
   auto const obj       = file.object_ref();
 
-  // Validate overlap and total the device-buffer bytes each segment fills (the
-  // value reported back to the caller — not the host read size, which may be
-  // larger).
+  // Validate overlap, total the device-buffer bytes each segment fills (the
+  // value reported to the caller — not the host read size, which over-reads to
+  // the file end), and clamp each segment's read to the file end (single-buffer,
+  // file order preserved for the merge).
   size_t bytes_covered = 0;
+  std::vector<io_object_segment> clamped;
+  clamped.reserve(segments.size());
   for (auto const& s : segments) {
     size_t const lo = std::max(offset, s.offset);
     size_t const hi = std::min({req_end, s.offset + s.size, fsize});
@@ -503,31 +512,50 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
         "device range");
     }
     bytes_covered += hi - lo;
+    // hi > lo implies s.offset < fsize, so the clamp is well-defined.
+    clamped.push_back(io_object_segment{s.offset, std::min(s.size, fsize - s.offset), s.data()});
   }
 
-  auto manager = std::make_shared<request_manager>(bytes_covered, segments.size());
+  // Fuse contiguous buffers into scatter groups (no sub-splitting: each caller
+  // buffer must stay one buffer so its H2D copy maps to that allocation).
+  auto groups =
+    chunk_host_segments(std::span<const io_object_segment>(clamped.data(), clamped.size()),
+                        cfg.chunk_size,
+                        cfg.max_n_chunks,
+                        /*allow_split=*/false);
+
+  auto manager = std::make_shared<request_manager>(bytes_covered, groups.size());
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
-  chunks.reserve(segments.size());
-  for (auto const& s : segments) {
-    size_t const lo        = std::max(offset, s.offset);
-    size_t const hi        = std::min({req_end, s.offset + s.size, fsize});
-    size_t const read_size = s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
-
-    auto req       = std::make_unique<rest_chunked_rx_request>();
-    req->object    = obj;
-    req->chunk     = io_object_segment{s.offset, read_size, s.data()};  // caller buffer
-    req->file_size = fsize;
+  chunks.reserve(groups.size());
+  for (auto& g : groups) {
+    // One copy per buffer in the group, each clipped to the device window and
+    // carrying an absolute src (the buffers are separate host allocations).
     auto cpy       = std::make_unique<device_cpy_request>();
     cpy->stream    = stream;
     cpy->device_id = device_id;
-    cpy->copies.push_back(device_cpy_request::copy{
-      /*dst=*/dst + (lo - offset),
-      /*src=*/static_cast<uint8_t*>(s.data()) + (lo - s.offset),  // separate host allocation
-      /*src_off=*/0,
-      /*size=*/hi - lo});
-    req->cpy_req = std::move(cpy);
-    req->manager = manager;
+    cpy->copies.reserve(g.n_chunks());
+    size_t file_lo = g.offset;
+    for (auto const& b : g.buffers) {
+      size_t const file_hi = file_lo + b.iov_len;
+      size_t const data_lo = std::max(offset, file_lo);
+      size_t const data_hi = std::min(req_end, file_hi);
+      if (data_lo < data_hi) {
+        cpy->copies.push_back(
+          device_cpy_request::copy{/*dst=*/dst + (data_lo - offset),
+                                   /*src=*/static_cast<uint8_t*>(b.iov_base) + (data_lo - file_lo),
+                                   /*src_off=*/0,
+                                   /*size=*/data_hi - data_lo});
+      }
+      file_lo = file_hi;
+    }
+
+    auto req       = std::make_unique<rest_chunked_rx_request>();
+    req->object    = obj;
+    req->chunk     = std::move(g);
+    req->file_size = fsize;
+    req->cpy_req   = std::move(cpy);
+    req->manager   = manager;
     chunks.push_back(std::move(req));
   }
   return rest_rx_request::create(std::move(chunks));
