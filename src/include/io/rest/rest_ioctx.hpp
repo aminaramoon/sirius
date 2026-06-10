@@ -78,6 +78,12 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
   /// Throws on a non-s3 scheme or a failed HEAD.
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
+
+ private:
+  /// Delegated-to target: build the reactor pool from a shared context (one
+  /// context shared across all reactors).  The public constructor assembles the
+  /// context from its arguments and forwards here.
+  rest_ioctx(const std::shared_ptr<rest_reactor::reactor_context>& ctx, std::size_t n_reactors);
 };
 
 }  // namespace sirius::io::rest

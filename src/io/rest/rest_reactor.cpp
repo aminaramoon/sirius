@@ -314,10 +314,13 @@ std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_seg
 // construction / lifecycle
 // ---------------------------------------------------------------------------
 
-rest_reactor::rest_reactor(config cfg, std::string_view tname) : _config(std::move(cfg))
+rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
+  : _ctx(std::move(ctx))
 {
-  if (!_config.authorizer) {
-    throw std::invalid_argument("rest_reactor: config.authorizer must be non-null");
+  if (!_ctx) { throw std::invalid_argument("rest_reactor: reactor_context must be non-null"); }
+  _config = _ctx->cfg();
+  if (!_ctx->authorizer()) {
+    throw std::invalid_argument("rest_reactor: context authorizer must be non-null");
   }
   if (_config.max_connections == 0) {
     throw std::invalid_argument("rest_reactor: max_connections must be > 0");
@@ -329,11 +332,11 @@ rest_reactor::rest_reactor(config cfg, std::string_view tname) : _config(std::mo
   // ready before any handle is created (here or on the worker).
   (void)global_curl_context::instance();
 
-  if (_config.host_memory_resource != nullptr) {
+  if (_ctx->host_memory_resource() != nullptr) {
     // One pinned bounce buffer per slot (1:1 with the easy-handle pool), since a
     // slot stages at most one device read at a time.
-    _bounce_slot_size = _config.host_memory_resource->get_block_size();
-    _bounce_storage   = _config.host_memory_resource->allocate_multiple_blocks(
+    _bounce_slot_size = _ctx->host_memory_resource()->get_block_size();
+    _bounce_storage   = _ctx->host_memory_resource()->allocate_multiple_blocks(
       _config.max_connections * _bounce_slot_size);
   }
 
@@ -482,10 +485,10 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(const reacto
                                                                     int device_id)
 {
   if (size == 0) { return rest_rx_request::create({}); }
-  if (cfg.host_memory_resource == nullptr) {
+  if (cfg.bounce_block_size == 0) {
     throw std::runtime_error(
-      "rest_reactor::prep_device_rx_request: device reads require a host_memory_resource for "
-      "bounce staging");
+      "rest_reactor::prep_device_rx_request: device reads require a host_memory_resource on the "
+      "reactor_context for bounce staging");
   }
 
   // REST has no GPU-direct path, so the read is staged through reactor-owned
@@ -496,7 +499,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(const reacto
   size_t const end   = std::min(offset + size, fsize);
   if (offset >= end) { return rest_rx_request::create({}); }
   size_t const wanted = end - offset;
-  size_t const bounce = cfg.host_memory_resource->get_block_size();
+  size_t const bounce = cfg.bounce_block_size;
   size_t const n_win  = (wanted + bounce - 1) / bounce;
 
   auto manager   = std::make_shared<request_manager>(wanted, n_win);
@@ -639,7 +642,7 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
   for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
     header_capture hc;
     auto const authd =
-      _config.authorizer->authorize(obj, s3::s3_request_method::HEAD, presign_ttl(_config));
+      _ctx->authorizer()->authorize(obj, s3::s3_request_method::HEAD, presign_ttl(_config));
 
     curl_easy_ptr h{curl_easy_init()};
     if (!h) { throw std::runtime_error("rest_reactor::head_object_size: curl_easy_init failed"); }
@@ -1051,7 +1054,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
 
     auto setup_easy = [&](io_slot& s) {
       CURL* const h = s.easy.get();
-      auto authd    = _config.authorizer->authorize(
+      auto authd    = _ctx->authorizer()->authorize(
         s.req->object, s3::s3_request_method::GET, presign_ttl(_config));
       s.url           = std::move(authd.url);
       s.sink.buffers  = std::span<iovec>(s.req->chunk.buffers);

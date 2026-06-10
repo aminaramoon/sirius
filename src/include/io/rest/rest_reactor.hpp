@@ -91,10 +91,6 @@ class rest_io_object : public sirius_io_object {
 class rest_reactor {
  public:
   struct config {
-    /// Source of presigned GET/HEAD URLs (and/or SigV4 headers).  Shared
-    /// across threads; consulted once per attempt, inline at submit time.
-    std::shared_ptr<s3::s3_request_authorizer> authorizer;
-
     /// Whole-request timeout (seconds, 0 = no limit) and presigned-URL TTL.
     long request_timeout_s{30};
 
@@ -123,9 +119,12 @@ class rest_reactor {
     /// than 2 MiB stays a single GET.
     std::size_t max_read_split{16};
 
-    /// Pinned host resource for device-read staging; null disables the
-    /// reactor-staged device path.  Bounce-slot size is its block size.
-    cucascade::memory::fixed_size_host_memory_resource* host_memory_resource{nullptr};
+    /// Bounce-slot size (bytes) for the reactor-staged device path, cached from
+    /// the staging resource's block size by @c rest_ioctx.  Zero disables the
+    /// reactor-staged device read (the static @c prep_device_rx_request needs
+    /// this size without access to the live resource, which lives on the
+    /// @c reactor_context).
+    std::size_t bounce_block_size{0};
 
     /// Idle-connection keepalive.  While the reactor is idle, every
     /// @c upkeep_interval the worker calls @c curl_easy_upkeep on its pooled
@@ -154,12 +153,47 @@ class rest_reactor {
     bool honor_retry_after{true};
   };
 
-  using io_object_type      = rest_io_object;
-  using request_type        = rest_rx_request;
-  using request_type_ptr    = std::unique_ptr<rest_rx_request>;
-  using reactor_config_type = config;
+  /// Shared, immutable services for a pool of reactors.  One instance is built
+  /// by @c rest_ioctx and shared (via shared_ptr) across every reactor in the
+  /// pool, so it is the natural home for things that are shared rather than
+  /// per-reactor: the presigning @c authorizer, the pinned bounce-staging
+  /// resource, and — in future — a shared connection pool, a registered-buffer
+  /// table, etc.  It also carries the primitive @c config (separating the
+  /// injected collaborators from the plain, file-settable tunables).
+  class reactor_context {
+   public:
+    reactor_context(config cfg,
+                    std::shared_ptr<s3::s3_request_authorizer> authorizer,
+                    cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr)
+      : _config(std::move(cfg)), _authorizer(std::move(authorizer)), _host_mr(host_mr)
+    {
+    }
 
-  explicit rest_reactor(config cfg, std::string_view tname = "rest_reactor");
+    [[nodiscard]] const config& cfg() const noexcept { return _config; }
+    [[nodiscard]] const std::shared_ptr<s3::s3_request_authorizer>& authorizer() const noexcept
+    {
+      return _authorizer;
+    }
+    [[nodiscard]] cucascade::memory::fixed_size_host_memory_resource* host_memory_resource()
+      const noexcept
+    {
+      return _host_mr;
+    }
+
+   private:
+    config _config;
+    std::shared_ptr<s3::s3_request_authorizer> _authorizer;
+    cucascade::memory::fixed_size_host_memory_resource* _host_mr{nullptr};
+  };
+
+  using io_object_type       = rest_io_object;
+  using request_type         = rest_rx_request;
+  using request_type_ptr     = std::unique_ptr<rest_rx_request>;
+  using reactor_config_type  = config;
+  using reactor_context_type = reactor_context;
+
+  explicit rest_reactor(std::shared_ptr<reactor_context> ctx,
+                        std::string_view tname = "rest_reactor");
   ~rest_reactor();
 
   rest_reactor(rest_reactor const&)            = delete;
@@ -234,7 +268,10 @@ class rest_reactor {
   /// Enqueue a batch of chunks with a single wake notification.
   void enqueue_chunks(std::span<std::unique_ptr<rest_chunked_rx_request>> batch);
 
-  config _config;
+  // Shared services + tunables for the whole reactor pool; kept alive for this
+  // reactor's lifetime (the authorizer is used on every request).
+  std::shared_ptr<reactor_context> _ctx;
+  config _config;  // copy of _ctx->cfg() for hot-path access
   std::size_t _bounce_slot_size{0};
 
   // Keeps the bounce-slot blocks alive for the reactor's lifetime; the

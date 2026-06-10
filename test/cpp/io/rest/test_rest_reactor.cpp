@@ -113,7 +113,7 @@ TEST_CASE("align_and_coalesce honors a caller alignment as a lower bound", "[res
 
 TEST_CASE("prep_host_rx_request builds a single chunk for the segment", "[rest]")
 {
-  rest_reactor::config cfg;  // authorizer unused by prep
+  rest_reactor::config cfg;  // pure primitives; shared services live on the context
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
 
   SECTION("non-empty segment")
