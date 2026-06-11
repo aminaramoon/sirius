@@ -18,7 +18,7 @@
 
 // sirius
 #include <helper/logical_type.hpp>
-#include <io/gpu_ingestible.hpp>
+#include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
 #include <sirius_config.hpp>
@@ -37,16 +37,10 @@
 // standard library
 #include <atomic>
 #include <cstddef>
-#include <functional>
 #include <memory>
 #include <span>
 #include <string>
-#include <unordered_map>
 #include <vector>
-
-namespace sirius::scan_manager {
-class sirius_scan_manager;
-}  // namespace sirius::scan_manager
 
 namespace sirius::op::scan {
 
@@ -58,9 +52,8 @@ namespace sirius::op::scan {
  *
  * Populated once by the pipeline converter from the DuckDB
  * @c parquet_scan binding, parked on the gpu scan operator until
- * @c sirius_scan_manager::prepare_for_query consumes it.
  */
-class parquet_ingestible_table_info : public io::ingestible_table_info {
+class parquet_ingestible_table_info : public ingestible_table_info {
  public:
   duckdb::vector<sirius::logical_type> returned_types;
   std::vector<std::string> resolved_file_paths;
@@ -79,10 +72,6 @@ class parquet_ingestible_table_info : public io::ingestible_table_info {
   std::size_t max_file_processed = 1;
 
   parquet_ingestible_table_info() = default;
-
-  std::shared_ptr<io::gpu_ingestible> make_ingestible(
-    std::unique_ptr<io::ingestible_table_info> self,
-    scan_manager::sirius_scan_manager const& mgr) override;
 
   [[nodiscard]] std::span<std::string const> file_paths() const override
   {
@@ -103,7 +92,7 @@ class parquet_ingestible_table_info : public io::ingestible_table_info {
  * pushdown), the canonical scan plan, and the per-batch pushdown safety
  * flag.
  */
-class parquet_split_info : public io::scan_info {
+class parquet_split_info : public scan_info {
  public:
   /// Row-group slices for this batch — possibly across multiple parquet
   /// files when the per-file row groups don't fill the byte budget.
@@ -153,7 +142,7 @@ class parquet_split_info : public io::scan_info {
  * shared across the whole batch because every file in the batch carries
  * identical hive values (enforced at emission).
  */
-class parquet_post_filter_and_projection_info : public io::post_filter_and_projection_info {
+class parquet_post_filter_and_projection_info : public post_filter_and_projection_info {
  public:
   /// Hive partition values for the split, in @c scan_plan::partition_columns
   /// order. Empty when the plan has no partition columns.
@@ -177,26 +166,27 @@ class parquet_post_filter_and_projection_info : public io::post_filter_and_proje
  * @c sirius_gpu_parquet_scan_operator::read_table_from_metadata, minus
  * assembly). @ref post_filter_and_project does assembly only.
  */
-class parquet_gpu_ingestible : public io::gpu_ingestible {
+class parquet_gpu_ingestible : public gpu_ingestible {
  public:
   /// Built by @c parquet_ingestible_table_info::make_ingestible. The base
   /// @c _table_info owns the parquet bind data; this constructor casts it
   /// back to @c parquet_ingestible_table_info for typed access.
-  parquet_gpu_ingestible(std::unique_ptr<io::ingestible_table_info> info,
-                         scan_manager::sirius_scan_manager const& mgr);
+  explicit parquet_gpu_ingestible(std::unique_ptr<parquet_ingestible_table_info> info);
 
   ~parquet_gpu_ingestible() override;
 
-  [[nodiscard]] bool has_more_splits() const override;
-  std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
+  [[nodiscard]] bool has_processed_all_metadata() const override;
 
-  io::filtered_table materialize_table(io::scan_info const& info,
-                                       ::cucascade::memory::memory_space const& mem_space,
-                                       rmm::cuda_stream_view stream) override;
+  metadata_scan_task_t next_split_provider() override;
+
+  op::scan::filtered_table materialize_metadata_to_table(
+    op::scan::scan_info const& info,
+    ::cucascade::memory::memory_space& mem_space,
+    rmm::cuda_stream_view stream) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
-    std::unique_ptr<cudf::table> input,
-    io::post_filter_and_projection_info const& info,
+    std::unique_ptr<cudf::table> table,
+    op::scan::post_filter_and_projection_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) override;
 
@@ -210,6 +200,8 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
 
   void run_batch(file_batch const& batch, std::vector<std::unique_ptr<op::operator_data>>& out);
 
+  std::unique_ptr<parquet_ingestible_table_info> _info;
+
   // Canonical scan plan — built once in the constructor, shared by every
   // emitted split via its parquet_split_info::plan member.
   std::shared_ptr<scan_plan const> _plan;
@@ -220,10 +212,12 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
   std::size_t _approximate_batch_size{};
   std::size_t _max_file_processed{};
   std::size_t _total_files{};
-  scan_manager::sirius_scan_manager const* _scan_manager{nullptr};
 
   std::vector<file_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};
 };
+
+std::shared_ptr<gpu_ingestible> make_ingestible(
+  std::unique_ptr<parquet_ingestible_table_info> info);
 
 }  // namespace sirius::op::scan

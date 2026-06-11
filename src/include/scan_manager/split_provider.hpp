@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include "io/gpu_ingestible.hpp"
+#include "cucascade/data/data_batch.hpp"
+#include "op/scan/gpu_ingestible.hpp"
 #include "scan_manager/split_connector.hpp"
 
 #include <atomic>
@@ -74,9 +75,15 @@ class split_provider {
   /// away. Callers that need a shared_ptr can promote via
   /// `provider.get_ingestible().shared_from_this()` (enabled by
   /// @c gpu_ingestible inheriting @c std::enable_shared_from_this).
-  explicit split_provider(io::gpu_ingestible& ingestible) : _ingestible(&ingestible) {}
+  explicit split_provider(op::scan::gpu_ingestible& ingestible) : _ingestible(&ingestible) {}
 
   virtual ~split_provider() = default;
+
+  void attach_cached_splits(std::vector<std::shared_ptr<cucascade::data_batch>> cached_batches)
+  {
+    _cached_batches   = std::move(cached_batches);
+    _next_batch_index = 0UL;
+  }
 
   /**
    * @brief Drive the provider to completion, dispatching one task per claimed
@@ -105,7 +112,9 @@ class split_provider {
    */
   [[nodiscard]] virtual bool has_more_splits() const
   {
-    return _ingestible && _ingestible->has_more_splits();
+    if (_cached_batches.empty()) { return !_ingestible->has_processed_all_metadata(); }
+    auto index = _next_batch_index.load(std::memory_order_relaxed);
+    return index < _cached_batches.size();
   }
 
   /**
@@ -120,7 +129,19 @@ class split_provider {
    */
   virtual std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider()
   {
-    if (!_ingestible) { return nullptr; }
+    if (!_cached_batches.empty()) {
+      auto index = _next_batch_index.fetch_add(1, std::memory_order_relaxed);
+      if (index < _cached_batches.size()) {
+        auto batch = _cached_batches[index];
+        return [batch = std::move(batch)]() mutable {
+          std::vector<std::unique_ptr<op::operator_data>> splits;
+          auto split = std::make_unique<op::scan::scan_operator_input>(std::move(batch), nullptr);
+          splits.emplace_back(std::move(split));
+          return splits;
+        };
+      }
+      return nullptr;
+    }
     return _ingestible->next_split_provider();
   }
 
@@ -128,7 +149,7 @@ class split_provider {
   /// default-ctor path (which never calls this). Callers that need a
   /// @c shared_ptr<gpu_ingestible> can promote via
   /// `provider.get_ingestible().shared_from_this()`.
-  [[nodiscard]] io::gpu_ingestible& get_ingestible() const noexcept { return *_ingestible; }
+  [[nodiscard]] op::scan::gpu_ingestible& get_ingestible() const noexcept { return *_ingestible; }
 
   /**
    * @brief Install the balancing strategy that places this provider's splits.
@@ -181,7 +202,7 @@ class split_provider {
   /// Non-owning pointer to the composed ingestible (null on the legacy
   /// default-ctor path). The operator owns the lifetime; the provider is
   /// always destroyed first via @c sirius_scan_manager::reset.
-  io::gpu_ingestible* _ingestible{nullptr};
+  op::scan::gpu_ingestible* _ingestible{nullptr};
 
   /// Placement policy for the splits this provider emits. May be shared with
   /// other providers. Null until @ref set_balancing_strategy is called, which
@@ -190,6 +211,9 @@ class split_provider {
 
   /// Pipeline this provider's scan belongs to, forwarded to the strategy.
   std::size_t _pipeline_id{0};
+
+  std::atomic<std::size_t> _next_batch_index{0};
+  std::vector<std::shared_ptr<cucascade::data_batch>> _cached_batches;
 
   /// RAII coordination shared across the enqueued tasks. Destructor closes
   /// the connector with the captured exception (if any) once the last task

@@ -20,8 +20,6 @@
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/gpu_ingestible.hpp"
-#include "io/s3/s3_blocking_ioctx.hpp"
-#include "io/s3/s3_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
 #include "scan_manager/gpu_ingestible_factory.hpp"
 #include "scan_manager/split_provider.hpp"
@@ -42,21 +40,29 @@ class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
+namespace cucascade::memory {
+class memory_reservation_manager;
+}  // namespace cucascade::memory
+
 namespace sirius::io {
 class sirius_ioctx;
+namespace cache {
 class buffer_pool;
+}  // namespace cache
 }  // namespace sirius::io
 
 namespace sirius::op::scan {
 class sirius_gpu_scan_operator;
 }  // namespace sirius::op::scan
+
+namespace sirius::scan_manager {
+class pipeline_ordered_prefetching_manager;
+}  // namespace sirius::scan_manager
 
 namespace sirius::planner {
 class query;
@@ -70,11 +76,7 @@ namespace sirius::scan_manager {
  * @c use_sirius_datasource controls whether the manager builds a
  * @c sirius_ioctx and routes parquet reads through @c sirius_datasource.
  * Set to @c false to fall back to @c cudf::io::datasource::create() at
- * every read site (e.g. when the sirius IO path is misbehaving). Only
- * valid in single-GPU configurations — when more than one GPU is
- * configured, @c sirius_config::enforce_sirius_datasource_for_multi_gpu()
- * forces this field to @c true because kvikio's per-FileHandle CUDA-context
- * binding breaks multi-GPU residency.
+ * every read site (e.g. when the sirius IO path is misbehaving).
  */
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
@@ -86,10 +88,8 @@ struct scan_manager_config {
   /// YAML and kept for forward compatibility / tests; setting it has no effect
   /// on the engine today.
   std::size_t uring_n_reactors{4};
-  /// Reserved (not currently consumed). Intended io_uring submission/completion
-  /// queue depth per reactor; the production @c uring_ioctx hardcodes 64. Parsed
-  /// from YAML and kept for forward compatibility / tests; setting it has no
-  /// effect on the engine today.
+  /// io_uring submission/completion queue depth per reactor.  Ignored when
+  /// @c use_sirius_datasource is false.
   unsigned uring_ring_entries{64};
   /// Enable the prefetching cache.  Requires @c use_sirius_datasource=true;
   /// when true, SiriusContext (S6) allocates a pinned-host buffer_pool and
@@ -212,15 +212,11 @@ class sirius_scan_manager {
    * The scan_manager owns a single io_context (uring_ioctx) and optionally
    * an S3 backend and a prefetch buffer pool, all created from @p config.
    *
-   * @param config   Scan-manager configuration (thread pool, io settings,
-   *                 S3 credentials, prefetch cache knobs).
-   * @param host_fsmr  Host fixed-size memory resource for S3 backend and
-   *                   prefetch cache buffer pool. May be nullptr when prefetch
-   *                   cache is disabled and no S3 backend is configured.
+   * @param config Scan-manager configuration (thread pool + sirius_datasource toggle).
+   * @param reservation_manager Memory reservation manager for GPU memory.
    */
-  explicit sirius_scan_manager(
-    scan_manager_config config,
-    cucascade::memory::fixed_size_host_memory_resource* host_fsmr = nullptr);
+  explicit sirius_scan_manager(const scan_manager_config& config,
+                               cucascade::memory::memory_reservation_manager& reservation_manager);
 
   ~sirius_scan_manager();
 
@@ -243,14 +239,7 @@ class sirius_scan_manager {
   /// needed.
   ///
   /// @param query        The query whose scan operators must be prepared.
-  /// @param gpu_memory_spaces device_id -> GPU memory_space lookup used by the
-  ///                     HOST-tier cached_split_provider to materialize host
-  ///                     chunks onto the executing GPU. Empty map disables the
-  ///                     HOST-tier cache path (queries against a host pin fall
-  ///                     through to parquet).
-  void prepare_for_query(
-    const sirius::planner::query& query,
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces = {});
+  void prepare_for_query(const sirius::planner::query& query);
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -325,63 +314,46 @@ class sirius_scan_manager {
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
 
-  /// \brief Public read-accessor for the pinned-entries map. Used by unit
-  /// tests to assert per-chunk memory_space placement after CALL pin_table.
-  /// Const-only — callers cannot mutate the map.
-  [[nodiscard]] const std::unordered_map<std::string, pinned_entry>& get_pinned_entries()
-    const noexcept
-  {
-    return _pinned_entries;
-  }
+  /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
+  ///        Returns nullptr when the manager was configured with
+  ///        @c use_sirius_datasource=false.
+  [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path) const noexcept;
-
-  /// \brief Whether parquet_split_provider should prewarm column-chunk byte
-  /// ranges via @c cache->insert(obj, metadata, ranges). Mirrors
-  /// @c scan_manager_config::enable_chunk_prewarm. False disables the
-  /// prewarm (insert is called with empty ranges — metadata-only, §24
-  /// describe_parquet shape), letting B1 micro-bench A/B prefetch overlap.
-  [[nodiscard]] bool chunk_prewarm_enabled() const noexcept { return _config.enable_chunk_prewarm; }
-
-  /// \brief Probe a parquet file's schema for the SQL bind path.
-  ///
-  /// Resolves @p uri to a backend via @c io_ctx_for, fetches only the parquet
-  /// footer (no full-file download), and infers the column types and names.
-  /// When the resolved backend has a prefetch cache, the parsed footer is
-  /// inserted as metadata-only so a subsequent scan reuses it instead of
-  /// fetching and parsing the footer a second time.
-  ///
-  /// This is the C++ entry point behind the @c sirius_read_parquet table
-  /// function's bind callback.
-  ///
-  /// \throws std::runtime_error when no backend supports @p uri, or when the
-  ///         footer fetch / schema inference fails.
-  [[nodiscard]] parquet_bind_result describe_parquet(std::string const& uri);
 
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
+  void try_attach_cache_to_provider(op::scan::sirius_gpu_scan_operator* op,
+                                    split_provider& provider);
+
   scan_manager_config _config;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
-  std::unique_ptr<sirius::io::buffer_pool> _prefetch_buffer_pool;
-  std::unique_ptr<sirius::exec::static_thread_pool> _s3_thread_pool;
-  /// Owned io_context backends, in priority order. The first entry is the
-  /// local-file backend (uring_ioctx); subsequent entries are object-store
-  /// backends (s3_ioctx). Per-path dispatch in io_ctx_for / io_ctx_shared_for
-  /// walks the vector and returns the first whose supports(path) is true.
-  std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> _io_ctxs;
+  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
+  /// Buffer pool owned by the scan_manager (not the cache).  Constructed
+  /// when a HOST-tier @c fixed_size_host_memory_resource is available;
+  /// null otherwise.  The cache (owned by @c _io_ctx) holds the pool
+  /// by raw pointer, so the destructor MUST call
+  /// @c _io_ctx->shutdown_cache() before resetting this pool.
+  std::unique_ptr<sirius::io::cache::buffer_pool> _buffer_pool;
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
-  /// Produces the right gpu_ingestible per scan source during
-  /// prepare_for_query. Holds a borrowed reference to @c _pinned_entries
-  /// — declared AFTER it so its constructor's reference is bound to a
-  /// fully-constructed member.
-  gpu_ingestible_factory _factory;
+
+  /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
+  /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached
+  /// parquet scan (allocated by @ref create_provider_for when it builds
+  /// a parquet_split_provider).  The sequencer task is enqueued on the
+  /// per-query @c _dispatcher, which injects its own stop_token; the
+  /// dispatcher's @c request_stop() in @ref reset() therefore tears the
+  /// sequencer down without an extra side-channel.
+  std::unique_ptr<pipeline_ordered_prefetching_manager> _prefetch_manager;
+
+  std::vector<int> _device_ids;
 };
 
 }  // namespace sirius::scan_manager

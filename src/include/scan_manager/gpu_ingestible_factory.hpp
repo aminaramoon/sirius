@@ -16,19 +16,14 @@
 
 #pragma once
 
-#include "io/gpu_ingestible.hpp"
+#include "op/scan/gpu_ingestible.hpp"
 
 #include <cucascade/memory/memory_space.hpp>
 
 #include <cstddef>
 #include <memory>
-#include <string>
-#include <unordered_map>
 
 namespace sirius::scan_manager {
-
-class sirius_scan_manager;
-struct pinned_entry;
 
 /**
  * @brief Single entry point for producing the right gpu_ingestible for a
@@ -56,12 +51,6 @@ struct pinned_entry;
  */
 class gpu_ingestible_factory {
  public:
-  /// @param pinned_entries  Borrowed reference to the scan_manager's
-  ///                        pinned-entries map. The factory must not
-  ///                        outlive the map.
-  explicit gpu_ingestible_factory(
-    std::unordered_map<std::string, pinned_entry> const& pinned_entries) noexcept;
-
   /**
    * @brief Build the right gpu_ingestible for an operator's bind data.
    *
@@ -79,22 +68,8 @@ class gpu_ingestible_factory {
    *                          chunks onto the executing GPU.
    * @param op_id             Operator id (logging only).
    */
-  std::shared_ptr<io::gpu_ingestible> produce(
-    std::unique_ptr<io::ingestible_table_info> table_info,
-    sirius_scan_manager const& mgr,
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces,
-    std::size_t op_id);
-
- private:
-  /// Try the pinned-cache short-circuit. Peeks @p table_info; on a hit,
-  /// steals it into the constructed @c pinned_table_gpu_ingestible.
-  /// Returns nullptr on miss (table_info stays intact).
-  std::shared_ptr<io::gpu_ingestible> try_cached(
-    std::unique_ptr<io::ingestible_table_info>& table_info,
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces,
-    std::size_t op_id) const;
-
-  std::unordered_map<std::string, pinned_entry> const& _pinned_entries;
+  std::shared_ptr<op::scan::gpu_ingestible> produce(
+    std::unique_ptr<op::scan::ingestible_table_info> table_info, std::size_t op_id);
 };
 
 }  // namespace sirius::scan_manager

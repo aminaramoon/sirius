@@ -565,7 +565,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // case, injects its own s3_thread_pool into the config copy.
   config_.set_scan_manager_config(std::move(sm_config));
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
-    config_.get_scan_manager_config(), host_fsmr);
+    config_.get_scan_manager_config(), *memory_manager_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.

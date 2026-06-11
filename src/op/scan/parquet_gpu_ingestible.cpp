@@ -19,7 +19,6 @@
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <io/io_context.hpp>
-#include <io/prefetching_cache.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
@@ -54,8 +53,6 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
-#include <string_view>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -80,18 +77,17 @@ bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string:
 //===----------------------------------------------------------------------===//
 // parquet_ingestible_table_info::make_ingestible
 //===----------------------------------------------------------------------===//
-std::shared_ptr<io::gpu_ingestible> parquet_ingestible_table_info::make_ingestible(
-  std::unique_ptr<io::ingestible_table_info> self, scan_manager::sirius_scan_manager const& mgr)
+std::shared_ptr<gpu_ingestible> make_ingestible(std::unique_ptr<parquet_ingestible_table_info> info)
 {
-  return std::make_shared<parquet_gpu_ingestible>(std::move(self), mgr);
+  return std::make_shared<parquet_gpu_ingestible>(std::unique_ptr<parquet_ingestible_table_info>(
+    static_cast<parquet_ingestible_table_info*>(info.release())));
 }
 
 //===----------------------------------------------------------------------===//
 // parquet_gpu_ingestible — construction
 //===----------------------------------------------------------------------===//
-parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<io::ingestible_table_info> info,
-                                               scan_manager::sirius_scan_manager const& mgr)
-  : io::gpu_ingestible(std::move(info)), _scan_manager(&mgr)
+parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestible_table_info> info)
+  : _info(std::move(info))
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
 
@@ -145,9 +141,9 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 // split-provider interface
 //===----------------------------------------------------------------------===//
-bool parquet_gpu_ingestible::has_more_splits() const
+bool parquet_gpu_ingestible::has_processed_all_metadata() const
 {
-  return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
+  return _next_batch_idx.load(std::memory_order_relaxed) >= _batches.size();
 }
 
 std::function<std::vector<std::unique_ptr<op::operator_data>>()>
@@ -250,7 +246,8 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
   bool const needs_post_processing = needs_output_assembly(*_plan);
 
   auto build_post_filter_info =
-    [&accum, needs_post_processing]() -> std::unique_ptr<io::post_filter_and_projection_info> {
+    [&accum,
+     needs_post_processing]() -> std::unique_ptr<op::scan::post_filter_and_projection_info> {
     if (!needs_post_processing) { return nullptr; }
     auto info              = std::make_unique<parquet_post_filter_and_projection_info>();
     info->partition_values = accum.partition_values.value_or(std::vector<std::string>{});
@@ -267,9 +264,8 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     split_info->disable_filter_pushdown = skip_pushdown_due_to_flba;
     split_info->needs_assembly          = needs_post_processing;
     split_info->partition_values = accum.partition_values.value_or(std::vector<std::string>{});
-    auto metadata = std::make_unique<io::scan_and_filter_metadata>(std::move(split_info),
-                                                                   build_post_filter_info());
-    out.push_back(std::make_unique<scan_operator_input>(std::move(metadata)));
+    out.push_back(std::make_unique<op::scan::scan_operator_input>(std::move(split_info),
+                                                                  build_post_filter_info()));
     accum.slices.clear();
     accum.total_uncompressed_bytes = 0;
   };
@@ -425,9 +421,9 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
 //===----------------------------------------------------------------------===//
 // materialize_table — ports read_table_from_metadata
 //===----------------------------------------------------------------------===//
-io::filtered_table parquet_gpu_ingestible::materialize_table(
-  io::scan_info const& info,
-  ::cucascade::memory::memory_space const& mem_space,
+filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
+  op::scan::scan_info const& info,
+  ::cucascade::memory::memory_space& mem_space,
   rmm::cuda_stream_view stream)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
@@ -485,7 +481,7 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
   // Determine filter state. When pushdown engaged the reader applied the
   // filter; otherwise we apply post-decode here. `sirius_filter_ast` must
   // outlive `exec` — the executor only borrows the AST.
-  io::filter_state state = io::filter_state::UNFILTERED;
+  auto state = op::scan::filter_state::UNFILTERED;
   if (sirius_filter_ast) {
     if (!ast_expression) {
       sirius::gpu_expression_executor exec(
@@ -496,21 +492,21 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
         "[parquet_gpu_ingestible::materialize_table] Applied duckdb filter expression "
         "post-decode.");
     }
-    state = io::filter_state::ROW_FILTERED;
+    state = op::scan::filter_state::ROW_FILTERED;
   }
 
   // Reader-side pushdown succeeded and the plan needs assembly — inline it
   // here so the scan operator can skip post_filter_and_project entirely.
   // (post-decode fallback keeps assembly external because re-allocating after
   // exec.select is the same shape either way.)
-  if (state == io::filter_state::ROW_FILTERED && ast_expression && split.needs_assembly) {
+  if (state == op::scan::filter_state::ROW_FILTERED && ast_expression && split.needs_assembly) {
     table = assemble_scan_output(*_plan, std::move(table), split.partition_values, stream);
-    state = io::filter_state::ROW_FILTERED_AND_PROJECTED;
+    state = op::scan::filter_state::ROW_FILTERED_AND_PROJECTED;
     SIRIUS_LOG_DEBUG(
       "[parquet_gpu_ingestible::materialize_table] Assembled inline on reader-side pushdown path.");
   }
 
-  return io::filtered_table{std::move(table), state};
+  return op::scan::filtered_table{std::move(table), state};
 }
 
 //===----------------------------------------------------------------------===//
@@ -518,7 +514,7 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
 //===----------------------------------------------------------------------===//
 std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   std::unique_ptr<cudf::table> input,
-  io::post_filter_and_projection_info const& info,
+  op::scan::post_filter_and_projection_info const& info,
   ::cucascade::memory::memory_space const& /*mem_space*/,
   rmm::cuda_stream_view stream)
 {

@@ -16,31 +16,36 @@
 
 #pragma once
 
+#include <op/scan/sirius_gpu_scan_operator_data.hpp>
+
 // cudf
 #include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
+
+#include <cucascade/data/gpu_data_representation.hpp>
 
 // rmm
 #include <rmm/cuda_stream_view.hpp>
+
+// standard library
+#include <concepts>
+#include <functional>
+#include <memory>
+#include <vector>
 
 // cucascade (forward-declare to keep this header light; full include in .cpp)
 namespace cucascade::memory {
 class memory_space;
 }  // namespace cucascade::memory
 
-// standard library
-#include <functional>
-#include <memory>
-#include <vector>
-
-namespace sirius::op {
-class operator_data;
-}  // namespace sirius::op
-
 namespace sirius::scan_manager {
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
 
-namespace sirius::io {
+namespace sirius::op {
+class operator_data;
+
+namespace scan {
 
 class gpu_ingestible;
 
@@ -62,25 +67,6 @@ class ingestible_table_info {
 
   ingestible_table_info(ingestible_table_info const&)            = delete;
   ingestible_table_info& operator=(ingestible_table_info const&) = delete;
-
-  /**
-   * @brief Build the format-specific gpu_ingestible for this table.
-   *
-   * Called once during sirius_scan_manager::prepare_for_query after the
-   * pinned-cache short-circuit misses. The override is expected to move
-   * format-specific fields off *this into the constructed ingestible;
-   * @p self is the owning unique_ptr of *this, threaded through so the
-   * ingestible base can co-own the bind data (so accessors like
-   * @ref table_info remain valid post-construction).
-   *
-   * @param self        Owning handle of *this. The override moves it into
-   *                    the constructed ingestible's base.
-   * @param mgr         Owning scan_manager. Forwarded so the ingestible
-   *                    can route each path to its backend via
-   *                    @c sirius_scan_manager::io_ctx_shared_for.
-   */
-  virtual std::shared_ptr<gpu_ingestible> make_ingestible(
-    std::unique_ptr<ingestible_table_info> self, scan_manager::sirius_scan_manager const& mgr) = 0;
 
   /**
    * @brief Resolved file paths captured at bind time.
@@ -153,10 +139,10 @@ class post_filter_and_projection_info {
  * inline (the parquet reader-side pushdown path).
  */
 enum class filter_state {
-  UNFILTERED,
-  ROWGROUP_FILTERED,
-  ROW_FILTERED,
-  ROW_FILTERED_AND_PROJECTED,
+  UNFILTERED,                  // pinned table is an example of this
+  ROWGROUP_FILTERED,           // hybrid_scan materialize is an example of this
+  ROW_FILTERED,                // read_parquet is an example of this
+  ROW_FILTERED_AND_PROJECTED,  // table for the particular query is cached
 };
 
 /**
@@ -168,39 +154,6 @@ enum class filter_state {
 struct filtered_table {
   std::unique_ptr<cudf::table> table;
   filter_state state{filter_state::UNFILTERED};
-};
-
-//===----------------------------------------------------------------------===//
-// scan_and_filter_metadata
-//===----------------------------------------------------------------------===//
-/**
- * @brief Pair of per-split scan descriptor and (optional) post-decode
- *        filter/projection description.
- *
- * Owned by @c sirius::op::scan::scan_operator_input — the operator_data
- * pushed into the scan operator's connector for fresh (non-cached) splits.
- * The scan operator inspects @ref has_filter to decide whether to call the
- * ingestible's @ref gpu_ingestible::post_filter_and_project after the
- * materialize step.
- */
-class scan_and_filter_metadata {
- public:
-  scan_and_filter_metadata(std::unique_ptr<scan_info> scan,
-                           std::unique_ptr<post_filter_and_projection_info> filter_and_project)
-    : _scan(std::move(scan)), _filter_and_project(std::move(filter_and_project))
-  {
-  }
-
-  [[nodiscard]] bool has_filter() const noexcept { return _filter_and_project != nullptr; }
-  [[nodiscard]] scan_info const& scan() const noexcept { return *_scan; }
-  [[nodiscard]] post_filter_and_projection_info const& filter_and_project() const noexcept
-  {
-    return *_filter_and_project;
-  }
-
- private:
-  std::unique_ptr<scan_info> _scan;
-  std::unique_ptr<post_filter_and_projection_info> _filter_and_project;
 };
 
 //===----------------------------------------------------------------------===//
@@ -220,10 +173,7 @@ class scan_and_filter_metadata {
  */
 class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
  public:
-  explicit gpu_ingestible(std::unique_ptr<ingestible_table_info> info)
-    : _table_info(std::move(info))
-  {
-  }
+  using metadata_scan_task_t = std::function<std::vector<std::unique_ptr<op::operator_data>>()>;
 
   virtual ~gpu_ingestible() = default;
 
@@ -232,6 +182,9 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   gpu_ingestible(gpu_ingestible&&)                 = delete;
   gpu_ingestible& operator=(gpu_ingestible&&)      = delete;
 
+  filtered_table materialize_table(const op::scan::scan_operator_input& split,
+                                   rmm::cuda_stream_view stream);
+
   /**
    * @brief Snapshot check for remaining work. Thread-safe.
    *
@@ -239,7 +192,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * the next batch. Implementations typically compare an atomic batch
    * index against a precomputed total.
    */
-  [[nodiscard]] virtual bool has_more_splits() const = 0;
+  [[nodiscard]] virtual bool has_processed_all_metadata() const = 0;
 
   /**
    * @brief Atomically claim the next batch and return a callable that
@@ -251,8 +204,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * null callable indicates no work was claimed (the driver loop skips
    * empty handoffs).
    */
-  virtual std::function<std::vector<std::unique_ptr<op::operator_data>>()>
-  next_split_provider() = 0;
+  virtual metadata_scan_task_t next_split_provider() = 0;
 
   /**
    * @brief Materialize the cudf table for one split. Called by
@@ -263,9 +215,10 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * sirius_ioctx for the read — implementations route the read through
    * that ioctx so per-GPU CUDA contexts bind correctly.
    */
-  virtual filtered_table materialize_table(scan_info const& info,
-                                           ::cucascade::memory::memory_space const& mem_space,
-                                           rmm::cuda_stream_view stream) = 0;
+  virtual filtered_table materialize_metadata_to_table(
+    const scan_info& info,
+    const cucascade::memory::memory_space& mem_space,
+    rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Apply post-decode filter and/or projection to the materialized
@@ -279,28 +232,24 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * fresh-read + assembly path.
    */
   virtual std::unique_ptr<cudf::table> post_filter_and_project(
-    std::unique_ptr<cudf::table> input,
-    post_filter_and_projection_info const& info,
-    ::cucascade::memory::memory_space const& mem_space,
+    std::unique_ptr<cudf::table> table,
+    const post_filter_and_projection_info& info,
+    const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) = 0;
 
-  [[nodiscard]] ingestible_table_info const& table_info() const noexcept { return *_table_info; }
+  [[nodiscard]] virtual const ingestible_table_info& table_info() const noexcept = 0;
 
  protected:
-  std::unique_ptr<ingestible_table_info> _table_info;
+  gpu_ingestible() noexcept = default;
 };
 
-//===----------------------------------------------------------------------===//
-// make_gpu_ingestible
-//===----------------------------------------------------------------------===//
-/**
- * @brief Free-function wrapper around @ref ingestible_table_info::make_ingestible.
- *
- * Single call site used by @c sirius_scan_manager::prepare_for_query to
- * build the format-specific ingestible from the operator's bind data.
- * Throws when @p info is null.
- */
-std::shared_ptr<gpu_ingestible> make_gpu_ingestible(std::unique_ptr<ingestible_table_info> info,
-                                                    scan_manager::sirius_scan_manager const& mgr);
+template <typename Derived>
+  requires std::derived_from<ingestible_table_info, Derived>
+std::shared_ptr<op::scan::gpu_ingestible> make_ingestible(std::unique_ptr<Derived> self)
+{
+  throw std::logic_error("make_ingestible not implemented for " +
+                         std::string(typeid(Derived).name()));
+}
 
-}  // namespace sirius::io
+}  // namespace scan
+}  // namespace sirius::op
