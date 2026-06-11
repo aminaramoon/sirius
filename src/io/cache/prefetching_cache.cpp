@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstddef>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -392,7 +393,8 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
 }
 
 prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
-                                             std::span<const byte_range> ranges)
+                                             std::span<const byte_range> ranges,
+                                             std::optional<int> gpu_id)
 {
   if (!_armed) { return prefetching_handle(nullptr); }
 

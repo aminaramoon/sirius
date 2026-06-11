@@ -19,6 +19,7 @@
 #include "exec/config.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
+#include "io/sirius_datasource.hpp"
 #include "scan_manager/split_provider.hpp"
 
 #include <cudf/column/column.hpp>
@@ -26,10 +27,6 @@
 
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-namespace cucascade::memory {
-class fixed_size_host_memory_resource;
-}  // namespace cucascade::memory
 
 #include <memory>
 #include <string>
@@ -243,6 +240,9 @@ class sirius_scan_manager {
   ///        Returns nullptr when the manager was configured with
   ///        @c use_sirius_datasource=false.
   [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
+
+  [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
+    std::string_view path) const noexcept;
 
  private:
   /// \brief Build a split_provider for @p op by reading its parquet scan_info.

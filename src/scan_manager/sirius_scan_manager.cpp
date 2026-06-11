@@ -394,6 +394,13 @@ void sirius_scan_manager::start_metadata_processing()
   }
 }
 
+std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
+  std::string_view path) const noexcept
+{
+  if (!_io_ctx) { return nullptr; }
+  return _io_ctx->open_datasource(std::string(path));
+}
+
 void sirius_scan_manager::reset()
 {
   _dispatcher->request_stop();

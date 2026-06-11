@@ -169,7 +169,8 @@ class prefetching_cache {
 
  private:
   [[nodiscard]] prefetching_handle insert(const sirius_io_object& obj,
-                                          std::span<const byte_range> ranges);
+                                          std::span<const byte_range> ranges,
+                                          std::optional<int> gpu_id = {});
 
   struct file_entry {
     std::vector<cached_chunk*> update_and_get_chunks(std::span<size_t> incoming, uint32_t ticker);
