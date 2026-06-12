@@ -17,7 +17,7 @@
 #pragma once
 
 // sirius
-#include <io/gpu_ingestible.hpp>
+#include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 
 // cudf

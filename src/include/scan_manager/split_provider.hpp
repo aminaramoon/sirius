@@ -18,6 +18,7 @@
 
 #include "cucascade/data/data_batch.hpp"
 #include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan_manager/split_connector.hpp"
 
 #include <atomic>

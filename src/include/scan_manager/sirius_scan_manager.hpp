@@ -19,9 +19,7 @@
 #include "exec/config.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
-#include "io/gpu_ingestible.hpp"
 #include "io/sirius_datasource.hpp"
-#include "scan_manager/gpu_ingestible_factory.hpp"
 #include "scan_manager/split_provider.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type

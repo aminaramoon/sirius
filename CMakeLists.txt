@@ -193,14 +193,16 @@ set(EXTENSION_SOURCES
     src/io/duckdb_io_object.cpp
     src/io/io_context.cpp
     src/io/parquet_helpers.cpp
-    src/io/prefetching_cache.cpp
-    src/io/s3/s3_blocking_ioctx.cpp
-    src/io/s3/s3_reactor.cpp
-    src/io/s3/s3_ioctx.cpp
-    src/io/s3/sigv4.cpp
-    src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/sirius_datasource.cpp
     src/io/uri_parser.cpp
+    src/io/cache/metadata_store.cpp
+    src/io/cache/prefetching_cache.cpp
+    src/io/kvikio/kvikio_context.cpp
+    src/io/rest/curl_handle.cpp
+    src/io/rest/rest_ioctx.cpp
+    src/io/rest/rest_reactor.cpp
+    src/io/s3/sigv4.cpp
+    src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
     src/memory/defragmenter_oom_policy.cpp

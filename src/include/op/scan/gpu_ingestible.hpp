@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include <op/scan/sirius_gpu_scan_operator_data.hpp>
-
 // cudf
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -48,6 +46,9 @@ class operator_data;
 namespace scan {
 
 class gpu_ingestible;
+// Forward-declared to break the gpu_ingestible.hpp <-> sirius_gpu_scan_operator_data.hpp
+// include cycle; only used by const-reference below. Full definition pulled in by .cpp.
+class scan_operator_input;
 
 //===----------------------------------------------------------------------===//
 // ingestible_table_info
