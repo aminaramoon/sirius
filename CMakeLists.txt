@@ -227,7 +227,6 @@ set(EXTENSION_SOURCES
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/puffin_reader.cpp
     src/op/scan/parquet_schema_mapping.cpp
-    src/op/scan/prefetched_data_source.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_gpu_scan_operator.cpp
@@ -235,7 +234,6 @@ set(EXTENSION_SOURCES
     src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
-    # src/op/scan/pinned_table_gpu_ingestible.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
@@ -547,7 +545,6 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     # test/cpp/scan/test_parquet_gpu_ingestible.cpp  # stale against new io interface
-    # test/cpp/scan/test_pinned_table_gpu_ingestible.cpp
     test/cpp/scan/test_split_connector.cpp
     # test/cpp/scan_manager/test_describe_parquet_s3.cpp  # stale against new io interface
     # test/cpp/scan_manager/test_pin_table_multi_gpu.cpp  # stale against new io interface
