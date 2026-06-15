@@ -84,7 +84,9 @@ class load_balancing_scan_batch_coalecer {
   /// sequencer task in the order they were added — typically scan_manager
   /// adds them in pipeline-id order so the head-of-line pipeline drains
   /// first.  The returned pointer is valid for the manager's lifetime.
-  metadata_processing_state* register_pipeline(op::scan::sirius_gpu_scan_operator* op,
+  metadata_processing_state* register_pipeline(std::size_t pipeline_id,
+                                               split_connector& connector,
+                                               std::unique_ptr<batch_coalecer> coalecer,
                                                std::shared_ptr<balancing_strategy> balancer);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must

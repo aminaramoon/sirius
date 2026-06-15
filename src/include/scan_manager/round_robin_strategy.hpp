@@ -33,7 +33,7 @@ namespace sirius::scan_manager {
  * whole scan stage rather than restarting per provider. @c pipeline_id is
  * ignored — placement is global.
  */
-class round_robin_strategy : public batch_coalecer {
+class round_robin_strategy : public balancing_strategy {
  public:
   /// @param device_ids GPUs to round-robin over, in a stable order. An empty
   ///                   set turns @ref get_next_gpu into a no-op returning -1.

@@ -22,45 +22,32 @@
 namespace sirius::scan_manager {
 
 load_balancing_scan_batch_coalecer::metadata_processing_state*
-load_balancing_scan_batch_coalecer::register_pipeline(std::size_t pipeline_id)
+load_balancing_scan_batch_coalecer::register_pipeline(std::size_t pipeline_id,
+                                                      split_connector& connector,
+                                                      std::unique_ptr<batch_coalecer> coalecer,
+                                                      std::shared_ptr<balancing_strategy> balancer)
 {
+  // TODO(plumbing): the per-pipeline coalecing/balancing worker loop is not yet
+  // implemented (see worker_loop). This just records the supplied pieces on the
+  // slot so the new register_pipeline interface compiles and is consumable.
   auto slot         = std::make_unique<metadata_processing_state>();
   slot->pipeline_id = pipeline_id;
-  auto* p           = slot.get();
+  slot->coalecer    = std::move(coalecer);
+  slot->balancer    = std::move(balancer);
+  // The slot holds a shared_ptr but callers pass a non-owning reference to a
+  // connector owned by the scan operator; store a non-owning alias.
+  slot->connector = std::shared_ptr<split_connector>(std::shared_ptr<void>{}, &connector);
+  auto* p         = slot.get();
   _slots.emplace(pipeline_id, std::move(slot));
   return p;
 }
 
-void load_balancing_scan_batch_coalecer::worker_loop(std::stop_token const& stop)
+void load_balancing_scan_batch_coalecer::worker_loop([[maybe_unused]] std::stop_token const& stop)
 {
-  for (auto& slot_ptr : _slots) {
-    auto& slot = *slot_ptr;
-    while (!stop.stop_requested()) {
-      // Block on the semaphore, but with a poll timeout so the
-      // stop_token is observed promptly even when a slot is silent
-      // (provider hasn't pushed yet).
-      if (!slot.sem.try_acquire_for(SEQUENCER_POLL_INTERVAL)) continue;
-
-      fadvise_entry entry;
-      if (!slot.queue.try_dequeue(entry)) continue;  // spurious wake — unlikely
-
-      if (!entry.datasource) {
-        // Closure sentinel — provider is done with this pipeline.
-        // Drop any leftover entries (there shouldn't be any if the
-        // provider pushes sentinel last, but be defensive).
-        SIRIUS_LOG_DEBUG("[pipeline_ordered_prefetching_manager] pipeline_id={} closed",
-                         slot.pipeline_id);
-        break;
-      }
-
-      SIRIUS_LOG_INFO(
-        "[fadvise opportunistic] pipeline_id={} ranges={}", slot.pipeline_id, entry.ranges.size());
-
-      entry.datasource->fadvise(entry.ranges);
-      entry.datasource->prefetch(sirius::io::cache::prefetching_stage::opportunistic);
-    }
-    if (stop.stop_requested()) break;
-  }
+  // TODO(plumbing): the original fadvise-sequencer body referenced the old
+  // per-slot semaphore/fadvise_entry model that no longer exists on
+  // metadata_processing_state. Left as a no-op until the new coalecing/
+  // balancing worker loop is implemented.
 }
 
 }  // namespace sirius::scan_manager

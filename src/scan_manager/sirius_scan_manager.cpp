@@ -305,7 +305,7 @@ void sirius_scan_manager::reset()
   _dispatcher->wait_for_all();
   _scan_op_order.clear();
   _providers_by_op.clear();
-  _prefetch_manager.reset();
+  _metadata_processor.reset();
   _dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads);
 }

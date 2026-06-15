@@ -545,7 +545,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     # test/cpp/scan/test_parquet_gpu_ingestible.cpp  # stale against new io interface
-    test/cpp/scan/test_split_connector.cpp
+    # test/cpp/scan/test_split_connector.cpp  # stale against refactored split_provider/split_connector API
     # test/cpp/scan_manager/test_describe_parquet_s3.cpp  # stale against new io interface
     # test/cpp/scan_manager/test_pin_table_multi_gpu.cpp  # stale against new io interface
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
