@@ -59,7 +59,7 @@ class sirius_gpu_scan_operator;
 }  // namespace sirius::op::scan
 
 namespace sirius::scan_manager {
-class pipeline_ordered_prefetching_manager;
+class load_balancing_scan_batch_coalecer;
 }  // namespace sirius::scan_manager
 
 namespace sirius::planner {
@@ -326,7 +326,7 @@ class sirius_scan_manager {
   /// per-query @c _dispatcher, which injects its own stop_token; the
   /// dispatcher's @c request_stop() in @ref reset() therefore tears the
   /// sequencer down without an extra side-channel.
-  std::unique_ptr<pipeline_ordered_prefetching_manager> _prefetch_manager;
+  std::unique_ptr<load_balancing_scan_batch_coalecer> _prefetch_manager;
 
   std::vector<int> _device_ids;
 };

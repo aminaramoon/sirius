@@ -36,7 +36,7 @@ class operator_data;
 
 namespace sirius::scan_manager {
 
-class balancing_strategy;
+class batch_coalecer;
 
 /**
  * @brief Driver of splits for a scan operator.
@@ -168,7 +168,7 @@ class split_provider {
    * disables placement — splits then carry no preference and the task creator
    * falls back to its own locality logic.
    */
-  void set_balancing_strategy(std::shared_ptr<balancing_strategy> strategy, std::size_t pipeline_id)
+  void set_balancing_strategy(std::shared_ptr<batch_coalecer> strategy, std::size_t pipeline_id)
   {
     _balancing_strategy = std::move(strategy);
     _pipeline_id        = pipeline_id;
@@ -214,7 +214,7 @@ class split_provider {
   /// Placement policy for the splits this provider emits. May be shared with
   /// other providers. Null until @ref set_balancing_strategy is called, which
   /// disables placement.
-  std::shared_ptr<balancing_strategy> _balancing_strategy;
+  std::shared_ptr<batch_coalecer> _balancing_strategy;
 
   /// Pipeline this provider's scan belongs to, forwarded to the strategy.
   std::size_t _pipeline_id{0};

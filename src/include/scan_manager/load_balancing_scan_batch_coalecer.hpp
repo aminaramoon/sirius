@@ -16,7 +16,11 @@
 
 #pragma once
 
+#include "blockingconcurrentqueue.h"
 #include "io/sirius_datasource.hpp"
+#include "scan_manager/balancing_strategy.hpp"
+#include "scan_manager/batch_coalecer.hpp"
+#include "scan_manager/split_connector.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
 
@@ -58,46 +62,46 @@ namespace sirius::scan_manager {
  *     slots in insertion order until either all slots are drained or the
  *     stop_token fires.
  */
-class pipeline_ordered_prefetching_manager {
+class load_balancing_scan_batch_coalecer {
  public:
-  /// One unit of work pushed by a provider.  A null @c datasource is the
-  /// closure sentinel: the sequencer treats it as "slot done, move on".
-  struct fadvise_entry {
-    std::shared_ptr<sirius::io::sirius_datasource> datasource;
-    std::vector<cudf::io::text::byte_range_info> ranges;
-  };
-
   /// Per-pipeline mailbox.  The provider produces, the sequencer task
   /// consumes.  Holds its own semaphore so the sequencer can block on
   /// an empty slot without spinning.
   struct pipeline_slot {
     std::size_t pipeline_id{0};
-    duckdb_moodycamel::ConcurrentQueue<fadvise_entry> queue;
-    std::counting_semaphore<> sem{0};
+    duckdb_moodycamel::BlockingConcurrentQueue<fadvise_entry> queue;
+    std::shared_ptr<batch_coalecer> coalecer;
+    std::shared_ptr<balancing_strategy> balancer;
 
     /// Push one (datasource, ranges) pair.  Pass a default-constructed
     /// entry (or one with null datasource) to signal closure.
-    void push(fadvise_entry entry)
-    {
-      queue.enqueue(std::move(entry));
-      sem.release();
-    }
+    void push(fadvise_entry entry) { queue.enqueue(std::move(entry)); }
 
     /// Closure sentinel — the provider calls this when all metadata
     /// scans for its pipeline have completed.
     void close() { push({}); }
   };
 
-  pipeline_ordered_prefetching_manager()                                            = default;
-  pipeline_ordered_prefetching_manager(pipeline_ordered_prefetching_manager const&) = delete;
-  pipeline_ordered_prefetching_manager& operator=(pipeline_ordered_prefetching_manager const&) =
-    delete;
+  load_balancing_scan_batch_coalecer()                                          = default;
+  load_balancing_scan_batch_coalecer(load_balancing_scan_batch_coalecer const&) = delete;
+  load_balancing_scan_batch_coalecer& operator=(load_balancing_scan_batch_coalecer const&) = delete;
 
   /// Register a slot for @p pipeline_id.  Slots are processed by the
   /// sequencer task in the order they were added — typically scan_manager
   /// adds them in pipeline-id order so the head-of-line pipeline drains
   /// first.  The returned pointer is valid for the manager's lifetime.
-  pipeline_slot* add_pipeline_slot(std::size_t pipeline_id);
+  pipeline_slot* register_pipeline(std::size_t pipeline_id,
+                                   split_connector& connector,
+                                   std::shared_ptr<batch_coalecer> coalecer,
+                                   std::shared_ptr<balancing_strategy> balancer)
+  {
+    auto [it, inserted] = _slots.emplace(pipeline_id, std::make_unique<pipeline_slot>());
+    auto& slot          = it->second;
+    slot->pipeline_id   = pipeline_id;
+    slot->coalecer      = std::move(coalecer);
+    slot->balancer      = std::move(balancer);
+    return it->second.get();
+  }
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when
@@ -108,7 +112,7 @@ class pipeline_ordered_prefetching_manager {
   template <class Dispatcher>
   void register_ranges(Dispatcher& dispatcher)
   {
-    dispatcher.enqueue([this](std::stop_token const& stop) { run_sequencer(stop); });
+    dispatcher.enqueue([this](std::stop_token const& stop) { worker_loop(stop); });
   }
 
  private:
@@ -116,14 +120,14 @@ class pipeline_ordered_prefetching_manager {
   /// entries (semaphore-blocked with a poll timeout so stop_token is
   /// observed promptly) until it hits a closure sentinel (null
   /// datasource) or stop is requested.
-  void run_sequencer(std::stop_token const& stop);
+  void worker_loop(std::stop_token const& stop);
 
   static constexpr auto SEQUENCER_POLL_INTERVAL = std::chrono::milliseconds(50);
 
   /// unique_ptr storage: the slot contains a semaphore and a moodycamel
   /// queue, both of which are non-movable, so we need stable addresses
   /// in the vector.
-  std::vector<std::unique_ptr<pipeline_slot>> _slots;
+  std::unordered_map<std::size_t, std::unique_ptr<pipeline_slot>> _slots;
 };
 
 }  // namespace sirius::scan_manager

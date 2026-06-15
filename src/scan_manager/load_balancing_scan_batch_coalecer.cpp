@@ -14,24 +14,24 @@
  * limitations under the License.
  */
 
-#include "scan_manager/pipeline_ordered_prefetching_manager.hpp"
+#include "scan_manager/load_balancing_scan_batch_coalecer.hpp"
 
 #include "io/io_context.hpp"
 #include "log/logging.hpp"
 
 namespace sirius::scan_manager {
 
-pipeline_ordered_prefetching_manager::pipeline_slot*
-pipeline_ordered_prefetching_manager::add_pipeline_slot(std::size_t pipeline_id)
+load_balancing_scan_batch_coalecer::pipeline_slot*
+load_balancing_scan_batch_coalecer::register_pipeline(std::size_t pipeline_id)
 {
   auto slot         = std::make_unique<pipeline_slot>();
   slot->pipeline_id = pipeline_id;
   auto* p           = slot.get();
-  _slots.push_back(std::move(slot));
+  _slots.emplace(pipeline_id, std::move(slot));
   return p;
 }
 
-void pipeline_ordered_prefetching_manager::run_sequencer(std::stop_token const& stop)
+void load_balancing_scan_batch_coalecer::worker_loop(std::stop_token const& stop)
 {
   for (auto& slot_ptr : _slots) {
     auto& slot = *slot_ptr;

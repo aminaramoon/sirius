@@ -257,7 +257,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   // The sequencer task piggy-backs on the dispatcher's injected
   // stop_token, so reset()/request_stop on the dispatcher tears it
   // down without a side-channel stop_source.
-  _prefetch_manager = std::make_unique<pipeline_ordered_prefetching_manager>();
+  _prefetch_manager = std::make_unique<load_balancing_scan_batch_coalecer>();
 
   for (auto const& scan_op : query.get_scan_operators()) {
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }

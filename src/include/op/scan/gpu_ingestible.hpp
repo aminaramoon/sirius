@@ -21,6 +21,7 @@
 #include <cudf/table/table_view.hpp>
 
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <scan_manager/batch_coalecer.hpp>
 
 // rmm
 #include "io/io_context.hpp"
@@ -96,9 +97,18 @@ class ingestible_table_info {
  * ingestible produces many @c scan_info instances during its lifetime —
  * one per emitted split.
  */
-class scan_info {
+class scan_info : public std::enable_shared_from_this<scan_info> {
  public:
+  /// One unit of work pushed by a provider.  A null @c datasource is the
+  /// closure sentinel: the sequencer treats it as "slot done, move on".
+  struct fadvise_entry {
+    std::shared_ptr<sirius::io::sirius_datasource> datasource;
+    std::vector<cudf::io::text::byte_range_info> ranges;
+  };
+
   virtual ~scan_info() = default;
+
+  virtual std::vector<fadvise_entry> fadvise_entries() const { return {}; }
 
   /**
    * @brief Estimated uncompressed byte count for the split.
@@ -124,7 +134,8 @@ class scan_info {
  * the scan's output arity. Cached splits use this for their (rare) filter
  * application path.
  */
-class post_filter_and_projection_info {
+class post_filter_and_projection_info
+  : public std::enable_shared_from_this<post_filter_and_projection_info> {
  public:
   virtual ~post_filter_and_projection_info() = default;
 };
@@ -184,6 +195,8 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   gpu_ingestible& operator=(gpu_ingestible const&) = delete;
   gpu_ingestible(gpu_ingestible&&)                 = delete;
   gpu_ingestible& operator=(gpu_ingestible&&)      = delete;
+
+  std::unique_ptr<batch_coalecer> make_batch_coalecer() const;
 
   filtered_table materialize_table(const op::scan::scan_operator_input& split,
                                    rmm::cuda_stream_view stream);

@@ -14,27 +14,30 @@
  * limitations under the License.
  */
 
-#include "scan_manager/round_robin_strategy.hpp"
+#pragma once
 
-#include "op/sirius_physical_operator.hpp"
-
-#include <utility>
+#include <cstddef>
+#include <variant>
 
 namespace sirius::scan_manager {
 
-round_robin_strategy::round_robin_strategy(std::vector<int> device_ids)
-  : _device_ids(std::move(device_ids))
-{
-}
+/**
+ * @brief Policy for placing a scan split onto a GPU.
+ *
+ * Split providers consult a batch_coalecer as they emit splits, so the
+ * choice of which GPU a split's task should run on is decoupled from how
+ * splits are produced. Implementations pick a device and record it on the
+ * split via @c op::operator_data::set_preferred_device_id; the task creator
+ * later reads it back and forwards it onto the pipeline task so the scheduler
+ * dispatches the task to that GPU.
+ */
+class batch_coalecer {
+ public:
+  std::vector<int> push();
 
-int round_robin_strategy::get_next_gpu(std::size_t pipeline_id,
-                                       [[maybe_unused]] const op::operator_data* data,
-                                       [[maybe_unused]] batch_coalecer::device_id_hint hint)
-{
-  if (_device_ids.empty()) { return -1; }
-  auto const idx   = _cursor.fetch_add(1, std::memory_order_relaxed) % _device_ids.size();
-  int const device = _device_ids[idx];
-  return device;
-}
+  std::vector<int> flush();
+
+  virtual ~batch_coalecer() = default;
+};
 
 }  // namespace sirius::scan_manager

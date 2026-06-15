@@ -294,7 +294,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
     # src/scan_manager/gpu_ingestible_factory.cpp
-    src/scan_manager/pipeline_ordered_prefetching_manager.cpp
+    src/scan_manager/load_balancing_scan_batch_coalecer.cpp
     src/scan_manager/round_robin_strategy.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
