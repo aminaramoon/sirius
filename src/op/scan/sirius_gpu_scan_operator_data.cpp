@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <data/sirius_converter_registry.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
 namespace sirius::op::scan {

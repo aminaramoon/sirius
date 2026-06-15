@@ -77,10 +77,10 @@ bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string:
 //===----------------------------------------------------------------------===//
 // parquet_ingestible_table_info::make_ingestible
 //===----------------------------------------------------------------------===//
-std::shared_ptr<gpu_ingestible> make_ingestible(std::unique_ptr<parquet_ingestible_table_info> info)
+std::shared_ptr<parquet_gpu_ingestible> make_ingestible(
+  std::unique_ptr<parquet_ingestible_table_info> info)
 {
-  return std::make_shared<parquet_gpu_ingestible>(std::unique_ptr<parquet_ingestible_table_info>(
-    static_cast<parquet_ingestible_table_info*>(info.release())));
+  return std::make_shared<parquet_gpu_ingestible>(std::move(info));
 }
 
 //===----------------------------------------------------------------------===//
@@ -147,13 +147,16 @@ bool parquet_gpu_ingestible::has_processed_all_metadata() const
 }
 
 std::function<std::vector<std::unique_ptr<op::operator_data>>()>
-parquet_gpu_ingestible::next_split_provider()
+parquet_gpu_ingestible::next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx)
 {
+  if (io_ctx == nullptr) {
+    throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired.");
+  }
   auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
   if (batch_idx >= _batches.size()) { return nullptr; }
-  return [this, batch_idx]() {
+  return [this, batch_idx, ctx = std::move(io_ctx)]() {
     std::vector<std::unique_ptr<op::operator_data>> out;
-    run_batch(_batches[batch_idx], out);
+    run_batch(_batches[batch_idx], out, std::move(ctx));
     return out;
   };
 }
@@ -162,7 +165,8 @@ parquet_gpu_ingestible::next_split_provider()
 // run_batch — ports parquet_split_provider::run_batch
 //===----------------------------------------------------------------------===//
 void parquet_gpu_ingestible::run_batch(file_batch const& batch,
-                                       std::vector<std::unique_ptr<op::operator_data>>& out)
+                                       std::vector<std::unique_ptr<op::operator_data>>& out,
+                                       std::shared_ptr<io::sirius_ioctx> io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
@@ -171,10 +175,6 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     cudf::io::parquet_reader_options::builder().build());
 
   if (_plan->is_projected()) { reader_options->set_column_names(data_column_names); }
-
-  if (_scan_manager == nullptr) {
-    throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired.");
-  }
 
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
   bool skip_pushdown_due_to_flba                                                 = false;
@@ -192,7 +192,7 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
         try {
           // Resolve the probe file to a datasource (carries its own io backend,
           // cache and metadata) instead of reaching into io_context.
-          auto probe_ds = _scan_manager->create_datasource(probe_path);
+          auto probe_ds = io_ctx->open_datasource(probe_path);
           if (!probe_ds) { throw std::runtime_error("no backend supports path: " + probe_path); }
           std::shared_ptr<cudf::io::parquet::FileMetaData const> probe_meta;
           if (auto cached = probe_ds->metadata()) {
@@ -289,7 +289,7 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     // prefetch cache and cached metadata, so the ingestible no longer reaches
     // into io_context. Fall back to a plain cudf datasource only for local
     // paths no sirius backend claims.
-    auto sirius_ds = _scan_manager->create_datasource(file_path);
+    std::shared_ptr<io::sirius_datasource> sirius_ds = io_ctx->open_datasource(file_path);
     if (!sirius_ds && has_uri_scheme(file_path)) {
       throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
     }
@@ -423,7 +423,7 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
 //===----------------------------------------------------------------------===//
 filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   op::scan::scan_info const& info,
-  ::cucascade::memory::memory_space& mem_space,
+  const cucascade::memory::memory_space& mem_space,
   rmm::cuda_stream_view stream)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);

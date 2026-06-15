@@ -21,6 +21,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/io_context.hpp"
+#include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -65,6 +66,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <future>
 #include <optional>
@@ -554,8 +556,7 @@ void batched_h2d(std::vector<void*> const& dst,
 
 void submit_and_await(rmm::device_buffer& device_buf,
                       staging_state const& s,
-                      sirius::io::sirius_ioctx& io_ctx,
-                      sirius::io::sirius_io_object& io_obj,
+                      const sirius::io::sirius_datasource& datasource,
                       cucascade::memory::memory_reservation_manager& host_mem_mgr,
                       int host_numa_node,
                       std::size_t coalesce_max_gap,
@@ -646,35 +647,24 @@ void submit_and_await(rmm::device_buffer& device_buf,
   auto host_alloc = host_fsmr->allocate_multiple_blocks(host_bytes, reservation.get());
 
   // One coalesced range + contiguous dst span per piece.
-  std::vector<cudf::io::text::byte_range_info> ranges;
-  std::vector<cudf::host_span<std::byte>> dsts;
+  std::vector<io::io_object_segment> ranges;
   ranges.reserve(pieces.size());
-  dsts.reserve(pieces.size());
   std::size_t total_read = 0;
   for (auto const& p : pieces) {
     std::size_t const sz = p.file_end - p.file_off;
-    ranges.emplace_back(static_cast<int64_t>(p.file_off), static_cast<int64_t>(sz));
-    dsts.emplace_back(
-      reinterpret_cast<std::byte*>(host_alloc->at(p.host_block).data()) + p.host_off, sz);
+    ranges.emplace_back(
+      p.file_off,
+      sz,
+      reinterpret_cast<std::uint8_t*>(host_alloc->at(p.host_block).data()) + p.host_off);
     total_read += sz;
   }
 
   // Issue the coalesced reads as one batch and await completion.
   {
     nvtx3::scoped_range nvtx_reads{"native_reads"};
-    std::promise<std::size_t> prom;
-    auto fut = prom.get_future();
-    io_ctx.host_read_ranges_async_io(io_obj,
-                                     ranges,
-                                     std::span<cudf::host_span<std::byte>>(dsts),
-                                     [&prom](std::size_t n, std::exception_ptr e) {
-                                       if (e) {
-                                         prom.set_exception(std::move(e));
-                                       } else {
-                                         prom.set_value(n);
-                                       }
-                                     });
-    std::size_t const got = fut.get();
+    auto io_ctx           = datasource.io_ctx();
+    auto fut              = io_ctx->host_read_ranges_async_io(datasource.io_object(), ranges);
+    std::size_t const got = std::move(fut).get();
     if (got != total_read) {
       throw std::runtime_error(std::string(kTag) + " short coalesced host read: got " +
                                std::to_string(got) + " expected " + std::to_string(total_read));
@@ -813,10 +803,8 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
   auto& block_manager = sm.GetBlockManager();
 
   // sirius_io routing
-  auto* io_ctx      = split.io_ctx.get();
-  auto* io_obj      = split.db_io_object.get();
   auto const* sf_bm = dynamic_cast<duckdb::SingleFileBlockManager const*>(&block_manager);
-  if (!io_ctx || !io_obj || !sf_bm) {
+  if (!sf_bm) {
     throw std::runtime_error(
       std::string(kTag) +
       " missing io_ctx, io_obj, or SingleFileBlockManager for duckdb_native_scan");
@@ -889,10 +877,13 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
     // them into one sequential read without pulling the larger unprojected-column waste
     // that sits between row groups.
     std::size_t const coalesce_max_gap = sf_bm->GetBlockHeaderSize();
+    if (!split.datasource) {
+      throw std::runtime_error(std::string(kTag) +
+                               " split has no datasource but staged reads are pending");
+    }
     submit_and_await(device_buf,
                      staging,
-                     *io_ctx,
-                     *io_obj,
+                     *split.datasource,
                      sirius_st->get_memory_manager(),
                      host_numa,
                      coalesce_max_gap,
