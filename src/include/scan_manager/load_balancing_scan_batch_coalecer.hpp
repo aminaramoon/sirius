@@ -122,15 +122,15 @@ class load_balancing_scan_batch_coalecer {
   /// datasource) or stop is requested.
   void worker_loop(std::stop_token const& stop);
 
-  void process_entry(metadata_processing_state& state);
+  void process_entry(metadata_processing_state& state, std::stop_token const& stop);
 
   static constexpr auto SEQUENCER_POLL_INTERVAL = std::chrono::milliseconds(50);
 
   /// unique_ptr storage: the slot contains a semaphore and a moodycamel
   /// queue, both of which are non-movable, so we need stable addresses
   /// in the vector.
+  std::vector<std::size_t> _pipeline_order;
   std::unordered_map<std::size_t, std::unique_ptr<metadata_processing_state>> _slots;
-  duckdb_moodycamel::BlockingConcurrentQueue<std::size_t> _ready_pipelines;
 };
 
 }  // namespace sirius::scan_manager

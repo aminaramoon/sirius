@@ -82,6 +82,21 @@ class scan_operator_input : public op::operator_data {
            std::get<std::unique_ptr<scan_info>>(materialization_info) != nullptr;
   }
 
+  [[nodiscard]] std::vector<op::scan::scan_info::fadvise_entry> get_fadvise_hints() const
+  {
+    if (!has_scan_metadata()) { return {}; }
+    return std::get<std::unique_ptr<scan_info>>(materialization_info)->fadvise_entries();
+  }
+
+  void prefetch(io::cache::prefetching_stage site) const
+  {
+    if (!has_scan_metadata()) { return; }
+    auto hints = get_fadvise_hints();
+    for (auto& hint : hints) {
+      hint.datasource->prefetch(site);
+    }
+  }
+
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                               rmm::cuda_stream_view /*stream*/) override;
 

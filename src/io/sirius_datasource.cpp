@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -176,7 +177,8 @@ std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
   return std::make_unique<sirius_datasource>(_io_ctx, _io_object);
 }
 
-void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges)
+void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges,
+                                std::optional<int> dev_id)
 {
   // Speculative / immediate: only honored when the backend asked for this
   // particular call site.  none falls through to no-op (the caller blindly
@@ -207,7 +209,7 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   // Hand the ranges to the cache.  insert() returns an empty handle when
   // it didn't enqueue any new work (dormant cache, every range coalesced
   // with an existing entry); we only stash a real handle.
-  auto handle = cache->insert(*_io_object, ranges);
+  auto handle = cache->insert(*_io_object, ranges, dev_id);
   if (handle) { _prefetch_handle = std::move(handle); }
 }
 

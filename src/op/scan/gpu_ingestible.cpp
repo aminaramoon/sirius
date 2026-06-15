@@ -25,6 +25,7 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
 {
   auto* mem_space = split.gpu_memory_space;
   if (split.has_scan_metadata()) [[likely]] {
+    split.prefetch(io::cache::prefetching_stage::disposable);
     return materialize_metadata_to_table(split.get_scan_info(), *mem_space, stream);
   } else {
     auto batch  = split.get_cached_batch();

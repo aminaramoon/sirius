@@ -130,7 +130,7 @@ class sirius_datasource : public cudf::io::datasource {
   /// already stored emits a warning: the datasource lifecycle expects one
   /// speculative-or-immediate insert per scan, with a single
   /// @c disposable call at consume time.
-  void fadvise(std::span<const cudf::io::text::byte_range_info> ranges);
+  void fadvise(std::span<const cudf::io::text::byte_range_info> ranges, std::optional<int> dev_id);
 
   void prefetch(cache::prefetching_stage site);
 

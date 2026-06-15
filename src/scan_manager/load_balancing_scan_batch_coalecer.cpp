@@ -16,8 +16,6 @@
 
 #include "scan_manager/load_balancing_scan_batch_coalecer.hpp"
 
-#include "io/io_context.hpp"
-#include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 
 #include <stop_token>
@@ -42,6 +40,7 @@ load_balancing_scan_batch_coalecer::register_pipeline(op::scan::sirius_gpu_scan_
     std::move(connector),
     std::move(balancer),
     ingestible->create_post_filter_and_projection_info());
+  _pipeline_order.push_back(uid);
   auto state_ptr = state.get();
   _slots[uid]    = std::move(state);
   return state_ptr;
@@ -49,32 +48,25 @@ load_balancing_scan_batch_coalecer::register_pipeline(op::scan::sirius_gpu_scan_
 
 void load_balancing_scan_batch_coalecer::worker_loop([[maybe_unused]] std::stop_token const& stop)
 {
-  std::stop_callback stop_cb(
-    stop, [this] { _ready_pipelines.enqueue(std::numeric_limits<std::size_t>::max()); });
-
-  while (!stop.stop_requested()) {
-    std::size_t pipeline_id;
-    if (!_ready_pipelines.wait_dequeue_timed(pipeline_id, SEQUENCER_POLL_INTERVAL)) { continue; }
-    if (pipeline_id == std::numeric_limits<std::size_t>::max()) { break; }
-
-    auto it = _slots.find(pipeline_id);
-    if (it == _slots.end()) {
-      spdlog::error("Received ready signal for unknown pipeline_id {}", pipeline_id);
-      continue;
-    }
-    while (!stop.stop_requested()) {
-      process_entry(*it->second);
-    }
+  for (auto pipeline_id : _pipeline_order) {
+    if (stop.stop_requested()) { break; }
+    auto& state = *_slots[pipeline_id];
+    process_entry(state, stop);
   }
 }
 
-void load_balancing_scan_batch_coalecer::process_entry(metadata_processing_state& state)
+void load_balancing_scan_batch_coalecer::process_entry(metadata_processing_state& state,
+                                                       std::stop_token const& stop)
 {
+  std::stop_callback stop_cb(stop, [&state] { state.queue.enqueue(nullptr); });
+
   auto& batch_queue = state.queue;
-  std::unique_ptr<op::scan::scan_info> entry;
-  while (batch_queue.try_dequeue(entry)) {
-    bool is_closed = entry == nullptr;
-    auto batches   = [&]() {
+  bool is_closed    = false;
+  while (!is_closed && !stop.stop_requested()) {
+    std::unique_ptr<op::scan::scan_info> entry;
+    batch_queue.wait_dequeue(entry);
+    is_closed    = entry == nullptr;
+    auto batches = [&]() {
       if (is_closed) {
         return state.coalecer->flush();
       } else {
@@ -86,6 +78,16 @@ void load_balancing_scan_batch_coalecer::process_entry(metadata_processing_state
         std::move(batch), state.filter_and_projection_info);
       auto dev_id = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
       if (dev_id >= 0) { op_data->set_preferred_device_id(dev_id); }
+
+      auto fadvise_hints = op_data->get_fadvise_hints();
+      if (!fadvise_hints.empty()) {
+        for (auto& hint : fadvise_hints) {
+          if (hint.datasource && !hint.ranges.empty()) {
+            hint.datasource->fadvise(hint.ranges, dev_id);
+          };
+        }
+      }
+      op_data->prefetch(io::cache::prefetching_stage::opportunistic);
       state.connector->push_split(std::move(op_data));
     }
     if (is_closed) {
