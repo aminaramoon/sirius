@@ -18,9 +18,10 @@
 
 #include "blockingconcurrentqueue.h"
 #include "io/sirius_datasource.hpp"
+#include "op/scan/batch_coalecer.hpp"
+#include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "scan_manager/balancing_strategy.hpp"
-#include "op/scan/batch_coalecer.hpp"
 #include "scan_manager/split_connector.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
@@ -30,10 +31,7 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
-#include <semaphore>
 #include <stop_token>
-#include <utility>
-#include <vector>
 
 namespace sirius::scan_manager {
 
@@ -69,11 +67,29 @@ class load_balancing_scan_batch_coalecer {
   /// consumes.  Holds its own semaphore so the sequencer can block on
   /// an empty slot without spinning.
   struct metadata_processing_state {
+    explicit metadata_processing_state(
+      std::size_t op_id,
+      std::size_t pipeline_id,
+      std::shared_ptr<op::scan::batch_coalecer> coalecer,
+      std::shared_ptr<split_connector> connector,
+      std::shared_ptr<balancing_strategy> balancer,
+      std::shared_ptr<op::scan::post_filter_and_projection_info> post_info)
+      : op_id(op_id),
+        pipeline_id(pipeline_id),
+        coalecer(std::move(coalecer)),
+        connector(std::move(connector)),
+        balancer(std::move(balancer)),
+        filter_and_projection_info(std::move(post_info))
+    {
+    }
+
+    std::size_t op_id{0};
     std::size_t pipeline_id{0};
     duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<op::scan::scan_info>> queue;
     std::shared_ptr<op::scan::batch_coalecer> coalecer;
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
+    std::shared_ptr<op::scan::post_filter_and_projection_info> filter_and_projection_info;
   };
 
   load_balancing_scan_batch_coalecer()                                          = default;
@@ -84,9 +100,7 @@ class load_balancing_scan_batch_coalecer {
   /// sequencer task in the order they were added — typically scan_manager
   /// adds them in pipeline-id order so the head-of-line pipeline drains
   /// first.  The returned pointer is valid for the manager's lifetime.
-  metadata_processing_state* register_pipeline(std::size_t pipeline_id,
-                                               split_connector& connector,
-                                               std::unique_ptr<op::scan::batch_coalecer> coalecer,
+  metadata_processing_state* register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
                                                std::shared_ptr<balancing_strategy> balancer);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
@@ -107,6 +121,8 @@ class load_balancing_scan_batch_coalecer {
   /// observed promptly) until it hits a closure sentinel (null
   /// datasource) or stop is requested.
   void worker_loop(std::stop_token const& stop);
+
+  void process_entry(metadata_processing_state& state);
 
   static constexpr auto SEQUENCER_POLL_INTERVAL = std::chrono::milliseconds(50);
 

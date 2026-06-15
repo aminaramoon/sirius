@@ -265,10 +265,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
     auto provider = std::make_unique<split_provider>(op->get_ingestible(), *_io_ctx);
-    _metadata_processor->register_pipeline(op->get_operator_id(),
-                                           op->get_split_connector(),
-                                           op->get_ingestible().create_batch_coalecer(),
-                                           round_robin);
+    _metadata_processor->register_pipeline(op, round_robin);
     try_attach_cache_to_provider(op, *provider);
     _providers_by_op.emplace(op, std::move(provider));
     _scan_op_order.push_back(op);
