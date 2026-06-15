@@ -79,7 +79,8 @@ sirius_scan_manager::sirius_scan_manager(
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _dispatcher(
-      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads))
+      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads)),
+    _ioctx_registry(config)
 {
   auto dev_spacs = reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   std::ranges::transform(

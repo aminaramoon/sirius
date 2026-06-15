@@ -55,14 +55,16 @@ namespace sirius::io {
  */
 class io_context_registry {
  public:
-  explicit io_context_registry(const sirius_config& config);
+  using config_type = scan_manager::scan_manager_config;
+
+  explicit io_context_registry(config_type config);
   ~io_context_registry() = default;
 
   io_context_registry(io_context_registry const&)            = delete;
   io_context_registry& operator=(io_context_registry const&) = delete;
 
   using scheme_checker_type = std::function<bool(std::string_view)>;
-  using factory_type = std::function<std::shared_ptr<io::sirius_ioctx>(const sirius_config&)>;
+  using factory_type        = std::function<std::shared_ptr<io::sirius_ioctx>(const config_type&)>;
 
   /**
    * @brief Register an ioctx for a scheme. Replaces any prior registration
@@ -91,7 +93,7 @@ class io_context_registry {
     factory_type factory;
     io_context_type type;
   };
-  const sirius_config _config;
+  const config_type _config;
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
   bool prefer_kvikio_for_file_scheme{false};  // single-GPU opt-out of sirius_datasource for file://

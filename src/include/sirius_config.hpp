@@ -20,7 +20,7 @@
 #include "exec/config.hpp"
 #include "io/object_store_config.hpp"
 #include "op/scan/config.hpp"
-#include "scan_manager/sirius_scan_manager.hpp"
+#include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>

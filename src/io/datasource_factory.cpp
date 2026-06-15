@@ -16,13 +16,9 @@
 
 #include "io/datasource_factory.hpp"
 
-#include "io/uri_parser.hpp"
-#include "sirius_config.hpp"
-
 #include <cudf/io/datasource.hpp>
 
 #include <cctype>
-#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -56,7 +52,7 @@ using factory_type        = io_context_registry::factory_type;
 // datasource_registry
 // ---------------------------------------------------------------------------
 
-io_context_registry::io_context_registry(const sirius_config& config) : _config(config) {}
+io_context_registry::io_context_registry(config_type config) : _config(std::move(config)) {}
 
 void io_context_registry::register_ioctx(io_context_type type,
                                          scheme_checker_type checker,
