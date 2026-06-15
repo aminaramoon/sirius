@@ -21,10 +21,10 @@
 
 namespace sirius::scan_manager {
 
-load_balancing_scan_batch_coalecer::pipeline_slot*
+load_balancing_scan_batch_coalecer::metadata_processing_state*
 load_balancing_scan_batch_coalecer::register_pipeline(std::size_t pipeline_id)
 {
-  auto slot         = std::make_unique<pipeline_slot>();
+  auto slot         = std::make_unique<metadata_processing_state>();
   slot->pipeline_id = pipeline_id;
   auto* p           = slot.get();
   _slots.emplace(pipeline_id, std::move(slot));

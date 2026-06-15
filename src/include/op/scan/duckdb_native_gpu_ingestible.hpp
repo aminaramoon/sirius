@@ -136,6 +136,17 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   ~duckdb_native_gpu_ingestible() override;
 
+  std::unique_ptr<scan_manager::batch_coalecer> create_batch_coalecer() const override
+  {
+    return nullptr;
+  }
+
+  std::shared_ptr<post_filter_and_projection_info> create_post_filter_and_projection_info()
+    const final
+  {
+    return nullptr;
+  }
+
   [[nodiscard]] bool has_processed_all_metadata() const override;
   metadata_scan_task_t next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx) override;
 

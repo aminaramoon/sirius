@@ -20,6 +20,7 @@
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/sirius_datasource.hpp"
+#include "scan_manager/load_balancing_scan_batch_coalecer.hpp"
 #include "scan_manager/split_provider.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
@@ -326,7 +327,7 @@ class sirius_scan_manager {
   /// per-query @c _dispatcher, which injects its own stop_token; the
   /// dispatcher's @c request_stop() in @ref reset() therefore tears the
   /// sequencer down without an extra side-channel.
-  std::unique_ptr<load_balancing_scan_batch_coalecer> _prefetch_manager;
+  std::unique_ptr<load_balancing_scan_batch_coalecer> _metadata_processor;
 
   std::vector<int> _device_ids;
 };

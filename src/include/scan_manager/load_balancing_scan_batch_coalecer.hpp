@@ -18,6 +18,7 @@
 
 #include "blockingconcurrentqueue.h"
 #include "io/sirius_datasource.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "scan_manager/balancing_strategy.hpp"
 #include "scan_manager/batch_coalecer.hpp"
 #include "scan_manager/split_connector.hpp"
@@ -67,19 +68,12 @@ class load_balancing_scan_batch_coalecer {
   /// Per-pipeline mailbox.  The provider produces, the sequencer task
   /// consumes.  Holds its own semaphore so the sequencer can block on
   /// an empty slot without spinning.
-  struct pipeline_slot {
+  struct metadata_processing_state {
     std::size_t pipeline_id{0};
-    duckdb_moodycamel::BlockingConcurrentQueue<fadvise_entry> queue;
+    duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<op::scan::scan_info>> queue;
     std::shared_ptr<batch_coalecer> coalecer;
     std::shared_ptr<balancing_strategy> balancer;
-
-    /// Push one (datasource, ranges) pair.  Pass a default-constructed
-    /// entry (or one with null datasource) to signal closure.
-    void push(fadvise_entry entry) { queue.enqueue(std::move(entry)); }
-
-    /// Closure sentinel — the provider calls this when all metadata
-    /// scans for its pipeline have completed.
-    void close() { push({}); }
+    std::shared_ptr<split_connector> connector;
   };
 
   load_balancing_scan_batch_coalecer()                                          = default;
@@ -90,18 +84,8 @@ class load_balancing_scan_batch_coalecer {
   /// sequencer task in the order they were added — typically scan_manager
   /// adds them in pipeline-id order so the head-of-line pipeline drains
   /// first.  The returned pointer is valid for the manager's lifetime.
-  pipeline_slot* register_pipeline(std::size_t pipeline_id,
-                                   split_connector& connector,
-                                   std::shared_ptr<batch_coalecer> coalecer,
-                                   std::shared_ptr<balancing_strategy> balancer)
-  {
-    auto [it, inserted] = _slots.emplace(pipeline_id, std::make_unique<pipeline_slot>());
-    auto& slot          = it->second;
-    slot->pipeline_id   = pipeline_id;
-    slot->coalecer      = std::move(coalecer);
-    slot->balancer      = std::move(balancer);
-    return it->second.get();
-  }
+  metadata_processing_state* register_pipeline(op::scan::sirius_gpu_scan_operator* op,
+                                               std::shared_ptr<balancing_strategy> balancer);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when
@@ -110,7 +94,7 @@ class load_balancing_scan_batch_coalecer {
   /// by reference, so adding slots after this call has undefined
   /// ordering with respect to the sequencer walk.
   template <class Dispatcher>
-  void register_ranges(Dispatcher& dispatcher)
+  void spawn_workers(Dispatcher& dispatcher)
   {
     dispatcher.enqueue([this](std::stop_token const& stop) { worker_loop(stop); });
   }
@@ -127,7 +111,8 @@ class load_balancing_scan_batch_coalecer {
   /// unique_ptr storage: the slot contains a semaphore and a moodycamel
   /// queue, both of which are non-movable, so we need stable addresses
   /// in the vector.
-  std::unordered_map<std::size_t, std::unique_ptr<pipeline_slot>> _slots;
+  std::unordered_map<std::size_t, std::unique_ptr<metadata_processing_state>> _slots;
+  duckdb_moodycamel::BlockingConcurrentQueue<std::size_t> _ready_pipelines;
 };
 
 }  // namespace sirius::scan_manager

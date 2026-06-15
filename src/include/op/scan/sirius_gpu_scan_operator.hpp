@@ -127,7 +127,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;
-  std::unique_ptr<scan_manager::split_connector> _split_connector;
+  std::shared_ptr<scan_manager::split_connector> _split_connector;
 };
 
 }  // namespace sirius::op::scan

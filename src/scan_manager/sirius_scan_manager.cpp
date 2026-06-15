@@ -24,7 +24,6 @@
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/query.hpp"
-#include "scan_manager/pipeline_ordered_prefetching_manager.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "scan_manager/split_connector.hpp"
 #include "scan_manager/split_provider.hpp"
@@ -257,7 +256,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   // The sequencer task piggy-backs on the dispatcher's injected
   // stop_token, so reset()/request_stop on the dispatcher tears it
   // down without a side-channel stop_source.
-  _prefetch_manager = std::make_unique<load_balancing_scan_batch_coalecer>();
+  _metadata_processor = std::make_unique<load_balancing_scan_batch_coalecer>();
 
   for (auto const& scan_op : query.get_scan_operators()) {
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
@@ -265,7 +264,10 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
     auto provider = std::make_unique<split_provider>(op->get_ingestible(), *_io_ctx);
-    provider->set_balancing_strategy(round_robin, op->get_operator_id());
+    _metadata_processor->register_pipeline(op->get_operator_id(),
+                                           op->get_split_connector(),
+                                           op->get_ingestible().create_batch_coalecer(),
+                                           round_robin);
     try_attach_cache_to_provider(op, *provider);
     _providers_by_op.emplace(op, std::move(provider));
     _scan_op_order.push_back(op);
@@ -276,34 +278,16 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 
   if (_scan_op_order.empty()) { return; }
 
-  // Spawn the sequencer task on the dispatcher.  Must happen after all
-  // slots have been added (create_provider_for allocates them above) so
-  // the task captures the full slot list in insertion order.  Safe to
-  // skip when no slots were added (purely-cached query) — the manager
-  // is fine with zero slots.
-  _prefetch_manager->register_ranges(*_dispatcher);
-
   start_metadata_processing();
 }
 
 void sirius_scan_manager::start_metadata_processing()
 {
+  _metadata_processor->spawn_workers(*_dispatcher);
   for (auto* op : _scan_op_order) {
     auto it = _providers_by_op.find(op);
     if (it == _providers_by_op.end()) { continue; }
-    auto& connector = op->get_split_connector();
-    try {
-      // run() is fire-and-forget: it enqueues workers and returns immediately.
-      // Worker exceptions ride on connector.close(exception_ptr) and surface
-      // when the consumer drains via get_next_split().
-      it->second->run(*_dispatcher, connector);
-    } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed to start: {}", e.what());
-      // Synchronous failure inside run() (e.g. scheduler.enqueue throwing)
-      // bypasses the worker error path, so forward it through the connector
-      // here. close() is idempotent and keeps the first stored exception.
-      connector.close(std::current_exception());
-    }
+    it->second->run(*_dispatcher, nullptr, nullptr);
   }
 }
 

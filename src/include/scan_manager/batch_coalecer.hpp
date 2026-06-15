@@ -16,8 +16,10 @@
 
 #pragma once
 
-#include <cstddef>
-#include <variant>
+#include <op/scan/gpu_ingestible_types.hpp>
+
+#include <memory>
+#include <vector>
 
 namespace sirius::scan_manager {
 
@@ -31,11 +33,13 @@ namespace sirius::scan_manager {
  * later reads it back and forwards it onto the pipeline task so the scheduler
  * dispatches the task to that GPU.
  */
+
 class batch_coalecer {
  public:
-  std::vector<int> push();
+  virtual std::vector<std::unique_ptr<op::scan::scan_info>> push(
+    std::unique_ptr<op::scan::scan_info>) = 0;
 
-  std::vector<int> flush();
+  virtual std::vector<std::unique_ptr<op::scan::scan_info>> flush() = 0;
 
   virtual ~batch_coalecer() = default;
 };

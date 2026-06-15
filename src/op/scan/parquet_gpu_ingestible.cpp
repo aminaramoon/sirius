@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "op/scan/gpu_ingestible_types.hpp"
+
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
@@ -146,19 +148,20 @@ bool parquet_gpu_ingestible::has_processed_all_metadata() const
   return _next_batch_idx.load(std::memory_order_relaxed) >= _batches.size();
 }
 
-std::function<std::vector<std::unique_ptr<op::operator_data>>()>
-parquet_gpu_ingestible::next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx)
+std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::next_split_provider(
+  std::shared_ptr<io::sirius_ioctx> io_ctx)
 {
   if (io_ctx == nullptr) {
     throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired.");
   }
-  auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
-  if (batch_idx >= _batches.size()) { return nullptr; }
-  return [this, batch_idx, ctx = std::move(io_ctx)]() {
-    std::vector<std::unique_ptr<op::operator_data>> out;
-    run_batch(_batches[batch_idx], out, std::move(ctx));
-    return out;
-  };
+  // auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
+  // if (batch_idx >= _batches.size()) { return nullptr; }
+  // return [this, batch_idx, ctx = std::move(io_ctx)]() {
+  //   std::vector<std::unique_ptr<op::operator_data>> out;
+  //   run_batch(_batches[batch_idx], out, std::move(ctx));
+  //   return out;
+  // };
+  return nullptr;
 }
 
 //===----------------------------------------------------------------------===//

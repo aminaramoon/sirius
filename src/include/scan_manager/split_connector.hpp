@@ -47,7 +47,7 @@ class split_provider;
  * close() and the consumer-side methods remain public so the scan manager
  * (driver loop) and the scan operator can drive the lifecycle.
  */
-class split_connector {
+class split_connector : public std::enable_shared_from_this<split_connector> {
  public:
   split_connector();
   ~split_connector();

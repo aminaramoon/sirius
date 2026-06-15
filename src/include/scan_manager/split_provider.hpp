@@ -65,11 +65,6 @@ class batch_coalecer;
  */
 class split_provider {
  public:
-  /// Default ctor — used by legacy subclasses that override both virtuals
-  /// (their @c _ingestible stays null). Removed when those subclasses are
-  /// deleted.
-  split_provider() = default;
-
   /// Concrete construction path — borrows the given ingestible non-owningly.
   /// The ingestible must outlive the provider; in practice the operator owns
   /// the ingestible (single shared_ptr) and the provider is created after
@@ -83,12 +78,6 @@ class split_provider {
   }
 
   virtual ~split_provider() = default;
-
-  void attach_cached_splits(std::vector<std::shared_ptr<cucascade::data_batch>> cached_batches)
-  {
-    _cached_batches   = std::move(cached_batches);
-    _next_batch_index = 0UL;
-  }
 
   /**
    * @brief Drive the provider to completion, dispatching one task per claimed
@@ -106,7 +95,9 @@ class split_provider {
    *                   @c scoped_dispatcher both satisfy this shape.
    */
   template <typename Scheduler>
-  void run(Scheduler& scheduler, split_connector& connector);
+  void run(Scheduler& scheduler,
+           const std::function<void(std::unique_ptr<op::scan::scan_info>)>& on_split,
+           const std::function<void(std::exception_ptr)>& on_error);
 
   /**
    * @brief Snapshot check for remaining work. Thread-safe.
@@ -117,9 +108,7 @@ class split_provider {
    */
   [[nodiscard]] virtual bool has_more_splits() const
   {
-    if (_cached_batches.empty()) { return !_ingestible->has_processed_all_metadata(); }
-    auto index = _next_batch_index.load(std::memory_order_relaxed);
-    return index < _cached_batches.size();
+    return !_ingestible->has_processed_all_metadata();
   }
 
   /**
@@ -132,21 +121,8 @@ class split_provider {
    * path, but the null fallback keeps the contract simple under concurrent
    * observers.
    */
-  virtual std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider()
+  virtual std::function<std::unique_ptr<op::scan::scan_info>()> next_split_provider()
   {
-    if (!_cached_batches.empty()) {
-      auto index = _next_batch_index.fetch_add(1, std::memory_order_relaxed);
-      if (index < _cached_batches.size()) {
-        auto batch = _cached_batches[index];
-        return [batch = std::move(batch)]() mutable {
-          std::vector<std::unique_ptr<op::operator_data>> splits;
-          auto split = std::make_unique<op::scan::scan_operator_input>(std::move(batch), nullptr);
-          splits.emplace_back(std::move(split));
-          return splits;
-        };
-      }
-      return nullptr;
-    }
     return _ingestible->next_split_provider(_io_ctx);
   }
 
@@ -156,53 +132,6 @@ class split_provider {
   /// `provider.get_ingestible().shared_from_this()`.
   [[nodiscard]] op::scan::gpu_ingestible& get_ingestible() const noexcept { return *_ingestible; }
 
-  /**
-   * @brief Install the balancing strategy that places this provider's splits.
-   *
-   * Wired up by @c sirius_scan_manager::prepare_for_query. @p strategy is
-   * consulted for each fresh-read split the provider emits (see
-   * @ref apply_balancing); it may be shared across providers so a stateful
-   * policy (e.g. round-robin) balances across the whole scan stage. @p pipeline_id
-   * identifies the pipeline this provider's scan belongs to and is forwarded to
-   * @c balancing_strategy::get_next_gpu. Leaving the strategy unset (null)
-   * disables placement — splits then carry no preference and the task creator
-   * falls back to its own locality logic.
-   */
-  void set_balancing_strategy(std::shared_ptr<batch_coalecer> strategy, std::size_t pipeline_id)
-  {
-    _balancing_strategy = std::move(strategy);
-    _pipeline_id        = pipeline_id;
-  }
-
- protected:
-  /**
-   * @brief Push a split into a connector.
-   *
-   * The only entry point for enqueueing splits: @ref split_connector::push_split
-   * is private and reaches in only via the @c friend relationship between
-   * @ref split_connector and this class. Because the helper is a protected
-   * static, only @ref split_provider and its subclasses can call it, so
-   * unrelated code cannot bypass the provider abstraction.
-   *
-   * Defined out-of-line because the unique_ptr's deleter needs the complete
-   * @c op::operator_data type, which we keep forward-declared in this header.
-   */
-  static void push_to_connector(split_connector& connector,
-                                std::unique_ptr<op::operator_data> split);
-
-  /**
-   * @brief Ask the balancing strategy to place a fresh-read split on a GPU.
-   *
-   * No-op when no strategy was installed (see @ref set_balancing_strategy) or
-   * when @p split already carries a device preference. Resident splits
-   * (pinned-cache batches, @c operator_data::is_resident) are skipped: their
-   * data already lives on a specific GPU, so placement is decided downstream by
-   * data locality rather than overridden here. Defined out-of-line because it
-   * touches the complete @c op::operator_data and @c balancing_strategy types,
-   * kept forward-declared in this header.
-   */
-  void apply_balancing(op::operator_data& split);
-
  private:
   /// Non-owning pointer to the composed ingestible (null on the legacy
   /// default-ctor path). The operator owns the lifetime; the provider is
@@ -211,71 +140,26 @@ class split_provider {
 
   std::shared_ptr<io::sirius_ioctx> _io_ctx;
 
-  /// Placement policy for the splits this provider emits. May be shared with
-  /// other providers. Null until @ref set_balancing_strategy is called, which
-  /// disables placement.
-  std::shared_ptr<batch_coalecer> _balancing_strategy;
-
   /// Pipeline this provider's scan belongs to, forwarded to the strategy.
   std::size_t _pipeline_id{0};
-
-  std::atomic<std::size_t> _next_batch_index{0};
-  std::vector<std::shared_ptr<cucascade::data_batch>> _cached_batches;
-
-  /// RAII coordination shared across the enqueued tasks. Destructor closes
-  /// the connector with the captured exception (if any) once the last task
-  /// drops its ref. Workers race to record the first error via CAS, so no
-  /// mutex is needed and the destructor reads `error_ptr` after all writers
-  /// have gone.
-  struct worker_state {
-    split_connector& connector;
-    std::atomic<bool> error_set{false};
-    std::exception_ptr error_ptr;
-
-    static std::shared_ptr<worker_state> create(split_connector& connector)
-    {
-      return std::shared_ptr<worker_state>(new worker_state(connector));
-    }
-
-    void set_error(std::exception_ptr eptr)
-    {
-      bool expected = false;
-      if (error_set.compare_exchange_strong(expected, true)) { error_ptr = std::move(eptr); }
-    }
-
-    ~worker_state()
-    {
-      // close()-side exceptions are swallowed because destructors must not
-      // propagate; close() is best-effort wakeup.
-      try {
-        connector.close(error_ptr);
-      } catch (...) {
-      }
-    }
-
-   private:
-    explicit worker_state(split_connector& c) : connector(c) {}
-  };
 };
 
 template <typename Scheduler>
-void split_provider::run(Scheduler& scheduler, split_connector& connector)
+void split_provider::run(Scheduler& scheduler,
+                         const std::function<void(std::unique_ptr<op::scan::scan_info>)>& on_split,
+                         const std::function<void(std::exception_ptr)>& on_error)
 {
-  auto state = worker_state::create(connector);
+  assert(on_split);
+  assert(on_error);
   while (has_more_splits()) {
     auto work = next_split_provider();
-    // Concurrent observer could have drained the last batch between the
-    // has_more_splits() check and our claim; skip the empty handoff.
     if (!work) { continue; }
-    scheduler.enqueue([this, state, work = std::move(work)]() mutable {
+    scheduler.enqueue([this, on_split, on_error, work = std::move(work)]() mutable {
       try {
-        auto splits = work();
-        for (auto& split : splits) {
-          if (split) { apply_balancing(*split); }
-          push_to_connector(state->connector, std::move(split));
-        }
+        auto split = work();
+        on_split(std::move(split));
       } catch (...) {
-        state->set_error(std::current_exception());
+        on_error(std::current_exception());
       }
     });
   }

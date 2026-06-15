@@ -50,7 +50,7 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(duckdb::vector<sirius::logica
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_SCAN, std::move(types), estimated_cardinality),
     _ingestible(std::move(ingestible)),
-    _split_connector(std::make_unique<scan_manager::split_connector>())
+    _split_connector(std::make_shared<scan_manager::split_connector>())
 {
 }
 

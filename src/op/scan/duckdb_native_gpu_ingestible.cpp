@@ -203,40 +203,42 @@ bool duckdb_native_gpu_ingestible::has_processed_all_metadata() const
 duckdb_native_gpu_ingestible::metadata_scan_task_t
 duckdb_native_gpu_ingestible::next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx)
 {
-  std::size_t idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
-  if (idx >= _batches.size()) { return {}; }
-  row_group_batch claimed = _batches[idx];
+  return nullptr;
+  // std::size_t idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
+  // if (idx >= _batches.size()) { return {}; }
+  // row_group_batch claimed = _batches[idx];
 
-  bool const apply_filter        = static_cast<bool>(_filter_expression);
-  bool const has_post_processing = apply_filter || _projection_required;
-  std::size_t const output_arity = _output_arity;
-  bool const projection_required = _projection_required;
+  // bool const apply_filter        = static_cast<bool>(_filter_expression);
+  // bool const has_post_processing = apply_filter || _projection_required;
+  // std::size_t const output_arity = _output_arity;
+  // bool const projection_required = _projection_required;
 
-  return
-    [this, claimed, apply_filter, projection_required, output_arity, has_post_processing, io_ctx]()
-      -> std::vector<std::unique_ptr<op::operator_data>> {
-      auto split_info = std::make_unique<duckdb_native_split_info>();
-      split_info->payload.table_info =
-        &static_cast<duckdb_native_ingestible_table_info const&>(table_info());
-      split_info->payload.datasource = io_ctx->open_datasource(_info->db_path);
-      split_info->payload.row_groups.reserve(claimed.count);
-      for (std::size_t i = claimed.first_idx; i < claimed.first_idx + claimed.count; ++i) {
-        split_info->payload.row_groups.push_back(std::move(_metadata.row_groups[i]));
-      }
+  // return
+  //   [this, claimed, apply_filter, projection_required, output_arity, has_post_processing,
+  //   io_ctx]()
+  //     -> std::vector<std::unique_ptr<op::operator_data>> {
+  //     auto split_info = std::make_unique<duckdb_native_split_info>();
+  //     split_info->payload.table_info =
+  //       &static_cast<duckdb_native_ingestible_table_info const&>(table_info());
+  //     split_info->payload.datasource = io_ctx->open_datasource(_info->db_path);
+  //     split_info->payload.row_groups.reserve(claimed.count);
+  //     for (std::size_t i = claimed.first_idx; i < claimed.first_idx + claimed.count; ++i) {
+  //       split_info->payload.row_groups.push_back(std::move(_metadata.row_groups[i]));
+  //     }
 
-      std::unique_ptr<op::scan::post_filter_and_projection_info> filter_info;
-      if (has_post_processing) {
-        auto pf          = std::make_unique<duckdb_native_post_filter_and_projection_info>();
-        pf->apply_filter = apply_filter;
-        pf->output_arity = projection_required ? output_arity : 0;
-        filter_info      = std::move(pf);
-      }
+  //     std::unique_ptr<op::scan::post_filter_and_projection_info> filter_info;
+  //     if (has_post_processing) {
+  //       auto pf          = std::make_unique<duckdb_native_post_filter_and_projection_info>();
+  //       pf->apply_filter = apply_filter;
+  //       pf->output_arity = projection_required ? output_arity : 0;
+  //       filter_info      = std::move(pf);
+  //     }
 
-      std::vector<std::unique_ptr<op::operator_data>> out;
-      out.push_back(
-        std::make_unique<scan_operator_input>(std::move(split_info), std::move(filter_info)));
-      return out;
-    };
+  //     std::vector<std::unique_ptr<op::operator_data>> out;
+  //     out.push_back(
+  //       std::make_unique<scan_operator_input>(std::move(split_info), std::move(filter_info)));
+  //     return out;
+  //   };
 }
 
 //===----------------------------------------------------------------------===//

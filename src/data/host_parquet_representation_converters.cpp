@@ -20,7 +20,6 @@
 #include <data/host_parquet_representation_converters.hpp>
 #include <log/logging.hpp>
 #include <op/scan/cached_ranges.hpp>
-#include <op/scan/prefetched_data_source.hpp>
 
 // cucascade
 #include <cucascade/data/gpu_data_representation.hpp>
