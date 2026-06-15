@@ -136,7 +136,7 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   ~duckdb_native_gpu_ingestible() override;
 
-  std::unique_ptr<scan_manager::batch_coalecer> create_batch_coalecer() const override
+  std::unique_ptr<batch_coalecer> create_batch_coalecer() const override
   {
     return nullptr;
   }

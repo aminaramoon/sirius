@@ -21,7 +21,7 @@
 #include <memory>
 #include <vector>
 
-namespace sirius::scan_manager {
+namespace sirius::op::scan {
 
 /**
  * @brief Policy for placing a scan split onto a GPU.
@@ -36,12 +36,11 @@ namespace sirius::scan_manager {
 
 class batch_coalecer {
  public:
-  virtual std::vector<std::unique_ptr<op::scan::scan_info>> push(
-    std::unique_ptr<op::scan::scan_info>) = 0;
+  virtual std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info>) = 0;
 
-  virtual std::vector<std::unique_ptr<op::scan::scan_info>> flush() = 0;
+  virtual std::vector<std::unique_ptr<scan_info>> flush() = 0;
 
   virtual ~batch_coalecer() = default;
 };
 
-}  // namespace sirius::scan_manager
+}  // namespace sirius::op::scan

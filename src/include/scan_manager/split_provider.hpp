@@ -36,8 +36,6 @@ class operator_data;
 
 namespace sirius::scan_manager {
 
-class batch_coalecer;
-
 /**
  * @brief Driver of splits for a scan operator.
  *

@@ -24,7 +24,7 @@ namespace sirius::scan_manager {
 load_balancing_scan_batch_coalecer::metadata_processing_state*
 load_balancing_scan_batch_coalecer::register_pipeline(std::size_t pipeline_id,
                                                       split_connector& connector,
-                                                      std::unique_ptr<batch_coalecer> coalecer,
+                                                      std::unique_ptr<op::scan::batch_coalecer> coalecer,
                                                       std::shared_ptr<balancing_strategy> balancer)
 {
   // TODO(plumbing): the per-pipeline coalecing/balancing worker loop is not yet

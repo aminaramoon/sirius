@@ -175,7 +175,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   ~parquet_gpu_ingestible() override;
 
-  std::unique_ptr<scan_manager::batch_coalecer> create_batch_coalecer() const override
+  std::unique_ptr<batch_coalecer> create_batch_coalecer() const override
   {
     return nullptr;
   }

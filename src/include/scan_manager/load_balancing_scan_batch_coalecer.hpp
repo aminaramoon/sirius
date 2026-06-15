@@ -20,7 +20,7 @@
 #include "io/sirius_datasource.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "scan_manager/balancing_strategy.hpp"
-#include "scan_manager/batch_coalecer.hpp"
+#include "op/scan/batch_coalecer.hpp"
 #include "scan_manager/split_connector.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
@@ -71,7 +71,7 @@ class load_balancing_scan_batch_coalecer {
   struct metadata_processing_state {
     std::size_t pipeline_id{0};
     duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<op::scan::scan_info>> queue;
-    std::shared_ptr<batch_coalecer> coalecer;
+    std::shared_ptr<op::scan::batch_coalecer> coalecer;
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
   };
@@ -86,7 +86,7 @@ class load_balancing_scan_batch_coalecer {
   /// first.  The returned pointer is valid for the manager's lifetime.
   metadata_processing_state* register_pipeline(std::size_t pipeline_id,
                                                split_connector& connector,
-                                               std::unique_ptr<batch_coalecer> coalecer,
+                                               std::unique_ptr<op::scan::batch_coalecer> coalecer,
                                                std::shared_ptr<balancing_strategy> balancer);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
