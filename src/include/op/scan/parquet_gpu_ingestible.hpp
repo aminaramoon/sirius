@@ -197,6 +197,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     std::unique_ptr<cudf::table> table,
+    filter_state state,
     op::scan::post_filter_and_projection_info const& info,
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) override;

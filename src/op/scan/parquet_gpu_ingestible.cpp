@@ -517,6 +517,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 //===----------------------------------------------------------------------===//
 std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   std::unique_ptr<cudf::table> input,
+  filter_state state,
   op::scan::post_filter_and_projection_info const& info,
   ::cucascade::memory::memory_space const& /*mem_space*/,
   rmm::cuda_stream_view stream)

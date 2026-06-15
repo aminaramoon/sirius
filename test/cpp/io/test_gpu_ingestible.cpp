@@ -58,8 +58,10 @@ class fake_gpu_ingestible : public sirius::io::gpu_ingestible {
   {
     throw std::runtime_error("not reachable in this test");
   }
+
   std::unique_ptr<cudf::table> post_filter_and_project(
     std::unique_ptr<cudf::table>,
+    filter_state state,
     sirius::io::post_filter_and_projection_info const&,
     cucascade::memory::memory_space const&,
     rmm::cuda_stream_view) override
