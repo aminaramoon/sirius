@@ -73,6 +73,8 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
                       std::optional<std::chrono::milliseconds> retry_jitter       = std::nullopt,
                       std::optional<bool> honor_retry_after                       = std::nullopt);
 
+  [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
+
  protected:
   /// Backend hook invoked by @c sirius_ioctx::open_datasource: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.

@@ -77,9 +77,10 @@ class buffer_pool {
   /// @p initial_slabs slabs are allocated up-front from @p mr (clamped to
   /// @p max_slabs).  Default preserves the historical behaviour of warming
   /// the pool with up to 10 slabs at construction.
-  buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr,
+  buffer_pool(std::vector<cucascade::memory::fixed_size_host_memory_resource*> mrs,
               uint32_t max_slabs,
               uint32_t initial_slabs = 10);
+
   ~buffer_pool();
 
   buffer_pool(buffer_pool const&)            = delete;

@@ -59,7 +59,12 @@ class sirius_datasource : public cudf::io::datasource {
   /// The underlying io_object this datasource reads through.  Exposed so
   /// callers that received the datasource from @c sirius_ioctx::open_datasource
   /// can still reach the io_object (e.g. as the metadata-store cache key).
-  [[nodiscard]] sirius_io_object& io_object() const noexcept { return *_io_object; }
+  [[nodiscard]] const sirius_io_object& io_object() const noexcept { return *_io_object; }
+
+  /// Backend-parsed metadata for this datasource's io_object, looked up in the
+  /// ioctx's metadata store (null when no cache or no entry). Independent of
+  /// the prefetching machinery.
+  [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> metadata() const;
 
   // ---- cudf::io::datasource overrides ---------------------------------------
 

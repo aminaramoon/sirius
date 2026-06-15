@@ -136,10 +136,10 @@ prefetching_handle::operator bool() const noexcept { return _state != nullptr; }
 // buffer_pool
 // ===========================================================================
 
-buffer_pool::buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr,
+buffer_pool::buffer_pool(std::vector<cucascade::memory::fixed_size_host_memory_resource*> mrs,
                          uint32_t max_slabs,
                          uint32_t initial_slabs)
-  : _mr(mr), _chunk_bytes(mr.get_block_size()), _max_slabs(max_slabs)
+  : _mr(*mrs.front()), _chunk_bytes(_mr.get_block_size()), _max_slabs(max_slabs)
 {
   std::unique_lock lk(_mtx);
   auto const n = std::min(initial_slabs, _max_slabs);

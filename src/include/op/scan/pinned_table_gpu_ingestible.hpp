@@ -42,13 +42,13 @@
 
 namespace sirius::op::scan {
 
-class pinned_table_post_filter_and_projection_info : public io::post_filter_and_projection_info {
+class pinned_table_post_filter_and_projection_info : public post_filter_and_projection_info {
  public:
   bool apply_filter   = false;
   bool apply_assembly = false;
 };
 
-class pinned_table_gpu_ingestible : public io::gpu_ingestible {
+class pinned_table_gpu_ingestible : public gpu_ingestible {
  public:
   using gpu_chunk     = std::vector<std::shared_ptr<cudf::column>>;
   using host_chunk    = std::shared_ptr<::cucascade::host_data_representation>;
@@ -56,7 +56,7 @@ class pinned_table_gpu_ingestible : public io::gpu_ingestible {
 
   /// GPU-tier constructor.
   pinned_table_gpu_ingestible(
-    std::unique_ptr<io::ingestible_table_info> table_info,
+    std::unique_ptr<ingestible_table_info> table_info,
     std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
     std::vector<::cucascade::memory::memory_space*> chunk_memory_spaces,
     std::shared_ptr<duckdb::Expression> filter_expression,
@@ -64,7 +64,7 @@ class pinned_table_gpu_ingestible : public io::gpu_ingestible {
 
   /// HOST-tier constructor.
   pinned_table_gpu_ingestible(
-    std::unique_ptr<io::ingestible_table_info> table_info,
+    std::unique_ptr<ingestible_table_info> table_info,
     std::vector<std::shared_ptr<::cucascade::host_data_representation>> host_chunks,
     std::vector<std::size_t> column_indices,
     ::cucascade::memory::memory_space& memory_space,
@@ -77,13 +77,13 @@ class pinned_table_gpu_ingestible : public io::gpu_ingestible {
   [[nodiscard]] bool has_more_splits() const override;
   std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
 
-  io::filtered_table materialize_table(io::scan_info const& info,
-                                       ::cucascade::memory::memory_space const& mem_space,
-                                       rmm::cuda_stream_view stream) override;
+  filtered_table materialize_table(scan_info const& info,
+                                   ::cucascade::memory::memory_space const& mem_space,
+                                   rmm::cuda_stream_view stream) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     std::unique_ptr<cudf::table> input,
-    io::post_filter_and_projection_info const& info,
+    post_filter_and_projection_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) override;
 

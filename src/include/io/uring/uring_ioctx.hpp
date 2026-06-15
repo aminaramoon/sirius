@@ -40,6 +40,8 @@ class uring_ioctx : public templated_ioctx<uring_reactor> {
               cucascade::memory::fixed_size_host_memory_resource& mr,
               bool use_odirect = true);
 
+  [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::uring; }
+
  private:
   /// Delegated-to target: build the reactor pool from a shared context (one
   /// context shared across all reactors).  The public constructor assembles the

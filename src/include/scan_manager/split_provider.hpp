@@ -17,6 +17,7 @@
 #pragma once
 
 #include "cucascade/data/data_batch.hpp"
+#include "io/io_context.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan_manager/split_connector.hpp"
@@ -76,7 +77,10 @@ class split_provider {
   /// away. Callers that need a shared_ptr can promote via
   /// `provider.get_ingestible().shared_from_this()` (enabled by
   /// @c gpu_ingestible inheriting @c std::enable_shared_from_this).
-  explicit split_provider(op::scan::gpu_ingestible& ingestible) : _ingestible(&ingestible) {}
+  explicit split_provider(op::scan::gpu_ingestible& ingestible, io::sirius_ioctx& io_ctx)
+    : _ingestible(&ingestible), _io_ctx(io_ctx.shared_from_this())
+  {
+  }
 
   virtual ~split_provider() = default;
 
@@ -143,7 +147,7 @@ class split_provider {
       }
       return nullptr;
     }
-    return _ingestible->next_split_provider();
+    return _ingestible->next_split_provider(_io_ctx);
   }
 
   /// Accessor for the composed ingestible. Undefined behavior on the legacy
@@ -204,6 +208,8 @@ class split_provider {
   /// default-ctor path). The operator owns the lifetime; the provider is
   /// always destroyed first via @c sirius_scan_manager::reset.
   op::scan::gpu_ingestible* _ingestible{nullptr};
+
+  std::shared_ptr<io::sirius_ioctx> _io_ctx;
 
   /// Placement policy for the splits this provider emits. May be shared with
   /// other providers. Null until @ref set_balancing_strategy is called, which

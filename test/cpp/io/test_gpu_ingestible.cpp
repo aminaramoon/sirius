@@ -26,7 +26,7 @@
 
 #include <cudf/table/table.hpp>
 
-#include <io/gpu_ingestible.hpp>
+#include <op/scan/gpu_ingestible.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
 #include <atomic>

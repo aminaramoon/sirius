@@ -24,7 +24,6 @@
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
-#include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
 #include <cudf/table/table.hpp>
@@ -35,6 +34,7 @@
 
 // standard library
 #include <algorithm>
+#include <cstddef>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -116,22 +116,13 @@ std::vector<row_group_batch_local> partition_row_groups_into_batches(
 }  // namespace
 
 //===----------------------------------------------------------------------===//
-// duckdb_native_ingestible_table_info::make_ingestible
-//===----------------------------------------------------------------------===//
-std::shared_ptr<op::scan::gpu_ingestible> duckdb_native_ingestible_table_info::make_ingestible(
-  std::unique_ptr<op::scan::ingestible_table_info> self)
-{
-  return std::make_shared<duckdb_native_gpu_ingestible>(std::move(self));
-}
-
-//===----------------------------------------------------------------------===//
 // duckdb_native_gpu_ingestible — construction
 //===----------------------------------------------------------------------===//
 duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
-  std::unique_ptr<op::scan::ingestible_table_info> info)
+  std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> info)
+  : _info(std::move(info))
 {
-  auto const& bind = static_cast<duckdb_native_ingestible_table_info const&>(table_info());
-
+  auto const& bind = *_info;
   if (bind.storage == nullptr) {
     throw std::invalid_argument(
       "[duckdb_native_gpu_ingestible] table_info.storage must be non-null");
@@ -159,13 +150,6 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
     throw std::runtime_error("duckdb-native scan rejected query: " +
                              _metadata.viability_failure_reason);
   }
-
-  // Resolve the .db file to a datasource once per query when the manager
-  // exposes a backend for db_path; derive the io_ctx + io_object from it
-  // (matches duckdb_native_split_provider) instead of reaching into io_context.
-  auto db_datasource = !bind.db_path.empty() ? mgr.create_datasource(bind.db_path) : nullptr;
-  _io_ctx            = db_datasource ? db_datasource->io_ctx() : nullptr;
-  _db_io_object      = db_datasource ? db_datasource->io_object() : nullptr;
 
   // Pre-build the coalesced filter expression once.
   if (bind.table_filters && !bind.table_filters->filters.empty()) {
@@ -216,7 +200,8 @@ bool duckdb_native_gpu_ingestible::has_processed_all_metadata() const
   return _next_batch_idx.load(std::memory_order_relaxed) >= _batches.size();
 }
 
-metadata_scan_task_t duckdb_native_gpu_ingestible::next_split_provider()
+duckdb_native_gpu_ingestible::metadata_scan_task_t
+duckdb_native_gpu_ingestible::next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx)
 {
   std::size_t idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _batches.size()) { return {}; }
@@ -227,39 +212,37 @@ metadata_scan_task_t duckdb_native_gpu_ingestible::next_split_provider()
   std::size_t const output_arity = _output_arity;
   bool const projection_required = _projection_required;
 
-  return [this, claimed, apply_filter, projection_required, output_arity, has_post_processing]()
-           -> std::vector<std::unique_ptr<op::operator_data>> {
-    auto split_info = std::make_unique<duckdb_native_split_info>();
-    split_info->payload.table_info =
-      &static_cast<duckdb_native_ingestible_table_info const&>(table_info());
-    split_info->payload.io_ctx       = _io_ctx;
-    split_info->payload.db_io_object = _db_io_object;
-    split_info->payload.row_groups.reserve(claimed.count);
-    for (std::size_t i = claimed.first_idx; i < claimed.first_idx + claimed.count; ++i) {
-      split_info->payload.row_groups.push_back(std::move(_metadata.row_groups[i]));
-    }
+  return
+    [this, claimed, apply_filter, projection_required, output_arity, has_post_processing, io_ctx]()
+      -> std::vector<std::unique_ptr<op::operator_data>> {
+      auto split_info = std::make_unique<duckdb_native_split_info>();
+      split_info->payload.table_info =
+        &static_cast<duckdb_native_ingestible_table_info const&>(table_info());
+      split_info->payload.datasource = io_ctx->open_datasource(_info->db_path);
+      split_info->payload.row_groups.reserve(claimed.count);
+      for (std::size_t i = claimed.first_idx; i < claimed.first_idx + claimed.count; ++i) {
+        split_info->payload.row_groups.push_back(std::move(_metadata.row_groups[i]));
+      }
 
-    std::unique_ptr<op::scan::post_filter_and_projection_info> filter_info;
-    if (has_post_processing) {
-      auto pf          = std::make_unique<duckdb_native_post_filter_and_projection_info>();
-      pf->apply_filter = apply_filter;
-      pf->output_arity = projection_required ? output_arity : 0;
-      filter_info      = std::move(pf);
-    }
+      std::unique_ptr<op::scan::post_filter_and_projection_info> filter_info;
+      if (has_post_processing) {
+        auto pf          = std::make_unique<duckdb_native_post_filter_and_projection_info>();
+        pf->apply_filter = apply_filter;
+        pf->output_arity = projection_required ? output_arity : 0;
+        filter_info      = std::move(pf);
+      }
 
-    auto metadata = std::make_unique<op::scan::scan_and_filter_metadata>(std::move(split_info),
-                                                                         std::move(filter_info));
-
-    std::vector<std::unique_ptr<op::operator_data>> out;
-    out.push_back(std::make_unique<scan_operator_input>(std::move(metadata)));
-    return out;
-  };
+      std::vector<std::unique_ptr<op::operator_data>> out;
+      out.push_back(
+        std::make_unique<scan_operator_input>(std::move(split_info), std::move(filter_info)));
+      return out;
+    };
 }
 
 //===----------------------------------------------------------------------===//
 // materialize_table
 //===----------------------------------------------------------------------===//
-op::scan::filtered_table duckdb_native_gpu_ingestible::materialize_table(
+op::scan::filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   op::scan::scan_info const& info,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream)
@@ -312,6 +295,12 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   }
 
   return input;
+}
+
+std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(
+  std::unique_ptr<duckdb_native_ingestible_table_info> info)
+{
+  return std::make_shared<duckdb_native_gpu_ingestible>(std::move(info));
 }
 
 }  // namespace sirius::op::scan

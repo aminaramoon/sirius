@@ -17,6 +17,8 @@
 #pragma once
 
 // sirius
+#include "io/sirius_datasource.hpp"
+
 #include <io/io_context.hpp>  // sirius_ioctx + sirius_io_object
 #include <op/scan/duckdb_native_metadata.hpp>
 
@@ -58,8 +60,7 @@ struct duckdb_native_split_payload {
   /// Sirius IO substrate handles used to read .db blocks via
   /// @c sirius_ioctx::host_read. Required by the decoder, which throws if
   /// either is absent.
-  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx;
-  std::shared_ptr<sirius::io::sirius_io_object> db_io_object;
+  std::shared_ptr<sirius::io::sirius_datasource> datasource;
 };
 
 //===----------------------------------------------------------------------===//

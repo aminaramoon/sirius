@@ -43,10 +43,6 @@
 #include <unordered_map>
 #include <vector>
 
-namespace sirius::scan_manager {
-class sirius_scan_manager;
-}  // namespace sirius::scan_manager
-
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -76,9 +72,6 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   std::string db_path;
 
   duckdb_native_ingestible_table_info() = default;
-
-  std::shared_ptr<op::scan::gpu_ingestible> make_ingestible(
-    std::unique_ptr<op::scan::ingestible_table_info> self);
 
   /// db_path-as-span. The cache match in @c sirius_scan_manager never
   /// matches duckdb-native ingestibles (pinned-cache key is parquet file
@@ -139,13 +132,12 @@ class duckdb_native_post_filter_and_projection_info
 //===----------------------------------------------------------------------===//
 class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
  public:
-  duckdb_native_gpu_ingestible(std::unique_ptr<op::scan::ingestible_table_info> info,
-                               scan_manager::sirius_scan_manager const& mgr);
+  duckdb_native_gpu_ingestible(std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> info);
 
   ~duckdb_native_gpu_ingestible() override;
 
   [[nodiscard]] bool has_processed_all_metadata() const override;
-  metadata_scan_task_t next_split_provider() override;
+  metadata_scan_task_t next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx) override;
 
   op::scan::filtered_table materialize_metadata_to_table(
     op::scan::scan_info const& info,
@@ -158,15 +150,16 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) override;
 
+  [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
+
  private:
   struct row_group_batch {
     std::size_t first_idx;
     std::size_t count;
   };
 
+  std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> _info;
   duckdb_native_metadata _metadata;
-  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
-  std::shared_ptr<sirius::io::sirius_io_object> _db_io_object;
   /// Pre-built coalesced filter expression. Empty when no translatable
   /// filters survived. Reused across every emitted split.
   std::shared_ptr<duckdb::Expression> _filter_expression;
@@ -176,5 +169,8 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   std::vector<row_group_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};
 };
+
+std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(
+  std::unique_ptr<duckdb_native_ingestible_table_info> info);
 
 }  // namespace sirius::op::scan

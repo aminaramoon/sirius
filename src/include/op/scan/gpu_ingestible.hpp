@@ -23,6 +23,8 @@
 #include <cucascade/data/gpu_data_representation.hpp>
 
 // rmm
+#include "io/io_context.hpp"
+
 #include <rmm/cuda_stream_view.hpp>
 
 // standard library
@@ -205,7 +207,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * null callable indicates no work was claimed (the driver loop skips
    * empty handoffs).
    */
-  virtual metadata_scan_task_t next_split_provider() = 0;
+  virtual metadata_scan_task_t next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx) = 0;
 
   /**
    * @brief Materialize the cudf table for one split. Called by
@@ -243,14 +245,6 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
  protected:
   gpu_ingestible() noexcept = default;
 };
-
-template <typename Derived>
-  requires std::derived_from<ingestible_table_info, Derived>
-std::shared_ptr<op::scan::gpu_ingestible> make_ingestible(std::unique_ptr<Derived> self)
-{
-  throw std::logic_error("make_ingestible not implemented for " +
-                         std::string(typeid(Derived).name()));
-}
 
 }  // namespace scan
 }  // namespace sirius::op

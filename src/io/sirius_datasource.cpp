@@ -70,9 +70,8 @@ sirius_datasource::~sirius_datasource() {}
 std::shared_ptr<sirius_io_object_metadata> sirius_datasource::metadata() const
 {
   if (!_io_ctx || !_io_object) { return nullptr; }
-  auto* cache = _io_ctx->cache();
-  if (cache == nullptr) { return nullptr; }
-  return cache->get_metadata(*_io_object);
+  auto& cache = _io_ctx->metadata_store();
+  return cache.get_metadata(*_io_object);
 }
 
 size_t sirius_datasource::size() const { return _io_object->size(); }

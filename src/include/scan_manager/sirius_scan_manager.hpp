@@ -85,6 +85,7 @@ struct scan_manager_config {
   /// (@c clamp(4 * devices, 4, 16)) rather than reading this field. Parsed from
   /// YAML and kept for forward compatibility / tests; setting it has no effect
   /// on the engine today.
+  bool use_odirect{true};
   std::size_t uring_n_reactors{4};
   /// io_uring submission/completion queue depth per reactor.  Ignored when
   /// @c use_sirius_datasource is false.
@@ -109,32 +110,6 @@ struct scan_manager_config {
   /// the B1 micro-bench A/B compare prefetch overlap on SF10.  Ignored when
   /// @c enable_prefetch_cache is false (no cache → no prewarm regardless).
   bool enable_chunk_prewarm{true};
-
-  /// S3 backend opt-in. When set, SiriusContext (S6) constructs an @c s3_ioctx
-  /// from these credentials/knobs and hands it to the scan_manager as a borrowed
-  /// backend (the scan_manager itself constructs nothing). Default construction
-  /// (empty optional) leaves the S3 backend disabled. SiriusContext populates
-  /// this from object_store_config during initialize() when the engine config
-  /// requests S3.
-  std::optional<sirius::io::s3::s3_ioctx_config> s3_config{};
-
-  /// Selects which S3 backend the scan_manager builds when @c s3_config is set.
-  /// Mirrors @c object_store_config::s3_use_async_backend (SiriusContext copies
-  /// it across in initialize()). When true (default) the manager builds the
-  /// async @c s3_ioctx (libcurl-multi reactor: concurrent GETs + pipelined
-  /// device reads); when false it builds the serial @c s3_blocking_ioctx fed by
-  /// @c s3_thread_pool. Ignored when @c s3_config is empty.
-  bool s3_use_async_backend{true};
-
-  /// Thread pool config for the blocking S3 backend's async workers. Ignored
-  /// when @c s3_config is empty or when @c s3_use_async_backend is true (the
-  /// async @c s3_ioctx reactor owns its own worker thread). Separate from the
-  /// main @c thread_pool because S3 I/O has different concurrency
-  /// characteristics (more threads, network-bound, not CPU-bound). Injected
-  /// into @c s3_ioctx_config::async_thread_pool before constructing the
-  /// @c s3_blocking_ioctx so its async paths bypass detached std::thread
-  /// fallbacks.
-  exec::thread_pool_config s3_thread_pool{.num_threads = 8, .thread_name_prefix = "s3_io"};
 };
 
 /**
@@ -311,6 +286,8 @@ class sirius_scan_manager {
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
+
+  parquet_bind_result describe_parquet(std::string const& uri);
 
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
   ///        Returns nullptr when the manager was configured with

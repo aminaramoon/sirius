@@ -96,6 +96,8 @@ class kvikio_context final : public sirius_ioctx {
     this->pre_destroy();
   }
 
+  [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::kvikio; }
+
   void shutdown() noexcept override {}
 
   [[nodiscard]] bool supports(std::string_view path) const noexcept override;

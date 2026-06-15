@@ -177,18 +177,20 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   [[nodiscard]] bool has_processed_all_metadata() const override;
 
-  metadata_scan_task_t next_split_provider() override;
+  metadata_scan_task_t next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx) override;
 
   op::scan::filtered_table materialize_metadata_to_table(
-    op::scan::scan_info const& info,
-    ::cucascade::memory::memory_space& mem_space,
+    scan_info const& info,
+    const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     std::unique_ptr<cudf::table> table,
     op::scan::post_filter_and_projection_info const& info,
-    ::cucascade::memory::memory_space const& mem_space,
+    const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) override;
+
+  [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 
  private:
   /// One per-task batch of files. The footer-read loop in @ref run_batch
@@ -198,7 +200,9 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     std::vector<std::string> file_paths;
   };
 
-  void run_batch(file_batch const& batch, std::vector<std::unique_ptr<op::operator_data>>& out);
+  void run_batch(const file_batch& batch,
+                 std::vector<std::unique_ptr<op::operator_data>>& out,
+                 std::shared_ptr<io::sirius_ioctx> io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
 
@@ -217,7 +221,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   std::atomic<std::size_t> _next_batch_idx{0};
 };
 
-std::shared_ptr<gpu_ingestible> make_ingestible(
+std::shared_ptr<parquet_gpu_ingestible> make_ingestible(
   std::unique_ptr<parquet_ingestible_table_info> info);
 
 }  // namespace sirius::op::scan

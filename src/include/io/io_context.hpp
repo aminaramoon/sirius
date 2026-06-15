@@ -33,6 +33,8 @@
 
 namespace sirius::io {
 
+enum class io_context_type { uring, restful, kvikio };
+
 namespace cache {
 class prefetching_cache;
 }
@@ -64,6 +66,8 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
  public:
   sirius_ioctx();
   virtual ~sirius_ioctx();
+
+  [[nodiscard]] virtual io_context_type type() const noexcept = 0;
 
   virtual void shutdown() noexcept = 0;
 
