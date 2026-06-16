@@ -27,12 +27,15 @@
 #include <rmm/resource_ref.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <functional>
 #include <memory>
 #include <numeric>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -87,22 +90,27 @@ class my_view {
   [[nodiscard]] std::size_t n_columns() const { return _selection.size(); }
 
   /// Swap the columns at the given current positions, applying each swap in
-  /// order. Pure index manipulation; allocates nothing.
+  /// order. Pure index manipulation; allocates nothing. Throws
+  /// @c std::out_of_range if any position is outside the current view.
   void reorder_columns(std::span<const std::pair<std::size_t, std::size_t>> swaps)
   {
     for (auto const& [a, b] : swaps) {
-      std::swap(_selection.at(a), _selection.at(b));
+      check_position(a);
+      check_position(b);
+      std::swap(_selection[a], _selection[b]);
     }
   }
 
   /// Drop the columns at the given current positions. Pure index manipulation;
-  /// allocates nothing.
+  /// allocates nothing. Throws @c std::out_of_range if any position is outside
+  /// the current view.
   void drop_columns(std::span<const std::size_t> positions)
   {
     std::vector<std::size_t> sorted(positions.begin(), positions.end());
     std::sort(sorted.begin(), sorted.end(), std::greater<>{});
     sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
     for (std::size_t p : sorted) {
+      check_position(p);
       _selection.erase(_selection.begin() + static_cast<std::ptrdiff_t>(p));
     }
   }
@@ -144,11 +152,17 @@ class my_view {
     {
       if constexpr (no_alloc_materializable<Owner>) {
         // Move the selected columns out of the owner; no device buffer copy.
+        // Precondition: the selection contains no duplicate original indices
+        // (guaranteed by the swap/drop operations, which only permute/subset an
+        // identity selection). Moving the same column twice would be a bug, so
+        // assert each slot is still occupied before moving it out.
         auto columns = (*_owner).release();
         std::vector<std::unique_ptr<cudf::column>> out;
         out.reserve(selection.size());
         for (auto idx : selection) {
-          out.push_back(std::move(columns[static_cast<std::size_t>(idx)]));
+          auto& column = columns[static_cast<std::size_t>(idx)];
+          assert(column != nullptr && "owning_table_view: duplicate column index in selection");
+          out.push_back(std::move(column));
         }
         return std::make_unique<cudf::table>(std::move(out));
       } else {
@@ -161,6 +175,16 @@ class my_view {
     Owner _owner;
     cudf::table_view _base_view;
   };
+
+  /// Validate a caller-supplied column position against the current view.
+  void check_position(std::size_t position) const
+  {
+    if (position >= _selection.size()) {
+      throw std::out_of_range("owning_table_view: column position " + std::to_string(position) +
+                              " is out of range (n_columns=" + std::to_string(_selection.size()) +
+                              ")");
+    }
+  }
 
   static std::vector<cudf::size_type> identity_selection(cudf::size_type n)
   {

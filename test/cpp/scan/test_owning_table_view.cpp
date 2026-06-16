@@ -28,6 +28,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -164,6 +165,21 @@ TEST_CASE("owning_table_view reorder then drop compose on current positions", "[
   handle.drop_columns(drop);  // drop current positions 1 and 2 -> 40, 10
   REQUIRE(handle.n_columns() == 2);
   REQUIRE(read_tags(handle.view()) == std::vector<std::int32_t>{40, 10});
+}
+
+TEST_CASE("owning_table_view rejects out-of-range positions", "[owning_table_view]")
+{
+  owning_table_view handle{tagged_table({10, 20, 30})};
+
+  std::array<std::size_t, 1> bad_drop{3};
+  REQUIRE_THROWS_AS(handle.drop_columns(bad_drop), std::out_of_range);
+
+  std::array<std::pair<std::size_t, std::size_t>, 1> bad_swap{{{0, 3}}};
+  REQUIRE_THROWS_AS(handle.reorder_columns(bad_swap), std::out_of_range);
+
+  // The handle is unchanged after the rejected operations.
+  REQUIRE(handle.n_columns() == 3);
+  REQUIRE(read_tags(handle.view()) == std::vector<std::int32_t>{10, 20, 30});
 }
 
 TEST_CASE("owning_table_view generic owner materializes by copy", "[owning_table_view]")
