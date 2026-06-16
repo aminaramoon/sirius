@@ -32,27 +32,31 @@ namespace sirius::io {
 // acquire() never blocks.  Its purpose is to track in-flight work so callers
 // can detect when every issued slot has been released ("drained").
 //
-// Completion is modelled as a std::stop_source: the first time the
-// outstanding-slot count transitions to zero, request_stop() is called on the
-// internal stop_source.  Subscribers observe completion by attaching their own
-// std::stop_callback to completion_token():
+// Completion is modelled as a std::stop_source.  Subscribers observe it by
+// attaching their own std::stop_callback to completion_token():
 //
 //     std::stop_callback cb{controller.completion_token(),
 //                           [] { /* all work drained */ }};
 //
 // std::stop_callback handles the registration race for free: if the token is
 // already stopped when the callback is constructed, it fires immediately on
-// the constructing thread.  request_stop() is always invoked WITHOUT holding
-// the internal mutex, so callbacks may safely re-enter this controller.
+// the constructing thread.
 //
-// Completion is ONE-SHOT: once drained, the stop_token stays stopped.
-// Acquiring further slots after that point is harmless (request_stop() is
-// idempotent) but will not re-fire the callbacks.
+// Completion fires exactly once and ONLY after the producer signals it is done
+// issuing work via close().  Concretely, request_stop() is called when EITHER:
+//   - close() is invoked while no slots are outstanding, or
+//   - the last outstanding slot drains after close() has been invoked.
+// Gating on close() avoids spurious early completion: a producer issuing slots
+// in a loop can transiently hit zero outstanding slots between releases, but
+// that does not fire completion until it has called close().
 //
-// Spurious-completion guard: if a producer issues slots in a loop, the count
-// can briefly hit zero between the first release and the next acquire, firing
-// completion early.  The producer should hold a "primer" slot for the duration
-// of production and release it only after all work has been enqueued.
+// As a backstop, the destructor also requests stop, so the token never leaks
+// un-stopped.  request_stop() is idempotent, so the callbacks fire at most
+// once regardless of which path triggers it.  It is always invoked WITHOUT
+// holding the internal mutex, so callbacks may safely re-enter this controller.
+//
+// Acquiring further slots after completion is harmless but will not re-fire the
+// callbacks.
 
 class completion_controller {
  public:
@@ -77,14 +81,19 @@ class completion_controller {
     completion_controller* _ctrl{nullptr};
   };
 
-  completion_controller()  = default;
-  ~completion_controller() = default;
+  completion_controller() = default;
+  /// Backstop: requests stop so the completion token never leaks un-stopped.
+  ~completion_controller();
 
   completion_controller(completion_controller const&)            = delete;
   completion_controller& operator=(completion_controller const&) = delete;
 
   /// Hand out a slot, incrementing the outstanding count.  Never blocks.
   [[nodiscard]] slot acquire();
+
+  /// Signal that no more work will be issued.  Completion fires now if no
+  /// slots are outstanding, otherwise when the last one drains.  Idempotent.
+  void close();
 
   /// Block until every slot handed out by @c acquire has been destroyed.
   void wait_for_idle();
@@ -107,6 +116,7 @@ class completion_controller {
   void release() noexcept;
 
   size_t _active_slots{0};
+  bool _closing{false};
   mutable std::mutex _mtx;
   std::condition_variable _cv;
   std::stop_source _completion;

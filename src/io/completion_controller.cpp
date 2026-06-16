@@ -18,6 +18,14 @@
 
 namespace sirius::io {
 
+completion_controller::~completion_controller()
+{
+  // Backstop for the case where the producer never called close(): make sure
+  // the token is stopped so subscribers are not left waiting forever.
+  // Idempotent — a no-op if completion already fired.
+  _completion.request_stop();
+}
+
 completion_controller::slot completion_controller::acquire()
 {
   std::lock_guard lk(_mtx);
@@ -25,22 +33,37 @@ completion_controller::slot completion_controller::acquire()
   return slot{this};
 }
 
+void completion_controller::close()
+{
+  bool fire;
+  {
+    std::lock_guard lk(_mtx);
+    _closing = true;
+    // Fire now only if there is nothing left to drain; otherwise release()
+    // fires when the last outstanding slot goes away.
+    fire = (_active_slots == 0);
+  }
+  if (fire) _completion.request_stop();
+}
+
 void completion_controller::release() noexcept
 {
-  bool drained;
+  bool fire;
   {
     std::lock_guard lk(_mtx);
     --_active_slots;
-    drained = (_active_slots == 0);
+    // Only complete once the producer has closed; transient zeros before
+    // close() must not fire the callbacks.
+    fire = _closing && (_active_slots == 0);
   }
   // notify_all (rather than notify_one): every wait_for_idle() waiter parks on
   // this same _cv and all need to observe _active_slots dropping to zero.
   _cv.notify_all();
   // Signal completion outside the lock: request_stop() invokes any registered
   // std::stop_callbacks synchronously on this thread, and they may re-enter
-  // this controller.  request_stop() is idempotent and thread-safe, so a
-  // racing acquire/release that re-reaches zero is harmless.
-  if (drained) _completion.request_stop();
+  // this controller.  request_stop() is idempotent, so it fires the callbacks
+  // at most once across close()/release()/the destructor.
+  if (fire) _completion.request_stop();
 }
 
 void completion_controller::wait_for_idle()
