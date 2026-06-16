@@ -104,7 +104,7 @@ struct io_slot {
                           static_cast<unsigned>(resume_iov.size()),
                           static_cast<__u64>(req->chunk.offset + bytes_read));
     } else {
-      register_bounce_buffer(sqe);
+      register_host_buffer(sqe);
     }
     io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(slot_index));
   }
@@ -121,7 +121,7 @@ struct io_slot {
   /// @c support_fixed_buffers on this slot and resubmits — this method then
   /// re-preps it as a plain read.  @c used_fixed_buffer records which path was
   /// taken so the reap loop can tell a fixed-read failure apart.
-  void register_bounce_buffer(io_uring_sqe* sqe)
+  void register_host_buffer(io_uring_sqe* sqe)
   {
     auto segment = req->get_remaining_chunk(bytes_read);
     if (use_internal_buffer && support_fixed_buffers) {
