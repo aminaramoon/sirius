@@ -114,6 +114,37 @@ TEST_CASE("owning_table_view from owned table exposes the table", "[owning_table
   REQUIRE(read_tags(handle.view()) == std::vector<std::int32_t>{10, 20, 30});
 }
 
+TEST_CASE("owning_table_view num_rows / column / column_types accessors", "[owning_table_view]")
+{
+  // 4 columns, 1 row each.
+  owning_table_view handle{tagged_table({10, 20, 30, 40})};
+
+  REQUIRE(handle.num_rows() == 1);
+  REQUIRE(handle.column_types().size() == 4);
+  for (auto const& t : handle.column_types()) {
+    REQUIRE(t.id() == cudf::type_id::INT32);
+  }
+
+  // column() returns the column at the current position; row count is
+  // unaffected by dropping columns.
+  std::array<std::size_t, 1> drop{0};
+  handle.drop_columns(drop);  // -> 20, 30, 40
+  REQUIRE(handle.num_rows() == 1);
+  REQUIRE(handle.column_types().size() == 3);
+
+  std::int32_t tag = 0;
+  cudaMemcpy(&tag, handle.column(0).data<std::int32_t>(), sizeof(tag), cudaMemcpyDeviceToHost);
+  REQUIRE(tag == 20);
+
+  REQUIRE_THROWS_AS(handle.column(3), std::out_of_range);
+
+  // Empty handle: zero rows, no columns.
+  owning_table_view empty;
+  REQUIRE(empty.num_rows() == 0);
+  REQUIRE(empty.column_types().empty());
+  REQUIRE_THROWS_AS(empty.column(0), std::out_of_range);
+}
+
 TEST_CASE("owning_table_view drop + materialize moves buffers (no copy)", "[owning_table_view]")
 {
   auto table = tagged_table({10, 20, 30});

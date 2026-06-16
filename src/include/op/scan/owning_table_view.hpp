@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -88,6 +89,10 @@ class my_view {
   [[nodiscard]] cudf::table_view view() const { return _model->full_view().select(_selection); }
 
   [[nodiscard]] std::size_t n_columns() const { return _selection.size(); }
+
+  /// Row count of the underlying data, independent of which columns are
+  /// currently exposed.
+  [[nodiscard]] cudf::size_type num_rows() const { return _model->full_view().num_rows(); }
 
   /// Swap the columns at the given current positions, applying each swap in
   /// order. Pure index manipulation; allocates nothing. Throws
@@ -252,6 +257,17 @@ class owning_table_view {
 
   /// Number of columns in the currently-exposed view.
   [[nodiscard]] std::size_t n_columns() const;
+
+  /// Number of rows in the data. Independent of the exposed column selection;
+  /// 0 when the handle has no valid state.
+  [[nodiscard]] cudf::size_type num_rows() const;
+
+  /// The column at the given current position. Throws @c std::out_of_range if
+  /// @p index is outside the currently-exposed view.
+  [[nodiscard]] cudf::column_view column(std::size_t index) const;
+
+  /// The data types of the currently-exposed columns, in order.
+  [[nodiscard]] std::vector<cudf::data_type> column_types() const;
 
   /// Swap columns at the given current positions (applied in order). Never
   /// allocates; demotes an owned table to a view first if necessary.

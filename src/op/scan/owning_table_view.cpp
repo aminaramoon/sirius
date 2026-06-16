@@ -16,7 +16,10 @@
 
 #include "op/scan/owning_table_view.hpp"
 
+#include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius::op::scan {
 
@@ -47,6 +50,39 @@ std::size_t owning_table_view::n_columns() const
     return (*view)->n_columns();
   }
   return 0;
+}
+
+cudf::size_type owning_table_view::num_rows() const
+{
+  if (auto* table = std::get_if<std::unique_ptr<cudf::table>>(&_state)) {
+    return (*table)->num_rows();
+  }
+  if (auto* view = std::get_if<std::unique_ptr<detail::my_view>>(&_state)) {
+    return (*view)->num_rows();
+  }
+  return 0;
+}
+
+cudf::column_view owning_table_view::column(std::size_t index) const
+{
+  auto current = view();
+  if (index >= static_cast<std::size_t>(current.num_columns())) {
+    throw std::out_of_range("owning_table_view::column: index " + std::to_string(index) +
+                            " is out of range (n_columns=" + std::to_string(current.num_columns()) +
+                            ")");
+  }
+  return current.column(static_cast<cudf::size_type>(index));
+}
+
+std::vector<cudf::data_type> owning_table_view::column_types() const
+{
+  auto current = view();
+  std::vector<cudf::data_type> types;
+  types.reserve(static_cast<std::size_t>(current.num_columns()));
+  for (cudf::size_type i = 0; i < current.num_columns(); ++i) {
+    types.push_back(current.column(i).type());
+  }
+  return types;
 }
 
 void owning_table_view::reorder_columns(
