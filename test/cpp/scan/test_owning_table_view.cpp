@@ -198,6 +198,44 @@ TEST_CASE("owning_table_view reorder then drop compose on current positions", "[
   REQUIRE(read_tags(handle.view()) == std::vector<std::int32_t>{40, 10});
 }
 
+TEST_CASE("owning_table_view select_columns projects and reorders (no copy)", "[owning_table_view]")
+{
+  auto table         = tagged_table({10, 20, 30, 40});
+  auto original_ptrs = data_ptrs(table->view());
+
+  owning_table_view handle{std::move(table)};
+
+  // Project down to columns 3 and 0, in that order.
+  std::array<std::size_t, 2> keep{3, 0};
+  handle.select_columns(keep);
+  REQUIRE(handle.n_columns() == 2);
+  REQUIRE(read_tags(handle.view()) == std::vector<std::int32_t>{40, 10});
+
+  // select_columns composes on current positions: now keep only position 1 (10).
+  std::array<std::size_t, 1> keep2{1};
+  handle.select_columns(keep2);
+  REQUIRE(read_tags(handle.view()) == std::vector<std::int32_t>{10});
+
+  // Zero-alloc: the surviving buffer is the original column 10 buffer.
+  auto result = handle.release(test_stream(), test_mr());
+  REQUIRE(data_ptrs(result->view())[0] == original_ptrs[0]);
+}
+
+TEST_CASE("owning_table_view select_columns rejects bad positions", "[owning_table_view]")
+{
+  owning_table_view handle{tagged_table({10, 20, 30})};
+
+  std::array<std::size_t, 2> out_of_range{0, 3};
+  REQUIRE_THROWS_AS(handle.select_columns(out_of_range), std::out_of_range);
+
+  std::array<std::size_t, 2> duplicate{1, 1};
+  REQUIRE_THROWS_AS(handle.select_columns(duplicate), std::invalid_argument);
+
+  // Unchanged after rejected operations.
+  REQUIRE(handle.n_columns() == 3);
+  REQUIRE(read_tags(handle.view()) == std::vector<std::int32_t>{10, 20, 30});
+}
+
 TEST_CASE("owning_table_view rejects out-of-range positions", "[owning_table_view]")
 {
   owning_table_view handle{tagged_table({10, 20, 30})};

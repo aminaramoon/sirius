@@ -100,6 +100,13 @@ void owning_table_view::drop_columns(std::span<const std::size_t> positions) con
   std::get<std::unique_ptr<detail::my_view>>(_state)->drop_columns(positions);
 }
 
+void owning_table_view::select_columns(std::span<const std::size_t> positions) const
+{
+  if (std::holds_alternative<std::monostate>(_state)) { return; }
+  ensure_view();
+  std::get<std::unique_ptr<detail::my_view>>(_state)->select_columns(positions);
+}
+
 void owning_table_view::materialize(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
 {
   if (auto* view = std::get_if<std::unique_ptr<detail::my_view>>(&_state)) {

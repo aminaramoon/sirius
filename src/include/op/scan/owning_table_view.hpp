@@ -120,6 +120,27 @@ class my_view {
     }
   }
 
+  /// Replace the current view with exactly the columns at @p positions, in the
+  /// given order (projection + reorder in one). Pure index manipulation;
+  /// allocates nothing. Throws @c std::out_of_range if any position is outside
+  /// the current view, or @c std::invalid_argument on a duplicate position
+  /// (the no-alloc materialization moves each column out at most once).
+  void select_columns(std::span<const std::size_t> positions)
+  {
+    std::vector<cudf::size_type> next;
+    next.reserve(positions.size());
+    for (std::size_t p : positions) {
+      check_position(p);
+      next.push_back(_selection[p]);
+    }
+    std::vector<cudf::size_type> sorted(next);
+    std::sort(sorted.begin(), sorted.end());
+    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+      throw std::invalid_argument("owning_table_view: duplicate column position in select_columns");
+    }
+    _selection = std::move(next);
+  }
+
   /// Realize the currently-exposed columns into an owned @c cudf::table. Moves
   /// buffers out of the owner when it is @ref no_alloc_materializable, otherwise
   /// copies the selected view (allocating).
@@ -276,6 +297,11 @@ class owning_table_view {
   /// Drop columns at the given current positions. Never allocates; demotes an
   /// owned table to a view first if necessary.
   void drop_columns(std::span<const std::size_t> positions) const;
+
+  /// Keep exactly the columns at the given current positions, in the given
+  /// order (projection + reorder). Never allocates; demotes an owned table to a
+  /// view first if necessary. Throws on out-of-range or duplicate positions.
+  void select_columns(std::span<const std::size_t> positions) const;
 
   /// Realize a view state into an owned table. No-op if already materialized or
   /// empty. May allocate (copying path) depending on the underlying owner.
