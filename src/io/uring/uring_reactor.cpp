@@ -69,8 +69,10 @@ struct io_slot {
   };
 
   using slot_token = slot_pool::token;
-  explicit io_slot(int slot_index, uint8_t* internal_buffer)
-    : slot_index(slot_index), internal_buffer(internal_buffer)
+  explicit io_slot(int slot_index, uint8_t* internal_buffer, bool support_fixed_buffers = true)
+    : slot_index(slot_index),
+      internal_buffer(internal_buffer),
+      support_fixed_buffers(support_fixed_buffers)
   {
     assert(internal_buffer && "io_slot: internal_buffer must not be null");
   }
@@ -91,23 +93,42 @@ struct io_slot {
                           static_cast<unsigned>(resume_iov.size()),
                           static_cast<__u64>(req->chunk.offset + bytes_read));
     } else {
-      auto segment = req->get_remaining_chunk(bytes_read);
-      if (use_internal_buffer) {
-        io_uring_prep_read_fixed(sqe,
-                                 req->fd,
-                                 segment.data(),
-                                 static_cast<unsigned>(segment.size),
-                                 static_cast<__u64>(segment.offset),
-                                 slot_index);
-      } else {
-        io_uring_prep_read(sqe,
-                           req->fd,
-                           segment.data(),
-                           static_cast<unsigned>(segment.size),
-                           static_cast<__u64>(segment.offset));
-      }
+      register_bounce_buffer(sqe);
     }
     io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(slot_index));
+  }
+
+  /// Prepare the non-vectored read for this slot's remaining range, choosing the
+  /// fixed-buffer (pre-registered) path when it is available.  Fixed buffers are
+  /// only the reactor's internal bounce slots — caller-owned buffers are never
+  /// registered — so prep_read_fixed is used only when the read stages through
+  /// the internal buffer @e and fixed-buffer support has not been disabled.  All
+  /// other reads take the plain prep_read path.
+  ///
+  /// io_uring_prep_read_fixed cannot fail synchronously; a fixed read that the
+  /// kernel rejects surfaces as a CQE error, at which point the reap loop clears
+  /// @c support_fixed_buffers on this slot and resubmits — this method then
+  /// re-preps it as a plain read.  @c used_fixed_buffer records which path was
+  /// taken so the reap loop can tell a fixed-read failure apart.
+  void register_bounce_buffer(io_uring_sqe* sqe)
+  {
+    auto segment = req->get_remaining_chunk(bytes_read);
+    if (use_internal_buffer && support_fixed_buffers) {
+      io_uring_prep_read_fixed(sqe,
+                               req->fd,
+                               segment.data(),
+                               static_cast<unsigned>(segment.size),
+                               static_cast<__u64>(segment.offset),
+                               slot_index);
+      used_fixed_buffer = true;
+    } else {
+      io_uring_prep_read(sqe,
+                         req->fd,
+                         segment.data(),
+                         static_cast<unsigned>(segment.size),
+                         static_cast<__u64>(segment.offset));
+      used_fixed_buffer = false;
+    }
   }
 
   void on_request(chunk_io_request_type_ptr r,
@@ -163,6 +184,14 @@ struct io_slot {
   uint8_t* const internal_buffer;
   std::unique_ptr<chunked_rx_request> req;
   bool use_internal_buffer{false};
+  // Whether this slot may submit reads against pre-registered (fixed) buffers.
+  // Set at construction from the ring's buffer-registration result; cleared by
+  // the reap loop if a fixed read fails so the slot falls back to plain reads.
+  bool support_fixed_buffers{true};
+  // Records whether the in-flight read used the fixed-buffer path, so the reap
+  // loop can distinguish a fixed-read failure (which triggers fallback) from an
+  // ordinary I/O error.
+  bool used_fixed_buffer{false};
   size_t bytes_read{0};
   cucascade::cuda::cuda_event* event;
   slot_token pool_token;
