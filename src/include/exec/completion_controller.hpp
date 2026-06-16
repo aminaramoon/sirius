@@ -21,7 +21,7 @@
 #include <mutex>
 #include <stop_token>
 
-namespace sirius::io {
+namespace sirius::exec {
 
 // ---------------------------------------------------------------------------
 // completion_controller — unbounded slot tracking with one-shot completion
@@ -82,7 +82,7 @@ class completion_controller {
   };
 
   completion_controller() = default;
-  /// Backstop: requests stop so the completion token never leaks un-stopped.
+
   ~completion_controller();
 
   completion_controller(completion_controller const&)            = delete;
@@ -122,4 +122,4 @@ class completion_controller {
   std::stop_source _completion;
 };
 
-}  // namespace sirius::io
+}  // namespace sirius::exec

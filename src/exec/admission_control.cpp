@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include "io/details/admission_control.hpp"
+#include <exec/admission_control.hpp>
 
-namespace sirius::io {
+namespace sirius::exec {
 
 admission_control::admission_control(size_t budget) noexcept : _budget(budget) {}
 
@@ -89,4 +89,4 @@ admission_control::slot& admission_control::slot::operator=(slot&& o) noexcept
   return *this;
 }
 
-}  // namespace sirius::io
+}  // namespace sirius::exec

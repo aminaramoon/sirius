@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include "io/details/completion_controller.hpp"
+#include <exec/completion_controller.hpp>
 
-namespace sirius::io {
+namespace sirius::exec {
 
 completion_controller::~completion_controller()
 {
@@ -95,4 +95,4 @@ completion_controller::slot& completion_controller::slot::operator=(slot&& o) no
   return *this;
 }
 
-}  // namespace sirius::io
+}  // namespace sirius::exec

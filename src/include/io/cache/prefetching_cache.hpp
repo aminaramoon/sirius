@@ -17,11 +17,11 @@
 #pragma once
 
 #include "blockingconcurrentqueue.h"
+#include "exec/admission_control.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/types.hpp"
-#include "io/details/admission_control.hpp"
 #include "planner/query.hpp"
 
 #include <concurrentqueue.h>
@@ -227,7 +227,7 @@ class prefetching_cache {
   std::stop_source _preparation_stop_source;
 
   std::jthread _prefetch_thread;
-  io::admission_control _rate_limiter;
+  exec::admission_control _rate_limiter;
   request_queue_type _prefetch_queue;
   std::stop_source _prefetch_stop_source;
 

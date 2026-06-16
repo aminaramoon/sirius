@@ -21,7 +21,7 @@
 #include <mutex>
 #include <stop_token>
 
-namespace sirius::io {
+namespace sirius::exec {
 
 // ---------------------------------------------------------------------------
 // admission_control — blocking budget-based backpressure
@@ -98,4 +98,4 @@ class admission_control {
   std::condition_variable_any _cv;
 };
 
-}  // namespace sirius::io
+}  // namespace sirius::exec
