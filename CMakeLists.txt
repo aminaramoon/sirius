@@ -228,6 +228,7 @@ set(EXTENSION_SOURCES
     # src/op/scan/iceberg_metadata_reader.cpp
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/puffin_reader.cpp
+    src/op/scan/owning_table_view.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp

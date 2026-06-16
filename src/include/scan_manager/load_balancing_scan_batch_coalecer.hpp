@@ -17,7 +17,8 @@
 #pragma once
 
 #include "blockingconcurrentqueue.h"
-#include "io/sirius_datasource.hpp"
+#include "cucascade/data/data_batch.hpp"
+#include "exec/try.hpp"
 #include "op/scan/batch_coalecer.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -81,11 +82,15 @@ class load_balancing_scan_batch_coalecer {
         balancer(std::move(balancer)),
         filter_and_projection_info(std::move(post_info))
     {
+      assert(this->coalecer);
+      assert(this->connector);
+      assert(this->balancer);
     }
 
     std::size_t op_id{0};
     std::size_t pipeline_id{0};
-    duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<op::scan::scan_info>> queue;
+    using provider_value_t = exec::try_t<std::unique_ptr<op::scan::scan_info>>;
+    duckdb_moodycamel::BlockingConcurrentQueue<provider_value_t> queue;
     std::shared_ptr<op::scan::batch_coalecer> coalecer;
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
@@ -100,8 +105,12 @@ class load_balancing_scan_batch_coalecer {
   /// sequencer task in the order they were added — typically scan_manager
   /// adds them in pipeline-id order so the head-of-line pipeline drains
   /// first.  The returned pointer is valid for the manager's lifetime.
-  metadata_processing_state* register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
-                                               std::shared_ptr<balancing_strategy> balancer);
+  void register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
+                         std::shared_ptr<balancing_strategy> balancer);
+
+  void use_cached_entries_for_pipeline(
+    op::scan::sirius_gpu_scan_operator* scan_op,
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& cached_batches);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when

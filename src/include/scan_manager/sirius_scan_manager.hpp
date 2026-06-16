@@ -260,8 +260,8 @@ class sirius_scan_manager {
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
-  void try_attach_cache_to_provider(op::scan::sirius_gpu_scan_operator* op,
-                                    split_provider& provider);
+  std::vector<std::shared_ptr<pinned_entry>> try_get_cached_entries(
+    op::scan::sirius_gpu_scan_operator* op);
 
   scan_manager_config _config;
   exec::static_thread_pool _thread_pool;

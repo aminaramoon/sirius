@@ -17,8 +17,11 @@
 #pragma once
 
 #include "cucascade/data/data_batch.hpp"
+#include "exec/completion_controller.hpp"
+#include "exec/try.hpp"
 #include "io/io_context.hpp"
 #include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan_manager/split_connector.hpp"
 
@@ -63,6 +66,8 @@ namespace sirius::scan_manager {
  */
 class split_provider {
  public:
+  using value_type = exec::try_t<std::unique_ptr<op::scan::scan_info>>;
+
   /// Concrete construction path — borrows the given ingestible non-owningly.
   /// The ingestible must outlive the provider; in practice the operator owns
   /// the ingestible (single shared_ptr) and the provider is created after
@@ -93,9 +98,7 @@ class split_provider {
    *                   @c scoped_dispatcher both satisfy this shape.
    */
   template <typename Scheduler>
-  void run(Scheduler& scheduler,
-           const std::function<void(std::unique_ptr<op::scan::scan_info>)>& on_split,
-           const std::function<void(std::exception_ptr)>& on_error);
+  void run(Scheduler& scheduler, const std::function<void(value_type&&)>& on_split);
 
   /**
    * @brief Snapshot check for remaining work. Thread-safe.
@@ -140,26 +143,27 @@ class split_provider {
 
   /// Pipeline this provider's scan belongs to, forwarded to the strategy.
   std::size_t _pipeline_id{0};
+
+  exec::completion_controller _completion_controller;
 };
 
 template <typename Scheduler>
-void split_provider::run(Scheduler& scheduler,
-                         const std::function<void(std::unique_ptr<op::scan::scan_info>)>& on_split,
-                         const std::function<void(std::exception_ptr)>& on_error)
+void split_provider::run(Scheduler& scheduler, const std::function<void(value_type&&)>& on_split)
 {
   assert(on_split);
   assert(on_error);
   while (has_more_splits()) {
     auto work = next_split_provider();
     if (!work) { continue; }
-    scheduler.enqueue([this, on_split, on_error, work = std::move(work)]() mutable {
-      try {
-        auto split = work();
-        on_split(std::move(split));
-      } catch (...) {
-        on_error(std::current_exception());
-      }
-    });
+    scheduler.enqueue(
+      [this, on_split, work = std::move(work), token = _completion_controller.acquire()]() mutable {
+        try {
+          auto split = work();
+          on_split(std::move(split));
+        } catch (...) {
+          on_split(std::current_exception());
+        }
+      });
   }
 }
 

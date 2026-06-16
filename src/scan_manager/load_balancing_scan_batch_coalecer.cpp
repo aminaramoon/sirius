@@ -19,14 +19,14 @@
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 
 #include <stop_token>
+#include <utility>
 
 namespace sirius::scan_manager {
 
-load_balancing_scan_batch_coalecer::metadata_processing_state*
-load_balancing_scan_batch_coalecer::register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
-                                                      std::shared_ptr<balancing_strategy> balancer)
+void load_balancing_scan_batch_coalecer::register_pipeline(
+  op::scan::sirius_gpu_scan_operator* scan_op, std::shared_ptr<balancing_strategy> balancer)
 {
-  if (!scan_op) return nullptr;
+  if (!scan_op) return;
 
   auto connector   = scan_op->get_split_connector().shared_from_this();
   auto ingestible  = scan_op->get_ingestible().shared_from_this();
@@ -41,9 +41,18 @@ load_balancing_scan_batch_coalecer::register_pipeline(op::scan::sirius_gpu_scan_
     std::move(balancer),
     ingestible->create_post_filter_and_projection_info());
   _pipeline_order.push_back(uid);
-  auto state_ptr = state.get();
-  _slots[uid]    = std::move(state);
-  return state_ptr;
+  _slots[uid] = std::move(state);
+}
+
+void load_balancing_scan_batch_coalecer::use_cached_entries_for_pipeline(
+  op::scan::sirius_gpu_scan_operator* scan_op,
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& cached_batches)
+{
+  if (!scan_op) return;
+  auto uid = scan_op->get_operator_id();
+  auto it  = _slots.find(uid);
+  if (it == _slots.end()) { return; }
+  auto& state = *it->second;
 }
 
 void load_balancing_scan_batch_coalecer::worker_loop([[maybe_unused]] std::stop_token const& stop)
@@ -59,18 +68,21 @@ void load_balancing_scan_batch_coalecer::process_entry(metadata_processing_state
                                                        std::stop_token const& stop)
 {
   std::stop_callback stop_cb(stop, [&state] { state.queue.enqueue(nullptr); });
-
   auto& batch_queue = state.queue;
   bool is_closed    = false;
   while (!is_closed && !stop.stop_requested()) {
-    std::unique_ptr<op::scan::scan_info> entry;
+    metadata_processing_state::provider_value_t entry;
     batch_queue.wait_dequeue(entry);
-    is_closed    = entry == nullptr;
+    if (entry.has_exception()) {
+      state.connector->close(entry.exception());
+      break;
+    }
+    is_closed    = entry.is_empty();
     auto batches = [&]() {
       if (is_closed) {
         return state.coalecer->flush();
       } else {
-        return state.coalecer->push(std::move(entry));
+        return state.coalecer->push(std::move(entry).value());
       }
     }();
     for (auto& batch : batches) {

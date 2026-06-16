@@ -43,6 +43,17 @@ class ingestible_table_info {
   ingestible_table_info(ingestible_table_info const&)            = delete;
   ingestible_table_info& operator=(ingestible_table_info const&) = delete;
 
+  [[nodiscard]] virtual bool is_subset_of(const ingestible_table_info& other) const
+  {
+    return false;
+  }
+
+  [[nodiscard]] virtual std::vector<size_t> column_projections(
+    const ingestible_table_info& other) const
+  {
+    return {};
+  }
+
   /**
    * @brief Resolved file paths captured at bind time.
    *
