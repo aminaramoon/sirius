@@ -189,6 +189,7 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_reference.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/admission_control.cpp
+    src/io/completion_controller.cpp
     src/io/datasource_factory.cpp
     src/io/duckdb_io_object.cpp
     src/io/io_context.cpp

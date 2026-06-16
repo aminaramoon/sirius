@@ -66,6 +66,8 @@ class sirius_datasource : public cudf::io::datasource {
   /// the prefetching machinery.
   [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> metadata() const;
 
+  [[nodiscard]] bool store_metadata(std::shared_ptr<sirius_io_object_metadata> metadata);
+
   // ---- cudf::io::datasource overrides ---------------------------------------
 
   [[nodiscard]] size_t size() const override;

@@ -75,6 +75,15 @@ std::shared_ptr<sirius_io_object_metadata> sirius_datasource::metadata() const
   return cache.get_metadata(*_io_object);
 }
 
+[[nodiscard]] bool sirius_datasource::store_metadata(
+  std::shared_ptr<sirius_io_object_metadata> metadata)
+{
+  if (!_io_ctx || !_io_object) { return false; }
+  auto& cache = _io_ctx->metadata_store();
+  cache.register_metadata(*_io_object, std::move(metadata));
+  return true;
+}
+
 size_t sirius_datasource::size() const { return _io_object->size(); }
 
 bool sirius_datasource::supports_device_read() const { return _io_ctx->supports_device_read(); }
