@@ -546,6 +546,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_decode_rle.cpp
     test/cpp/scan/test_gpu_decode_strings.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
+    test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     # test/cpp/scan/test_parquet_gpu_ingestible.cpp  # stale against new io interface
     # test/cpp/scan/test_split_connector.cpp  # stale against refactored split_provider/split_connector API
