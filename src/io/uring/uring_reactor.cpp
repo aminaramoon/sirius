@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -57,6 +58,16 @@ namespace {
 [[nodiscard]] constexpr bool is_block_aligned(size_t v) noexcept
 {
   return (v & (static_cast<size_t>(IO_BLOCK_SIZE) - 1)) == 0;
+}
+
+/// True iff @p errc (a positive errno) means the kernel could not serve a
+/// fixed-buffer (IORING_OP_READ_FIXED) read because the registered-buffer table
+/// is missing or incompatible — so the slot should retry as a plain read.
+/// Other errno values are genuine I/O failures and must be reported, not masked
+/// by a silent fallback.
+[[nodiscard]] constexpr bool is_fixed_buffer_error(int errc) noexcept
+{
+  return errc == EOPNOTSUPP || errc == EINVAL || errc == EFAULT || errc == ENOBUFS;
 }
 
 struct io_slot {
@@ -395,12 +406,17 @@ struct unique_ring {
 
   [[nodiscard]] io_uring* native_handle() const noexcept { return ring.get(); }
 
-  void register_buffers(std::span<iovec> iovecs)
+  /// Register @p iovecs as fixed buffers for the ring.  Returns true on success;
+  /// on failure returns false (rather than throwing) so the reactor can fall
+  /// back to plain, unregistered reads instead of aborting startup.
+  [[nodiscard]] bool register_buffers(std::span<iovec> iovecs)
   {
     if (int rc = io_uring_register_buffers(ring.get(), iovecs.data(), iovecs.size()); rc < 0) {
-      throw std::runtime_error("uring_reactor: io_uring_register_buffers: " +
-                               std::string(strerror(-rc)));
+      spdlog::warn("uring_reactor: io_uring_register_buffers failed ({}); fixed buffers disabled",
+                   strerror(-rc));
+      return false;
     }
+    return true;
   }
 
   [[nodiscard]] int wait_for(std::chrono::milliseconds timeout) const
@@ -820,12 +836,18 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
       return iovec{.iov_base = b, .iov_len = len};
     });
 
+  // Register the bounce buffers up front so slots know whether the fixed-buffer
+  // read path is available.  If registration fails the reactor still works —
+  // every slot just falls back to plain (unregistered) reads.
+  bool const support_fixed_buffers = ring.register_buffers(iovecs);
+
   slot_pool slot_pool{NUM_CHUNKS};
   std::vector<io_slot> slots;
   slots.reserve(NUM_CHUNKS);
-  std::ranges::transform(iovecs, std::back_inserter(slots), [i = 0](auto& b) mutable {
-    return io_slot(i++, reinterpret_cast<uint8_t*>(b.iov_base));
-  });
+  std::ranges::transform(
+    iovecs, std::back_inserter(slots), [i = 0, support_fixed_buffers](auto& b) mutable {
+      return io_slot(i++, reinterpret_cast<uint8_t*>(b.iov_base), support_fixed_buffers);
+    });
 
   std::array<io_uring_cqe*, NUM_CHUNKS> cqes;
   std::vector<int> incomplete_requests;
@@ -920,7 +942,22 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
       auto& s = slots[si];
 
       if (cqe_bytes < 0) {
-        s.on_error(std::error_code(-cqe_bytes, std::generic_category()));
+        int const errc = -cqe_bytes;
+        // A fixed-buffer read the kernel can't serve (registered-buffer table
+        // missing/incompatible): disable the fixed path on this slot and
+        // resubmit — register_bound_buffer re-preps it as a plain read.  No
+        // bytes landed, so the resubmit reads the whole range from scratch.
+        if (s.used_fixed_buffer && is_fixed_buffer_error(errc)) {
+          spdlog::warn(
+            "uring_reactor: fixed-buffer read failed on slot {} ({}); "
+            "falling back to plain read",
+            si,
+            strerror(errc));
+          s.support_fixed_buffers = false;
+          incomplete_requests.push_back(si);
+          continue;
+        }
+        s.on_error(std::error_code(errc, std::generic_category()));
         continue;
       }
 
@@ -1002,8 +1039,6 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
       }
     }
   };
-
-  ring.register_buffers(iovecs);
 
   // The main loop: drain the request queue and submit new SQEs, wait for completions and reap
   {
