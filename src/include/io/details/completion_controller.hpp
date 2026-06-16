@@ -18,33 +18,44 @@
 
 #include <condition_variable>
 #include <cstddef>
-#include <functional>
 #include <mutex>
+#include <stop_token>
 
 namespace sirius::io {
 
 // ---------------------------------------------------------------------------
-// completion_controller — unbounded slot tracking with completion callback
+// completion_controller — unbounded slot tracking with one-shot completion
 // ---------------------------------------------------------------------------
 //
 // Like admission_control, hands out RAII `slot`s and releases them on slot
 // destruction — but the number of outstanding slots is unbounded, so
 // acquire() never blocks.  Its purpose is to track in-flight work so callers
-// can either:
-//   - block in wait_for_idle() until every slot has been released, or
-//   - register an on_completion callback that fires when the count of
-//     outstanding slots drops to zero.
+// can detect when every issued slot has been released ("drained").
 //
-// The on_completion callback is invoked each time the outstanding-slot count
-// transitions to zero while a callback is set.  If a callback is installed
-// when no slots are outstanding, it fires immediately.  Callbacks are always
-// invoked without holding the internal mutex, so it is safe for them to
-// acquire new slots or call back into this controller.
+// Completion is modelled as a std::stop_source: the first time the
+// outstanding-slot count transitions to zero, request_stop() is called on the
+// internal stop_source.  Subscribers observe completion by attaching their own
+// std::stop_callback to completion_token():
+//
+//     std::stop_callback cb{controller.completion_token(),
+//                           [] { /* all work drained */ }};
+//
+// std::stop_callback handles the registration race for free: if the token is
+// already stopped when the callback is constructed, it fires immediately on
+// the constructing thread.  request_stop() is always invoked WITHOUT holding
+// the internal mutex, so callbacks may safely re-enter this controller.
+//
+// Completion is ONE-SHOT: once drained, the stop_token stays stopped.
+// Acquiring further slots after that point is harmless (request_stop() is
+// idempotent) but will not re-fire the callbacks.
+//
+// Spurious-completion guard: if a producer issues slots in a loop, the count
+// can briefly hit zero between the first release and the next acquire, firing
+// completion early.  The producer should hold a "primer" slot for the duration
+// of production and release it only after all work has been enqueued.
 
 class completion_controller {
  public:
-  using completion_fn = std::function<void()>;
-
   class slot {
    public:
     slot() = default;
@@ -78,11 +89,16 @@ class completion_controller {
   /// Block until every slot handed out by @c acquire has been destroyed.
   void wait_for_idle();
 
-  /// Install (or replace) the callback invoked when the outstanding-slot
-  /// count reaches zero.  If no slots are currently outstanding, the callback
-  /// fires immediately on the calling thread.  Pass an empty function to
-  /// clear the callback.
-  void on_completion(completion_fn fn);
+  /// Token that becomes stopped the first time all outstanding slots drain.
+  /// Attach a std::stop_callback to it to be notified of completion.
+  [[nodiscard]] std::stop_token completion_token() const noexcept
+  {
+    return _completion.get_token();
+  }
+
+  /// True once completion has been signalled (all slots have drained at least
+  /// once).
+  [[nodiscard]] bool completed() const noexcept { return _completion.stop_requested(); }
 
   /// Number of slots currently outstanding.
   [[nodiscard]] size_t active() const noexcept;
@@ -91,9 +107,9 @@ class completion_controller {
   void release() noexcept;
 
   size_t _active_slots{0};
-  completion_fn _on_completion;
   mutable std::mutex _mtx;
   std::condition_variable _cv;
+  std::stop_source _completion;
 };
 
 }  // namespace sirius::io
