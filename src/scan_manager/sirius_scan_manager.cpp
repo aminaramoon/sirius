@@ -21,6 +21,7 @@
 #include "io/kvikio/kvikio_context.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
+#include "memory/topology_index.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/query.hpp"
@@ -73,8 +74,10 @@ std::string normalize_path(std::string const& p)
 
 sirius_scan_manager::sirius_scan_manager(
   const scan_manager_config& config,
-  cucascade::memory::memory_reservation_manager& reservation_manager)
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _config(config),
+    _topology_index(std::move(topology_index)),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
@@ -82,9 +85,9 @@ sirius_scan_manager::sirius_scan_manager(
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads)),
     _ioctx_registry(config)
 {
-  auto dev_spacs = reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-  std::ranges::transform(
-    dev_spacs, std::back_inserter(_device_ids), [](auto* sp) { return sp->get_device_id(); });
+  if (!_topology_index) {
+    throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
+  }
 
   auto host_spaces = reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
   std::vector<cucascade::memory::fixed_size_host_memory_resource*> host_mrs;
@@ -109,12 +112,12 @@ sirius_scan_manager::sirius_scan_manager(
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
                      _config.uring_n_reactors);
   } else {
-    if (_device_ids.size() > 1) {
+    if (_topology_index->gpu_ids().size() > 1) {
       throw std::runtime_error(
         "[sirius_scan_manager] kvikio_context fallback (use_sirius_datasource=false) "
-        "does not support multi-GPU; reservation_manager reports " +
-        std::to_string(_device_ids.size()) +
-        " GPU memory spaces.  Enable use_sirius_datasource for multi-GPU runs.");
+        "does not support multi-GPU; topology reports " +
+        std::to_string(_topology_index->gpu_ids().size()) +
+        " GPUs.  Enable use_sirius_datasource for multi-GPU runs.");
     }
     _io_ctx = std::make_shared<sirius::io::kvikio_context>();
     SIRIUS_LOG_DEBUG(
@@ -134,7 +137,8 @@ sirius_scan_manager::sirius_scan_manager(
       static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
     _buffer_pool = std::make_unique<sirius::io::cache::buffer_pool>(
       host_mrs, max_slabs, /*initial_slabs=*/max_slabs);
-    _io_ctx->initialize_cache(_buffer_pool.get(), _config.prefetch_inflight_budget_chunks);
+    _io_ctx->initialize_cache(
+      _buffer_pool.get(), _config.prefetch_inflight_budget_chunks, _topology_index);
   }
 
   if (_io_ctx->cache() && _io_ctx->cache()->is_armed()) {
@@ -240,7 +244,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     _io_ctx->cache()->prepare_for_query(query);
   }
 
-  auto round_robin = std::make_shared<round_robin_strategy>(_device_ids);
+  auto const gpu_ids = _topology_index->gpu_ids();
+  auto round_robin =
+    std::make_shared<round_robin_strategy>(std::vector<int>(gpu_ids.begin(), gpu_ids.end()));
 
   // Advance the cache age so the evictor can score this query's inserts
   // against entries left over from prior queries.
@@ -265,8 +271,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
     auto provider = std::make_unique<split_provider>(op->get_ingestible(), *_io_ctx);
     _metadata_processor->register_pipeline(op, round_robin);
-    auto entires = try_get_cached_entries(op);
-    if (!entires.empty()) { _metadata_processor->use_cached_entries_for_pipeline(op, {}); }
+    auto entries = try_get_cached_entries(op);
+    if (!entries.empty()) { _metadata_processor->use_cached_entries_for_pipeline(op, {}); }
     _providers_by_op.emplace(op, std::move(provider));
     _scan_op_order.push_back(op);
   }

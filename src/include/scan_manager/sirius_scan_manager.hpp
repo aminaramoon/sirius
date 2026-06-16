@@ -50,6 +50,10 @@ namespace cucascade::memory {
 class memory_reservation_manager;
 }  // namespace cucascade::memory
 
+namespace sirius::memory {
+class topology_index;
+}  // namespace sirius::memory
+
 namespace sirius::io {
 class sirius_ioctx;
 namespace cache {
@@ -146,9 +150,12 @@ class sirius_scan_manager {
    *
    * @param config Scan-manager configuration (thread pool + sirius_datasource toggle).
    * @param reservation_manager Memory reservation manager for GPU memory.
+   * @param topology_index Hardware GPU/NUMA topology index.  Drives round-robin
+   *        GPU assignment for scans and is forwarded to the prefetching cache.
    */
-  explicit sirius_scan_manager(const scan_manager_config& config,
-                               cucascade::memory::memory_reservation_manager& reservation_manager);
+  sirius_scan_manager(const scan_manager_config& config,
+                      cucascade::memory::memory_reservation_manager& reservation_manager,
+                      std::shared_ptr<const sirius::memory::topology_index> topology_index);
 
   ~sirius_scan_manager();
 
@@ -264,6 +271,9 @@ class sirius_scan_manager {
     op::scan::sirius_gpu_scan_operator* op);
 
   scan_manager_config _config;
+  /// Hardware GPU/NUMA topology, shared with the prefetching cache.  Source of
+  /// the GPU id set fed to the round-robin scan-balancing strategy.
+  std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
@@ -287,8 +297,6 @@ class sirius_scan_manager {
   /// sequencer down without an extra side-channel.
   std::unique_ptr<load_balancing_scan_batch_coalecer> _metadata_processor;
   io::io_context_registry _ioctx_registry;
-
-  std::vector<int> _device_ids;
 };
 
 }  // namespace sirius::scan_manager

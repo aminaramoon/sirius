@@ -31,14 +31,17 @@ namespace sirius::io {
 sirius_ioctx::sirius_ioctx()  = default;
 sirius_ioctx::~sirius_ioctx() = default;
 
-void sirius_ioctx::initialize_cache(cache::buffer_pool* pool,
-                                    size_t inflight_budget_chunks) noexcept
+void sirius_ioctx::initialize_cache(
+  cache::buffer_pool* pool,
+  size_t inflight_budget_chunks,
+  std::shared_ptr<const sirius::memory::topology_index> topology_index) noexcept
 {
   // One-shot.  Repeated calls are silent no-ops so callers can be
   // robust to multiple wiring sites.
   if (_cache) return;
   try {
-    _cache = std::make_unique<cache::prefetching_cache>(pool, this, inflight_budget_chunks);
+    _cache = std::make_unique<cache::prefetching_cache>(
+      pool, this, inflight_budget_chunks, std::move(topology_index));
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("prefetching_cache construction failed: {}", e.what());
     _cache.reset();

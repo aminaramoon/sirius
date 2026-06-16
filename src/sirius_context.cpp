@@ -26,6 +26,7 @@
 #include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "memory/topology_index.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 
@@ -525,8 +526,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // FSMR is available so the GPU-native scan path can read host data.
   if (host_fsmr != nullptr) { sm_config.use_sirius_datasource = true; }
   config_.set_scan_manager_config(std::move(sm_config));
+  auto hw_topology_index =
+    std::make_shared<const sirius::memory::topology_index>(config_.get_hw_topology());
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
-    config_.get_scan_manager_config(), *memory_manager_);
+    config_.get_scan_manager_config(), *memory_manager_, std::move(hw_topology_index));
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.

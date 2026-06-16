@@ -44,6 +44,10 @@ class sirius_ioctx;
 class sirius_datasource;
 }  // namespace sirius::io
 
+namespace sirius::memory {
+class topology_index;
+}  // namespace sirius::memory
+
 namespace sirius::io::cache {
 
 enum class prefetching_handle_state { idle, active, cancelled };
@@ -134,6 +138,7 @@ class prefetching_cache {
   prefetching_cache(buffer_pool* pool,
                     sirius_ioctx* io_ctx,
                     size_t inflight_budget_chunks,
+                    std::shared_ptr<const sirius::memory::topology_index> topology_index,
                     bool dispose_after_use = false);
   ~prefetching_cache();
 
@@ -194,6 +199,10 @@ class prefetching_cache {
   buffer_pool* const _pool;
 
   sirius_ioctx* const _io_ctx;
+
+  // Hardware GPU/NUMA topology index, shared from the scan_manager.  Used to
+  // place prefetch staging buffers on the NUMA node closest to the target GPU.
+  std::shared_ptr<const sirius::memory::topology_index> const _topology_index;
 
   bool const _armed;
 

@@ -342,12 +342,15 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::fetch_chunks(std::size
   return result;
 }
 
-prefetching_cache::prefetching_cache(buffer_pool* pool,
-                                     sirius_ioctx* io_ctx,
-                                     size_t inflight_budget_chunks,
-                                     bool dispose_after_use)
+prefetching_cache::prefetching_cache(
+  buffer_pool* pool,
+  sirius_ioctx* io_ctx,
+  size_t inflight_budget_chunks,
+  std::shared_ptr<const sirius::memory::topology_index> topology_index,
+  bool dispose_after_use)
   : _pool(pool),
     _io_ctx(io_ctx),
+    _topology_index(std::move(topology_index)),
     _armed(true),
     _rate_limiter(inflight_budget_chunks),
     _dispose_after_use(dispose_after_use)
