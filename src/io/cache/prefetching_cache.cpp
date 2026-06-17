@@ -49,6 +49,46 @@
 
 namespace sirius::io::cache {
 
+namespace {
+
+using chunk_iter = std::vector<std::unique_ptr<cached_chunk>>::iterator;
+
+// Locates the first chunk with offset >= `off` within [first, last) using a
+// galloping (exponential) search seeded at `first`.
+//
+// The incoming offsets are sorted and clustered — successive queries are
+// usually exactly one chunk apart — so we probe `first`, then `first+1`,
+// `first+2`, `first+4`, ... until we overshoot, then binary-search the bounded
+// window.  This collapses the common neighboring case to O(1) and keeps gaps at
+// O(log gap) rather than O(log N) over the whole (20-40K-element) vector that a
+// plain lower_bound(first, last, ...) would incur on every single offset.
+chunk_iter gallop_lower_bound(chunk_iter first, chunk_iter last, size_t off)
+{
+  auto cmp = [](const std::unique_ptr<cached_chunk>& c, size_t v) { return c->offset < v; };
+
+  if (first == last || (*first)->offset >= off) { return first; }
+
+  auto probe  = first;  // invariant: (*probe)->offset < off
+  size_t step = 1;
+  while (true) {
+    const auto remaining = static_cast<size_t>(last - probe);
+    if (step >= remaining) {
+      // `off` lies in (probe, last): bounded binary search of the tail.
+      return std::lower_bound(probe + 1, last, off, cmp);
+    }
+    const auto hi = probe + static_cast<std::ptrdiff_t>(step);
+    if ((*hi)->offset < off) {
+      probe = hi;
+      step <<= 1U;
+    } else {
+      // `off` lies in (probe, hi]: binary search that bounded window.
+      return std::lower_bound(probe + 1, hi + 1, off, cmp);
+    }
+  }
+}
+
+}  // namespace
+
 class prefetching_handle::prefetch_lifecycle_manager {
  public:
   explicit prefetch_lifecycle_manager(
@@ -149,9 +189,7 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
 
     for (size_t i = 0; i < incoming.size(); ++i) {
       const size_t off = incoming[i];
-      s = std::lower_bound(s, s_end, off, [](const std::unique_ptr<cached_chunk>& c, size_t v) {
-        return c->offset < v;
-      });
+      s                = gallop_lower_bound(s, s_end, off);
 
       if (s != s_end && (*s)->offset == off) {
         s->get()->lifecycle.on_request(ticker);
@@ -180,9 +218,7 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
 
     for (size_t idx : missing_indices) {
       const size_t off = incoming[idx];
-      s = std::lower_bound(s, s_end, off, [](const std::unique_ptr<cached_chunk>& c, size_t v) {
-        return c->offset < v;
-      });
+      s                = gallop_lower_bound(s, s_end, off);
 
       if (s != s_end && (*s)->offset == off) {
         result[idx] = s->get();  // someone else inserted it
