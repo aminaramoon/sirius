@@ -22,6 +22,7 @@
 #include "io/cache/types.hpp"
 #include "io/io_context.hpp"
 #include "io/types.hpp"
+#include "memory/topology_index.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -132,122 +133,6 @@ prefetching_handle::prefetching_handle(std::unique_ptr<prefetch_lifecycle_manage
 
 prefetching_handle::operator bool() const noexcept { return _state != nullptr; }
 
-// ===========================================================================
-// buffer_pool
-// ===========================================================================
-
-buffer_pool::buffer_pool(std::vector<cucascade::memory::fixed_size_host_memory_resource*> mrs,
-                         uint32_t max_slabs,
-                         uint32_t initial_slabs)
-  : _mr(*mrs.front()), _chunk_bytes(_mr.get_block_size()), _max_slabs(max_slabs)
-{
-  std::unique_lock lk(_mtx);
-  auto const n = std::min(initial_slabs, _max_slabs);
-  for (uint32_t i = 0; i < n; ++i) {
-    if (!grow_locked()) break;
-  }
-}
-
-buffer_pool::~buffer_pool() = default;
-
-bool buffer_pool::grow_locked()
-{
-  if (_allocations.size() >= _max_slabs) return false;
-
-  auto const bytes = slab_bytes();
-  cucascade::memory::fixed_multiple_blocks_allocation alloc;
-  try {
-    alloc = _mr.allocate_multiple_blocks(bytes);
-  } catch (std::exception const& e) {
-    spdlog::warn("buffer_pool: allocate_multiple_blocks({:.0f}MB) failed: {}",
-                 static_cast<double>(bytes) / (1024.0 * 1024.0),
-                 e.what());
-    return false;
-  }
-  if (!alloc) return false;
-
-  auto blocks = alloc->get_blocks();
-  _free_list.reserve(_free_list.size() + blocks.size());
-  // cucascade hands back std::byte* blocks; the cache plumbs buffers as uint8_t*.
-  for (auto* p : blocks)
-    _free_list.push_back(reinterpret_cast<uint8_t*>(p));
-  auto const n = static_cast<uint32_t>(blocks.size());
-  _allocations.push_back(std::move(alloc));
-  _total_chunks.fetch_add(n, std::memory_order_relaxed);
-  _total_free.fetch_add(n, std::memory_order_relaxed);
-
-  spdlog::debug("buffer_pool: allocated slab {} ({} chunks, {:.0f}MB)",
-                _allocations.size(),
-                n,
-                static_cast<double>(bytes) / (1024.0 * 1024.0));
-  return true;
-}
-
-uint8_t* buffer_pool::allocate()
-{
-  std::unique_lock lk(_mtx);
-  if (_free_list.empty() && !grow_locked()) return nullptr;
-  uint8_t* p = _free_list.back();
-  _free_list.pop_back();
-  _total_free.fetch_sub(1, std::memory_order_relaxed);
-  return p;
-}
-
-size_t buffer_pool::allocate_bulk(size_t n, std::vector<uint8_t*>& out)
-{
-  if (n == 0) return 0;
-
-  std::unique_lock lk(_mtx);
-  size_t got = 0;
-  while (got < n) {
-    auto take = std::min(n - got, _free_list.size());
-    if (take > 0) {
-      out.insert(out.end(), _free_list.end() - static_cast<ptrdiff_t>(take), _free_list.end());
-      _free_list.resize(_free_list.size() - take);
-      got += take;
-    }
-    if (got == n) break;
-    if (!grow_locked()) break;
-  }
-  _total_free.fetch_sub(static_cast<uint32_t>(got), std::memory_order_relaxed);
-  return got;
-}
-
-void buffer_pool::deallocate_bulk(std::vector<uint8_t*>& out) noexcept
-{
-  if (out.empty()) return;
-  std::unique_lock lk(_mtx);
-  _free_list.insert(_free_list.end(), out.begin(), out.end());
-  _total_free.fetch_add(static_cast<uint32_t>(out.size()), std::memory_order_relaxed);
-  lk.unlock();
-  out.clear();
-}
-
-void buffer_pool::deallocate(uint8_t* p)
-{
-  std::unique_lock lk(_mtx);
-  _free_list.push_back(p);
-  _total_free.fetch_add(1, std::memory_order_relaxed);
-}
-
-void buffer_pool::reclaim_all()
-{
-  std::unique_lock lk(_mtx);
-  _free_list.clear();
-  // The slabs we already pulled from the upstream resource stay live; rebuild
-  // the free list from their per-block pointers.  No upstream traffic.
-  size_t total = 0;
-  for (auto const& alloc : _allocations) {
-    auto blocks = alloc->get_blocks();
-    _free_list.reserve(_free_list.size() + blocks.size());
-    for (auto* p : blocks)
-      _free_list.push_back(reinterpret_cast<uint8_t*>(p));
-    total += blocks.size();
-  }
-  _total_free.store(static_cast<uint32_t>(total), std::memory_order_relaxed);
-  _total_chunks.store(static_cast<uint32_t>(total), std::memory_order_relaxed);
-}
-
 std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
   std::span<size_t> incoming, uint32_t ticker)
 {
@@ -343,12 +228,13 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::fetch_chunks(std::size
 }
 
 prefetching_cache::prefetching_cache(
-  buffer_pool* pool,
+  cucascade::memory::memory_reservation_manager& reservation_manager,
   sirius_ioctx* io_ctx,
   size_t inflight_budget_chunks,
+  uint32_t buffer_pool_slabs,
   std::shared_ptr<const sirius::memory::topology_index> topology_index,
   bool dispose_after_use)
-  : _pool(pool),
+  : _pool(std::make_unique<buffer_pool>(reservation_manager, buffer_pool_slabs)),
     _io_ctx(io_ctx),
     _topology_index(std::move(topology_index)),
     _armed(true),
@@ -413,6 +299,9 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
 
   auto work    = std::make_shared<prefetch_request_context>(obj, _ticker.load());
   work->chunks = std::move(chunks_to_fetch);
+  // Resolve the preferred NUMA node for staging buffers from the target GPU's
+  // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
+  if (gpu_id && _topology_index) { work->preferred_numa = _topology_index->numa_node_of(*gpu_id); }
 
   prefetching_handle handle(std::make_unique<prefetching_handle::prefetch_lifecycle_manager>(
     work, _eviction_queue, _prefetch_queue));
@@ -745,21 +634,25 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
     std::size_t n_chunks_needed = std::ranges::count_if(
       chunks, [](cached_chunk* c) { return c->state.get_state() == entry_state::empty; });
 
-    std::vector<uint8_t*> buffers;
-    buffers.reserve(n_chunks_needed);
-    auto n_allocated = _pool->allocate_bulk(n_chunks_needed, buffers);
-    if (n_allocated != n_chunks_needed) {
-      // Pool is exhausted and cannot grow.  Return the buffers we did get and
+    // Allocate from the arena on the request's preferred NUMA node, falling
+    // back to any other arena (allocate_bulk wraps around).  numa_allocated is
+    // updated to the arena we actually drew from — the whole batch comes from a
+    // single arena, so all chunks share that NUMA node.
+    int numa_allocated = req->preferred_numa;
+    auto buffers       = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
+    if (buffers.size() != n_chunks_needed) {
+      // No single arena could satisfy the request.  Return whatever we got and
       // re-enqueue the work for a retry after the evictor frees some.
       // todo(amin): needs eviction and then backoff
-      if (n_allocated > 0) _pool->deallocate_bulk(buffers);
+      if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
       _preparation_queue.enqueue(std::move(req));
       continue;
     }
 
     for (size_t i = 0; i < n_chunks_needed; ++i) {
       if (chunks[i]->state.mark_queued()) {
-        chunks[i]->data = buffers[i];  // revert the swap if we lost the
+        chunks[i]->data      = reinterpret_cast<uint8_t*>(buffers[i]);
+        chunks[i]->numa_node = numa_allocated;
         if (!chunks[i]->state.mark_allocated()) {
           spdlog::error(
             "prefetching_cache: chunk at offset {} was marked queued but failed to mark "
@@ -840,7 +733,9 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
   };
 
   std::vector<eviction_request> eviction_batch;
-  std::vector<uint8_t*> reclaim_buffers;
+  // Reclaimed buffers grouped by their origin NUMA node so each group can be
+  // returned to the arena it came from.
+  std::unordered_map<int, std::vector<std::byte*>> reclaim_by_numa;
   while (!_shutting_down && !st.stop_requested()) {
     prefetch_request req = nullptr;
     _eviction_queue.wait_dequeue(req);
@@ -857,18 +752,22 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     }
 
     // When disposing after use we reclaim everything; otherwise we only evict
-    // under memory pressure and stop once enough chunks are free again.
-    bool const dispose      = _dispose_after_use;
-    uint32_t const total    = _pool->total_chunks();
-    uint32_t const free_now = _pool->free_count();
-    bool const should_evict = dispose || free_now < total / 4;  // evict below 25% free
+    // under memory pressure and stop once enough chunks are free again.  Memory
+    // pressure is scored as outstanding (handed-out) chunks against the pool's
+    // aggregate reserved capacity.
+    bool const dispose       = _dispose_after_use;
+    size_t const capacity    = _pool->capacity_chunks();
+    size_t const outstanding = _pool->total_chunks();
+    bool const should_evict =
+      dispose || (capacity > 0 && outstanding > (capacity * 3) / 4);  // <25% free
     if (!should_evict) { continue; }
 
-    // Number of additional free chunks we want before stopping (unbounded when
-    // disposing, so every evictable chunk is reclaimed).
-    size_t const target_free = (total * 3) / 4;  // aim to restore ~75% free
-    size_t const need        = dispose ? std::numeric_limits<size_t>::max()
-                                       : (target_free > free_now ? target_free - free_now : 0);
+    // Number of chunks we want to evict before stopping (unbounded when
+    // disposing).  Aim to bring outstanding back down to ~25% of capacity.
+    size_t const target_outstanding = capacity / 4;
+    size_t const need =
+      dispose ? std::numeric_limits<size_t>::max()
+              : (outstanding > target_outstanding ? outstanding - target_outstanding : 0);
 
     auto const query_tick = static_cast<uint32_t>(_ticker.load(std::memory_order_relaxed));
 
@@ -900,27 +799,35 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     }
 
     // Pass 2: a single sweep evicts every chunk below the cutoff tier, plus
-    // chunks at the cutoff tier until the target is met.
-    reclaim_buffers.clear();
+    // chunks at the cutoff tier until the target is met.  Reclaimed buffers are
+    // bucketed by their origin NUMA node so they go back to the right arena.
+    for (auto& [_, buffers] : reclaim_by_numa) {
+      buffers.clear();
+    }
+    size_t reclaimed = 0;
     for (auto& er : eviction_batch) {
       if (er.req == nullptr) { continue; }
       for (cached_chunk* c : er.req->chunks) {
         uint16_t const tier = c->lifecycle.load().eviction_tier(query_tick);
         if (tier > cutoff) { continue; }
-        if (tier == cutoff && reclaim_buffers.size() >= need) { continue; }  // top bar satisfied
+        if (tier == cutoff && reclaimed >= need) { continue; }  // top bar satisfied
         // mark_evicting only succeeds from cached/allocated with pin == 0, so
         // in-use, loading, queued or already-evicted chunks are skipped.
         if (c->state.mark_evicting()) {
-          reclaim_buffers.push_back(c->data);
+          reclaim_by_numa[c->numa_node].push_back(reinterpret_cast<std::byte*>(c->data));
           c->data = nullptr;
           static_cast<void>(c->state.mark_empty());
+          ++reclaimed;
           ++er.n_evicted;
           _counters.evictions.fetch_add(1, std::memory_order_relaxed);
         }
       }
     }
 
-    if (!reclaim_buffers.empty()) { _pool->deallocate_bulk(reclaim_buffers); }
+    // Return each NUMA group to its own arena (origin-safe).
+    for (auto& [numa, buffers] : reclaim_by_numa) {
+      if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa); }
+    }
 
     // Drop requests whose chunks have all been evicted; keep the rest for a
     // later round.

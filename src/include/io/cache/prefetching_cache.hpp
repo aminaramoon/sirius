@@ -27,12 +27,8 @@
 #include <concurrentqueue.h>
 
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
-#include <deque>
-#include <list>
 #include <memory>
-#include <semaphore>
 #include <shared_mutex>
 #include <stop_token>
 #include <thread>
@@ -47,6 +43,10 @@ class sirius_datasource;
 namespace sirius::memory {
 class topology_index;
 }  // namespace sirius::memory
+
+namespace cucascade::memory {
+class memory_reservation_manager;
+}  // namespace cucascade::memory
 
 namespace sirius::io::cache {
 
@@ -79,6 +79,9 @@ struct prefetch_request_context {
   std::shared_ptr<entry_state> state;
   std::shared_ptr<std::atomic<prefetching_handle_state>> user_state;
   std::vector<cached_chunk*> chunks;
+  /// Preferred NUMA node for the staging buffers, derived from the requesting
+  /// GPU's topology.  -1 means "no preference" (allocate from any arena).
+  int preferred_numa{-1};
 };
 
 class prefetching_handle {
@@ -135,9 +138,10 @@ class prefetching_cache {
   using prefetch_request   = std::shared_ptr<prefetch_request_context>;
   using request_queue_type = duckdb_moodycamel::BlockingConcurrentQueue<prefetch_request>;
 
-  prefetching_cache(buffer_pool* pool,
+  prefetching_cache(cucascade::memory::memory_reservation_manager& reservation_manager,
                     sirius_ioctx* io_ctx,
                     size_t inflight_budget_chunks,
+                    uint32_t buffer_pool_slabs,
                     std::shared_ptr<const sirius::memory::topology_index> topology_index,
                     bool dispose_after_use = false);
   ~prefetching_cache();
@@ -196,7 +200,7 @@ class prefetching_cache {
 
   file_entry& get_or_create_file_entry(const sirius_io_object& obj);
 
-  buffer_pool* const _pool;
+  std::unique_ptr<buffer_pool> _pool;
 
   sirius_ioctx* const _io_ctx;
 

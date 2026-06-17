@@ -197,15 +197,15 @@ sirius_scan_manager::sirius_scan_manager(
   // unconditional and there's no "is the cache present" branch to
   // worry about in callers.
   if (_config.enable_prefetch_cache) {
+    // Total slab budget for the cache's pool; the cache builds and owns the
+    // pool from the reservation manager's HOST-tier spaces.
     auto const slab_bytes =
       host_mrs.front()->get_block_size() *
       static_cast<std::size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB);
     auto const max_slabs =
       static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-    _buffer_pool = std::make_unique<sirius::io::cache::buffer_pool>(
-      host_mrs, max_slabs, /*initial_slabs=*/max_slabs);
     _io_ctx->initialize_cache(
-      _buffer_pool.get(), _config.prefetch_inflight_budget_chunks, _topology_index);
+      reservation_manager, _config.prefetch_inflight_budget_chunks, max_slabs, _topology_index);
   }
 
   if (_io_ctx->cache() && _io_ctx->cache()->is_armed()) {
@@ -225,12 +225,10 @@ sirius_scan_manager::~sirius_scan_manager()
   // metadata-scan / sequencer task can still be reaching into the
   // cache via _io_ctx when we tear it down below.
   stop();
-  // Tear down the cache before releasing the buffer_pool — the cache's
-  // worker holds a raw _pool pointer, and its destructor drains
-  // in-flight IO before returning, so the pool stays alive long
-  // enough for callbacks to release their chunks safely.
+  // Tear down the cache (which owns its buffer_pool).  shutdown_cache drains
+  // in-flight IO before the pool is destroyed, so callbacks release their
+  // chunks safely.
   if (_io_ctx) { _io_ctx->shutdown_cache(); }
-  _buffer_pool.reset();
 }
 
 namespace {

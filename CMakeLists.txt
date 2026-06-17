@@ -198,6 +198,7 @@ set(EXTENSION_SOURCES
     src/io/uri_parser.cpp
     src/io/cache/metadata_store.cpp
     src/io/cache/prefetching_cache.cpp
+    src/io/cache/types.cpp
     src/io/kvikio/kvikio_context.cpp
     src/io/rest/curl_handle.cpp
     src/io/rest/rest_ioctx.cpp

@@ -47,6 +47,10 @@ namespace sirius::memory {
 class topology_index;
 }  // namespace sirius::memory
 
+namespace cucascade::memory {
+class memory_reservation_manager;
+}  // namespace cucascade::memory
+
 namespace sirius::io {
 
 // ---------------------------------------------------------------------------
@@ -117,17 +121,17 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// Build the prefetching cache.  One-shot — calling twice is a no-op
   /// after the first successful build.  The cache holds a raw
   /// back-pointer to this ioctx and stays alive until @ref
-  /// shutdown_cache is called (or this ioctx is destroyed).  @p pool
-  /// is non-owning; the caller (typically @c scan_manager) guarantees
-  /// it outlives the cache.
+  /// shutdown_cache is called (or this ioctx is destroyed).  The cache
+  /// builds and owns its @c buffer_pool from @p reservation_manager's
+  /// HOST-tier memory spaces; @p buffer_pool_slabs sizes that pool.
   ///
   /// The cache constructs itself in an "armed" or "unarmed" state
-  /// depending on @p pool and @c supports_vector_host_read(); the
-  /// ioctx is unaware of that distinction — it simply forwards lookups
-  /// through @c cache().
+  /// depending on @c supports_vector_host_read(); the ioctx is unaware
+  /// of that distinction — it simply forwards lookups through @c cache().
   void initialize_cache(
-    cache::buffer_pool* pool,
+    cucascade::memory::memory_reservation_manager& reservation_manager,
     size_t inflight_budget_chunks,
+    uint32_t buffer_pool_slabs,
     std::shared_ptr<const sirius::memory::topology_index> topology_index) noexcept;
 
   /// Tear down the cache (drains background workers and any in-flight

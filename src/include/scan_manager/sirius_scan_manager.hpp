@@ -278,12 +278,6 @@ class sirius_scan_manager {
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
-  /// Buffer pool owned by the scan_manager (not the cache).  Constructed
-  /// when a HOST-tier @c fixed_size_host_memory_resource is available;
-  /// null otherwise.  The cache (owned by @c _io_ctx) holds the pool
-  /// by raw pointer, so the destructor MUST call
-  /// @c _io_ctx->shutdown_cache() before resetting this pool.
-  std::unique_ptr<sirius::io::cache::buffer_pool> _buffer_pool;
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;

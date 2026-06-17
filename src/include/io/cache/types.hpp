@@ -20,6 +20,8 @@
 // virtual interface (device_read_async_io_using).  Extracted here to break the
 // circular include between io_context.hpp and prefetching_cache.hpp.
 
+#include "cucascade/memory/memory_reservation.hpp"
+#include "cucascade/memory/memory_reservation_manager.hpp"
 #include "io/types.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -37,6 +39,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <utility>
@@ -77,8 +80,7 @@ class buffer_pool {
   /// @p initial_slabs slabs are allocated up-front from @p mr (clamped to
   /// @p max_slabs).  Default preserves the historical behaviour of warming
   /// the pool with up to 10 slabs at construction.
-  buffer_pool(std::vector<cucascade::memory::fixed_size_host_memory_resource*> mrs,
-              uint32_t max_slabs,
+  buffer_pool(cucascade::memory::memory_reservation_manager& reservation_manager,
               uint32_t initial_slabs = 10);
 
   ~buffer_pool();
@@ -86,69 +88,36 @@ class buffer_pool {
   buffer_pool(buffer_pool const&)            = delete;
   buffer_pool& operator=(buffer_pool const&) = delete;
 
-  /// Allocate a single chunk.  Returns nullptr when the pool is exhausted
-  /// and the upstream resource cannot supply a fresh slab.
-  uint8_t* allocate();
-
   /// Bulk-allocate up to @p n chunks, appending pointers to @p out.
   /// Returns the number actually allocated (may be < n if the pool is
   /// exhausted and cannot grow).
-  size_t allocate_bulk(size_t n, std::vector<uint8_t*>& out);
+  std::vector<std::byte*> allocate_bulk(size_t n, int& numa_node);
 
-  void deallocate_bulk(std::vector<uint8_t*>& out) noexcept;
+  std::vector<std::byte*> allocate_bulk_from(size_t n, int numa_node);
 
-  /// Return a chunk to the pool.
-  void deallocate(uint8_t* p);
-
-  /// Restore the free list to "all chunks free".  Caller must guarantee
-  /// every previously-handed-out chunk is no longer in use — the pool
-  /// rebuilds its free list from the slabs it already holds without
-  /// touching the upstream resource.  Slabs themselves are retained, so
-  /// no allocation happens; subsequent allocate() calls reuse them.
-  void reclaim_all();
+  void deallocate_bulk(std::vector<std::byte*>&& out, int numa) noexcept;
 
   [[nodiscard]] size_t chunk_bytes() const noexcept { return _chunk_bytes; }
-  [[nodiscard]] size_t slab_bytes() const noexcept
-  {
-    return static_cast<size_t>(CHUNKS_PER_SLAB) * _chunk_bytes;
-  }
-  [[nodiscard]] size_t capacity() const noexcept
-  {
-    return static_cast<size_t>(_total_chunks.load(std::memory_order_relaxed)) * _chunk_bytes;
-  }
-  [[nodiscard]] uint32_t free_count() const noexcept
-  {
-    return _total_free.load(std::memory_order_relaxed);
-  }
-  [[nodiscard]] uint32_t total_chunks() const noexcept
-  {
-    return _total_chunks.load(std::memory_order_relaxed);
-  }
-  /// Hard cap on chunks the pool can grow to (i.e. @c max_slabs ×
-  /// CHUNKS_PER_SLAB).  Stable for the pool's lifetime.  Used by the
-  /// prefetching_cache evictor to score pool pressure against the
-  /// configured ceiling rather than the (lazily-grown) current size.
-  [[nodiscard]] uint32_t max_chunks() const noexcept { return _max_slabs * CHUNKS_PER_SLAB; }
+
+  /// Number of chunks currently handed out (outstanding) across all arenas.
+  [[nodiscard]] size_t total_chunks() const noexcept { return _n_allocated_chunks; }
+
+  /// Aggregate chunk capacity reserved across all arenas.  Stable for the
+  /// pool's lifetime; used to score memory pressure for eviction.
+  [[nodiscard]] size_t capacity_chunks() const noexcept { return _capacity_chunks; }
 
  private:
-  /// Pull one slab worth of blocks from the upstream resource and append
-  /// them to @c _free_list.  Caller must hold @c _mtx.
-  bool grow_locked();
+  struct host_arena {
+    int numa_id;
+    std::unique_ptr<cucascade::memory::reservation> reservation;
+    cucascade::memory::fixed_size_host_memory_resource* mr;
+  };
 
-  cucascade::memory::fixed_size_host_memory_resource& _mr;
   size_t _chunk_bytes;
-  uint32_t _max_slabs;
-
-  // Protects _allocations and _free_list.
-  std::mutex _mtx;
-  // Held to keep upstream blocks alive for the lifetime of the pool —
-  // the multiple_blocks_allocation destructor is what returns blocks to
-  // the resource, so we never drop these until the pool is destroyed.
-  std::vector<cucascade::memory::fixed_multiple_blocks_allocation> _allocations;
-  std::vector<uint8_t*> _free_list;
-
-  std::atomic<uint32_t> _total_free{0};
-  std::atomic<uint32_t> _total_chunks{0};
+  size_t _capacity_chunks{0};
+  std::unordered_map<int, size_t> _numa_to_arena_index;
+  std::vector<host_arena> _host_arenas;
+  std::atomic<size_t> _n_allocated_chunks{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -458,6 +427,7 @@ struct alignas(64) cached_chunk {
 
   std::size_t offset;
   uint8_t* data;
+  int numa_node{-1};
   entry_state state;
   chunk_lifecycle lifecycle;
 };
