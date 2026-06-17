@@ -18,10 +18,39 @@
 
 #include <condition_variable>
 #include <cstddef>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <stop_token>
 
 namespace sirius::exec {
+
+// ---------------------------------------------------------------------------
+// completion_token — opaque RAII handle owning a completion subscription
+// ---------------------------------------------------------------------------
+//
+// Returned by completion_controller::on_completion().  It type-erases the
+// registered callback and owns its lifetime: destroying the token deregisters
+// the callback.  It has no public API — it exists only to be moved around
+// (behind the returned unique_ptr) and eventually destroyed.  Internally it
+// wraps a std::stop_callback, which gives the one-shot firing and the
+// register-after-already-fired behaviour for free.
+
+class completion_token {
+ public:
+  completion_token(completion_token const&)            = delete;
+  completion_token& operator=(completion_token const&) = delete;
+  ~completion_token()                                  = default;
+
+ private:
+  friend class completion_controller;
+  completion_token(std::stop_token tok, std::function<void()> fn)
+    : _cb(std::move(tok), std::move(fn))
+  {
+  }
+
+  std::stop_callback<std::function<void()>> _cb;
+};
 
 // ---------------------------------------------------------------------------
 // completion_controller — unbounded slot tracking with one-shot completion
@@ -32,28 +61,29 @@ namespace sirius::exec {
 // acquire() never blocks.  Its purpose is to track in-flight work so callers
 // can detect when every issued slot has been released ("drained").
 //
-// Completion is modelled as a std::stop_source.  Subscribers observe it by
-// attaching their own std::stop_callback to completion_token():
+// Subscribers register a callback via on_completion(), which returns an owning
+// completion_token handle:
 //
-//     std::stop_callback cb{controller.completion_token(),
-//                           [] { /* all work drained */ }};
+//     auto tok = controller.on_completion([] { /* all work drained */ });
+//     // ... keep `tok` alive for as long as the callback should stay armed;
+//     // destroying it deregisters the callback.
 //
-// std::stop_callback handles the registration race for free: if the token is
-// already stopped when the callback is constructed, it fires immediately on
-// the constructing thread.
+// If completion has already fired when on_completion() is called, the callback
+// runs immediately on the calling thread before on_completion() returns.
 //
 // Completion fires exactly once and ONLY after the producer signals it is done
-// issuing work via close().  Concretely, request_stop() is called when EITHER:
+// issuing work via close().  Concretely, completion is triggered when EITHER:
 //   - close() is invoked while no slots are outstanding, or
 //   - the last outstanding slot drains after close() has been invoked.
 // Gating on close() avoids spurious early completion: a producer issuing slots
 // in a loop can transiently hit zero outstanding slots between releases, but
 // that does not fire completion until it has called close().
 //
-// As a backstop, the destructor also requests stop, so the token never leaks
-// un-stopped.  request_stop() is idempotent, so the callbacks fire at most
-// once regardless of which path triggers it.  It is always invoked WITHOUT
-// holding the internal mutex, so callbacks may safely re-enter this controller.
+// As a backstop, the destructor also signals completion, so registered
+// callbacks never leak un-fired.  The trigger is idempotent, so callbacks fire
+// at most once regardless of which path triggers it.  It is always invoked
+// WITHOUT holding the internal mutex, so callbacks may safely re-enter this
+// controller.
 //
 // Acquiring further slots after completion is harmless but will not re-fire the
 // callbacks.
@@ -98,15 +128,15 @@ class completion_controller {
   /// Block until every slot handed out by @c acquire has been destroyed.
   void wait_for_idle();
 
-  /// Token that becomes stopped the first time all outstanding slots drain.
-  /// Attach a std::stop_callback to it to be notified of completion.
-  [[nodiscard]] std::stop_token completion_token() const noexcept
-  {
-    return _completion.get_token();
-  }
+  /// Register @p fn to run exactly once when completion fires (see class
+  /// docs).  The returned handle owns the subscription: keep it alive for as
+  /// long as the callback should stay armed; destroying it deregisters @p fn.
+  /// If completion has already fired, @p fn runs immediately on the calling
+  /// thread before this returns.
+  [[nodiscard]] std::unique_ptr<completion_token> on_completion(std::function<void()> fn);
 
   /// True once completion has been signalled (all slots have drained at least
-  /// once).
+  /// once after close()).
   [[nodiscard]] bool completed() const noexcept { return _completion.stop_requested(); }
 
   /// Number of slots currently outstanding.

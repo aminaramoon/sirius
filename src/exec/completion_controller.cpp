@@ -33,6 +33,16 @@ completion_controller::slot completion_controller::acquire()
   return slot{this};
 }
 
+std::unique_ptr<completion_token> completion_controller::on_completion(std::function<void()> fn)
+{
+  // completion_controller is a friend of completion_token, so it can reach the
+  // private constructor directly; std::make_unique cannot, hence the explicit
+  // new.  The std::stop_callback inside the token fires immediately on this
+  // thread if completion has already been signalled.
+  return std::unique_ptr<completion_token>(
+    new completion_token(_completion.get_token(), std::move(fn)));
+}
+
 void completion_controller::close()
 {
   bool fire;
