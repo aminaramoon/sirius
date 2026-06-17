@@ -21,6 +21,7 @@
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
 #include "io/sirius_datasource.hpp"
+#include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalecer.hpp"
 #include "scan_manager/split_provider.hpp"
@@ -83,6 +84,8 @@ namespace sirius::scan_manager {
  * pinned table. The vector may be empty until splits are populated.
  */
 struct pinned_entry {
+  std::unique_ptr<op::scan::ingestible_table_info> table_info;
+
   std::vector<std::string> column_names;
   /// Resolved (globbed) file paths captured at pin time. The scan_manager uses
   /// this list to match an incoming scan operator's scan_info::file_paths
@@ -267,8 +270,7 @@ class sirius_scan_manager {
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
-  std::vector<std::shared_ptr<pinned_entry>> try_get_cached_entries(
-    op::scan::sirius_gpu_scan_operator* op);
+  void try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op);
 
   scan_manager_config _config;
   /// Hardware GPU/NUMA topology, shared with the prefetching cache.  Source of

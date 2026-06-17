@@ -92,7 +92,7 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
     "convert_host_parquet_to_gpu_with_prefetched_data_source: prefetched_data_source "
     "adapter was removed in the io rebase; cached-host-parquet GPU conversion is "
     "unavailable until it is reimplemented.");
-#if 0  // disabled: depends on the removed prefetched_data_source adapter
+#if 0   // disabled: depends on the removed prefetched_data_source adapter
   auto& host_src                         = source.cast<host_parquet_representation>();
   auto const& post_filter_projection_ids = host_src.get_post_filter_projection_ids();
 

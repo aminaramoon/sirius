@@ -52,6 +52,26 @@ namespace sirius::scan_manager {
 
 namespace {
 
+struct cached_databatch_provider : public databatch_provider {
+  explicit cached_databatch_provider(pinned_entry const& entry, std::span<size_t> selected_columns)
+    : _entry(entry), selected_columns(selected_columns.begin(), selected_columns.end())
+  {
+  }
+
+  std::shared_ptr<cucascade::data_batch> get_next_batch() override { return nullptr; }
+
+ private:
+  const pinned_entry& _entry;
+  std::vector<size_t> selected_columns;
+  std::size_t _index{0};
+};
+
+std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
+  pinned_entry const& entry, std::span<size_t> selected_columns)
+{
+  return std::make_unique<cached_databatch_provider>(entry, selected_columns);
+}
+
 /// Strip a leading "file://" scheme (case-insensitive) so the path can be
 /// resolved by a local-file backend.
 std::string normalize_path(std::string const& p)
@@ -271,8 +291,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
     auto provider = std::make_unique<split_provider>(op->get_ingestible(), *_io_ctx);
     _metadata_processor->register_pipeline(op, round_robin);
-    auto entries = try_get_cached_entries(op);
-    if (!entries.empty()) { _metadata_processor->use_cached_entries_for_pipeline(op, {}); }
+    try_assign_cached_entries(op);
     _providers_by_op.emplace(op, std::move(provider));
     _scan_op_order.push_back(op);
   }
@@ -488,43 +507,28 @@ void sirius_scan_manager::remove_pinned_entry(const std::string& name)
   _pinned_entries.erase(name);
 }
 
-std::vector<std::shared_ptr<pinned_entry>> sirius_scan_manager::try_get_cached_entries(
-  op::scan::sirius_gpu_scan_operator* op)
+void sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op)
 {
   const auto& table_info = op->get_ingestible().table_info();
 
-  auto file_paths = table_info.file_paths();
-  std::vector<std::string> normalized_file_paths;
-  normalized_file_paths.reserve(file_paths.size());
-  for (const auto& path : file_paths) {
-    normalized_file_paths.push_back(normalize_path(path));
-  }
-
-  std::sort(normalized_file_paths.begin(), normalized_file_paths.end());
-  std::span<std::string const> target_file_paths(normalized_file_paths);
-
-  // If a pinned entry's file paths match this table_info, build the same
-  // scan_plan the parquet path would build and serve the scan from cache.
-  auto matches_scan_info = [target_file_paths](const pinned_entry& entry) {
-    if (entry.file_paths.size() != target_file_paths.size()) { return false; }
-    auto sorted_a = entry.file_paths;
-    std::sort(sorted_a.begin(), sorted_a.end());
-    return std::equal(sorted_a.begin(), sorted_a.end(), target_file_paths.begin());
-  };
   try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
-      if (!matches_scan_info(entry)) { continue; }
-      if (entry.is_partial) {
-        SIRIUS_LOG_WARN(
-          "[sirius_scan_manager::try_get_cached_entries] pinned entry '{}' matches file paths "
-          "but is marked partial — skipping cached read",
-          pinned_name);
-        break;
+      if (entry.table_info->is_subset_of(table_info)) {
+        auto projection = entry.table_info->column_projections(table_info);
+        auto provider   = make_provider_for_pinned_entry(entry, projection);
+        _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
+        spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
+                     pinned_name,
+                     op->get_operator_id());
       }
     }
   } catch (...) {
+    spdlog::error(
+      "[sirius_scan_manager] error while trying to assign cached entries to "
+      "operator '{}': {}",
+      op->get_operator_id(),
+      std::current_exception());
   }
-  return {};
 }
 
 }  // namespace sirius::scan_manager

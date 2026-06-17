@@ -36,6 +36,11 @@
 
 namespace sirius::scan_manager {
 
+struct databatch_provider {
+  virtual ~databatch_provider()                                   = default;
+  virtual std::shared_ptr<cucascade::data_batch> get_next_batch() = 0;
+};
+
 /**
  * @brief Pipeline-ordered sequencer for @c fadvise(opportunistic) calls.
  *
@@ -87,6 +92,11 @@ class load_balancing_scan_batch_coalecer {
       assert(this->balancer);
     }
 
+    void attach_batch_provider(std::unique_ptr<databatch_provider> provider)
+    {
+      batch_provider = std::move(provider);
+    }
+
     std::size_t op_id{0};
     std::size_t pipeline_id{0};
     using provider_value_t = exec::try_t<std::unique_ptr<op::scan::scan_info>>;
@@ -95,6 +105,7 @@ class load_balancing_scan_batch_coalecer {
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
     std::shared_ptr<op::scan::post_filter_and_projection_info> filter_and_projection_info;
+    std::unique_ptr<databatch_provider> batch_provider;
   };
 
   load_balancing_scan_batch_coalecer()                                          = default;
@@ -105,12 +116,11 @@ class load_balancing_scan_batch_coalecer {
   /// sequencer task in the order they were added — typically scan_manager
   /// adds them in pipeline-id order so the head-of-line pipeline drains
   /// first.  The returned pointer is valid for the manager's lifetime.
-  void register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
-                         std::shared_ptr<balancing_strategy> balancer);
+  metadata_processing_state* register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
+                                               std::shared_ptr<balancing_strategy> balancer);
 
-  void use_cached_entries_for_pipeline(
-    op::scan::sirius_gpu_scan_operator* scan_op,
-    const std::vector<std::shared_ptr<cucascade::data_batch>>& cached_batches);
+  void use_cached_entries_for_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
+                                       std::unique_ptr<databatch_provider> provider);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when
@@ -131,7 +141,9 @@ class load_balancing_scan_batch_coalecer {
   /// datasource) or stop is requested.
   void worker_loop(std::stop_token const& stop);
 
-  void process_entry(metadata_processing_state& state, std::stop_token const& stop);
+  void process_provider_inputs(metadata_processing_state& state, std::stop_token const& stop);
+
+  void process_cached_entries(metadata_processing_state& state, std::stop_token const& stop);
 
   static constexpr auto SEQUENCER_POLL_INTERVAL = std::chrono::milliseconds(50);
 

@@ -23,10 +23,11 @@
 
 namespace sirius::scan_manager {
 
-void load_balancing_scan_batch_coalecer::register_pipeline(
-  op::scan::sirius_gpu_scan_operator* scan_op, std::shared_ptr<balancing_strategy> balancer)
+load_balancing_scan_batch_coalecer::metadata_processing_state*
+load_balancing_scan_batch_coalecer::register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
+                                                      std::shared_ptr<balancing_strategy> balancer)
 {
-  if (!scan_op) return;
+  if (!scan_op) return nullptr;
 
   auto connector   = scan_op->get_split_connector().shared_from_this();
   auto ingestible  = scan_op->get_ingestible().shared_from_this();
@@ -41,18 +42,20 @@ void load_balancing_scan_batch_coalecer::register_pipeline(
     std::move(balancer),
     ingestible->create_post_filter_and_projection_info());
   _pipeline_order.push_back(uid);
-  _slots[uid] = std::move(state);
+  auto state_ptr = state.get();
+  _slots[uid]    = std::move(state);
+  return state_ptr;
 }
 
 void load_balancing_scan_batch_coalecer::use_cached_entries_for_pipeline(
-  op::scan::sirius_gpu_scan_operator* scan_op,
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& cached_batches)
+  op::scan::sirius_gpu_scan_operator* scan_op, std::unique_ptr<databatch_provider> provider)
 {
   if (!scan_op) return;
   auto uid = scan_op->get_operator_id();
   auto it  = _slots.find(uid);
   if (it == _slots.end()) { return; }
   auto& state = *it->second;
+  state.attach_batch_provider(std::move(provider));
 }
 
 void load_balancing_scan_batch_coalecer::worker_loop([[maybe_unused]] std::stop_token const& stop)
@@ -60,12 +63,16 @@ void load_balancing_scan_batch_coalecer::worker_loop([[maybe_unused]] std::stop_
   for (auto pipeline_id : _pipeline_order) {
     if (stop.stop_requested()) { break; }
     auto& state = *_slots[pipeline_id];
-    process_entry(state, stop);
+    if (state.batch_provider) {
+      process_cached_entries(state, stop);
+    } else {
+      process_provider_inputs(state, stop);
+    }
   }
 }
 
-void load_balancing_scan_batch_coalecer::process_entry(metadata_processing_state& state,
-                                                       std::stop_token const& stop)
+void load_balancing_scan_batch_coalecer::process_provider_inputs(metadata_processing_state& state,
+                                                                 std::stop_token const& stop)
 {
   std::stop_callback stop_cb(stop, [&state] { state.queue.enqueue(nullptr); });
   auto& batch_queue = state.queue;
@@ -107,6 +114,25 @@ void load_balancing_scan_batch_coalecer::process_entry(metadata_processing_state
       break;
     }
   }
+}
+
+void load_balancing_scan_batch_coalecer::process_cached_entries(
+  metadata_processing_state& state, [[maybe_unused]] std::stop_token const& stop)
+{
+  auto& batch_queue = state.queue;
+  bool is_closed    = false;
+  while (!is_closed) {
+    auto databatch = state.batch_provider->get_next_batch();
+    is_closed      = databatch == nullptr;
+    if (!is_closed) {
+      auto op_data = std::make_unique<op::scan::scan_operator_input>(
+        std::move(databatch), state.filter_and_projection_info);
+      auto dev_id = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
+      if (dev_id >= 0) { op_data->set_preferred_device_id(dev_id); }
+      state.connector->push_split(std::move(op_data));
+    }
+  }
+  state.connector->close();
 }
 
 }  // namespace sirius::scan_manager
