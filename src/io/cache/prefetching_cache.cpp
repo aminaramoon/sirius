@@ -326,9 +326,26 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
   const auto& key = obj.raw_file_cache_id();
   auto& file      = get_or_create_file_entry(obj);
 
-  std::vector<size_t> chunk_offsets;  // sorted
-  std::size_t last_offset = 0;
-  auto coalesged_ranges   = _io_ctx->align_and_coalesce(ranges, _pool->chunk_bytes());
+  const size_t chunk_bytes = _pool->chunk_bytes();
+  auto coalesced_ranges    = _io_ctx->align_and_coalesce(ranges, chunk_bytes);
+
+  // Enumerate the chunk-aligned offsets covered by the coalesced ranges.  The
+  // ranges come back aligned to chunk_bytes, sorted, and non-overlapping, so the
+  // resulting offsets are sorted, unique, and chunk_bytes apart within each
+  // range — the contract update_and_get_chunks' galloping search relies on.
+  std::vector<size_t> chunk_offsets;  // sorted, unique, chunk-aligned
+  size_t total_chunks = 0;
+  for (const auto& r : coalesced_ranges) {
+    total_chunks += (static_cast<size_t>(r.size()) + chunk_bytes - 1) / chunk_bytes;
+  }
+  chunk_offsets.reserve(total_chunks);
+  for (const auto& r : coalesced_ranges) {
+    const auto start = static_cast<size_t>(r.offset());
+    const auto end   = start + static_cast<size_t>(r.size());
+    for (size_t off = start; off < end; off += chunk_bytes) {
+      chunk_offsets.push_back(off);
+    }
+  }
 
   auto chunks_to_fetch =
     file.update_and_get_chunks(chunk_offsets, _ticker.load(std::memory_order_relaxed));
