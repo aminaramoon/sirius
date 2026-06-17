@@ -40,9 +40,11 @@ class balancing_strategy {
   virtual ~balancing_strategy() = default;
 
   struct gpu_id_hint {
+    explicit gpu_id_hint(int id) : device_id(id) {}
     int device_id;
   };
   struct numa_id_hint {
+    explicit numa_id_hint(int id) : numa_id(id) {}
     int numa_id;
   };
   using device_id_hint = std::variant<std::monostate, gpu_id_hint, numa_id_hint>;

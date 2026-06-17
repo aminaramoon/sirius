@@ -41,21 +41,32 @@ namespace sirius::exec {
 
 class completion_token {
  public:
+  completion_token() = default;
+
   template <typename Fn, typename... Args>
   completion_token(std::stop_token token, Fn&& fn, Args&&... args)
-    : _cb(std::move(token),
-          [fn = std::forward<Fn>(fn), ... args = std::forward<Args>(args)]() mutable {
-            std::invoke(fn, args...);
-          })
+    : _cb(std::make_unique<impl_type>(
+        std::move(token),
+        [fn = std::forward<Fn>(fn), ... args = std::forward<Args>(args)]() mutable {
+          std::invoke(fn, args...);
+        }))
   {
   }
 
-  completion_token(completion_token const&)            = delete;
-  completion_token& operator=(completion_token const&) = delete;
-  ~completion_token()                                  = default;
+  // Naturally movable now because std::unique_ptr is movable!
+  completion_token(completion_token&&) noexcept            = default;
+  completion_token& operator=(completion_token&&) noexcept = default;
+
+  completion_token(const completion_token&)            = delete;
+  completion_token& operator=(const completion_token&) = delete;
+
+  [[nodiscard]] explicit operator bool() const noexcept { return _cb != nullptr; }
+
+  [[nodiscard]] bool is_armed() const noexcept { return _cb != nullptr; }
 
  private:
-  std::stop_callback<absl::AnyInvocable<void()>> _cb;
+  using impl_type = std::stop_callback<absl::AnyInvocable<void()>>;
+  std::unique_ptr<impl_type> _cb;
 };
 
 // ---------------------------------------------------------------------------
@@ -139,10 +150,9 @@ class completion_controller {
   /// callback.  If completion has already fired, the callback runs immediately
   /// on the calling thread before this returns.
   template <typename Fn, typename... Args>
-  [[nodiscard]] std::unique_ptr<completion_token> on_completion(Fn&& fn, Args&&... args)
+  [[nodiscard]] completion_token on_completion(Fn&& fn, Args&&... args)
   {
-    return std::make_unique<completion_token>(
-      _token, std::forward<Fn>(fn), std::forward<Args>(args)...);
+    return completion_token(_token, std::forward<Fn>(fn), std::forward<Args>(args)...);
   }
 
   /// True once completion has been signalled.

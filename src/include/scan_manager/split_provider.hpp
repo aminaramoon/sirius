@@ -144,26 +144,27 @@ class split_provider {
   /// Pipeline this provider's scan belongs to, forwarded to the strategy.
   std::size_t _pipeline_id{0};
 
-  exec::completion_controller _completion_controller;
+  exec::completion_token _completion_token;
 };
 
 template <typename Scheduler>
 void split_provider::run(Scheduler& scheduler, const std::function<void(value_type&&)>& on_split)
 {
   assert(on_split);
-  assert(on_error);
+  exec::completion_controller ctrl;
+  _completion_token =
+    ctrl.on_completion([on_split] { on_split(exec::try_t<typename value_type::value_type>()); });
   while (has_more_splits()) {
     auto work = next_split_provider();
     if (!work) { continue; }
-    scheduler.enqueue(
-      [this, on_split, work = std::move(work), token = _completion_controller.acquire()]() mutable {
-        try {
-          auto split = work();
-          on_split(std::move(split));
-        } catch (...) {
-          on_split(std::current_exception());
-        }
-      });
+    scheduler.enqueue([this, on_split, work = std::move(work), token = ctrl.acquire()]() mutable {
+      try {
+        auto split = work();
+        on_split(std::move(split));
+      } catch (...) {
+        on_split(std::current_exception());
+      }
+    });
   }
 }
 
