@@ -16,6 +16,7 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/kvikio/kvikio_context.hpp"
@@ -54,16 +55,62 @@ namespace {
 
 struct cached_databatch_provider : public databatch_provider {
   explicit cached_databatch_provider(pinned_entry const& entry, std::span<size_t> selected_columns)
-    : _entry(entry), selected_columns(selected_columns.begin(), selected_columns.end())
+    : _entry(entry)
   {
+    std::ranges::for_each(selected_columns, [this](size_t idx) {
+      _column_names.push_back(_entry.column_names.at(idx));
+      _column_indices.push_back(idx);
+    });
+
+    if (_entry.tier == cucascade::memory::Tier::GPU) {
+      if (_entry.data_batches_by_column.empty()) {
+        _n_chunks = 0;
+      } else {
+        _n_chunks = _entry.data_batches_by_column.begin()->second.size();
+      }
+    } else if (_entry.tier == cucascade::memory::Tier::HOST) {
+      _n_chunks = _entry.host_chunks.size();
+    }
   }
 
-  std::shared_ptr<cucascade::data_batch> get_next_batch() override { return nullptr; }
+  std::shared_ptr<cucascade::data_batch> get_next_batch() override
+  {
+    auto index = _index.fetch_add(1);
+    if (index >= _n_chunks) { return nullptr; }
+    if (_entry.tier == cucascade::memory::Tier::GPU) {
+      return get_device_databatch(index);
+    } else if (_entry.tier == cucascade::memory::Tier::HOST) {
+      return get_host_databatch(index);
+    }
+    return nullptr;
+  }
 
  private:
+  std::shared_ptr<cucascade::data_batch> get_host_databatch(std::size_t index)
+  {
+    if (index >= _entry.host_chunks.size()) { return nullptr; }
+    const auto& chunk = _entry.host_chunks.at(index);
+    if (!chunk) { return nullptr; }
+    auto data_rep = chunk->slice(_column_indices);
+    return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(data_rep));
+  }
+
+  std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
+  {
+    std::vector<std::shared_ptr<cudf::column>> columns;
+    for (const auto& col_idx : _column_names) {
+      const auto& col_chunks = _entry.data_batches_by_column.at(col_idx);
+      if (index >= col_chunks.size()) { return nullptr; }
+      columns.push_back(col_chunks.at(index));
+    }
+    return nullptr;
+  }
+
+  std::size_t _n_chunks;
+  std::vector<std::string> _column_names;
+  std::vector<size_t> _column_indices;
   const pinned_entry& _entry;
-  std::vector<size_t> selected_columns;
-  std::size_t _index{0};
+  std::atomic<std::size_t> _index{0};
 };
 
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
@@ -525,9 +572,8 @@ void sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
   } catch (...) {
     spdlog::error(
       "[sirius_scan_manager] error while trying to assign cached entries to "
-      "operator '{}': {}",
-      op->get_operator_id(),
-      std::current_exception());
+      "operator '{}'",
+      op->get_operator_id());
   }
 }
 

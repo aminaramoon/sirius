@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "exec/config.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
