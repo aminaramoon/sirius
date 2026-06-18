@@ -451,23 +451,22 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   auto opts = *split.reader_options;
   opts.set_row_groups(std::move(rg_per_src));
 
-  // Per-task AST translation. set_filter is gated on translation success AND on
-  // the per-batch disable_filter_pushdown flag (set when the FLBA-decimal probe
-  // failed). `sirius_filter_ast` is hoisted so the post-decode fallback can
-  // reuse it on a pushdown miss.
-  std::unique_ptr<sirius::ast::node> sirius_filter_ast;
+  // Per-task AST translation for reader-side row-group + row pushdown. set_filter
+  // is gated on translation success AND on the per-batch disable_filter_pushdown
+  // flag (set when the FLBA-decimal probe failed). When pushdown does not engage
+  // — disabled, or translation fails — the row filter is left for
+  // post_filter_and_project to apply post-decode. The translated cuDF AST
+  // (`ast_expression`) must outlive read_parquet; the borrowed Sirius AST and
+  // the translator are only needed during translation.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
-  if (_duckdb_filter_expression) {
-    sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-    if (!split.disable_filter_pushdown) {
-      auto name_resolver = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
-        return plan->batch_column_name(ref_index);
-      };
-      gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-      ast_expression =
-        translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
-      if (ast_expression) { opts.set_filter(ast_expression->back()); }
-    }
+  if (_duckdb_filter_expression && !split.disable_filter_pushdown) {
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
+    auto name_resolver     = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
+      return plan->batch_column_name(ref_index);
+    };
+    gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+    ast_expression = translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
+    if (ast_expression) { opts.set_filter(ast_expression->back()); }
   }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
@@ -482,34 +481,12 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     table->num_rows(),
     table->num_columns());
 
-  // Determine filter state. When pushdown engaged the reader applied the
-  // filter; otherwise we apply post-decode here. `sirius_filter_ast` must
-  // outlive `exec` — the executor only borrows the AST.
-  auto state = op::scan::filter_state::UNFILTERED;
-  if (sirius_filter_ast) {
-    if (!ast_expression) {
-      sirius::gpu_expression_executor exec(
-        sirius_filter_ast.get(), cudf::get_current_device_resource_ref(), stream);
-      auto input = std::move(table);
-      table      = exec.select(input->view());
-      SIRIUS_LOG_DEBUG(
-        "[parquet_gpu_ingestible::materialize_table] Applied duckdb filter expression "
-        "post-decode.");
-    }
-    state = op::scan::filter_state::ROW_FILTERED;
-  }
-
-  // Reader-side pushdown succeeded and the plan needs assembly — inline it
-  // here so the scan operator can skip post_filter_and_project entirely.
-  // (post-decode fallback keeps assembly external because re-allocating after
-  // exec.select is the same shape either way.)
-  if (state == op::scan::filter_state::ROW_FILTERED && ast_expression && split.needs_assembly) {
-    table = assemble_scan_output(*_plan, std::move(table), split.partition_values, stream);
-    state = op::scan::filter_state::ROW_FILTERED_AND_PROJECTED;
-    SIRIUS_LOG_DEBUG(
-      "[parquet_gpu_ingestible::materialize_table] Assembled inline on reader-side pushdown path.");
-  }
-
+  // The reader applied the row filter iff pushdown engaged (ast_expression was
+  // set as the reader filter). Otherwise the filter — if any — is still pending
+  // and post_filter_and_project applies it post-decode. Output assembly
+  // (projection / hive injection) is likewise deferred to post_filter_and_project.
+  auto const state = ast_expression.has_value() ? op::scan::filter_state::ROW_FILTERED
+                                                : op::scan::filter_state::UNFILTERED;
   return op::scan::filtered_table{owning_table_view{std::move(table)}, state};
 }
 
