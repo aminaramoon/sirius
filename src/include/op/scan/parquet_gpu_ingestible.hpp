@@ -62,14 +62,11 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
+  /// Target uncompressed byte budget for one data-batch split. Consumed only by
+  /// parquet_batch_coalecer when it bundles files / chunks row groups — the
+  /// ingestible's metadata scan operates one file at a time and does no batching.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   std::size_t scan_output_arity      = 0;
-  /// Maximum number of files handled by one metadata-scan task. One file per
-  /// task gives the scan-side balancing_strategy the finest placement
-  /// granularity: each file lands on a different GPU via round-robin, spreading
-  /// I/O and decode work evenly across all GPUs. Coarser values (e.g. 8) would
-  /// batch all files into a single task and prevent cross-GPU distribution.
-  std::size_t max_file_processed = 1;
 
   parquet_ingestible_table_info() = default;
 
@@ -185,21 +182,15 @@ class parquet_file_scan_info : public scan_info {
 // parquet_post_filter_and_projection_info
 //===----------------------------------------------------------------------===//
 /**
- * @brief Per-split post-decode assembly description.
+ * @brief Marker that a split needs a post-decode step.
  *
- * Emitted only when @c needs_output_assembly(*plan) is true for the
- * batch — assembly is the only post-decode work parquet does (the filter
- * is fully handled inside @c materialize_table, either via pushdown or
- * via a post-decode @c gpu_expression_executor). @c partition_values is
- * shared across the whole batch because every file in the batch carries
- * identical hive values (enforced at emission).
+ * Pipeline-shared (one per scan, from @c create_post_filter_and_projection_info)
+ * and attached to every emitted split. Carries no per-split data: the post step
+ * applies a pending row filter and/or projects a non-partition output layout.
+ * Hive-partition assembly is done inline in @c materialize_table, which owns the
+ * per-split partition values, so partition values never travel through here.
  */
-class parquet_post_filter_and_projection_info : public post_filter_and_projection_info {
- public:
-  /// Hive partition values for the split, in @c scan_plan::partition_columns
-  /// order. Empty when the plan has no partition columns.
-  std::vector<std::string> partition_values;
-};
+class parquet_post_filter_and_projection_info : public post_filter_and_projection_info {};
 
 //===----------------------------------------------------------------------===//
 // parquet_gpu_ingestible
@@ -207,16 +198,17 @@ class parquet_post_filter_and_projection_info : public post_filter_and_projectio
 /**
  * @brief Concrete @c io::gpu_ingestible for parquet sources.
  *
- * Owns the shared scan plan and coalesced filter expression; pre-decomposes
- * the file list into per-task batches in its constructor (one batch per
- * @c max_file_processed files). @ref next_split_provider atomically claims
- * the next batch index and returns a callable that runs the footer-read /
- * row-group-pruning / partition-by-bytes work — port of
- * @c parquet_split_provider::run_batch.
+ * Owns the shared scan plan, reader options, and coalesced filter expression.
+ * @ref next_split_provider hands out one file at a time: each metadata-scan task
+ * reads that file's footer, prunes its row groups, and emits a single
+ * @c parquet_file_scan_info. File bundling and row-group chunking by byte budget
+ * are handled downstream by @c parquet_batch_coalecer (@ref create_batch_coalecer),
+ * which coalesces the per-file units into @c parquet_split_info data batches.
  *
- * @ref materialize_table is the per-task read + filter step (port of
- * @c sirius_gpu_parquet_scan_operator::read_table_from_metadata, minus
- * assembly). @ref post_filter_and_project does assembly only.
+ * @ref materialize_table is the per-split read + filter step; it also assembles
+ * hive-partition output inline (it owns the per-split partition values).
+ * @ref post_filter_and_project applies a pending filter and non-partition
+ * projection.
  */
 class parquet_gpu_ingestible : public gpu_ingestible {
  public:
@@ -249,16 +241,12 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 
  private:
-  /// One per-task batch of files. The footer-read loop in @ref run_batch
-  /// walks these files sequentially, building up a single output vector
-  /// of @c scan_operator_input splits.
-  struct file_batch {
-    std::vector<std::string> file_paths;
-  };
-
-  void run_batch(const file_batch& batch,
-                 std::vector<std::unique_ptr<op::operator_data>>& out,
-                 std::shared_ptr<io::sirius_ioctx> io_ctx);
+  /// Read one file's footer, prune its row groups against the filter, and record
+  /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
+  /// Runs on a scan-manager dispatcher thread (the task returned by
+  /// @ref next_split_provider).
+  std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
+                                                  std::shared_ptr<io::sirius_ioctx> const& io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
 
@@ -273,16 +261,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
   std::vector<std::string> _file_paths;
-  std::size_t _approximate_batch_size{};
-  std::size_t _max_file_processed{};
-  std::size_t _total_files{};
 
   // Per-file metadata-scan cursor. next_split_provider hands out one file index
   // per claim; the coalescer downstream batches files and chunks row groups.
   std::atomic<std::size_t> _next_file_idx{0};
-
-  std::vector<file_batch> _batches;
-  std::atomic<std::size_t> _next_batch_idx{0};
 };
 
 std::shared_ptr<parquet_gpu_ingestible> make_ingestible(

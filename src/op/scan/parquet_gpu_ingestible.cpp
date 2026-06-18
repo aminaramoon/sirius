@@ -51,8 +51,6 @@
 #include <io/uring/uring_reactor.hpp>
 
 // standard library
-#include <algorithm>
-#include <cctype>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -62,16 +60,6 @@
 namespace sirius::op::scan {
 
 namespace {
-
-struct rg_accumulator {
-  std::vector<row_group_slice> slices;
-  std::size_t total_uncompressed_bytes = 0;
-  // Partition values for the files currently bundled, in scan_plan::partition_columns order.
-  // nullopt until the first file is added. Bundling is only safe across files with identical
-  // values: post_filter_and_project synthesizes constant scalar columns from this single vector
-  // on behalf of every file in the bundle, so all files in the bundle must share those values.
-  std::optional<std::vector<std::string>> partition_values;
-};
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
 
@@ -87,8 +75,7 @@ bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string:
  * single large file spans multiple splits (each with its own row_group_slice),
  * and several small files bundle into one split. Bundling across files is only
  * safe when they share hive-partition values and the same pushdown decision, so
- * a mismatch on either forces a flush — porting the boundary rules from the old
- * @c run_batch accumulator.
+ * a mismatch on either forces a flush.
  */
 class parquet_batch_coalecer : public batch_coalecer {
  public:
@@ -236,18 +223,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
     cudf::io::parquet_reader_options::builder().build());
   if (_plan->is_projected()) { _reader_options->set_column_names(_plan->data_column_names()); }
 
-  _file_paths             = bind.resolved_file_paths;
-  _approximate_batch_size = bind.approximate_batch_size;
-  _max_file_processed     = bind.max_file_processed;
-  _total_files            = _file_paths.size();
-
-  for (std::size_t start = 0; start < _total_files; start += _max_file_processed) {
-    auto const end = std::min(start + _max_file_processed, _total_files);
-    file_batch batch;
-    batch.file_paths.assign(_file_paths.begin() + static_cast<std::ptrdiff_t>(start),
-                            _file_paths.begin() + static_cast<std::ptrdiff_t>(end));
-    _batches.push_back(std::move(batch));
-  }
+  _file_paths = bind.resolved_file_paths;
 }
 
 parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
@@ -280,7 +256,7 @@ parquet_gpu_ingestible::create_post_filter_and_projection_info() const
 //===----------------------------------------------------------------------===//
 bool parquet_gpu_ingestible::has_processed_all_metadata() const
 {
-  return _next_batch_idx.load(std::memory_order_relaxed) >= _batches.size();
+  return _next_file_idx.load(std::memory_order_relaxed) >= _file_paths.size();
 }
 
 std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::next_split_provider(
@@ -289,271 +265,163 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   if (io_ctx == nullptr) {
     throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired.");
   }
-  // auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
-  // if (batch_idx >= _batches.size()) { return nullptr; }
-  // return [this, batch_idx, ctx = std::move(io_ctx)]() {
-  //   std::vector<std::unique_ptr<op::operator_data>> out;
-  //   run_batch(_batches[batch_idx], out, std::move(ctx));
-  //   return out;
-  // };
-  return nullptr;
+  auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
+  if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
+
+  // One metadata-scan task per file. Row-group chunking and file bundling happen
+  // downstream in parquet_batch_coalecer.
+  return [this, file_path = _file_paths[idx], io_ctx = std::move(io_ctx)]()
+           -> std::unique_ptr<scan_info> { return build_file_scan_info(file_path, io_ctx); };
 }
 
 //===----------------------------------------------------------------------===//
-// run_batch — ports parquet_split_provider::run_batch
+// build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
-void parquet_gpu_ingestible::run_batch(file_batch const& batch,
-                                       std::vector<std::unique_ptr<op::operator_data>>& out,
-                                       std::shared_ptr<io::sirius_ioctx> io_ctx)
+std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
+  std::string const& file_path, std::shared_ptr<io::sirius_ioctx> const& io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
-  auto const data_column_names = _plan->data_column_names();
-  auto reader_options          = std::make_shared<cudf::io::parquet_reader_options>(
-    cudf::io::parquet_reader_options::builder().build());
+  // Resolve the file to a sirius_datasource (own io backend, prefetch cache and
+  // cached metadata). Fall back to a plain cudf datasource only for local paths
+  // no sirius backend claims.
+  std::shared_ptr<io::sirius_datasource> sirius_ds = io_ctx->open_datasource(file_path);
+  if (!sirius_ds && has_uri_scheme(file_path)) {
+    throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
+  }
 
-  if (_plan->is_projected()) { reader_options->set_column_names(data_column_names); }
+  // Local copy of the shared options; the per-file filter pushdown decision is
+  // applied here, never on _reader_options.
+  auto opts = *_reader_options;
 
+  // Obtain footer metadata — from the datasource's cached parquet_metadata when
+  // present, else by fetching and parsing the footer.
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  if (sirius_ds) {
+    if (auto cached = sirius_ds->metadata()) {
+      if (auto pm = std::dynamic_pointer_cast<scan_manager::parquet_metadata>(std::move(cached))) {
+        file_metadata = pm->file_metadata();
+      }
+    }
+  }
+  if (!file_metadata) {
+    auto footer = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
+    hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
+                                     opts);
+    file_metadata =
+      std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
+  }
+  auto const& metadata = *file_metadata;
+
+  // FLBA-decimal pushdown probe: cudf's row-group stats filter cannot compare a
+  // fixed_point_scalar AST literal against FLBA / BYTE_ARRAY decimal stats, so
+  // pushdown is disabled for such files (the filter still applies post-decode).
+  bool disable_filter_pushdown = false;
+  for (auto const& elem : metadata.schema) {
+    bool const is_decimal = (elem.converted_type.has_value() &&
+                             *elem.converted_type == cudf::io::parquet::ConvertedType::DECIMAL) ||
+                            (elem.logical_type.has_value() &&
+                             elem.logical_type->type == cudf::io::parquet::LogicalType::DECIMAL);
+    if (!is_decimal) { continue; }
+    if (elem.type == cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY ||
+        elem.type == cudf::io::parquet::Type::BYTE_ARRAY) {
+      disable_filter_pushdown = true;
+      break;
+    }
+  }
+
+  // Translate the filter for reader-side row-group pruning unless disabled. The
+  // translated cuDF AST must outlive filter_row_groups_with_stats below.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
-  bool skip_pushdown_due_to_flba                                                 = false;
-  if (_duckdb_filter_expression) {
+  if (_duckdb_filter_expression && !disable_filter_pushdown) {
     auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
       return _plan->batch_column_name(ref_index);
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
     ast_expression = translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
-    if (ast_expression) {
-      // FLBA-decimal pushdown probe — see parquet_split_provider.cpp:276-326.
-      if (!batch.file_paths.empty()) {
-        auto const& probe_path = batch.file_paths.front();
-        try {
-          // Resolve the probe file to a datasource (carries its own io backend,
-          // cache and metadata) instead of reaching into io_context.
-          auto probe_ds = io_ctx->open_datasource(probe_path);
-          if (!probe_ds) { throw std::runtime_error("no backend supports path: " + probe_path); }
-          std::shared_ptr<cudf::io::parquet::FileMetaData const> probe_meta;
-          if (auto cached = probe_ds->metadata()) {
-            if (auto pm = std::dynamic_pointer_cast<scan_manager::parquet_metadata>(cached)) {
-              probe_meta = pm->file_metadata();
-            }
-          }
-          if (!probe_meta) {
-            auto footer = cudf::io::parquet::fetch_footer_to_host(*probe_ds);
-            hybrid_scan_reader probe_reader(
-              cudf::host_span<uint8_t const>(footer->data(), footer->size()), *reader_options);
-            probe_meta = std::make_shared<cudf::io::parquet::FileMetaData const>(
-              probe_reader.parquet_metadata());
-          }
-          for (auto const& elem : probe_meta->schema) {
-            bool const is_decimal =
-              (elem.converted_type.has_value() &&
-               *elem.converted_type == cudf::io::parquet::ConvertedType::DECIMAL) ||
-              (elem.logical_type.has_value() &&
-               elem.logical_type->type == cudf::io::parquet::LogicalType::DECIMAL);
-            if (!is_decimal) { continue; }
-            if (elem.type == cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY ||
-                elem.type == cudf::io::parquet::Type::BYTE_ARRAY) {
-              skip_pushdown_due_to_flba = true;
-              break;
-            }
-          }
-        } catch (std::exception const& e) {
-          SIRIUS_LOG_DEBUG(
-            "[parquet_gpu_ingestible] FLBA-decimal probe failed ({}); proceeding without "
-            "pushdown",
-            e.what());
-          skip_pushdown_due_to_flba = true;
-        }
-      }
+    if (ast_expression) { opts.set_filter(ast_expression->back()); }
+  }
 
-      if (!skip_pushdown_due_to_flba) {
-        reader_options->set_filter(ast_expression->back());
-        SIRIUS_LOG_DEBUG(
-          "[parquet_gpu_ingestible] Translated filter expression for row group pruning.");
-      } else {
-        SIRIUS_LOG_DEBUG(
-          "[parquet_gpu_ingestible] Skipping row-group pruning pushdown: FLBA-decimal file.");
+  hybrid_scan_reader reader(metadata, opts);
+
+  // Per-file leaf-column selection for byte accounting. Pure-filter columns are
+  // read for filter evaluation but excluded from the uncompressed accounting.
+  auto const data_column_names = _plan->data_column_names();
+  std::vector<std::size_t> selected_chunk_indices;
+  std::unordered_set<std::size_t> pure_filter_chunk_indices;
+  if (_plan->is_projected()) {
+    auto const pure_filter_positions = _plan->pure_filter_batch_positions();
+    selected_chunk_indices.reserve(data_column_names.size());
+    for (std::size_t k = 0; k < data_column_names.size(); ++k) {
+      auto leaves = detail::leaf_indices_for_column(metadata, data_column_names[k]);
+      if (leaves.empty()) {
+        throw std::runtime_error("[parquet_gpu_ingestible] Projected column '" +
+                                 data_column_names[k] +
+                                 "' not found in parquet file: " + file_path);
       }
-    } else {
-      SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible] AST translation failed for row group pruning.");
+      bool const is_pure_filter = pure_filter_positions.count(k);
+      for (auto const leaf : leaves) {
+        selected_chunk_indices.push_back(leaf);
+        if (is_pure_filter) { pure_filter_chunk_indices.insert(leaf); }
+      }
     }
   }
 
-  rg_accumulator accum;
-  bool const needs_post_processing = needs_output_assembly(*_plan);
+  auto row_group_indices = reader.all_row_groups(opts);
+  if (ast_expression && !disable_filter_pushdown) {
+    auto const rgs_before = row_group_indices.size();
+    row_group_indices     = reader.filter_row_groups_with_stats(row_group_indices, opts, stream);
+    SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible] Row group pruning {}: {} -> {} row group(s)",
+                     file_path,
+                     rgs_before,
+                     row_group_indices.size());
+  }
 
-  auto build_post_filter_info =
-    [&accum,
-     needs_post_processing]() -> std::unique_ptr<op::scan::post_filter_and_projection_info> {
-    if (!needs_post_processing) { return nullptr; }
-    auto info              = std::make_unique<parquet_post_filter_and_projection_info>();
-    info->partition_values = accum.partition_values.value_or(std::vector<std::string>{});
-    return info;
-  };
-
-  auto flush = [&](std::shared_ptr<cudf::io::parquet_reader_options> shared_opts,
-                   std::shared_ptr<scan_plan const> shared_plan) {
-    if (accum.slices.empty()) { return; }
-    auto split_info                     = std::make_unique<parquet_split_info>();
-    split_info->rg_slices               = std::move(accum.slices);
-    split_info->reader_options          = std::move(shared_opts);
-    split_info->plan                    = std::move(shared_plan);
-    split_info->disable_filter_pushdown = skip_pushdown_due_to_flba;
-    split_info->needs_assembly          = needs_post_processing;
-    split_info->partition_values = accum.partition_values.value_or(std::vector<std::string>{});
-    out.push_back(std::make_unique<op::scan::scan_operator_input>(std::move(split_info),
-                                                                  build_post_filter_info()));
-    accum.slices.clear();
-    accum.total_uncompressed_bytes = 0;
-  };
-
-  for (auto const& file_path : batch.file_paths) {
-    if (!_plan->partition_columns.empty()) {
-      std::vector<std::string> file_partition_values;
-      file_partition_values.reserve(_plan->partition_columns.size());
-      auto parsed = duckdb::HivePartitioning::Parse(file_path);
-      for (auto const& pc : _plan->partition_columns) {
-        auto it = parsed.find(pc.name);
-        file_partition_values.push_back(it != parsed.end() ? it->second : std::string{});
+  auto rg_contribution = [&](cudf::io::parquet::RowGroup const& row_group) {
+    std::size_t rg_uncompressed = 0;
+    std::size_t rg_compressed   = 0;
+    auto add_chunk = [&](cudf::io::parquet::ColumnChunk const& chunk, bool is_pure_filter) {
+      auto const& column_metadata = chunk.meta_data;
+      if (!is_pure_filter) {
+        rg_uncompressed += static_cast<std::size_t>(column_metadata.total_uncompressed_size);
       }
-      if (accum.partition_values && *accum.partition_values != file_partition_values) {
-        flush(reader_options, _plan);
-      }
-      accum.partition_values = std::move(file_partition_values);
-    }
-
-    // Resolve the file to a sirius_datasource — it carries its own io backend,
-    // prefetch cache and cached metadata, so the ingestible no longer reaches
-    // into io_context. Fall back to a plain cudf datasource only for local
-    // paths no sirius backend claims.
-    std::shared_ptr<io::sirius_datasource> sirius_ds = io_ctx->open_datasource(file_path);
-    if (!sirius_ds && has_uri_scheme(file_path)) {
-      throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
-    }
-
-    std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
-    std::shared_ptr<scan_manager::parquet_metadata> cached_parquet_metadata;
-    std::size_t footer_byte_len = 0;
-    std::unique_ptr<hybrid_scan_reader> reader_ptr;
-
-    if (sirius_ds) {
-      if (auto cached = sirius_ds->metadata()) {
-        cached_parquet_metadata =
-          std::dynamic_pointer_cast<scan_manager::parquet_metadata>(std::move(cached));
-      }
-    }
-
-    if (cached_parquet_metadata) {
-      file_metadata   = cached_parquet_metadata->file_metadata();
-      footer_byte_len = cached_parquet_metadata->footer_byte_len();
-      reader_ptr      = std::make_unique<hybrid_scan_reader>(*file_metadata, *reader_options);
-    } else {
-      auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
-      footer_byte_len    = footer_buffer->size();
-      reader_ptr         = std::make_unique<hybrid_scan_reader>(
-        cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
-        *reader_options);
-      file_metadata =
-        std::make_shared<cudf::io::parquet::FileMetaData const>(reader_ptr->parquet_metadata());
-    }
-    auto& reader         = *reader_ptr;
-    auto const& metadata = *file_metadata;
-
-    std::vector<std::size_t> selected_chunk_indices;
-    std::unordered_set<std::size_t> pure_filter_chunk_indices;
+      rg_compressed += static_cast<std::size_t>(column_metadata.total_compressed_size);
+    };
     if (_plan->is_projected()) {
-      auto const pure_filter_positions = _plan->pure_filter_batch_positions();
-      selected_chunk_indices.reserve(data_column_names.size());
-      for (std::size_t k = 0; k < data_column_names.size(); ++k) {
-        auto leaves = detail::leaf_indices_for_column(metadata, data_column_names[k]);
-        if (leaves.empty()) {
-          throw std::runtime_error("[parquet_gpu_ingestible] Projected column '" +
-                                   data_column_names[k] +
-                                   "' not found in parquet file: " + file_path);
-        }
-        bool const is_pure_filter = pure_filter_positions.count(k);
-        for (auto const leaf : leaves) {
-          selected_chunk_indices.push_back(leaf);
-          if (is_pure_filter) { pure_filter_chunk_indices.insert(leaf); }
-        }
+      for (auto const chunk_idx : selected_chunk_indices) {
+        add_chunk(row_group.columns[chunk_idx], pure_filter_chunk_indices.contains(chunk_idx));
+      }
+    } else {
+      for (auto const& chunk : row_group.columns) {
+        add_chunk(chunk, false);
       }
     }
+    return std::pair{rg_uncompressed, rg_compressed};
+  };
 
-    auto row_group_indices = reader.all_row_groups(*reader_options);
-    if (ast_expression && !skip_pushdown_due_to_flba) {
-      auto const rgs_before = row_group_indices.size();
-      SIRIUS_LOG_DEBUG(
-        "[parquet_gpu_ingestible] Row group pruning: file: {}\n"
-        "                                                  before: {}",
-        file_path,
-        rgs_before);
-      row_group_indices =
-        reader.filter_row_groups_with_stats(row_group_indices, *reader_options, stream);
-      SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible]                     after: {} (pruned {})",
-                       row_group_indices.size(),
-                       rgs_before - row_group_indices.size());
-    }
-
-    std::vector<cudf::size_type> cur_rgs;
-    std::size_t cur_uncompressed_bytes = 0;
-    std::size_t cur_compressed_bytes   = 0;
-
-    auto seal_current_file = [&]() {
-      if (cur_rgs.empty()) { return; }
-      accum.slices.emplace_back(file_metadata,
-                                file_path,
-                                std::move(cur_rgs),
-                                cur_uncompressed_bytes,
-                                cur_compressed_bytes,
-                                sirius_ds);
-      accum.total_uncompressed_bytes += cur_uncompressed_bytes;
-      cur_rgs.clear();
-      cur_uncompressed_bytes = 0;
-      cur_compressed_bytes   = 0;
-    };
-
-    auto rg_contribution = [&](cudf::io::parquet::RowGroup const& row_group) {
-      std::size_t rg_uncompressed = 0;
-      std::size_t rg_compressed   = 0;
-      auto add_chunk = [&](cudf::io::parquet::ColumnChunk const& chunk, bool is_pure_filter) {
-        auto const& column_metadata = chunk.meta_data;
-        if (!is_pure_filter) {
-          rg_uncompressed += static_cast<std::size_t>(column_metadata.total_uncompressed_size);
-        }
-        rg_compressed += static_cast<std::size_t>(column_metadata.total_compressed_size);
-      };
-      if (_plan->is_projected()) {
-        for (auto const chunk_idx : selected_chunk_indices) {
-          add_chunk(row_group.columns[chunk_idx], pure_filter_chunk_indices.contains(chunk_idx));
-        }
-      } else {
-        for (auto const& chunk : row_group.columns) {
-          add_chunk(chunk, false);
-        }
-      }
-      return std::pair{rg_uncompressed, rg_compressed};
-    };
-
-    for (auto const rg_idx : row_group_indices) {
-      auto const& row_group        = metadata.row_groups[rg_idx];
-      auto const [rg_unc, rg_comp] = rg_contribution(row_group);
-
-      if (!accum.slices.empty() || !cur_rgs.empty()) {
-        if (accum.total_uncompressed_bytes + cur_uncompressed_bytes + rg_unc >
-            _approximate_batch_size) {
-          seal_current_file();
-          flush(reader_options, _plan);
-        }
-      }
-
-      cur_uncompressed_bytes += rg_unc;
-      cur_compressed_bytes += rg_comp;
-      cur_rgs.push_back(rg_idx);
-    }
-    seal_current_file();
+  auto out                     = std::make_unique<parquet_file_scan_info>();
+  out->file_metadata           = file_metadata;
+  out->file_path               = file_path;
+  out->datasource              = std::move(sirius_ds);
+  out->disable_filter_pushdown = disable_filter_pushdown;
+  out->row_groups.reserve(row_group_indices.size());
+  for (auto const rg_idx : row_group_indices) {
+    auto const [rg_unc, rg_comp] = rg_contribution(metadata.row_groups[rg_idx]);
+    out->row_groups.push_back({rg_idx, rg_unc, rg_comp});
   }
-  flush(reader_options, _plan);
+
+  // Hive partition values for this file, in scan_plan::partition_columns order.
+  if (!_plan->partition_columns.empty()) {
+    out->partition_values.reserve(_plan->partition_columns.size());
+    auto parsed = duckdb::HivePartitioning::Parse(file_path);
+    for (auto const& pc : _plan->partition_columns) {
+      auto it = parsed.find(pc.name);
+      out->partition_values.push_back(it != parsed.end() ? it->second : std::string{});
+    }
+  }
+
+  return out;
 }
 
 //===----------------------------------------------------------------------===//
