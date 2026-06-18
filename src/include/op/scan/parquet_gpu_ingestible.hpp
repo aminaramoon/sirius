@@ -130,6 +130,58 @@ class parquet_split_info : public scan_info {
 };
 
 //===----------------------------------------------------------------------===//
+// parquet_file_scan_info
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Per-file metadata unit emitted by @ref next_split_provider.
+ *
+ * Each metadata-scan task processes exactly one parquet file: it reads the
+ * footer, prunes row groups against the filter, and records per-row-group byte
+ * accounting. The result is one @c parquet_file_scan_info. File batching and
+ * row-group chunking by byte budget are then performed downstream by
+ * @c parquet_batch_coalecer, which coalesces these into @c parquet_split_info
+ * data batches. The shared @c reader_options and @c scan_plan live on the
+ * ingestible and are stamped onto the emitted splits by the coalescer.
+ */
+class parquet_file_scan_info : public scan_info {
+ public:
+  /// A single pruned row group with the byte accounting the coalescer chunks on.
+  /// @c uncompressed_bytes excludes pure-filter columns (read for filtering but
+  /// not emitted), matching the legacy @c rg_contribution accounting.
+  struct row_group_entry {
+    cudf::size_type index;
+    std::size_t uncompressed_bytes;
+    std::size_t compressed_bytes;
+  };
+
+  /// Parsed footer metadata for this file.
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  /// File path (also the datasource cache key).
+  std::string file_path;
+  /// Pre-built datasource for this file, reused by @c materialize_table. May be
+  /// null for local paths no sirius backend claims.
+  std::shared_ptr<io::sirius_datasource> datasource;
+  /// Pruned row groups for this file, in file order, with byte accounting.
+  std::vector<row_group_entry> row_groups;
+  /// Hive partition values for this file, in @c scan_plan::partition_columns
+  /// order. Empty when the plan has no partition columns.
+  std::vector<std::string> partition_values;
+  /// When true, this file has an FLBA-decimal column whose row-group stats cudf
+  /// cannot compare against an AST literal — reader-side pushdown must be
+  /// disabled for any split that includes it.
+  bool disable_filter_pushdown = false;
+
+  [[nodiscard]] std::size_t estimated_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& rg : row_groups) {
+      total += rg.uncompressed_bytes;
+    }
+    return total;
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // parquet_post_filter_and_projection_info
 //===----------------------------------------------------------------------===//
 /**
@@ -175,13 +227,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   ~parquet_gpu_ingestible() override;
 
-  std::unique_ptr<batch_coalecer> create_batch_coalecer() const override { return nullptr; }
+  std::unique_ptr<batch_coalecer> create_batch_coalecer() const override;
 
   std::shared_ptr<post_filter_and_projection_info> create_post_filter_and_projection_info()
-    const final
-  {
-    return nullptr;
-  }
+    const final;
 
   [[nodiscard]] bool has_processed_all_metadata() const override;
 
@@ -216,6 +265,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // Canonical scan plan — built once in the constructor, shared by every
   // emitted split via its parquet_split_info::plan member.
   std::shared_ptr<scan_plan const> _plan;
+  // Shared reader options (column projection only — never set_filter, which is
+  // a per-split decision applied in materialize_table). Built once in the
+  // constructor and stamped onto every emitted split by the coalescer.
+  std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
@@ -223,6 +276,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   std::size_t _approximate_batch_size{};
   std::size_t _max_file_processed{};
   std::size_t _total_files{};
+
+  // Per-file metadata-scan cursor. next_split_provider hands out one file index
+  // per claim; the coalescer downstream batches files and chunks row groups.
+  std::atomic<std::size_t> _next_file_idx{0};
 
   std::vector<file_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};

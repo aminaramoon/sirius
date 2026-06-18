@@ -75,6 +75,110 @@ struct rg_accumulator {
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
 
+//===----------------------------------------------------------------------===//
+// parquet_batch_coalecer
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Coalesces per-file metadata units into data-batch splits.
+ *
+ * Receives one @c parquet_file_scan_info per file (each already pruned and
+ * byte-accounted by the metadata-scan task) and accumulates their row groups
+ * into @c parquet_split_info batches sized to @c approximate_batch_size. A
+ * single large file spans multiple splits (each with its own row_group_slice),
+ * and several small files bundle into one split. Bundling across files is only
+ * safe when they share hive-partition values and the same pushdown decision, so
+ * a mismatch on either forces a flush — porting the boundary rules from the old
+ * @c run_batch accumulator.
+ */
+class parquet_batch_coalecer : public batch_coalecer {
+ public:
+  parquet_batch_coalecer(std::size_t cap,
+                         std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
+                         std::shared_ptr<scan_plan const> plan)
+    : _cap(cap),
+      _reader_options(std::move(reader_options)),
+      _plan(std::move(plan)),
+      _needs_assembly(needs_output_assembly(*_plan))
+  {
+  }
+
+  std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info> info) override
+  {
+    std::vector<std::unique_ptr<scan_info>> emitted;
+    auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
+    if (file == nullptr) { return emitted; }
+
+    if (!_slices.empty() && (_partition_values != file->partition_values ||
+                             _disable_pushdown != file->disable_filter_pushdown)) {
+      emitted.push_back(emit_current());
+    }
+    _partition_values = file->partition_values;
+    _disable_pushdown = file->disable_filter_pushdown;
+
+    std::vector<cudf::size_type> cur_rgs;
+    std::size_t cur_unc  = 0;
+    std::size_t cur_comp = 0;
+    auto seal_file       = [&]() {
+      if (cur_rgs.empty()) { return; }
+      _slices.emplace_back(file->file_metadata,
+                           file->file_path,
+                           std::move(cur_rgs),
+                           cur_unc,
+                           cur_comp,
+                           file->datasource);
+      _acc_bytes += cur_unc;
+      cur_rgs.clear();
+      cur_unc  = 0;
+      cur_comp = 0;
+    };
+
+    for (auto const& rg : file->row_groups) {
+      if ((!_slices.empty() || !cur_rgs.empty()) && _cap > 0 &&
+          _acc_bytes + cur_unc + rg.uncompressed_bytes > _cap) {
+        seal_file();
+        emitted.push_back(emit_current());
+      }
+      cur_unc += rg.uncompressed_bytes;
+      cur_comp += rg.compressed_bytes;
+      cur_rgs.push_back(rg.index);
+    }
+    seal_file();
+    return emitted;
+  }
+
+  std::vector<std::unique_ptr<scan_info>> flush() override
+  {
+    std::vector<std::unique_ptr<scan_info>> out;
+    if (!_slices.empty()) { out.push_back(emit_current()); }
+    return out;
+  }
+
+ private:
+  std::unique_ptr<scan_info> emit_current()
+  {
+    auto split                     = std::make_unique<parquet_split_info>();
+    split->rg_slices               = std::move(_slices);
+    split->reader_options          = _reader_options;
+    split->plan                    = _plan;
+    split->disable_filter_pushdown = _disable_pushdown;
+    split->needs_assembly          = _needs_assembly;
+    split->partition_values        = _partition_values;
+    _slices.clear();
+    _acc_bytes = 0;
+    return split;
+  }
+
+  const std::size_t _cap;
+  std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
+  std::shared_ptr<scan_plan const> _plan;
+  const bool _needs_assembly;
+
+  std::vector<row_group_slice> _slices;
+  std::size_t _acc_bytes = 0;
+  std::vector<std::string> _partition_values;
+  bool _disable_pushdown = false;
+};
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -125,6 +229,13 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
     if (duckdb_expression) { _duckdb_filter_expression = std::move(duckdb_expression); }
   }
 
+  // Shared reader options — column projection only. set_filter is never applied
+  // here: it is a per-split decision (FLBA files disable it) made in
+  // materialize_table on a copy of these options.
+  _reader_options = std::make_shared<cudf::io::parquet_reader_options>(
+    cudf::io::parquet_reader_options::builder().build());
+  if (_plan->is_projected()) { _reader_options->set_column_names(_plan->data_column_names()); }
+
   _file_paths             = bind.resolved_file_paths;
   _approximate_batch_size = bind.approximate_batch_size;
   _max_file_processed     = bind.max_file_processed;
@@ -140,6 +251,29 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
 }
 
 parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
+
+//===----------------------------------------------------------------------===//
+// coalescer / post-filter factories
+//===----------------------------------------------------------------------===//
+std::unique_ptr<batch_coalecer> parquet_gpu_ingestible::create_batch_coalecer() const
+{
+  return std::make_unique<parquet_batch_coalecer>(
+    _info->approximate_batch_size, _reader_options, _plan);
+}
+
+std::shared_ptr<post_filter_and_projection_info>
+parquet_gpu_ingestible::create_post_filter_and_projection_info() const
+{
+  // post_filter_and_project runs to apply a post-decode filter (reader-side
+  // pushdown disabled / translation failed) or to project a non-partition
+  // output layout. Hive-partition assembly is handled inline in
+  // materialize_table — it owns the per-split partition values — so partitions
+  // alone do not require a post step.
+  bool const apply_filter     = static_cast<bool>(_duckdb_filter_expression);
+  bool const needs_projection = needs_output_assembly(*_plan) && !_plan->has_partitions();
+  if (!apply_filter && !needs_projection) { return nullptr; }
+  return std::make_shared<parquet_post_filter_and_projection_info>();
+}
 
 //===----------------------------------------------------------------------===//
 // split-provider interface
