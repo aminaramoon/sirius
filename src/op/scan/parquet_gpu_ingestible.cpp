@@ -491,7 +491,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 }
 
 //===----------------------------------------------------------------------===//
-// post_filter_and_project — assembly only
+// post_filter_and_project — post-decode filter + output assembly
 //===----------------------------------------------------------------------===//
 std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
@@ -500,14 +500,32 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   rmm::cuda_stream_view stream)
 {
   auto const& pf = static_cast<parquet_post_filter_and_projection_info const&>(info);
-  // The per-batch assembly call. The ingestible only emits a non-null
-  // post_filter_and_projection_info when needs_output_assembly(*_plan) is true,
-  // so this is unconditionally meaningful.
-  auto filtered_table = input.table.release(stream, mem_space.get_default_allocator());
-  auto out = assemble_scan_output(*_plan, std::move(filtered_table), pf.partition_values, stream);
+  rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
+
+  // Apply the row filter post-decode when materialization did not — reader-side
+  // pushdown was disabled (FLBA-decimal file) or AST translation failed. A
+  // ROW_FILTERED / ROW_FILTERED_AND_PROJECTED state means the reader already
+  // applied it. `sirius_filter_ast` must outlive `exec` — the executor only
+  // borrows the AST.
+  if (input.state != filter_state::ROW_FILTERED &&
+      input.state != filter_state::ROW_FILTERED_AND_PROJECTED && _duckdb_filter_expression) {
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
+    sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
+    auto filtered = exec.select(input.table.view());
+    input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
+    SIRIUS_LOG_DEBUG(
+      "[parquet_gpu_ingestible::post_filter_and_project] Applied duckdb filter expression "
+      "post-decode.");
+  }
+
+  // Reshape the reader's D-order batch to the plan's output layout: project /
+  // reorder data columns (non-owning, no GPU copy) and inject hive-partition
+  // columns. The release below moves the surviving column buffers out.
+  auto assembled =
+    assemble_scan_output(*_plan, std::move(input.table), pf.partition_values, stream);
   SIRIUS_LOG_DEBUG(
     "[parquet_gpu_ingestible::post_filter_and_project] Assembled scan output to plan layout.");
-  return out;
+  return assembled.release(stream, mr_ref);
 }
 
 }  // namespace sirius::op::scan
