@@ -81,9 +81,10 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
     return std::span<std::string const>(&db_path, 1);
   }
 
-  /// Subset iff @p other is the same duckdb table (same DataTable*) and every projected column here
-  /// also appears in @p other. Columns are matched by storage column id, not by name or position.
-  [[nodiscard]] bool is_subset_of(const ingestible_table_info& other) const override
+  /// Can serve @p other iff it is the same duckdb table (same DataTable*) and every projected
+  /// column here also appears in @p other. Columns are matched by storage column id, not by name or
+  /// position.
+  [[nodiscard]] bool can_serve(const ingestible_table_info& other) const override
   {
     auto const* o = dynamic_cast<duckdb_native_ingestible_table_info const*>(&other);
     if (o == nullptr || storage != o->storage) { return false; }

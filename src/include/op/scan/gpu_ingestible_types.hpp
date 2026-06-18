@@ -45,10 +45,11 @@ class ingestible_table_info {
   ingestible_table_info(ingestible_table_info const&)            = delete;
   ingestible_table_info& operator=(ingestible_table_info const&) = delete;
 
-  [[nodiscard]] virtual bool is_subset_of(const ingestible_table_info& other) const
-  {
-    return false;
-  }
+  /// True iff this (cached) table info can serve @p other — i.e. it reads a
+  /// superset of @p other's data so a pinned scan of this can feed @p other
+  /// (after the @ref column_projections gather). Implementations define the
+  /// per-format match (e.g. same files + column superset).
+  [[nodiscard]] virtual bool can_serve(const ingestible_table_info& other) const { return false; }
 
   [[nodiscard]] virtual std::vector<size_t> column_projections(
     const ingestible_table_info& other) const

@@ -558,7 +558,7 @@ void sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
 
   try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
-      if (entry.table_info->is_subset_of(table_info)) {
+      if (entry.table_info->can_serve(table_info)) {
         auto projection = entry.table_info->column_projections(table_info);
         auto provider   = make_provider_for_pinned_entry(entry, projection);
         _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));

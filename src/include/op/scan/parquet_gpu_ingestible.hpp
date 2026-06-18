@@ -85,9 +85,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// @c duckdb_native_ingestible_table_info.
   ///
   /// Used by @c sirius_scan_manager::try_assign_cached_entries as
-  /// @c cached_entry->is_subset_of(new_query): a true result means the pinned
+  /// @c cached_entry->can_serve(new_query): a true result means the pinned
   /// entry can feed the new query (after the @ref column_projections gather).
-  [[nodiscard]] bool is_subset_of(const ingestible_table_info& other) const override
+  [[nodiscard]] bool can_serve(const ingestible_table_info& other) const override
   {
     auto const* o = dynamic_cast<parquet_ingestible_table_info const*>(&other);
     if (o == nullptr) { return false; }
@@ -117,7 +117,7 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// into this scan's (cached) materialized columns that reproduces @p other's
   /// requested layout. Returns empty when @p other is a different scan type or
   /// requests a column this scan does not read (so callers should gate on
-  /// @ref is_subset_of). Columns are matched by primary (storage) index.
+  /// @ref can_serve). Columns are matched by primary (storage) index.
   [[nodiscard]] std::vector<std::size_t> column_projections(
     const ingestible_table_info& other) const override
   {
