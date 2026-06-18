@@ -81,42 +81,46 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
     return std::span<std::string const>(&db_path, 1);
   }
 
-  /// Can serve @p other iff it is the same duckdb table (same DataTable*) and every projected
-  /// column here also appears in @p other. Columns are matched by storage column id, not by name or
-  /// position.
+  /// Can serve @p other iff it is the same duckdb table (same DataTable*) and every column @p other
+  /// requests is also read by this scan — i.e. this scan's (cached) data is a superset that can
+  /// serve @p other. Columns are matched by storage column id, not by name or position.
   [[nodiscard]] bool can_serve(const ingestible_table_info& other) const override
   {
     auto const* o = dynamic_cast<duckdb_native_ingestible_table_info const*>(&other);
     if (o == nullptr || storage != o->storage) { return false; }
 
-    std::unordered_set<duckdb::idx_t> other_cols;
-    for (auto const& c : o->column_ids) {
-      other_cols.insert(c.GetPrimaryIndex());
-    }
+    std::unordered_set<duckdb::idx_t> this_cols;
+    this_cols.reserve(column_ids.size());
     for (auto const& c : column_ids) {
-      if (!other_cols.contains(c.GetPrimaryIndex())) { return false; }
+      this_cols.insert(c.GetPrimaryIndex());
+    }
+    for (auto const& c : o->column_ids) {
+      if (!this_cols.contains(c.GetPrimaryIndex())) { return false; }
     }
     return true;
   }
 
-  /// For each of this scan's column positions, the position of the same storage column in @p other
-  /// — a gather index over @p other's materialized columns (e.g. this [C,B] over [A,B,C] -> [2,1]).
-  /// Empty when @p other is a different table or not a superset.
+  /// For each column @p other requests (in @p other's @c column_ids order), the position of that
+  /// column within THIS scan's @c column_ids — a gather index into this scan's (cached)
+  /// materialized columns that reproduces @p other's requested layout (the index space
+  /// @c cached_databatch_provider slices). Empty when @p other is a different table or requests a
+  /// column this scan does not read. Columns are matched by storage column id.
   [[nodiscard]] std::vector<std::size_t> column_projections(
     const ingestible_table_info& other) const override
   {
     auto const* o = dynamic_cast<duckdb_native_ingestible_table_info const*>(&other);
     if (o == nullptr || storage != o->storage) { return {}; }
 
-    std::unordered_map<duckdb::idx_t, std::size_t> other_pos;
-    for (std::size_t j = 0; j < o->column_ids.size(); ++j) {
-      other_pos.emplace(o->column_ids[j].GetPrimaryIndex(), j);
+    std::unordered_map<duckdb::idx_t, std::size_t> this_pos;
+    this_pos.reserve(column_ids.size());
+    for (std::size_t i = 0; i < column_ids.size(); ++i) {
+      this_pos.emplace(column_ids[i].GetPrimaryIndex(), i);
     }
     std::vector<std::size_t> projection;
-    projection.reserve(column_ids.size());
-    for (auto const& c : column_ids) {
-      auto it = other_pos.find(c.GetPrimaryIndex());
-      if (it == other_pos.end()) { return {}; }  // not a superset -> no projection
+    projection.reserve(o->column_ids.size());
+    for (auto const& c : o->column_ids) {
+      auto it = this_pos.find(c.GetPrimaryIndex());
+      if (it == this_pos.end()) { return {}; }  // this scan lacks a requested column
       projection.push_back(it->second);
     }
     return projection;
