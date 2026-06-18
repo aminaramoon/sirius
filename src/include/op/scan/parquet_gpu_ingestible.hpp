@@ -187,14 +187,12 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   metadata_scan_task_t next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx) override;
 
-  op::scan::filtered_table materialize_metadata_to_table(
-    scan_info const& info,
-    const cucascade::memory::memory_space& mem_space,
-    rmm::cuda_stream_view stream) override;
+  filtered_table materialize_metadata_to_table(scan_info const& info,
+                                               const cucascade::memory::memory_space& mem_space,
+                                               rmm::cuda_stream_view stream) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
-    std::unique_ptr<cudf::table> table,
-    filter_state state,
+    filtered_table&& table,
     op::scan::post_filter_and_projection_info const& info,
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) override;

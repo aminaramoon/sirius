@@ -16,6 +16,7 @@
 
 // sirius
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/owning_table_view.hpp"
 
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
@@ -509,24 +510,24 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
       "[parquet_gpu_ingestible::materialize_table] Assembled inline on reader-side pushdown path.");
   }
 
-  return op::scan::filtered_table{std::move(table), state};
+  return op::scan::filtered_table{owning_table_view{std::move(table)}, state};
 }
 
 //===----------------------------------------------------------------------===//
 // post_filter_and_project — assembly only
 //===----------------------------------------------------------------------===//
 std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
-  std::unique_ptr<cudf::table> input,
-  filter_state state,
+  filtered_table&& input,
   op::scan::post_filter_and_projection_info const& info,
-  ::cucascade::memory::memory_space const& /*mem_space*/,
+  ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream)
 {
   auto const& pf = static_cast<parquet_post_filter_and_projection_info const&>(info);
   // The per-batch assembly call. The ingestible only emits a non-null
   // post_filter_and_projection_info when needs_output_assembly(*_plan) is true,
   // so this is unconditionally meaningful.
-  auto out = assemble_scan_output(*_plan, std::move(input), pf.partition_values, stream);
+  auto filtered_table = input.table.release(stream, mem_space.get_default_allocator());
+  auto out = assemble_scan_output(*_plan, std::move(filtered_table), pf.partition_values, stream);
   SIRIUS_LOG_DEBUG(
     "[parquet_gpu_ingestible::post_filter_and_project] Assembled scan output to plan layout.");
   return out;

@@ -115,13 +115,10 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   std::unique_ptr<cudf::table> output_table;
   auto materialized_table = _ingestible->materialize_table(*scan_input, stream);
   if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
-    output_table = _ingestible->post_filter_and_project(std::move(materialized_table.table),
-                                                        materialized_table.state,
-                                                        *scan_input->filter_and_project,
-                                                        *mem_space,
-                                                        stream);
+    output_table = _ingestible->post_filter_and_project(
+      std::move(materialized_table), *scan_input->filter_and_project, *mem_space, stream);
   } else {
-    output_table = std::move(materialized_table.table);
+    output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
   }
 
   auto batch = sirius::make_data_batch(std::move(output_table), *mem_space, stream);

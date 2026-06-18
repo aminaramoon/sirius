@@ -202,13 +202,12 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   metadata_scan_task_t next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx) override;
 
   op::scan::filtered_table materialize_metadata_to_table(
-    op::scan::scan_info const& info,
+    scan_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
-    std::unique_ptr<cudf::table> input,
-    filter_state state,
+    filtered_table&& input,
     op::scan::post_filter_and_projection_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) override;

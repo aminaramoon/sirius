@@ -135,8 +135,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * fresh-read + assembly path.
    */
   virtual std::unique_ptr<cudf::table> post_filter_and_project(
-    std::unique_ptr<cudf::table> table,
-    filter_state state,
+    filtered_table&& input,
     const post_filter_and_projection_info& info,
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) = 0;

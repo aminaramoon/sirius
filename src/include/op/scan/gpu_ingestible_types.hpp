@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "op/scan/owning_table_view.hpp"
+
 #include <io/sirius_datasource.hpp>
 
 #include <memory>
@@ -148,7 +150,7 @@ enum class filter_state {
  * the split's filter + projection work was applied during materialization.
  */
 struct filtered_table {
-  std::unique_ptr<cudf::table> table;
+  owning_table_view table;
   filter_state state{filter_state::UNFILTERED};
 };
 

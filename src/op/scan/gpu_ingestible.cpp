@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "op/scan/owning_table_view.hpp"
+
 #include <data/data_batch_utils.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -31,8 +33,7 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
     auto batch  = split.get_cached_batch();
     auto rbatch = batch->to_read_only();
     auto view   = get_cudf_table_view(rbatch);
-    return {.table = std::make_unique<cudf::table>(view, stream),
-            .state = filter_state::UNFILTERED};
+    return {.table = owning_table_view{std::move(rbatch), view}, .state = filter_state::UNFILTERED};
   }
 }
 
