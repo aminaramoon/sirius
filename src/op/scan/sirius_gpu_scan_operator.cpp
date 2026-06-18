@@ -114,7 +114,13 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;
   std::unique_ptr<cudf::table> output_table;
   auto materialized_table = _ingestible->materialize_table(*scan_input, stream);
-  if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
+  // post_filter_and_project runs only when the split carries a post-filter info
+  // and materialization did not already fully filter + project. A fully
+  // assembled result (ROW_FILTERED_AND_PROJECTED, e.g. hive-partition scans) or
+  // a null filter_and_project (identity scan, no filter/projection) flows
+  // straight through.
+  if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED &&
+      scan_input->filter_and_project) {
     output_table = _ingestible->post_filter_and_project(
       std::move(materialized_table), *scan_input->filter_and_project, *mem_space, stream);
   } else {

@@ -615,25 +615,48 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     table->num_rows(),
     table->num_columns());
 
-  // The reader applied the row filter iff pushdown engaged (ast_expression was
-  // set as the reader filter). Otherwise the filter — if any — is still pending
-  // and post_filter_and_project applies it post-decode. Output assembly
-  // (projection / hive injection) is likewise deferred to post_filter_and_project.
+  // Hive-partition scans assemble inline here: partition_values are per-split
+  // (carried on parquet_split_info) and do not travel to the pipeline-shared
+  // post_filter info. Apply the row filter first when pushdown did not, then
+  // inject the partition columns and project to the output layout, so the
+  // result is fully ROW_FILTERED_AND_PROJECTED and post_filter_and_project is
+  // skipped. `sirius_filter_ast` must outlive `exec` — the executor borrows it.
+  if (_plan->has_partitions()) {
+    owning_table_view view{std::move(table)};
+    if (!ast_expression.has_value() && _duckdb_filter_expression) {
+      auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
+      sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
+      view = owning_table_view{exec.select(view.view())};
+      SIRIUS_LOG_DEBUG(
+        "[parquet_gpu_ingestible::materialize_table] Applied duckdb filter expression post-decode "
+        "(partitioned).");
+    }
+    auto assembled = assemble_scan_output(*_plan, std::move(view), split.partition_values, stream);
+    return op::scan::filtered_table{std::move(assembled),
+                                    op::scan::filter_state::ROW_FILTERED_AND_PROJECTED};
+  }
+
+  // No partitions: the reader applied the row filter iff pushdown engaged
+  // (ast_expression was set as the reader filter). Any pending filter and the
+  // output projection are deferred to post_filter_and_project.
   auto const state = ast_expression.has_value() ? op::scan::filter_state::ROW_FILTERED
                                                 : op::scan::filter_state::UNFILTERED;
   return op::scan::filtered_table{owning_table_view{std::move(table)}, state};
 }
 
 //===----------------------------------------------------------------------===//
-// post_filter_and_project — post-decode filter + output assembly
+// post_filter_and_project — post-decode filter + non-partition projection
 //===----------------------------------------------------------------------===//
+// Hive-partition scans are fully assembled in materialize_table (it owns the
+// per-split partition values) and return ROW_FILTERED_AND_PROJECTED, so they
+// never reach here. This path therefore only applies a pending row filter and a
+// non-partition projection; partition injection is unreachable.
 std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
-  op::scan::post_filter_and_projection_info const& info,
+  op::scan::post_filter_and_projection_info const& /*info*/,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream)
 {
-  auto const& pf = static_cast<parquet_post_filter_and_projection_info const&>(info);
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
   // Apply the row filter post-decode when materialization did not — reader-side
@@ -652,11 +675,12 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
       "post-decode.");
   }
 
-  // Reshape the reader's D-order batch to the plan's output layout: project /
-  // reorder data columns (non-owning, no GPU copy) and inject hive-partition
-  // columns. The release below moves the surviving column buffers out.
+  // Project / reorder the reader's D-order batch to the plan's output layout
+  // (non-owning select_columns, no GPU copy). No partitions reach this path, so
+  // partition_values is unused. The release below moves the surviving column
+  // buffers out.
   auto assembled =
-    assemble_scan_output(*_plan, std::move(input.table), pf.partition_values, stream);
+    assemble_scan_output(*_plan, std::move(input.table), /*partition_values=*/{}, stream);
   SIRIUS_LOG_DEBUG(
     "[parquet_gpu_ingestible::post_filter_and_project] Assembled scan output to plan layout.");
   return assembled.release(stream, mr_ref);
