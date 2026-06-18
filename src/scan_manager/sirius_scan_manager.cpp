@@ -20,9 +20,12 @@
 #include "exec/thread_pool.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/kvikio/kvikio_context.hpp"
+#include "io/parquet_helpers.hpp"
+#include "io/sirius_datasource.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
+#include "op/scan/parquet_metadata.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/query.hpp"
@@ -261,42 +264,43 @@ Out lookup_supporting(Container const& ioctxs,
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
-  // auto datasource = create_datasource(uri);
-  // if (!datasource) {
-  //   throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: "
-  //   +
-  //                            uri);
-  // }
+  auto datasource = create_datasource(uri);
+  if (!datasource) {
+    throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
+                             uri);
+  }
 
-  // // Footer-only fetch + Thrift parse — the same path parquet_split_provider's
-  // // run_batch takes on a metadata-cache miss, so bind and scan agree on how
-  // // the footer is read.
-  // auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
-  // auto const footer_byte_len = footer_buffer->size();
-  // auto reader_options        = cudf::io::parquet_reader_options::builder().build();
-  // cudf::io::parquet::experimental::hybrid_scan_reader reader{
-  //   cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
-  //   reader_options};
-  // auto file_metadata         = reader.parquet_metadata();
-  // auto const footer_num_rows = file_metadata.num_rows;
+  // Reuse a previously parsed footer when present — a prior bind or scan of the
+  // same file parks it in the ioctx metadata store, which lives for the ioctx's
+  // lifetime. On a miss, fetch + Thrift-parse the footer once and park it so the
+  // subsequent scan reuses it. Mirrors parquet_gpu_ingestible::build_file_scan_info,
+  // so the footer is parsed exactly once per file per process.
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  if (auto cached = datasource->metadata()) {
+    if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached))) {
+      file_metadata = pm->file_metadata();
+    }
+  }
+  if (!file_metadata) {
+    auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
+    auto const footer_byte_len = footer_buffer->size();
+    auto reader_options        = cudf::io::parquet_reader_options::builder().build();
+    cudf::io::parquet::experimental::hybrid_scan_reader reader{
+      cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
+      reader_options};
+    file_metadata =
+      std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
+    [[maybe_unused]] auto const stored = datasource->store_metadata(
+      std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len));
+  }
 
-  // auto schema = sirius::io::parquet_helpers::extract_schema(file_metadata);
-
-  // // Footer-parse reuse: a metadata-only insert (empty ranges => no chunk
-  // // prefetch) lets the subsequent scan's get_metadata hit, so the footer is
-  // // Thrift-parsed once instead of twice.
-  // if (auto* cache = datasource->io_ctx()->cache(); cache != nullptr) {
-  //   auto metadata = std::make_shared<parquet_metadata>(
-  //     std::make_shared<cudf::io::parquet::FileMetaData const>(std::move(file_metadata)),
-  //     footer_byte_len);
-  //   cache->insert(*datasource->io_object(), std::move(metadata), /*ranges=*/{});
-  // }
+  auto schema = sirius::io::parquet_helpers::extract_schema(*file_metadata);
 
   parquet_bind_result result;
-  // result.return_types   = std::move(schema.types);
-  // result.names          = std::move(schema.names);
-  // result.object_size    = datasource->size();
-  // result.total_num_rows = static_cast<std::size_t>(footer_num_rows);
+  result.return_types   = std::move(schema.types);
+  result.names          = std::move(schema.names);
+  result.object_size    = datasource->size();
+  result.total_num_rows = static_cast<std::size_t>(file_metadata->num_rows);
   return result;
 }
 

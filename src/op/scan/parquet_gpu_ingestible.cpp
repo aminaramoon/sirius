@@ -25,10 +25,10 @@
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
+#include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
-#include <scan_manager/parquet_metadata.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
@@ -36,9 +36,11 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
+#include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/span.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
@@ -107,12 +109,19 @@ class parquet_batch_coalecer : public batch_coalecer {
     std::size_t cur_comp = 0;
     auto seal_file       = [&]() {
       if (cur_rgs.empty()) { return; }
+      // A file's row groups can span multiple splits, each sealed into its own
+      // slice. fadvise stores a per-scan prefetch handle on the datasource, so
+      // each slice gets its own datasource (sharing the io_object) — otherwise
+      // a later split's fadvise would stomp an earlier one's handle.
+      auto slice_ds = file->datasource
+                              ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
+                              : std::shared_ptr<io::sirius_datasource>{};
       _slices.emplace_back(file->file_metadata,
                            file->file_path,
                            std::move(cur_rgs),
                            cur_unc,
                            cur_comp,
-                           file->datasource);
+                           std::move(slice_ds));
       _acc_bytes += cur_unc;
       cur_rgs.clear();
       cur_unc  = 0;
@@ -166,7 +175,61 @@ class parquet_batch_coalecer : public batch_coalecer {
   bool _disable_pushdown = false;
 };
 
+/// Column-chunk byte ranges a read fetches for @p row_group_indices, honoring
+/// @p options' column projection — the ranges materialize_table reads, used to
+/// drive prefetch. Empty when there are no row groups.
+std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
+  cudf::io::parquet::FileMetaData const& metadata,
+  cudf::io::parquet_reader_options const& options,
+  std::vector<cudf::size_type> const& row_group_indices)
+{
+  if (row_group_indices.empty()) { return {}; }
+  hybrid_scan_reader reader(metadata, options);
+  return reader.all_column_chunks_byte_ranges(
+    cudf::host_span<cudf::size_type const>(row_group_indices.data(), row_group_indices.size()),
+    options);
+}
+
 }  // namespace
+
+//===----------------------------------------------------------------------===//
+// scan_info fadvise_entries — prefetch byte ranges
+//===----------------------------------------------------------------------===//
+std::vector<scan_info::fadvise_entry> parquet_file_scan_info::fadvise_entries() const
+{
+  if (!datasource || !file_metadata || !reader_options) { return {}; }
+  std::vector<cudf::size_type> rg_indices;
+  rg_indices.reserve(row_groups.size());
+  for (auto const& rg : row_groups) {
+    rg_indices.push_back(rg.index);
+  }
+  auto ranges = column_chunk_ranges(*file_metadata, *reader_options, rg_indices);
+  if (ranges.empty()) { return {}; }
+  fadvise_entry entry;
+  entry.datasource = datasource;
+  entry.ranges     = std::move(ranges);
+  std::vector<fadvise_entry> out;
+  out.push_back(std::move(entry));
+  return out;
+}
+
+std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() const
+{
+  if (!reader_options) { return {}; }
+  std::vector<fadvise_entry> entries;
+  entries.reserve(rg_slices.size());
+  for (auto const& slice : rg_slices) {
+    if (!slice.datasource || !slice.file_metadata) { continue; }
+    auto ranges =
+      column_chunk_ranges(*slice.file_metadata, *reader_options, slice.row_group_indices);
+    if (ranges.empty()) { continue; }
+    fadvise_entry entry;
+    entry.datasource = slice.datasource;
+    entry.ranges     = std::move(ranges);
+    entries.push_back(std::move(entry));
+  }
+  return entries;
+}
 
 //===----------------------------------------------------------------------===//
 // parquet_ingestible_table_info::make_ingestible
@@ -299,17 +362,23 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
   if (sirius_ds) {
     if (auto cached = sirius_ds->metadata()) {
-      if (auto pm = std::dynamic_pointer_cast<scan_manager::parquet_metadata>(std::move(cached))) {
+      if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached))) {
         file_metadata = pm->file_metadata();
       }
     }
   }
   if (!file_metadata) {
-    auto footer = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
+    auto footer           = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
+    auto const footer_len = footer->size();
     hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
                                      opts);
     file_metadata =
       std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
+    // Park the parse in the ioctx metadata store so a later scan of the same
+    // file skips the footer fetch + Thrift parse (the read above already
+    // dereferences *sirius_ds, so it is non-null here). Best-effort.
+    [[maybe_unused]] auto const stored =
+      sirius_ds->store_metadata(std::make_shared<parquet_metadata>(file_metadata, footer_len));
   }
   auto const& metadata = *file_metadata;
 
@@ -404,6 +473,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   out->file_metadata           = file_metadata;
   out->file_path               = file_path;
   out->datasource              = std::move(sirius_ds);
+  out->reader_options          = _reader_options;
   out->disable_filter_pushdown = disable_filter_pushdown;
   out->row_groups.reserve(row_group_indices.size());
   for (auto const rg_idx : row_group_indices) {

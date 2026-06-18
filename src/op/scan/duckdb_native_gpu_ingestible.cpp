@@ -160,7 +160,7 @@ class duckdb_native_batch_coalecer : public batch_coalecer {
 // duckdb_native_gpu_ingestible — construction
 //===----------------------------------------------------------------------===//
 duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
-  std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> info)
+  std::unique_ptr<duckdb_native_ingestible_table_info> info)
   : _info(std::move(info))
 {
   auto const& bind = *_info;
@@ -271,8 +271,8 @@ duckdb_native_gpu_ingestible::next_split_provider(std::shared_ptr<io::sirius_ioc
 //===----------------------------------------------------------------------===//
 // materialize_table
 //===----------------------------------------------------------------------===//
-op::scan::filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
-  op::scan::scan_info const& info,
+filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
+  scan_info const& info,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream)
 {
@@ -291,8 +291,8 @@ op::scan::filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_t
     table->num_columns());
   // duckdb-native applies filter + projection inside post_filter_and_project,
   // never during materialization — always UNFILTERED here.
-  return op::scan::filtered_table{.table = owning_table_view{std::move(table)},
-                                  .state = op::scan::filter_state::UNFILTERED};
+  return filtered_table{.table = owning_table_view{std::move(table)},
+                        .state = filter_state::UNFILTERED};
 }
 
 //===----------------------------------------------------------------------===//
@@ -335,7 +335,7 @@ duckdb_native_gpu_ingestible::create_post_filter_and_projection_info() const
 //===----------------------------------------------------------------------===//
 std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
-  op::scan::post_filter_and_projection_info const& info,
+  post_filter_and_projection_info const& info,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream)
 {
@@ -344,26 +344,26 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
   //===----------Filter Evaluation----------===//
-  std::unique_ptr<cudf::table> filtered_table;
+  std::unique_ptr<cudf::table> final_table;
   if (pf.apply_filter && _filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
     sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
-    filtered_table = exec.select(input.table.view());
+    final_table = exec.select(input.table.view());
   }
 
   //===----------Projection----------===//
   if (pf.output_arity > 0 &&
-      static_cast<std::size_t>(filtered_table->num_columns()) > pf.output_arity) {
-    auto cols = filtered_table->release();
+      static_cast<std::size_t>(final_table->num_columns()) > pf.output_arity) {
+    auto cols = final_table->release();
     std::vector<std::unique_ptr<cudf::column>> selected;
     selected.reserve(pf.output_arity);
     for (std::size_t i = 0; i < pf.output_arity; ++i) {
       selected.push_back(std::move(cols[i]));
     }
-    filtered_table = std::make_unique<cudf::table>(std::move(selected));
+    final_table = std::make_unique<cudf::table>(std::move(selected));
   }
 
-  return filtered_table;
+  return final_table;
 }
 
 std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(
