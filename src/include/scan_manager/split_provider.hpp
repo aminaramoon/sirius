@@ -24,10 +24,8 @@
 #include "scan_manager/split_connector.hpp"
 
 #include <cstddef>
-#include <exception>
 #include <functional>
 #include <memory>
-#include <utility>
 
 namespace sirius::op {
 class operator_data;
@@ -72,10 +70,7 @@ class split_provider {
   /// away. Callers that need a shared_ptr can promote via
   /// `provider.get_ingestible().shared_from_this()` (enabled by
   /// @c gpu_ingestible inheriting @c std::enable_shared_from_this).
-  explicit split_provider(op::scan::gpu_ingestible& ingestible, io::sirius_ioctx& io_ctx)
-    : _ingestible(&ingestible), _io_ctx(io_ctx.shared_from_this())
-  {
-  }
+  explicit split_provider(op::scan::gpu_ingestible& ingestible, io::sirius_ioctx& io_ctx);
 
   virtual ~split_provider() = default;
 
@@ -104,10 +99,7 @@ class split_provider {
    * subclasses override and ignore @c _ingestible (which is null on the
    * default-ctor path they use).
    */
-  [[nodiscard]] virtual bool has_more_splits() const
-  {
-    return !_ingestible->has_processed_all_metadata();
-  }
+  [[nodiscard]] virtual bool has_more_splits() const;
 
   /**
    * @brief Atomically claim the next batch and return a callable that
@@ -119,10 +111,7 @@ class split_provider {
    * path, but the null fallback keeps the contract simple under concurrent
    * observers.
    */
-  virtual std::function<std::unique_ptr<op::scan::scan_info>()> next_split_provider()
-  {
-    return _ingestible->next_split_provider(_io_ctx);
-  }
+  virtual std::function<std::unique_ptr<op::scan::scan_info>()> next_split_provider();
 
   /// Accessor for the composed ingestible. Undefined behavior on the legacy
   /// default-ctor path (which never calls this). Callers that need a
@@ -143,27 +132,5 @@ class split_provider {
 
   exec::completion_token _completion_token;
 };
-
-template <typename Scheduler>
-void split_provider::run(Scheduler& scheduler, const std::function<void(value_type&&)>& on_split)
-{
-  using split_type = typename value_type::value_type;
-  assert(on_split);
-  exec::completion_controller ctrl;
-  _completion_token =
-    ctrl.on_completion([on_split] { on_split(exec::make_empty_try<split_type>()); });
-  while (has_more_splits()) {
-    auto work = next_split_provider();
-    if (!work) { continue; }
-    scheduler.enqueue([this, on_split, work = std::move(work), token = ctrl.acquire()]() mutable {
-      try {
-        auto split = work();
-        on_split(std::move(split));
-      } catch (...) {
-        on_split(std::current_exception());
-      }
-    });
-  }
-}
 
 }  // namespace sirius::scan_manager
