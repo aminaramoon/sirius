@@ -52,15 +52,13 @@ namespace sirius::op::scan {
  */
 class scan_operator_input : public op::operator_data {
  public:
-  explicit scan_operator_input(std::unique_ptr<scan_info> metadata,
-                               std::shared_ptr<post_filter_and_projection_info> fp)
-    : materialization_info(std::move(metadata)), filter_and_project(std::move(fp))
+  explicit scan_operator_input(std::unique_ptr<scan_info> metadata)
+    : materialization_info(std::move(metadata))
   {
   }
 
-  explicit scan_operator_input(std::shared_ptr<cucascade::data_batch> cached_batch,
-                               std::shared_ptr<post_filter_and_projection_info> fp)
-    : materialization_info(std::move(cached_batch)), filter_and_project(std::move(fp))
+  explicit scan_operator_input(std::shared_ptr<cucascade::data_batch> cached_batch)
+    : materialization_info(std::move(cached_batch))
   {
   }
 
@@ -73,8 +71,6 @@ class scan_operator_input : public op::operator_data {
   {
     return std::holds_alternative<std::shared_ptr<::cucascade::data_batch>>(materialization_info);
   }
-
-  [[nodiscard]] bool has_filter() const noexcept { return filter_and_project != nullptr; }
 
   [[nodiscard]] bool has_scan_metadata() const noexcept
   {
@@ -125,7 +121,6 @@ class scan_operator_input : public op::operator_data {
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
   std::variant<std::monostate, std::unique_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
     materialization_info;
-  std::shared_ptr<post_filter_and_projection_info> filter_and_project;
 };
 
 }  // namespace sirius::op::scan

@@ -153,26 +153,6 @@ class duckdb_native_scan_info : public op::scan::scan_info {
 };
 
 //===----------------------------------------------------------------------===//
-// duckdb_native_post_filter_and_projection_info
-//===----------------------------------------------------------------------===//
-/**
- * @brief Per-split post-decode filter + projection description.
- *
- * Emitted by @c duckdb_native_gpu_ingestible whenever the @c table_filters
- * survived translation OR the scan emitted more columns than
- * @c output_types requested (trailing filter-only columns).
- * @c apply_filter triggers the @c gpu_expression_executor pass against the
- * ingestible's shared filter expression; @c output_arity drives the
- * projection-down step.
- */
-class duckdb_native_post_filter_and_projection_info
-  : public op::scan::post_filter_and_projection_info {
- public:
-  bool apply_filter        = false;
-  std::size_t output_arity = 0;
-};
-
-//===----------------------------------------------------------------------===//
 // duckdb_native_gpu_ingestible
 //===----------------------------------------------------------------------===//
 class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
@@ -182,9 +162,6 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   ~duckdb_native_gpu_ingestible() override;
 
   std::unique_ptr<batch_coalecer> create_batch_coalecer() const override;
-
-  std::shared_ptr<post_filter_and_projection_info> create_post_filter_and_projection_info()
-    const final;
 
   [[nodiscard]] bool has_processed_all_metadata() const override;
 
@@ -197,7 +174,6 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& input,
-    op::scan::post_filter_and_projection_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) override;
 

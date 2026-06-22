@@ -243,20 +243,6 @@ class parquet_file_scan_info : public scan_info {
 };
 
 //===----------------------------------------------------------------------===//
-// parquet_post_filter_and_projection_info
-//===----------------------------------------------------------------------===//
-/**
- * @brief Marker that a split needs a post-decode step.
- *
- * Pipeline-shared (one per scan, from @c create_post_filter_and_projection_info)
- * and attached to every emitted split. Carries no per-split data: the post step
- * applies a pending row filter and/or projects a non-partition output layout.
- * Hive-partition assembly is done inline in @c materialize_table, which owns the
- * per-split partition values, so partition values never travel through here.
- */
-class parquet_post_filter_and_projection_info : public post_filter_and_projection_info {};
-
-//===----------------------------------------------------------------------===//
 // parquet_gpu_ingestible
 //===----------------------------------------------------------------------===//
 /**
@@ -285,9 +271,6 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   std::unique_ptr<batch_coalecer> create_batch_coalecer() const override;
 
-  std::shared_ptr<post_filter_and_projection_info> create_post_filter_and_projection_info()
-    const final;
-
   [[nodiscard]] bool has_processed_all_metadata() const override;
 
   metadata_scan_task_t next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx) override;
@@ -298,7 +281,6 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& table,
-    op::scan::post_filter_and_projection_info const& info,
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) override;
 

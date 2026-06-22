@@ -300,20 +300,6 @@ std::unique_ptr<batch_coalecer> parquet_gpu_ingestible::create_batch_coalecer() 
     _info->approximate_batch_size, _reader_options, _plan);
 }
 
-std::shared_ptr<post_filter_and_projection_info>
-parquet_gpu_ingestible::create_post_filter_and_projection_info() const
-{
-  // post_filter_and_project runs to apply a post-decode filter (reader-side
-  // pushdown disabled / translation failed) or to project a non-partition
-  // output layout. Hive-partition assembly is handled inline in
-  // materialize_table — it owns the per-split partition values — so partitions
-  // alone do not require a post step.
-  bool const apply_filter     = static_cast<bool>(_duckdb_filter_expression);
-  bool const needs_projection = needs_output_assembly(*_plan) && !_plan->has_partitions();
-  if (!apply_filter && !needs_projection) { return nullptr; }
-  return std::make_shared<parquet_post_filter_and_projection_info>();
-}
-
 //===----------------------------------------------------------------------===//
 // split-provider interface
 //===----------------------------------------------------------------------===//
@@ -545,14 +531,6 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   auto [table, _] =
     cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
 
-  SIRIUS_LOG_DEBUG(
-    "[parquet_gpu_ingestible::materialize_table] Read {} file(s) (first: {}) — {} rows, {} "
-    "columns",
-    split.rg_slices.size(),
-    split.rg_slices.empty() ? "<none>" : split.rg_slices.front().file_path,
-    table->num_rows(),
-    table->num_columns());
-
   // Hive-partition scans assemble inline here: partition_values are per-split
   // (carried on parquet_split_info) and do not travel to the pipeline-shared
   // post_filter info. Apply the row filter first when pushdown did not, then
@@ -565,18 +543,12 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
       auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
       sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
       view = owning_table_view{exec.select(view.view())};
-      SIRIUS_LOG_DEBUG(
-        "[parquet_gpu_ingestible::materialize_table] Applied duckdb filter expression post-decode "
-        "(partitioned).");
     }
     auto assembled = assemble_scan_output(*_plan, std::move(view), split.partition_values, stream);
     return op::scan::filtered_table{std::move(assembled),
                                     op::scan::filter_state::ROW_FILTERED_AND_PROJECTED};
   }
 
-  // No partitions: the reader applied the row filter iff pushdown engaged
-  // (ast_expression was set as the reader filter). Any pending filter and the
-  // output projection are deferred to post_filter_and_project.
   auto const state = ast_expression.has_value() ? op::scan::filter_state::ROW_FILTERED
                                                 : op::scan::filter_state::UNFILTERED;
   return op::scan::filtered_table{owning_table_view{std::move(table)}, state};
@@ -591,7 +563,6 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 // non-partition projection; partition injection is unreachable.
 std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
-  op::scan::post_filter_and_projection_info const& /*info*/,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream)
 {

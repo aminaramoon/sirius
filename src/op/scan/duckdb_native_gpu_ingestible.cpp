@@ -44,6 +44,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -310,60 +311,37 @@ std::unique_ptr<batch_coalecer> duckdb_native_gpu_ingestible::create_batch_coale
 }
 
 //===----------------------------------------------------------------------===//
-// post_filter_and_projection_info
+// post_filter_and_project — filter eval + projection to output arity
 //===----------------------------------------------------------------------===//
-std::shared_ptr<post_filter_and_projection_info>
-duckdb_native_gpu_ingestible::create_post_filter_and_projection_info() const
+std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_project(
+  filtered_table&& input,
+  ::cucascade::memory::memory_space const& mem_space,
+  rmm::cuda_stream_view stream)
 {
-  // Projection-down is needed when the decoder emits trailing filter-only columns beyond the
-  // query's output arity. Both are read straight off the bind data.
-  auto const apply_filter = static_cast<bool>(_filter_expression);
   auto const output_arity = _info->output_types.size();
   auto const decoded_cols =
     _info->projection_ids.empty() ? _info->column_ids.size() : _info->projection_ids.size();
   auto const projection_required = (output_arity > 0) && (decoded_cols > output_arity);
 
-  if (!apply_filter && !projection_required) { return nullptr; }
-  auto pf          = std::make_shared<duckdb_native_post_filter_and_projection_info>();
-  pf->apply_filter = apply_filter;
-  pf->output_arity = projection_required ? output_arity : 0;
-  return pf;
-}
-
-//===----------------------------------------------------------------------===//
-// post_filter_and_project — filter eval + projection to output arity
-//===----------------------------------------------------------------------===//
-std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_project(
-  filtered_table&& input,
-  post_filter_and_projection_info const& info,
-  ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
-{
-  auto const& pf = static_cast<duckdb_native_post_filter_and_projection_info const&>(info);
-
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
   //===----------Filter Evaluation----------===//
-  std::unique_ptr<cudf::table> final_table;
-  if (pf.apply_filter && _filter_expression) {
+  owning_table_view final_table;
+  if (_filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
     sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
-    final_table = exec.select(input.table.view());
+    final_table = owning_table_view{exec.select(input.table.view())};
   }
 
   //===----------Projection----------===//
-  if (pf.output_arity > 0 &&
-      static_cast<std::size_t>(final_table->num_columns()) > pf.output_arity) {
-    auto cols = final_table->release();
-    std::vector<std::unique_ptr<cudf::column>> selected;
-    selected.reserve(pf.output_arity);
-    for (std::size_t i = 0; i < pf.output_arity; ++i) {
-      selected.push_back(std::move(cols[i]));
-    }
-    final_table = std::make_unique<cudf::table>(std::move(selected));
+  if (projection_required &&
+      static_cast<std::size_t>(final_table.view().num_columns()) > output_arity) {
+    std::vector<size_t> selected_cols(output_arity);
+    std::iota(selected_cols.begin(), selected_cols.end(), 0);
+    final_table.select_columns(selected_cols);
   }
 
-  return final_table;
+  return final_table.release(stream, mr_ref);
 }
 
 std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(

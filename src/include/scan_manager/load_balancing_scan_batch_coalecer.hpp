@@ -73,19 +73,16 @@ class load_balancing_scan_batch_coalecer {
   /// consumes.  Holds its own semaphore so the sequencer can block on
   /// an empty slot without spinning.
   struct metadata_processing_state {
-    explicit metadata_processing_state(
-      std::size_t op_id,
-      std::size_t pipeline_id,
-      std::shared_ptr<op::scan::batch_coalecer> coalecer,
-      std::shared_ptr<split_connector> connector,
-      std::shared_ptr<balancing_strategy> balancer,
-      std::shared_ptr<op::scan::post_filter_and_projection_info> post_info)
+    explicit metadata_processing_state(std::size_t op_id,
+                                       std::size_t pipeline_id,
+                                       std::shared_ptr<op::scan::batch_coalecer> coalecer,
+                                       std::shared_ptr<split_connector> connector,
+                                       std::shared_ptr<balancing_strategy> balancer)
       : op_id(op_id),
         pipeline_id(pipeline_id),
         coalecer(std::move(coalecer)),
         connector(std::move(connector)),
-        balancer(std::move(balancer)),
-        filter_and_projection_info(std::move(post_info))
+        balancer(std::move(balancer))
     {
       assert(this->coalecer);
       assert(this->connector);
@@ -104,7 +101,6 @@ class load_balancing_scan_batch_coalecer {
     std::shared_ptr<op::scan::batch_coalecer> coalecer;
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
-    std::shared_ptr<op::scan::post_filter_and_projection_info> filter_and_projection_info;
     std::unique_ptr<databatch_provider> batch_provider;
   };
 

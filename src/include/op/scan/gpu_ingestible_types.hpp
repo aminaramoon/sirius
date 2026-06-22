@@ -108,24 +108,6 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
 };
 
 //===----------------------------------------------------------------------===//
-// post_filter_and_projection_info
-//===----------------------------------------------------------------------===//
-/**
- * @brief Per-split post-decode filter + projection description. Optional.
- *
- * Carried on @ref scan_and_filter_metadata when the materialized table needs
- * any of: post-decode DuckDB-expression evaluation (filter pushdown into the
- * parquet reader failed), hive-partition injection, or projection down to
- * the scan's output arity. Cached splits use this for their (rare) filter
- * application path.
- */
-class post_filter_and_projection_info
-  : public std::enable_shared_from_this<post_filter_and_projection_info> {
- public:
-  virtual ~post_filter_and_projection_info() = default;
-};
-
-//===----------------------------------------------------------------------===//
 // filter_state / filtered_table
 //===----------------------------------------------------------------------===//
 /**

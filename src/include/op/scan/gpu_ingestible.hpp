@@ -85,9 +85,6 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
 
   virtual std::unique_ptr<batch_coalecer> create_batch_coalecer() const = 0;
 
-  virtual std::shared_ptr<post_filter_and_projection_info> create_post_filter_and_projection_info()
-    const = 0;
-
   /**
    * @brief Snapshot check for remaining work. Thread-safe.
    *
@@ -136,7 +133,6 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    */
   virtual std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& input,
-    const post_filter_and_projection_info& info,
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) = 0;
 

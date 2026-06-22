@@ -35,12 +35,7 @@ load_balancing_scan_batch_coalecer::register_pipeline(op::scan::sirius_gpu_scan_
   auto uid         = scan_op->get_operator_id();
   auto pipeline_id = scan_op->get_pipeline()->get_pipeline_id();
   auto state       = std::make_unique<metadata_processing_state>(
-    uid,
-    pipeline_id,
-    std::move(coalecer),
-    std::move(connector),
-    std::move(balancer),
-    ingestible->create_post_filter_and_projection_info());
+    uid, pipeline_id, std::move(coalecer), std::move(connector), std::move(balancer));
   _pipeline_order.push_back(uid);
   auto state_ptr = state.get();
   _slots[uid]    = std::move(state);
@@ -93,9 +88,8 @@ void load_balancing_scan_batch_coalecer::process_provider_inputs(metadata_proces
       }
     }();
     for (auto& batch : batches) {
-      auto op_data = std::make_unique<op::scan::scan_operator_input>(
-        std::move(batch), state.filter_and_projection_info);
-      auto dev_id = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
+      auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
+      auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
       if (dev_id >= 0) { op_data->set_preferred_device_id(dev_id); }
 
       auto fadvise_hints = op_data->get_fadvise_hints();
@@ -125,9 +119,8 @@ void load_balancing_scan_batch_coalecer::process_cached_entries(
     auto databatch = state.batch_provider->get_next_batch();
     is_closed      = databatch == nullptr;
     if (!is_closed) {
-      auto op_data = std::make_unique<op::scan::scan_operator_input>(
-        std::move(databatch), state.filter_and_projection_info);
-      auto dev_id = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
+      auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(databatch));
+      auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
       if (dev_id >= 0) { op_data->set_preferred_device_id(dev_id); }
       state.connector->push_split(std::move(op_data));
     }
