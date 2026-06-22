@@ -53,6 +53,19 @@ void load_balancing_scan_batch_coalecer::use_cached_entries_for_pipeline(
   state.attach_batch_provider(std::move(provider));
 }
 
+std::function<void(exec::try_t<std::unique_ptr<op::scan::scan_info>>&&)>
+load_balancing_scan_batch_coalecer::get_split_provider_bridge(
+  op::scan::sirius_gpu_scan_operator* scan_op)
+{
+  if (!scan_op) return nullptr;
+  auto uid = scan_op->get_operator_id();
+  auto it  = _slots.find(uid);
+  if (it == _slots.end()) { return {}; }
+  return [state_ptr = it->second](exec::try_t<std::unique_ptr<op::scan::scan_info>>&& entry) {
+    state_ptr->queue.enqueue(std::move(entry));
+  };
+}
+
 void load_balancing_scan_batch_coalecer::worker_loop([[maybe_unused]] std::stop_token const& stop)
 {
   for (auto pipeline_id : _pipeline_order) {

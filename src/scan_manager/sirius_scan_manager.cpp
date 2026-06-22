@@ -379,7 +379,7 @@ void sirius_scan_manager::start_metadata_processing()
   for (auto* op : _scan_op_order) {
     auto it = _providers_by_op.find(op);
     if (it == _providers_by_op.end()) { continue; }
-    it->second->run(*_dispatcher, nullptr);
+    it->second->run(*_dispatcher, _metadata_processor->get_split_provider_bridge(op));
   }
 }
 

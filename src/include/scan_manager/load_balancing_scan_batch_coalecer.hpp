@@ -118,6 +118,9 @@ class load_balancing_scan_batch_coalecer {
   void use_cached_entries_for_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
                                        std::unique_ptr<databatch_provider> provider);
 
+  std::function<void(exec::try_t<std::unique_ptr<op::scan::scan_info>>&&)>
+  get_split_provider_bridge(op::scan::sirius_gpu_scan_operator* scan_op);
+
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when
   /// the callable asks for one (e.g. @c scoped_dispatcher).  Call once
@@ -147,7 +150,7 @@ class load_balancing_scan_batch_coalecer {
   /// queue, both of which are non-movable, so we need stable addresses
   /// in the vector.
   std::vector<std::size_t> _pipeline_order;
-  std::unordered_map<std::size_t, std::unique_ptr<metadata_processing_state>> _slots;
+  std::unordered_map<std::size_t, std::shared_ptr<metadata_processing_state>> _slots;
 };
 
 }  // namespace sirius::scan_manager

@@ -16,22 +16,18 @@
 
 #pragma once
 
-#include "cucascade/data/data_batch.hpp"
 #include "exec/completion_controller.hpp"
 #include "exec/try.hpp"
 #include "io/io_context.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
-#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan_manager/split_connector.hpp"
 
-#include <atomic>
 #include <cstddef>
 #include <exception>
 #include <functional>
 #include <memory>
 #include <utility>
-#include <vector>
 
 namespace sirius::op {
 class operator_data;
