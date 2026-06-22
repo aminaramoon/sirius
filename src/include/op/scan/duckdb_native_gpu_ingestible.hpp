@@ -39,7 +39,6 @@
 #include <span>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace duckdb {
@@ -84,28 +83,13 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   /// Can serve @p other iff it is the same duckdb table (same DataTable*) and every column @p other
   /// requests is also read by this scan — i.e. this scan's (cached) data is a superset that can
   /// serve @p other. Columns are matched by storage column id, not by name or position.
-  [[nodiscard]] bool can_serve(const ingestible_table_info& other) const override
-  {
-    auto const* o = dynamic_cast<duckdb_native_ingestible_table_info const*>(&other);
-    if (o == nullptr || storage != o->storage) { return false; }
-
-    std::unordered_set<duckdb::idx_t> this_cols;
-    this_cols.reserve(column_ids.size());
-    for (auto const& c : column_ids) {
-      this_cols.insert(c.GetPrimaryIndex());
-    }
-    for (auto const& c : o->column_ids) {
-      if (!this_cols.contains(c.GetPrimaryIndex())) { return false; }
-    }
-    return true;
-  }
-
-  /// For each column @p other requests (in @p other's @c column_ids order), the position of that
-  /// column within THIS scan's @c column_ids — a gather index into this scan's (cached)
+  ///
+  /// Returns, for each column @p other requests (in @p other's @c column_ids order), the position
+  /// of that column within THIS scan's @c column_ids — a gather index into this scan's (cached)
   /// materialized columns that reproduces @p other's requested layout (the index space
   /// @c cached_databatch_provider slices). Empty when @p other is a different table or requests a
-  /// column this scan does not read. Columns are matched by storage column id.
-  [[nodiscard]] std::vector<std::size_t> column_projections(
+  /// column this scan does not read.
+  [[nodiscard]] std::vector<std::size_t> can_serve_with_columns(
     const ingestible_table_info& other) const override
   {
     auto const* o = dynamic_cast<duckdb_native_ingestible_table_info const*>(&other);

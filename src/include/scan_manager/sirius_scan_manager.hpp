@@ -85,11 +85,6 @@ namespace sirius::scan_manager {
 struct pinned_entry {
   std::unique_ptr<op::scan::ingestible_table_info> table_info;
 
-  std::vector<std::string> column_names;
-  /// Resolved (globbed) file paths captured at pin time. The scan_manager uses
-  /// this list to match an incoming scan operator's scan_info::file_paths
-  /// against this entry, so it can swap in a cached split provider.
-  std::vector<std::string> file_paths;
   /// GPU-tier storage: one chunk vector per pinned column name. Populated by
   /// @ref sirius_scan_manager::insert_pinned_entry. Empty when @ref tier is HOST.
   std::unordered_map<std::string, std::vector<std::shared_ptr<cudf::column>>>
@@ -114,12 +109,6 @@ struct pinned_entry {
   /// to decide whether a re-insert merges into the existing entry (same row
   /// count → add unique columns) or replaces it (different row count).
   std::size_t num_rows{0};
-  /// True when the pin was created with a row-count budget (e.g.
-  /// `CALL pin_table(..., n_rows=N)`) that capped the captured rows below
-  /// the full file content. Partial entries MUST NOT serve cached reads
-  /// because a subsequent full scan of the same file paths would silently
-  /// return only the pinned prefix.
-  bool is_partial{false};
 };
 
 /**
@@ -166,6 +155,8 @@ class sirius_scan_manager {
   sirius_scan_manager& operator=(const sirius_scan_manager&) = delete;
   sirius_scan_manager(sirius_scan_manager&&)                 = delete;
   sirius_scan_manager& operator=(sirius_scan_manager&&)      = delete;
+
+  using ingestible_table_info = op::scan::ingestible_table_info;
 
   /// \brief Prepare per-scan state for the given query.
   ///
@@ -220,11 +211,9 @@ class sirius_scan_manager {
   ///                              content (e.g. pin_table n_rows budget). Partial entries
   ///                              must NOT serve cached reads — see pinned_entry::is_partial.
   void insert_pinned_entry(const std::string& name,
-                           std::vector<std::string> column_names,
-                           std::vector<std::string> file_paths,
+                           std::unique_ptr<ingestible_table_info> table_info,
                            std::vector<std::unique_ptr<cudf::table>> data_tables,
-                           std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
-                           bool is_partial = false);
+                           std::vector<cucascade::memory::memory_space*> chunk_memory_spaces);
 
   /// \brief Pin the entry for a table on the host tier.
   ///
@@ -246,11 +235,9 @@ class sirius_scan_manager {
   ///                      must NOT serve cached reads — see pinned_entry::is_partial.
   void insert_pinned_entry_host(
     const std::string& name,
-    std::vector<std::string> column_names,
-    std::vector<std::string> file_paths,
+    std::unique_ptr<ingestible_table_info> table_info,
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
-    cucascade::memory::memory_space& memory_space,
-    bool is_partial = false);
+    cucascade::memory::memory_space& memory_space);
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);

@@ -176,4 +176,10 @@ auto make_try_with(fn_t&& f, arg_ts&&... args)
   }
 }
 
+template <class r_t>
+auto make_empty_try()
+{
+  return try_t<r_t>{};
+}
+
 }  // namespace sirius::exec

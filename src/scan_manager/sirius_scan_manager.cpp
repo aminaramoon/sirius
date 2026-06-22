@@ -16,6 +16,7 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
+#include "cucascade/data/gpu_data_representation.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/prefetching_cache.hpp"
@@ -33,11 +34,15 @@
 #include "scan_manager/split_connector.hpp"
 #include "scan_manager/split_provider.hpp"
 
+#include <cudf/column/column_view.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -60,8 +65,9 @@ struct cached_databatch_provider : public databatch_provider {
   explicit cached_databatch_provider(pinned_entry const& entry, std::span<size_t> selected_columns)
     : _entry(entry)
   {
-    std::ranges::for_each(selected_columns, [this](size_t idx) {
-      _column_names.push_back(_entry.column_names.at(idx));
+    auto entry_column_names = _entry.table_info->column_names();
+    std::ranges::for_each(selected_columns, [this, entry_column_names](size_t idx) {
+      _column_names.emplace_back(entry_column_names[idx]);
       _column_indices.push_back(idx);
     });
 
@@ -101,12 +107,22 @@ struct cached_databatch_provider : public databatch_provider {
   std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
   {
     std::vector<std::shared_ptr<cudf::column>> columns;
+    std::vector<cudf::column_view> column_views;
+    std::size_t alloc_size = 0;
     for (const auto& col_idx : _column_names) {
       const auto& col_chunks = _entry.data_batches_by_column.at(col_idx);
       if (index >= col_chunks.size()) { return nullptr; }
       columns.push_back(col_chunks.at(index));
+      column_views.emplace_back(columns.back()->view());
+      alloc_size += columns.back()->alloc_size();
     }
-    return nullptr;
+    cudf::table_view view(column_views);
+    auto* chunk_space = !_entry.chunk_memory_spaces.empty() ? _entry.chunk_memory_spaces.at(index)
+                                                            : _entry.memory_space;
+    auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
+      view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
+    return std::make_shared<::cucascade::data_batch>(::sirius::get_next_batch_id(),
+                                                     std::move(gpu_repr));
   }
 
   std::size_t _n_chunks;
@@ -148,11 +164,11 @@ sirius_scan_manager::sirius_scan_manager(
   std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _config(config),
     _topology_index(std::move(topology_index)),
-    _thread_pool(_config.thread_pool.num_threads,
+    _thread_pool(_config.thread_pool.num_threads + 1,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _dispatcher(
-      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads)),
+      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads + 1)),
     _ioctx_registry(config)
 {
   if (!_topology_index) {
@@ -193,6 +209,10 @@ sirius_scan_manager::sirius_scan_manager(
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] sirius_datasource disabled — using kvikio_context fallback");
   }
+
+  // Reactors are built parked; start() launches their worker threads and
+  // allocates per-reactor staging.  No-op for the kvikio fallback (no reactors).
+  _io_ctx->start();
 
   // Build the prefetching cache on the ioctx.  Budget=0 keeps the
   // cache unarmed (no background threads); we pass that whenever the
@@ -379,7 +399,7 @@ void sirius_scan_manager::reset()
   _providers_by_op.clear();
   _metadata_processor.reset();
   _dispatcher =
-    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads);
+    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads + 1);
 }
 
 void sirius_scan_manager::start() {}
@@ -396,11 +416,9 @@ void sirius_scan_manager::stop()
 
 void sirius_scan_manager::insert_pinned_entry(
   const std::string& name,
-  std::vector<std::string> column_names,
-  std::vector<std::string> file_paths,
+  std::unique_ptr<ingestible_table_info> table_info,
   std::vector<std::unique_ptr<cudf::table>> data_tables,
-  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
-  bool is_partial)
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces)
 {
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per
@@ -421,13 +439,18 @@ void sirius_scan_manager::insert_pinned_entry(
     if (table) { new_num_rows += static_cast<std::size_t>(table->num_rows()); }
   }
 
+  // Column identity for this pin lives on its table_info. The span stays valid
+  // after table_info is moved into the entry below (moving the unique_ptr does
+  // not relocate the pointed-to ingestible_table_info).
+  std::span<std::string const> column_names =
+    table_info ? table_info->column_names() : std::span<std::string const>{};
+
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
     // Same-row-count merge only applies when the completeness contracts match.
     // Mixing a full pin with a partial pin produces an entry whose columns came
     // from different row coverage — drop and rebuild instead.
-    if (existing_it->second.num_rows == new_num_rows &&
-        existing_it->second.is_partial == is_partial) {
+    if (existing_it->second.num_rows == new_num_rows) {
       // Same-row-count merge MUST preserve per-chunk memory_space alignment
       // between existing and new entry. The round-robin counter restarts at
       // chunk 0 → GPU 0 per pin_table call, and chunks at index i across all
@@ -478,17 +501,12 @@ void sirius_scan_manager::insert_pinned_entry(
             // duplicate chunk.
             continue;
           }
-          entry.data_batches_by_column[column_names[i]].emplace_back(std::move(cols[i]));
+          entry.data_batches_by_column[std::string{column_names[i]}].emplace_back(
+            std::move(cols[i]));
         }
       }
-      // Append any new column names to the entry's column_names list so its
-      // metadata reflects the union of pinned columns.
-      for (auto& cn : column_names) {
-        if (std::find(entry.column_names.begin(), entry.column_names.end(), cn) ==
-            entry.column_names.end()) {
-          entry.column_names.push_back(std::move(cn));
-        }
-      }
+      // The union of pinned column names is reflected by entry.table_info; the
+      // merged columns are keyed into data_batches_by_column above.
       return;
     }
     // Row count or completeness contract differs → drop the stale entry and rebuild below.
@@ -496,23 +514,21 @@ void sirius_scan_manager::insert_pinned_entry(
   }
 
   pinned_entry entry;
-  entry.column_names        = std::move(column_names);
-  entry.file_paths          = std::move(file_paths);
+  entry.table_info          = std::move(table_info);
   entry.chunk_memory_spaces = std::move(chunk_memory_spaces);
   entry.tier                = cucascade::memory::Tier::GPU;
   entry.num_rows            = new_num_rows;
-  entry.is_partial          = is_partial;
 
   for (auto& table : data_tables) {
     if (!table) { continue; }
     auto cols = table->release();
-    if (cols.size() != entry.column_names.size()) {
+    if (cols.size() != column_names.size()) {
       throw std::runtime_error("[sirius_scan_manager::insert_pinned_entry] table column count " +
                                std::to_string(cols.size()) + " does not match column_names size " +
-                               std::to_string(entry.column_names.size()));
+                               std::to_string(column_names.size()));
     }
     for (std::size_t i = 0; i < cols.size(); ++i) {
-      entry.data_batches_by_column[entry.column_names[i]].emplace_back(std::move(cols[i]));
+      entry.data_batches_by_column[std::string{column_names[i]}].emplace_back(std::move(cols[i]));
     }
   }
 
@@ -521,11 +537,9 @@ void sirius_scan_manager::insert_pinned_entry(
 
 void sirius_scan_manager::insert_pinned_entry_host(
   const std::string& name,
-  std::vector<std::string> column_names,
-  std::vector<std::string> file_paths,
+  std::unique_ptr<ingestible_table_info> table_info,
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
-  cucascade::memory::memory_space& memory_space,
-  bool is_partial)
+  cucascade::memory::memory_space& memory_space)
 {
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column. Re-insert always replaces — there is no per-column merge analog
@@ -540,13 +554,11 @@ void sirius_scan_manager::insert_pinned_entry_host(
   }
 
   pinned_entry entry;
-  entry.column_names = std::move(column_names);
-  entry.file_paths   = std::move(file_paths);
+  entry.table_info   = std::move(table_info);
   entry.tier         = cucascade::memory::Tier::HOST;
   entry.memory_space = &memory_space;
   entry.num_rows     = new_num_rows;
   entry.host_chunks  = std::move(host_chunks);
-  entry.is_partial   = is_partial;
 
   _pinned_entries[name] = std::move(entry);
 }
@@ -562,9 +574,8 @@ void sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
 
   try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
-      if (entry.table_info->can_serve(table_info)) {
-        auto projection = entry.table_info->column_projections(table_info);
-        auto provider   = make_provider_for_pinned_entry(entry, projection);
+      if (auto cols = entry.table_info->can_serve_with_columns(table_info); !cols.empty()) {
+        auto provider = make_provider_for_pinned_entry(entry, cols);
         _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
         spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
                      pinned_name,

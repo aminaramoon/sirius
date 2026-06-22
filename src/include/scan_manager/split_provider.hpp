@@ -66,7 +66,8 @@ namespace sirius::scan_manager {
  */
 class split_provider {
  public:
-  using value_type = exec::try_t<std::unique_ptr<op::scan::scan_info>>;
+  using value_type      = exec::try_t<std::unique_ptr<op::scan::scan_info>>;
+  using push_callback_t = std::function<void(value_type&&)>;
 
   /// Concrete construction path — borrows the given ingestible non-owningly.
   /// The ingestible must outlive the provider; in practice the operator owns
@@ -98,7 +99,7 @@ class split_provider {
    *                   @c scoped_dispatcher both satisfy this shape.
    */
   template <typename Scheduler>
-  void run(Scheduler& scheduler, const std::function<void(value_type&&)>& on_split);
+  void run(Scheduler& scheduler, const push_callback_t& on_split);
 
   /**
    * @brief Snapshot check for remaining work. Thread-safe.
@@ -150,10 +151,11 @@ class split_provider {
 template <typename Scheduler>
 void split_provider::run(Scheduler& scheduler, const std::function<void(value_type&&)>& on_split)
 {
+  using split_type = typename value_type::value_type;
   assert(on_split);
   exec::completion_controller ctrl;
   _completion_token =
-    ctrl.on_completion([on_split] { on_split(exec::try_t<typename value_type::value_type>()); });
+    ctrl.on_completion([on_split] { on_split(exec::make_empty_try<split_type>()); });
   while (has_more_splits()) {
     auto work = next_split_provider();
     if (!work) { continue; }

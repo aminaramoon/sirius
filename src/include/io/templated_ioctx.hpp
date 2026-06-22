@@ -224,6 +224,19 @@ class templated_ioctx : public sirius_ioctx {
     shutdown();
   }
 
+  /// Start every reactor in the pool (launches their worker threads and
+  /// allocates their per-reactor staging).  The pool itself is built cheaply at
+  /// construction; the worker threads and pinned bounce buffers are not spun up
+  /// until here.  Idempotent — a second call is a no-op.
+  void start() override
+  {
+    if (_started) { return; }
+    for (auto& r : _reactors) {
+      r->start();
+    }
+    _started = true;
+  }
+
   void shutdown() noexcept override
   {
     for (auto& r : _reactors) {
@@ -443,6 +456,7 @@ class templated_ioctx : public sirius_ioctx {
   reactor_config_type _config;
   std::vector<std::unique_ptr<Reactor>> _reactors;
   std::atomic<size_t> _next{0};
+  bool _started{false};
 
  private:
   static const io_object_type& as_typed(const sirius_io_object& obj) noexcept

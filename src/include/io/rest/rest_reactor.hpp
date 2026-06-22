@@ -228,6 +228,13 @@ class rest_reactor {
 
   // -- dispatch / lifecycle ------------------------------------------------
 
+  /// Allocate the pinned bounce slots and launch the worker thread.  Split out
+  /// of the constructor so a reactor can be built cheaply (it only copies its
+  /// config and creates its wakeup fd) and parked until it is actually needed —
+  /// see @c sirius_ioctx::start.  Idempotent: a second call (while the worker is
+  /// already running) is a no-op.
+  void start();
+
   void enqueue(request_type_ptr req);
   void interrupt();
   void shutdown();
@@ -272,6 +279,8 @@ class rest_reactor {
   // reactor's lifetime (the authorizer is used on every request).
   std::shared_ptr<reactor_context> _ctx;
   config _config;  // copy of _ctx->cfg() for hot-path access
+  // Thread name prefix captured at construction; applied to the worker in start().
+  std::string _tname;
   std::size_t _bounce_slot_size{0};
 
   // Keeps the bounce-slot blocks alive for the reactor's lifetime; the

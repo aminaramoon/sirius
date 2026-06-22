@@ -49,13 +49,13 @@ class ingestible_table_info {
   /// superset of @p other's data so a pinned scan of this can feed @p other
   /// (after the @ref column_projections gather). Implementations define the
   /// per-format match (e.g. same files + column superset).
-  [[nodiscard]] virtual bool can_serve(const ingestible_table_info& other) const { return false; }
-
-  [[nodiscard]] virtual std::vector<size_t> column_projections(
+  [[nodiscard]] virtual std::vector<size_t> can_serve_with_columns(
     const ingestible_table_info& other) const
   {
     return {};
   }
+
+  [[nodiscard]] virtual std::span<std::string const> column_names() const { return {}; }
 
   /**
    * @brief Resolved file paths captured at bind time.

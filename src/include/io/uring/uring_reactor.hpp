@@ -217,6 +217,12 @@ class uring_reactor {
                                                 const io_object_type& file,
                                                 std::span<io_object_segment> segments);
 
+  /// Allocate the pinned bounce slots and launch the worker thread.  Split out
+  /// of the constructor so a reactor can be built cheaply (it only copies its
+  /// config) and parked until it is actually needed — see @c sirius_ioctx::start.
+  /// Idempotent: a second call (while the worker is already running) is a no-op.
+  void start();
+
   void interrupt();
   void shutdown();
 
@@ -299,6 +305,8 @@ class uring_reactor {
   // multiple_blocks_allocation destructor returns the blocks to the upstream
   // resource when the reactor is destroyed.
   reactor_config_type _config;
+  // Thread name prefix captured at construction; applied to the worker in start().
+  std::string _tname;
   cucascade::memory::fixed_multiple_blocks_allocation _bounce_storage;
   std::size_t _bounce_slot_size;
   std::stop_source _stop_source;

@@ -968,8 +968,8 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   }
   for (std::size_t ci = 0; ci < num_cols; ++ci) {
     if (!is_rowid_col[ci]) continue;
-    final_cols[ci] = build_rowid_column(
-      row_groups, static_cast<cudf::size_type>(total_rows), stream, mr_ref);
+    final_cols[ci] =
+      build_rowid_column(row_groups, static_cast<cudf::size_type>(total_rows), stream, mr_ref);
   }
 
   return std::make_unique<cudf::table>(std::move(final_cols));

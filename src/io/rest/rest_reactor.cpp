@@ -315,7 +315,7 @@ std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_seg
 // ---------------------------------------------------------------------------
 
 rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
-  : _ctx(std::move(ctx))
+  : _ctx(std::move(ctx)), _tname(tname)
 {
   if (!_ctx) { throw std::invalid_argument("rest_reactor: reactor_context must be non-null"); }
   _config = _ctx->cfg();
@@ -329,23 +329,35 @@ rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_vie
   if (_config.max_read_split == 0) { _config.max_read_split = 1; }
 
   // Touch the process-wide curl context so global init + the shared cache are
-  // ready before any handle is created (here or on the worker).
+  // ready before any handle is created — including the blocking HEAD that
+  // rest_ioctx::create_io_object issues before start() is ever called.
   (void)global_curl_context::instance();
+
+  if (_ctx->host_memory_resource() != nullptr) {
+    _bounce_slot_size = _ctx->host_memory_resource()->get_block_size();
+  }
+
+  // The wakeup fd is cheap and the worker (started in start()) registers it with
+  // epoll, so create it up front.  No pinned bounce allocation and no worker
+  // thread until start() — keeps a parked (unused) reactor cheap.
+  _wakeup_fd = make_event_fd();
+}
+
+void rest_reactor::start()
+{
+  if (_worker.joinable()) { return; }  // already started
 
   if (_ctx->host_memory_resource() != nullptr) {
     // One pinned bounce buffer per slot (1:1 with the easy-handle pool), since a
     // slot stages at most one device read at a time.
-    _bounce_slot_size = _ctx->host_memory_resource()->get_block_size();
-    _bounce_storage   = _ctx->host_memory_resource()->allocate_multiple_blocks(
+    _bounce_storage = _ctx->host_memory_resource()->allocate_multiple_blocks(
       _config.max_connections * _bounce_slot_size);
   }
 
-  _wakeup_fd = make_event_fd();
-
   _worker =
     std::jthread([this](const std::stop_token& st) { worker_loop(st); }, _stop_source.get_token());
-  if (!tname.empty()) {
-    std::string const full_name = std::string(tname) + "_worker";
+  if (!_tname.empty()) {
+    std::string const full_name = _tname + "_worker";
     pthread_setname_np(_worker.native_handle(), full_name.c_str());
   }
 }

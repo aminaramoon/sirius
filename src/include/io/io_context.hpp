@@ -81,6 +81,14 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   [[nodiscard]] virtual io_context_type type() const noexcept = 0;
 
+  /// Start the backend's reactors: launch their worker threads and allocate
+  /// per-reactor staging.  Deferred from construction so an ioctx can be built
+  /// and parked (e.g. in a per-query map of contexts) without spending thread
+  /// or pinned-memory resources until it is first used.  Must be called before
+  /// the read API is exercised.  Idempotent.  Backends with no reactors
+  /// (kvikio, blocking) inherit the default no-op.
+  virtual void start() {}
+
   virtual void shutdown() noexcept = 0;
 
   /// Open a datasource for @p path.  The backend creates the underlying
