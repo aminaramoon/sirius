@@ -191,7 +191,6 @@ set(EXTENSION_SOURCES
     src/exec/admission_control.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
-    src/io/duckdb_io_object.cpp
     src/io/io_context.cpp
     src/io/parquet_helpers.cpp
     src/io/sirius_datasource.cpp
@@ -495,7 +494,6 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     # test/cpp/io/test_datasource_factory.cpp
-    test/cpp/io/test_duckdb_io_object.cpp
     # test/cpp/io/test_gpu_ingestible.cpp  # stale header path (io/gpu_ingestible.hpp moved)
     test/cpp/io/test_parquet_helpers.cpp
     # test/cpp/io/test_prefetching_cache_telemetry.cpp  # stale header path (io/prefetching_cache.hpp moved)

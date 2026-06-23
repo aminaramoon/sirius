@@ -53,14 +53,6 @@ inline void cuda_check(cudaError_t e, char const* file, int line)
 
 namespace sirius::io::uring {
 
-/**
- * @brief Converts a byte count to mebibytes.
- */
-inline double to_mb(size_t bytes) noexcept
-{
-  return static_cast<double>(bytes) / (1024.0 * 1024.0);
-}
-
 // ---- bounce_slot -----------------------------------------------------------
 
 /**
@@ -89,12 +81,21 @@ struct bounce_slot {
  */
 class local_io_object : public sirius_io_object {
  public:
-  local_io_object(std::string path, file_descriptor fd, file_descriptor fd_direct, size_t file_size)
+  local_io_object(std::string path,
+                  file_descriptor fd,
+                  file_descriptor fd_direct,
+                  size_t file_size,
+                  std::string_view hash = "")
     : _path(std::move(path)),
       _fd(std::move(fd)),
       _fd_direct(std::move(fd_direct)),
       _file_size(file_size)
   {
+    if (hash.empty()) {
+      _hash = _path;
+    } else {
+      _hash = hash;
+    }
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
@@ -110,6 +111,7 @@ class local_io_object : public sirius_io_object {
 
  private:
   std::string _path;
+  std::string _hash;
   file_descriptor _fd;
   file_descriptor _fd_direct;
   size_t _file_size{0};
