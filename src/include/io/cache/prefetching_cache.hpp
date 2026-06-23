@@ -181,6 +181,12 @@ class prefetching_cache {
                                           std::span<const byte_range> ranges,
                                           std::optional<int> gpu_id = {});
 
+  [[nodiscard]] bool host_read_from_cache_only(const sirius_io_object& obj,
+                                               size_t offset,
+                                               size_t size,
+                                               uint8_t* dst,
+                                               prefetching_handle* out_handle);
+
   struct file_entry {
     std::vector<cached_chunk*> update_and_get_chunks(std::span<size_t> incoming, uint32_t ticker);
 

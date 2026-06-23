@@ -226,7 +226,13 @@ void sirius_datasource::prefetch(cache::prefetching_stage site)
 {
   auto const preferred = _io_ctx->preferred_prefetching_stage();
   if (preferred == cache::prefetching_stage::none) { return; }
-  if (_prefetch_handle && preferred == site) { _prefetch_handle.activate(); }
+  if (_prefetch_handle) {
+    if (site == cache::prefetching_stage::disposable) {
+      _prefetch_handle.cancel();
+    } else if (site == preferred) {
+      _prefetch_handle.activate();
+    }
+  }
 }
 
 bool sirius_datasource::uses_prefetching_cache()

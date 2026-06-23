@@ -16,7 +16,6 @@
 
 #include "io/cache/prefetching_cache.hpp"
 
-#include "cucascade/cuda/event.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/try.hpp"
 #include "io/cache/types.hpp"
@@ -363,17 +362,16 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
   return std::move(handle);
 }
 
-std::size_t prefetching_cache::host_read(const sirius_io_object& obj,
-                                         size_t offset,
-                                         size_t size,
-                                         uint8_t* dst,
-                                         prefetching_handle* out_handle)
+bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
+                                                  size_t offset,
+                                                  size_t size,
+                                                  uint8_t* dst,
+                                                  prefetching_handle* out_handle)
 {
-  if (size == 0 || dst == nullptr) return true;
+  if (size == 0) return true;
 
   std::vector<cached_chunk*> chunks;
   if (out_handle && *out_handle) {
-    out_handle->cancel();
     auto& requested_chunks = out_handle->get_context()->chunks;
     chunks                 = find_entry(requested_chunks, offset, size, coverage_policy::full);
   } else {
@@ -381,35 +379,37 @@ std::size_t prefetching_cache::host_read(const sirius_io_object& obj,
     {
       std::shared_lock lk(_map_mtx);
       auto it = _file_cache.find(obj.raw_file_cache_id());
-      if (it == _file_cache.end()) { return {}; }
-      file = it->second.get();
+      if (it != _file_cache.end()) { file = it->second.get(); }
     }
-    chunks = find_entry(file->chunks, offset, size, coverage_policy::full);
+    if (file) { chunks = file->fetch_chunks(offset, size, coverage_policy::full); }
   }
 
-  auto iter =
-    std::ranges::find_if(chunks, [](cached_chunk* c) { return !c->state.acquire_read(); });
+  while (!chunks.empty()) {
+    auto iter =
+      std::ranges::find_if(chunks, [](cached_chunk* c) { return !c->state.acquire_read(); });
 
-  if (iter != chunks.end()) {
-    std::for_each(chunks.begin(), iter, [](cached_chunk* c) { c->state.release_read(); });
-    return _io_ctx->host_read_io(obj, offset, size, dst);
+    if (iter != chunks.end()) {
+      std::for_each(chunks.begin(), iter, [](cached_chunk* c) { c->state.release_read(); });
+      break;
+    }
+
+    auto const end_offset = offset + size;
+    auto const chunk_size = _pool->chunk_bytes();
+
+    for (auto* chunk : chunks) {
+      auto const chunk_begin = std::max(offset, chunk->offset);
+      auto const chunk_end   = std::min(end_offset, chunk->offset + chunk_size);
+      auto const copy_size   = chunk_end - chunk_begin;
+      auto const src_offset  = chunk_begin - chunk->offset;
+      auto const dst_offset  = chunk_begin - offset;
+
+      std::memcpy(dst + dst_offset, chunk->data + src_offset, copy_size);
+      chunk->state.release_read();
+    }
+    _counters.hits.fetch_add(chunks.size(), std::memory_order_relaxed);
+    return true;
   }
-
-  auto const end_offset = offset + size;
-  auto const chunk_size = _pool->chunk_bytes();
-
-  for (auto* chunk : chunks) {
-    auto const chunk_begin = std::max(offset, chunk->offset);
-    auto const chunk_end   = std::min(end_offset, chunk->offset + chunk_size);
-    auto const copy_size   = chunk_end - chunk_begin;
-    auto const src_offset  = chunk_begin - chunk->offset;
-    auto const dst_offset  = chunk_begin - offset;
-
-    std::memcpy(dst + dst_offset, chunk->data + src_offset, copy_size);
-    chunk->state.release_read();
-  }
-
-  return size;
+  return false;
 }
 
 exec::semi_future<std::size_t> prefetching_cache::host_read_async(const sirius_io_object& obj,
@@ -418,49 +418,24 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_async(const sirius_i
                                                                   uint8_t* dst,
                                                                   prefetching_handle* out_handle)
 {
-  if (size == 0 || dst == nullptr) return true;
+  bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
+  if (status) { return exec::make_semi_future<std::size_t>(size); }
+  size_t n_chunks = (size + _pool->chunk_bytes() - 1) / _pool->chunk_bytes();
+  _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
+  return _io_ctx->host_read_async_io(obj, offset, size, dst);
+}
 
-  std::vector<cached_chunk*> chunks;
-  if (out_handle && *out_handle) {
-    out_handle->cancel();
-    auto& requested_chunks = out_handle->get_context()->chunks;
-    chunks                 = find_entry(requested_chunks, offset, size, coverage_policy::full);
-  } else {
-    file_entry* file = nullptr;
-    {
-      std::shared_lock lk(_map_mtx);
-      auto it = _file_cache.find(obj.raw_file_cache_id());
-      if (it == _file_cache.end()) { return {}; }
-      file = it->second.get();
-    }
-    chunks = file->fetch_chunks(offset, size, coverage_policy::full);
-  }
-
-  if (chunks.empty()) { return false; }  // full-miss
-
-  auto iter =
-    std::ranges::find_if(chunks, [](cached_chunk* c) { return !c->state.acquire_read(); });
-
-  if (iter != chunks.end()) {
-    std::for_each(chunks.begin(), iter, [](cached_chunk* c) { c->state.release_read(); });
-    return false;
-  }
-
-  auto const end_offset = offset + size;
-  auto const chunk_size = _pool->chunk_bytes();
-
-  for (auto* chunk : chunks) {
-    auto const chunk_begin = std::max(offset, chunk->offset);
-    auto const chunk_end   = std::min(end_offset, chunk->offset + chunk_size);
-    auto const copy_size   = chunk_end - chunk_begin;
-    auto const src_offset  = chunk_begin - chunk->offset;
-    auto const dst_offset  = chunk_begin - offset;
-
-    std::memcpy(dst + dst_offset, chunk->data + src_offset, copy_size);
-    chunk->state.release_read();
-  }
-
-  return true;
+std::size_t prefetching_cache::host_read(const sirius_io_object& obj,
+                                         size_t offset,
+                                         size_t size,
+                                         uint8_t* dst,
+                                         prefetching_handle* out_handle)
+{
+  bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
+  if (status) { return size; }
+  size_t n_chunks = (size + _pool->chunk_bytes() - 1) / _pool->chunk_bytes();
+  _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
+  return _io_ctx->host_read_io(obj, offset, size, dst);
 }
 
 exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius_io_object& obj,
@@ -477,9 +452,10 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
   coverage_policy policy =
     _io_ctx->supports_host_to_device_read() ? coverage_policy::partial : coverage_policy::full;
 
+  size_t n_chunks = (size + _pool->chunk_bytes() - 1) / _pool->chunk_bytes();
   std::vector<cached_chunk*> chunks;
+  chunks.reserve(n_chunks);
   if (out_handle && *out_handle) {
-    out_handle->cancel();
     auto& requested_chunks = out_handle->get_context()->chunks;
     chunks                 = find_entry(requested_chunks, offset, size, policy);
   } else {
@@ -488,7 +464,7 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
     if (it != _file_cache.end()) { chunks = it->second->fetch_chunks(offset, size, policy); }
   }
 
-  if (!chunks.empty()) {
+  while (!chunks.empty()) {
     size_t const chunk_bytes     = _pool->chunk_bytes();
     size_t const first_chunk_off = (offset / chunk_bytes) * chunk_bytes;
     size_t const last_chunk_off  = ((offset + size - 1) / chunk_bytes) * chunk_bytes;
@@ -504,11 +480,16 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
     //       bounce slot -> device with a null host buffer, leaving the cache
     //       untouched.
     // Cases (2) and (3) are issued together through host_to_device_read_async_io.
-    std::vector<cached_chunk*> read_pinned;       // case 1
-    std::vector<cached_chunk*> loading;           // case 2
-    std::vector<io::io_object_segment> segments;  // cases 2 + 3, in file order
+    std::vector<cached_chunk*> cached_chunks;        // case 1
+    std::vector<cached_chunk*> io_chunks;            // case 2
+    std::vector<io::io_object_segment> io_segments;  // cases 2 + 3, in file order
 
-    size_t ci = 0;  // cursor into `chunks` (sorted by offset)
+    bool cache_while_reading_enabled = _io_ctx->supports_host_to_device_read();
+    bool every_chunk_is_cached       = true;
+    std::size_t hits                 = 0;
+    std::size_t h2d                  = 0;
+    std::size_t misses               = 0;
+    size_t ci                        = 0;  // cursor into `chunks` (sorted by offset)
     for (size_t off = first_chunk_off; off <= last_chunk_off; off += chunk_bytes) {
       while (ci < chunks.size() && chunks[ci]->offset < off) {
         ++ci;
@@ -516,34 +497,39 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
       cached_chunk* c = (ci < chunks.size() && chunks[ci]->offset == off) ? chunks[ci] : nullptr;
 
       if (c != nullptr && c->state.acquire_read()) {
-        read_pinned.push_back(c);  // (1) hit
-        _counters.hits.fetch_add(1, std::memory_order_relaxed);
-      } else if (c != nullptr && c->state.mark_loading()) {
-        assert(c->data != nullptr);
-        loading.push_back(c);  // (2) host-to-device load
-        segments.emplace_back(off, chunk_bytes, c->data);
-        _counters.h2d.fetch_add(1, std::memory_order_relaxed);
+        cached_chunks.push_back(c);  // (1) hit
+        hits++;
       } else {
-        segments.emplace_back(off, chunk_bytes, nullptr);  // (3) miss
-        _counters.misses.fetch_add(1, std::memory_order_relaxed);
+        if (!cache_while_reading_enabled) {
+          every_chunk_is_cached = false;
+          break;  // (3) miss, but we can't do H2D IO, so fall back to direct device read
+        }
+        if (c != nullptr && c->state.mark_loading()) {
+          assert(c->data != nullptr);
+          io_chunks.push_back(c);  // (2) host-to-device load
+          io_segments.emplace_back(off, chunk_bytes, c->data);
+          h2d++;
+        } else {
+          io_segments.emplace_back(off, chunk_bytes, nullptr);  // (3) miss
+          misses++;
+        }
       }
     }
 
     // Without host-to-device IO we can only serve positions already in the cache.
     // If anything needs loading/bouncing, undo our marks and let the caller fall
     // back to a direct device read.
-    if (!_io_ctx->supports_host_to_device_read() && !segments.empty()) {
-      for (cached_chunk* c : read_pinned) {
-        c->state.release_read();
-      }
-      for (cached_chunk* c : loading) {
-        static_cast<void>(c->state.mark_load_failed());
-      }
-      return _io_ctx->device_read_async_io(obj, offset, size, dst, stream);
+    if (!cache_while_reading_enabled && !every_chunk_is_cached) {
+      std::ranges::for_each(cached_chunks, [](cached_chunk* c) { c->state.release_read(); });
+      break;
     }
 
+    _counters.hits.fetch_add(hits, std::memory_order_relaxed);
+    _counters.h2d.fetch_add(h2d, std::memory_order_relaxed);
+    _counters.misses.fetch_add(misses, std::memory_order_relaxed);
+
     // (1) copy the already-cached chunks straight to the device on `stream`.
-    for (cached_chunk* c : read_pinned) {
+    for (cached_chunk* c : cached_chunks) {
       size_t const copy_start = std::max(c->offset, offset);
       size_t const copy_end   = std::min(c->offset + chunk_bytes, offset + size);
       cudaMemcpyAsync(dst + (copy_start - offset),
@@ -559,69 +545,43 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
     // above) before mutating chunk state, since releasing a read pin or publishing
     // loading -> cached makes a chunk evictable.  Run the continuation on the IO
     // callback pool, not inline on the reactor thread, because it blocks on
-    // stream.synchronize().
-    if (!segments.empty()) {
-      auto io_fut = _io_ctx->host_to_device_read_async_io(obj, segments, offset, size, dst, stream);
-      return std::move(io_fut)
-        .via(&_io_cb_dispatcher)
-        .then_try(
-          [stream, size, read_pinned = std::move(read_pinned), loading = std::move(loading)](
-            exec::try_t<size_t>&& res) mutable -> size_t {
-            bool ok = !res.has_exception();
+    // stream.synchronize().  When there are no IO segments (cache-only path) we
+    // synthesize a ready future so both paths share one continuation; stream.synchronize()
+    // is equivalent to the previous event.synchronize() since only case-(1) copies are
+    // on the stream at that point.
+    auto io_fut = io_segments.empty() ? exec::make_semi_future<size_t>(size)
+                                      : _io_ctx->host_to_device_read_async_io(
+                                          obj, io_segments, offset, size, dst, stream);
+    return std::move(io_fut)
+      .via(&_io_cb_dispatcher)
+      .then_try([stream,
+                 size,
+                 read_pinned = std::move(cached_chunks),
+                 loading     = std::move(io_chunks)](exec::try_t<size_t>&& res) mutable -> size_t {
+        bool ok = !res.has_exception();
 
-            std::exception_ptr cuda_exception = nullptr;
-            try {
-              stream.synchronize();
-            } catch (...) {
-              cuda_exception = std::current_exception();
-              ok             = false;
-            }
-
-            // (1) drop the read pins; (2) publish loading -> cached on success, or
-            // revert loading -> allocated on failure so a later read can retry.
-            for (cached_chunk* c : read_pinned) {
-              c->state.release_read();
-            }
-            for (cached_chunk* c : loading) {
-              if (ok) {
-                static_cast<void>(c->state.mark_cached());
-              } else {
-                static_cast<void>(c->state.mark_load_failed());
-              }
-            }
-
-            if (res.has_exception() || cuda_exception) {
-              std::rethrow_exception(res.has_exception() ? std::move(res).exception()
-                                                         : cuda_exception);
-            }
-            return size;
-          })
-        .semi();
-    }
-
-    // Everything was already cached (case 1 only): wait on the copy event, then
-    // drop the read pins.  Releasing a pin makes the chunk evictable, so it must
-    // wait until the copy that reads the chunk has actually completed.
-    cucascade::cuda::cuda_event copy_evnt;
-    copy_evnt.record(stream);
-    return exec::make_semi_future(true).defer(
-      [copy_evnt = std::move(copy_evnt), size, read_pinned = std::move(read_pinned)](
-        exec::try_t<bool>&& status) mutable -> size_t {
-        std::exception_ptr copy_exception = nullptr;
+        std::exception_ptr cuda_exception = nullptr;
         try {
-          copy_evnt.synchronize();
+          stream.synchronize();
         } catch (...) {
-          copy_exception = std::current_exception();
+          cuda_exception = std::current_exception();
+          ok             = false;
         }
-        for (cached_chunk* c : read_pinned) {
-          c->state.release_read();
-        }
-        if (copy_exception || status.has_exception()) {
-          std::rethrow_exception(copy_exception ? copy_exception : status.exception());
+
+        // (1) drop the read pins; (2) publish loading -> cached on success, or
+        // revert loading -> allocated on failure so a later read can retry.
+        std::ranges::for_each(read_pinned, [](cached_chunk* c) { c->state.release_read(); });
+        auto transition = ok ? &entry_state::mark_cached : &entry_state::mark_load_failed;
+        std::ranges::for_each(loading, [transition](cached_chunk* c) { (c->state.*transition)(); });
+
+        if (res.has_exception() || cuda_exception) {
+          std::rethrow_exception(res.has_exception() ? std::move(res).exception() : cuda_exception);
         }
         return size;
-      });
+      })
+      .semi();
   }
+  _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
   return _io_ctx->device_read_async_io(obj, offset, size, dst, stream);
 }
 
