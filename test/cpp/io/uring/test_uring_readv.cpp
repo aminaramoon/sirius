@@ -511,3 +511,62 @@ TEST_CASE("prep_host_to_device caps each readv group at max_n_chunks", "[uring_r
 
   complete(chunks);
 }
+
+TEST_CASE("prep_host_to_device defers a null-buffer (bounce) chunk instead of baking an absolute src",
+          "[uring_readv]")
+{
+  // Regression: a cache-miss segment carries a null host buffer — the reactor
+  // stages it through one of its own internal bounce slots, which on_request
+  // late-binds into chunk.data().  The emitted copy must therefore be *deferred*
+  // (src == nullptr, src_off == the wanted data's offset within the read window)
+  // so copy_async resolves it as bounce_buffer + src_off.  Baking an absolute
+  // src here would yield nullptr + (data_lo - file_lo): a bogus non-null pointer
+  // that copy_async dereferences directly, crashing inside cuMemcpyHtoDAsync
+  // (observed faulting host source ~0x2611b on a request starting partway into
+  // a missed chunk).
+  temp_file tf(1 << 20);
+  sirius::io::uring::config cfg;
+  cfg.use_odirect  = false;
+  cfg.max_n_chunks = 16;
+
+  SECTION("request starts partway into a missed chunk (the crash case)")
+  {
+    // One null-buffer chunk [0, 4096); request [1024, 4096) begins 1024 bytes in.
+    std::vector<io_object_segment> segs{{0, 4096}};  // null buffer => bounce read
+    auto* dst = fake_ptr(0x40000000);
+    auto req  = uring_reactor::prep_host_to_device_rx_request(
+      cfg, *tf.obj, segs, dst, /*offset=*/1024, /*size=*/3072, rmm::cuda_stream_view{}, 0);
+    auto chunks = req->get_all_chunks();
+
+    REQUIRE(chunks.size() == 1);
+    CHECK_FALSE(chunks[0]->is_vectored());
+    CHECK_FALSE(chunks[0]->chunk.is_buffer_allocated());  // staged through a bounce slot
+    REQUIRE(chunks[0]->cpy_req != nullptr);
+    auto const& copies = chunks[0]->cpy_req->copies;
+    REQUIRE(copies.size() == 1);
+    CHECK(copies[0].dst == dst);       // data_lo - req_offset == 0
+    CHECK(copies[0].src == nullptr);   // deferred to the bounce buffer, NOT nullptr+1024
+    CHECK(copies[0].src_off == 1024);  // intra-window offset, resolved at copy time
+    CHECK(copies[0].size == 3072);
+
+    complete(chunks);
+  }
+
+  SECTION("chunk-aligned request keeps src null with a zero src_off")
+  {
+    std::vector<io_object_segment> segs{{0, 4096}};  // null buffer => bounce read
+    auto* dst = fake_ptr(0x40000000);
+    auto req  = uring_reactor::prep_host_to_device_rx_request(
+      cfg, *tf.obj, segs, dst, /*offset=*/0, /*size=*/4096, rmm::cuda_stream_view{}, 0);
+    auto chunks = req->get_all_chunks();
+
+    REQUIRE(chunks.size() == 1);
+    auto const& copies = chunks[0]->cpy_req->copies;
+    REQUIRE(copies.size() == 1);
+    CHECK(copies[0].src == nullptr);
+    CHECK(copies[0].src_off == 0);
+    CHECK(copies[0].size == 4096);
+
+    complete(chunks);
+  }
+}

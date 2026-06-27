@@ -296,11 +296,28 @@ struct io_slot {
     assert(data_lo < data_hi &&
            "make_device_chunk_vectored: buffer does not overlap the request — caller must filter "
            "non-overlapping segments before building a device copy");
-    cpy->copies.push_back(device_cpy_request::copy{
-      /*dst=*/dst + (data_lo - req_offset),  // where this buffer lands in dst
-      /*src=*/static_cast<uint8_t*>(b.iov_base) + (data_lo - file_lo),  // wanted data in buffer
-      /*src_off=*/0,
-      /*size=*/data_hi - data_lo});
+    if (b.iov_base == nullptr) {
+      // A null buffer is a cache-miss segment the reactor stages through one of
+      // its own internal bounce slots: merge_contiguous never fuses it, so it is
+      // always a standalone single-buffer (non-vectored) segment, and on_request
+      // late-binds chunk.data() to the bounce slot.  Emit a *deferred* copy —
+      // src=nullptr with src_off as the wanted data's offset within the read
+      // window — so copy_async resolves the source as host_buffer + src_off,
+      // exactly like make_device_chunk.  Baking an absolute src here would yield
+      // nullptr + (data_lo - file_lo): a bogus non-null pointer (which copy_async
+      // would dereference) whenever the request starts partway into the chunk.
+      cpy->copies.push_back(device_cpy_request::copy{
+        /*dst=*/dst + (data_lo - req_offset),  // where this window lands in dst
+        /*src=*/nullptr,                       // resolved late to the bounce host buffer
+        /*src_off=*/data_lo - file_lo,         // offset of the wanted data within host_buf
+        /*size=*/data_hi - data_lo});
+    } else {
+      cpy->copies.push_back(device_cpy_request::copy{
+        /*dst=*/dst + (data_lo - req_offset),  // where this buffer lands in dst
+        /*src=*/static_cast<uint8_t*>(b.iov_base) + (data_lo - file_lo),  // wanted data in buffer
+        /*src_off=*/0,
+        /*size=*/data_hi - data_lo});
+    }
     file_lo = file_hi;
   }
 
