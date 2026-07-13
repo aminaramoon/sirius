@@ -16,30 +16,29 @@
 
 // bench_partition_probe.cpp
 //
-// Measures the overhead of NOT partitioning the probe side of a partitioned
-// hash join (orders ⋈ lineitem, TPC-H Q9, key o_orderkey = l_orderkey).
+// Measures the overhead of the concat step in a partitioned hash join
+// (orders ⋈ lineitem, TPC-H Q9, key o_orderkey = l_orderkey).
 //
 // Common setup (not timed): the build side (orders) is hash-partitioned into
 // N partitions (cudf::hash_partition on o_orderkey, MURMUR3, seed 0 — same as
 // Sirius' gpu_partition_impl), and one cudf::hash_join is built per partition.
 //
-// Two scenarios are then compared on the probe/join phase:
+// Both scenarios first hash-partition every probe batch with the SAME hash/seed
+// as the build side (so probe partition i can only match build partition i).
+// They differ only in whether same-partition slices are concatenated before the
+// join — isolating the cost/benefit of concat:
 //
-//   BM_A — unpartitioned probe:
-//     The probe side is left unpartitioned. Because a probe row could match
-//     ANY build partition, every probe batch must be probed against ALL N
-//     build-partition hash tables → N passes over the probe data.
+//   BM1 — partition + concat + partitioned join:
+//     Same-partition slices from all batches are concatenated into
+//     ≤ CONCAT_CAP_BYTES (≈ 1 GB) chunks, so each partition is probed with one
+//     large join call. Pays the concat copy; fewer, bigger joins.
 //
-//   BM_B — partitioned probe + concat:
-//     Each probe batch is hash-partitioned into N partitions with the SAME
-//     hash/seed as the build side, so probe partition i can only match build
-//     partition i. The same-partition slices from all batches are concatenated
-//     (capped at CONCAT_CAP_BYTES ≈ 1 GB per chunk), then each chunk is probed
-//     against its build-partition hash table → 1 pass. BM_B's timed region
-//     includes the probe-side partition + concat cost (the tradeoff vs. BM_A).
+//   BM2 — partition + partitioned join (no concat):
+//     Each per-batch partition slice is probed directly against its
+//     build-partition hash table. No concat copy; more, smaller joins.
 //
-// Both scenarios produce the same total output row count (each probe row
-// matches exactly one build partition), which validates correctness.
+// Both time the probe-side partition step + the join(s). Both produce the same
+// total output row count, which validates correctness.
 //
 // Usage:
 //   build/release/test/io/partition_probe_benchmark <tpch_parquet_dir> \
@@ -83,7 +82,7 @@ namespace fs = std::filesystem;
 // Config
 // ---------------------------------------------------------------------------
 
-// Cap for the per-partition probe concat in BM_B (~1 GB). Same-partition slices
+// Cap for the per-partition probe concat in BM1 (~1 GB). Same-partition slices
 // are packed into chunks no larger than this, then each chunk is joined.
 static constexpr size_t CONCAT_CAP_BYTES = 1024ULL * 1024 * 1024;
 
@@ -230,52 +229,20 @@ struct GpuTimer {
   }
 };
 
-// ---------------------------------------------------------------------------
-// BM_A: unpartitioned probe — probe every batch against all N hash tables.
-// ---------------------------------------------------------------------------
-static double bm_a_unpartitioned(const std::vector<std::unique_ptr<cudf::hash_join>>& hts,
-                                 const std::vector<cudf::table_view>& build_parts,
-                                 const std::vector<std::unique_ptr<cudf::table>>& probe_batches,
-                                 rmm::cuda_stream_view stream,
-                                 rmm::device_async_resource_ref const& mr,
-                                 int64_t& out_rows)
+// Hash-partition every probe batch (same MURMUR3/seed as the build side, so
+// probe partition i can only match build partition i). Keeps the reordered
+// tables alive in `reordered_out` and returns per-partition slice views grouped
+// by partition index. This is the common first step of both scenarios below.
+static std::vector<std::vector<cudf::table_view>> partition_probe_batches(
+  const std::vector<std::unique_ptr<cudf::table>>& probe_batches,
+  int n_partitions,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref const& mr,
+  std::vector<std::unique_ptr<cudf::table>>& reordered_out)
 {
-  nvtx3::scoped_range r{"BM_A:unpartitioned_probe"};
-  GpuTimer timer;
-  timer.record_start(stream.value());
-
-  out_rows = 0;
-  int n    = static_cast<int>(hts.size());
-  for (int p = 0; p < n; ++p)
-    for (auto& b : probe_batches)
-      out_rows += probe_one(*hts[p], build_parts[p], b->view(), stream, mr);
-
-  timer.record_stop(stream.value());
-  return timer.elapsed_ms();
-}
-
-// ---------------------------------------------------------------------------
-// BM_B: partition each probe batch (same hash as build), concat same-partition
-//       slices into ≤ CONCAT_CAP_BYTES chunks, probe each chunk against its
-//       build-partition hash table.
-// ---------------------------------------------------------------------------
-static double bm_b_partitioned(const std::vector<std::unique_ptr<cudf::hash_join>>& hts,
-                               const std::vector<cudf::table_view>& build_parts,
-                               const std::vector<std::unique_ptr<cudf::table>>& probe_batches,
-                               int n_partitions,
-                               rmm::cuda_stream_view stream,
-                               rmm::device_async_resource_ref const& mr,
-                               int64_t& out_rows)
-{
-  nvtx3::scoped_range r{"BM_B:partitioned_probe"};
-  GpuTimer timer;
-  timer.record_start(stream.value());
-
-  // 1. Hash-partition every probe batch. Keep the reordered tables alive and
-  //    collect per-partition slice views (grouped by partition index).
-  std::vector<std::unique_ptr<cudf::table>> reordered_batches;
-  reordered_batches.reserve(probe_batches.size());
   std::vector<std::vector<cudf::table_view>> slices_by_part(n_partitions);
+  reordered_out.clear();
+  reordered_out.reserve(probe_batches.size());
 
   for (auto& b : probe_batches) {
     auto [reordered, offsets] = cudf::hash_partition(b->view(),
@@ -288,11 +255,32 @@ static double bm_b_partitioned(const std::vector<std::unique_ptr<cudf::hash_join
     auto parts                = slice_partitions(reordered->view(), offsets, n_partitions, stream);
     for (int p = 0; p < n_partitions; ++p)
       slices_by_part[p].push_back(parts[p]);
-    reordered_batches.push_back(std::move(reordered));
+    reordered_out.push_back(std::move(reordered));
   }
+  return slices_by_part;
+}
 
-  // 2. For each partition, pack slices into ≤ CONCAT_CAP_BYTES chunks, concat,
-  //    and probe against that partition's build hash table.
+// ---------------------------------------------------------------------------
+// BM1: partition + concat + partitioned join. After partitioning, the
+// same-partition slices from all batches are concatenated into ≤ CONCAT_CAP_BYTES
+// chunks, so each partition is probed with one large join call.
+// ---------------------------------------------------------------------------
+static double bm_partition_concat_join(
+  const std::vector<std::unique_ptr<cudf::hash_join>>& hts,
+  const std::vector<cudf::table_view>& build_parts,
+  const std::vector<std::unique_ptr<cudf::table>>& probe_batches,
+  int n_partitions,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref const& mr,
+  int64_t& out_rows)
+{
+  nvtx3::scoped_range r{"BM1:partition_concat_join"};
+  GpuTimer timer;
+  timer.record_start(stream.value());
+
+  std::vector<std::unique_ptr<cudf::table>> reordered;
+  auto slices_by_part = partition_probe_batches(probe_batches, n_partitions, stream, mr, reordered);
+
   out_rows = 0;
   for (int p = 0; p < n_partitions; ++p) {
     std::vector<cudf::table_view> chunk;
@@ -314,6 +302,35 @@ static double bm_b_partitioned(const std::vector<std::unique_ptr<cudf::hash_join
     }
     flush();
   }
+
+  timer.record_stop(stream.value());
+  return timer.elapsed_ms();
+}
+
+// ---------------------------------------------------------------------------
+// BM2: partition + partitioned join (no concat). After partitioning, each
+// per-batch partition slice is probed directly against its build-partition hash
+// table — more, smaller join calls, but no concat copy.
+// ---------------------------------------------------------------------------
+static double bm_partition_join(const std::vector<std::unique_ptr<cudf::hash_join>>& hts,
+                                const std::vector<cudf::table_view>& build_parts,
+                                const std::vector<std::unique_ptr<cudf::table>>& probe_batches,
+                                int n_partitions,
+                                rmm::cuda_stream_view stream,
+                                rmm::device_async_resource_ref const& mr,
+                                int64_t& out_rows)
+{
+  nvtx3::scoped_range r{"BM2:partition_join"};
+  GpuTimer timer;
+  timer.record_start(stream.value());
+
+  std::vector<std::unique_ptr<cudf::table>> reordered;
+  auto slices_by_part = partition_probe_batches(probe_batches, n_partitions, stream, mr, reordered);
+
+  out_rows = 0;
+  for (int p = 0; p < n_partitions; ++p)
+    for (auto& slice : slices_by_part[p])
+      out_rows += probe_one(*hts[p], build_parts[p], slice, stream, mr);
 
   timer.record_stop(stream.value());
   return timer.elapsed_ms();
@@ -479,16 +496,14 @@ int main(int argc, char** argv)
               << " ms  max=" << mx << " ms  (" << iters << " iters, " << warmup << " warmup)\n";
   };
 
-  run_bench("BM_A: unpartitioned probe → probe all " + std::to_string(n_partitions) +
-              " hash tables (" + std::to_string(n_partitions) + " passes)",
-            [&](int64_t& rows) {
-              return bm_a_unpartitioned(hts, build_parts, probe_batches, stream, mr, rows);
-            });
+  run_bench("BM1: partition + concat(≤1GB) + partitioned join", [&](int64_t& rows) {
+    return bm_partition_concat_join(
+      hts, build_parts, probe_batches, n_partitions, stream, mr, rows);
+  });
 
-  run_bench(
-    "BM_B: partition probe + concat(≤1GB) → probe matching partition (1 pass)", [&](int64_t& rows) {
-      return bm_b_partitioned(hts, build_parts, probe_batches, n_partitions, stream, mr, rows);
-    });
+  run_bench("BM2: partition + partitioned join (no concat)", [&](int64_t& rows) {
+    return bm_partition_join(hts, build_parts, probe_batches, n_partitions, stream, mr, rows);
+  });
 
   return 0;
 }
