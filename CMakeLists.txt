@@ -744,3 +744,81 @@ set_target_properties(
   PROPERTIES CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/concat_join_benchmark — probe-side concat vs. streaming join benchmark
+# Measures overhead of cudf::concatenate vs. per-batch cudf::hash_join for the
+# orders ⋈ lineitem join in TPC-H Q9.
+# -----------------------------------------------------------------------------
+add_executable(concat_join_benchmark test/io/bench_concat_join.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(concat_join_benchmark PROPERTIES NO_SYSTEM_FROM_IMPORTED
+                                                         ON)
+  target_include_directories(concat_join_benchmark BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  concat_join_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  concat_join_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(concat_join_benchmark "")
+
+target_link_options(concat_join_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  concat_join_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/partition_probe_benchmark — partitioned-join probe-side overhead
+# Measures the cost of NOT partitioning the probe side (probe every build
+# partition) vs. partitioning + concat then a single targeted join pass, for the
+# orders ⋈ lineitem join in TPC-H Q9.
+# -----------------------------------------------------------------------------
+add_executable(partition_probe_benchmark test/io/bench_partition_probe.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(partition_probe_benchmark
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(partition_probe_benchmark BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  partition_probe_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  partition_probe_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(partition_probe_benchmark "")
+
+target_link_options(partition_probe_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  partition_probe_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
