@@ -111,10 +111,12 @@ std::unique_ptr<cudf::table> read_full(std::vector<std::string> const& paths,
 }
 
 // Read the file set in ~chunk_bytes chunks and return each chunk as a resident
-// device table.
+// device table. Stops after `max_chunks` chunks (0 = no limit), which also
+// avoids materializing the whole file when only a bounded working set is wanted.
 std::vector<std::unique_ptr<cudf::table>> read_chunks(std::vector<std::string> const& paths,
                                                       std::vector<std::string> const& columns,
                                                       size_t chunk_bytes,
+                                                      size_t max_chunks,
                                                       rmm::cuda_stream_view stream)
 {
   auto opts = make_read_opts(paths, columns);
@@ -125,6 +127,7 @@ std::vector<std::unique_ptr<cudf::table>> read_chunks(std::vector<std::string> c
     auto chunk = reader.read_chunk();
     if (chunk.tbl->num_rows() == 0) continue;
     chunks.push_back(std::move(chunk.tbl));
+    if (max_chunks != 0 && chunks.size() >= max_chunks) break;
   }
   stream.synchronize();
   return chunks;
@@ -214,14 +217,15 @@ void usage(char const* prog)
 {
   std::cerr << "usage: " << prog
             << " <orders_path|glob> <lineitem_path|glob>"
-               " [num_passes=10] [chunk_mb=100] [num_streams=5] [iters=3]\n";
+               " [num_passes=10] [chunk_mb=100] [num_streams=5] [iters=3] [max_batches=0]\n"
+            << "  max_batches – cap total resident probe batches (0 = all); bounds GPU memory\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv)
 {
-  if (argc < 3 || argc > 7) {
+  if (argc < 3 || argc > 8) {
     usage(argv[0]);
     return 1;
   }
@@ -231,6 +235,7 @@ int main(int argc, char** argv)
   size_t chunk_mb           = argc > 4 ? std::stoull(argv[4]) : 100;
   int num_streams           = argc > 5 ? std::stoi(argv[5]) : 5;
   int iters                 = argc > 6 ? std::stoi(argv[6]) : 3;
+  size_t max_batches        = argc > 7 ? std::stoull(argv[7]) : 0;
   if (num_passes < 1 || num_streams < 1 || iters < 1) {
     std::cerr << "num_passes, num_streams and iters must be >= 1\n";
     return 1;
@@ -266,7 +271,11 @@ int main(int argc, char** argv)
   size_t chunk_bytes = chunk_mb * (1ull << 20);
   std::vector<std::unique_ptr<cudf::table>> probe_batches;
   for (int p = 0; p < num_passes; ++p) {
-    auto chunks = read_chunks(lineitem_paths, LINEITEM_COLUMNS, chunk_bytes, main_stream.view());
+    size_t remaining =
+      max_batches == 0 ? 0 : (max_batches - std::min(max_batches, probe_batches.size()));
+    if (max_batches != 0 && remaining == 0) break;
+    auto chunks =
+      read_chunks(lineitem_paths, LINEITEM_COLUMNS, chunk_bytes, remaining, main_stream.view());
     for (auto& c : chunks)
       probe_batches.push_back(std::move(c));
   }
