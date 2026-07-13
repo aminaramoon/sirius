@@ -744,3 +744,39 @@ set_target_properties(
   PROPERTIES CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/hash_join_concat_benchmark — probe-side concat overhead micro-benchmark
+# -----------------------------------------------------------------------------
+add_executable(hash_join_concat_benchmark test/io/hash_join_concat_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(hash_join_concat_benchmark PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(hash_join_concat_benchmark BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  hash_join_concat_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  hash_join_concat_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(hash_join_concat_benchmark "")
+
+target_link_options(hash_join_concat_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  hash_join_concat_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
