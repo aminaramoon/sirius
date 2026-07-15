@@ -28,9 +28,10 @@
 
 namespace sirius::exec {
 
-/// The priority type used to order items in inspectable_priority_queue. Larger values are
-/// higher priority (popped from the front first). Signed so callers can express "lower than
-/// default" priorities without underflow tricks.
+/// The priority type used to order items in inspectable_priority_queue. Smaller values are
+/// scheduled first (popped from the front first), so a task's priority correlates with its
+/// execution order. Signed so callers can express "lower than default" priorities without
+/// underflow tricks.
 using queue_priority = std::int64_t;
 
 /**
@@ -38,9 +39,9 @@ using queue_priority = std::int64_t;
  *
  * Drop-in replacement for inspectable_mpsc that orders items by an explicit priority rather
  * than by insertion order. The backing storage is a std::vector kept sorted by priority in
- * descending order (highest priority at the front), so:
- *   - pop() / try_pop() / pop_front() return the highest-priority item,
- *   - pop_back() returns the lowest-priority item.
+ * ascending order (lowest priority value at the front), so lower-numbered tasks run first:
+ *   - pop() / try_pop() / pop_front() return the lowest-priority (first-to-run) item,
+ *   - pop_back() returns the highest-priority (last-to-run) item.
  * Ties (equal priority) preserve insertion order (FIFO among equals), matching the legacy
  * queue's behavior when every item shares the default priority.
  *
@@ -55,8 +56,8 @@ using queue_priority = std::int64_t;
 template <typename T>
 class inspectable_priority_queue {
  public:
-  /// Extracts the priority of an item. Returning a larger value ranks the item closer to the
-  /// front (popped sooner).
+  /// Extracts the priority of an item. Returning a smaller value ranks the item closer to the
+  /// front (popped sooner / runs earlier).
   using priority_fn = std::function<queue_priority(const T&)>;
 
  private:
@@ -65,7 +66,7 @@ class inspectable_priority_queue {
     std::unique_ptr<T> item;
   };
 
-  std::vector<entry> _queue;  ///< Sorted by priority descending; ties keep insertion order.
+  std::vector<entry> _queue;  ///< Sorted by priority ascending; ties keep insertion order.
   mutable std::mutex _mutex;
   std::condition_variable _cv;
   bool _active{true};
@@ -121,10 +122,10 @@ class inspectable_priority_queue {
   }
 
   /**
-   * \brief Blocks waiting for the highest-priority item.
+   * \brief Blocks waiting for the lowest-priority (first-to-run) item.
    * \return Returns nullptr if the queue is interrupted and empty.
    *
-   * If the queue is interrupted but still has items, those items are returned (highest
+   * If the queue is interrupted but still has items, those items are returned (lowest
    * priority first) before nullptr. Uses condition_variable::wait for true blocking.
    */
   std::unique_ptr<T> pop()
@@ -136,7 +137,7 @@ class inspectable_priority_queue {
   }
 
   /**
-   * \brief Attempts to pop the highest-priority item without blocking.
+   * \brief Attempts to pop the lowest-priority (first-to-run) item without blocking.
    * \return Returns nullptr if the queue is empty.
    */
   std::unique_ptr<T> try_pop()
@@ -147,12 +148,14 @@ class inspectable_priority_queue {
   }
 
   /**
-   * \brief Removes and returns the highest-priority item, or nullptr if empty. Non-blocking.
+   * \brief Removes and returns the lowest-priority (first-to-run) item, or nullptr if empty.
+   *        Non-blocking.
    */
   std::unique_ptr<T> pop_front() { return try_pop(); }
 
   /**
-   * \brief Removes and returns the lowest-priority item, or nullptr if empty. Non-blocking.
+   * \brief Removes and returns the highest-priority (last-to-run) item, or nullptr if empty.
+   *        Non-blocking.
    */
   std::unique_ptr<T> pop_back()
   {
@@ -229,8 +232,8 @@ class inspectable_priority_queue {
   /**
    * \brief Removes and returns the first element matching the predicate.
    * \param predicate Callable receiving const T& and returning bool.
-   * \param front_to_back If true, searches highest-to-lowest priority; if false,
-   *        lowest-to-highest.
+   * \param front_to_back If true, searches lowest-to-highest priority (first-to-run first); if
+   *        false, highest-to-lowest.
    * \return The matching element, or nullptr if no match found.
    *
    * Holds the mutex for the entire scan. Predicate should be lightweight.
@@ -244,8 +247,8 @@ class inspectable_priority_queue {
   /**
    * \brief Removes and returns the first element matching the mutable predicate.
    * \param predicate Callable receiving T& (mutable) and returning bool.
-   * \param front_to_back If true, searches highest-to-lowest priority; if false,
-   *        lowest-to-highest.
+   * \param front_to_back If true, searches lowest-to-highest priority (first-to-run first); if
+   *        false, highest-to-lowest.
    * \return The matching element, or nullptr if no match found.
    */
   std::unique_ptr<T> mutable_pop_if(std::function<bool(T&)> predicate, bool front_to_back)
@@ -255,18 +258,19 @@ class inspectable_priority_queue {
   }
 
  private:
-  /// Insert item keeping the vector sorted by priority descending, with FIFO order among
+  /// Insert item keeping the vector sorted by priority ascending, with FIFO order among
   /// equal priorities. Caller must hold _mutex.
   void insert_unlocked(queue_priority priority, std::unique_ptr<T> item)
   {
-    // Find the first entry with strictly lower priority; insert before it so all
+    // Find the first entry with strictly higher priority; insert before it so all
     // equal-priority entries pushed earlier stay ahead (FIFO among equals).
     auto pos = std::find_if(
-      _queue.begin(), _queue.end(), [priority](const entry& e) { return e.priority < priority; });
+      _queue.begin(), _queue.end(), [priority](const entry& e) { return e.priority > priority; });
     _queue.insert(pos, entry{priority, std::move(item)});
   }
 
-  /// Pop the front (highest-priority) element. Caller must hold _mutex and ensure non-empty.
+  /// Pop the front (lowest-priority, first-to-run) element. Caller must hold _mutex and ensure
+  /// non-empty.
   std::unique_ptr<T> pop_front_unlocked()
   {
     auto item = std::move(_queue.front().item);

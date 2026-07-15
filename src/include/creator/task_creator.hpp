@@ -151,8 +151,9 @@ class task_creator {
    * @brief Compute a scheduling priority for every pipeline in the query.
    *
    * Partitions the pipeline DAG into branches (via query_index) and assigns each pipeline a
-   * priority so that earlier (closer-to-scan) branches outrank later ones, honoring the
-   * configured FIFO/LIFO ordering within each branch. Exposed for unit testing.
+   * priority so that earlier (closer-to-scan) branches get lower values and run first (priority
+   * ascends with execution order), honoring the configured FIFO/LIFO ordering within each branch.
+   * Exposed for unit testing.
    *
    * @param query The query whose pipelines are prioritized.
    * @return Map from pipeline to its scheduling priority (pipelines absent from the map keep the

@@ -126,12 +126,13 @@ std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority>
 task_creator::compute_pipeline_priorities(const sirius::planner::query& query) const
 {
   // Partition the pipeline DAG into branches (linear chains between branch points) and give each
-  // pipeline a scheduling priority. Higher priority is dispatched first by the pipeline-level
-  // priority queue. The rules (see query_index for the branch definition):
-  //   - Branches are ordered by plan order; an earlier branch is ALWAYS strictly higher priority
-  //     than a later one (guaranteed by a per-branch stride larger than any branch length).
-  //   - Within a branch, FIFO ranks the head (closest to the scan) highest; LIFO reverses it.
-  //   - A pipeline shared by several branches (a join/merge endpoint) takes the MAX priority of
+  // pipeline a scheduling priority. LOWER priority values are dispatched first by the pipeline-
+  // level priority queue, so a pipeline's priority ascends with its execution order (and lines up
+  // with pipeline ids). The rules (see query_index for the branch definition):
+  //   - Branches are ordered by plan order; an earlier branch is ALWAYS strictly lower (runs
+  //     first) than a later one (guaranteed by a per-branch stride larger than any branch length).
+  //   - Within a branch, FIFO ranks the head (closest to the scan) lowest; LIFO reverses it.
+  //   - A pipeline shared by several branches (a join/merge endpoint) takes the MIN priority of
   //     the branches that reach it, so it runs as soon as its earliest-needed branch wants it.
   std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority> priorities;
 
@@ -154,13 +155,14 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
   for (std::size_t b = 0; b < num_branches; ++b) {
     const auto& chain               = branches[b];
     const auto len                  = chain.size();
-    const exec::queue_priority base = static_cast<exec::queue_priority>(num_branches - b) * stride;
+    const exec::queue_priority base = static_cast<exec::queue_priority>(b) * stride;
     for (std::size_t pos = 0; pos < len; ++pos) {
-      const exec::queue_priority within   = lifo ? static_cast<exec::queue_priority>(pos + 1)
-                                                 : static_cast<exec::queue_priority>(len - pos);
+      // FIFO: head (pos 0) gets the smallest offset so it runs first; LIFO reverses within-branch.
+      const exec::queue_priority within   = lifo ? static_cast<exec::queue_priority>(len - pos)
+                                                 : static_cast<exec::queue_priority>(pos + 1);
       const exec::queue_priority priority = base + within;
       auto [it, inserted]                 = priorities.try_emplace(chain[pos], priority);
-      if (!inserted) { it->second = std::max(it->second, priority); }
+      if (!inserted) { it->second = std::min(it->second, priority); }
     }
   }
   return priorities;

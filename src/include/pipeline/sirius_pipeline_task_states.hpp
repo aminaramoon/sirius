@@ -121,7 +121,7 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
   /**
    * @brief Set the scheduling priority shared by all tasks of this pipeline.
    *
-   * Higher values are scheduled first by the pipeline-level priority queue. Assigned once per
+   * Lower values are scheduled first by the pipeline-level priority queue. Assigned once per
    * query by task_creator::prepare_for_query() based on the pipeline's position in the plan.
    */
   void set_priority(exec::queue_priority priority) { _priority = priority; }

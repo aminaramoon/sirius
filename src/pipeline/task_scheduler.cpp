@@ -31,6 +31,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -48,12 +49,13 @@ task_scheduler::task_scheduler(
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
   : _task_queue([](const sirius::parallel::itask& task) -> exec::queue_priority {
-      // Order the pipeline-level queue by per-task priority. Non-pipeline tasks (and tasks
-      // whose priority was never assigned) fall back to 0, preserving FIFO among equals.
+      // Order the pipeline-level queue by per-task priority (lower value = dispatched first).
+      // Non-pipeline tasks fall back to the maximum priority so they sort last, behind every
+      // pipeline task that was assigned an explicit (lower) priority.
       if (const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&task)) {
         return gpu_task->get_priority();
       }
-      return 0;
+      return std::numeric_limits<exec::queue_priority>::max();
     }),
     _task_queue_ordering(task_queue_ordering),
     _telemetry_context(std::move(telemetry_context))

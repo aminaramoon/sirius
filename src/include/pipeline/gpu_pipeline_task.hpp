@@ -185,8 +185,9 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    * @brief Get the scheduling priority for this task.
    *
    * Priority is a pipeline-level property carried on the shared global state, so every task of a
-   * pipeline reports the same value. Higher priorities are dispatched first by the pipeline-level
-   * priority queue. Defaults to 0 when no global state is attached.
+   * pipeline reports the same value. Lower priority values are dispatched first by the pipeline-
+   * level priority queue (priority ascends with execution order). Defaults to 0 when no global
+   * state is attached.
    *
    * @return The scheduling priority for this task.
    */

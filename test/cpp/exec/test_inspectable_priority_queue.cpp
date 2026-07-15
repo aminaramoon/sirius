@@ -70,7 +70,7 @@ TEST_CASE("priority_queue default extractor pops in FIFO order", "[inspectable_p
 // Priority ordering
 // =============================================================================
 
-TEST_CASE("priority_queue pops highest priority first", "[inspectable_priority_queue]")
+TEST_CASE("priority_queue pops lowest priority first", "[inspectable_priority_queue]")
 {
   inspectable_priority_queue<prio_payload> queue(by_field());
   // Pushed in arbitrary order; priorities: 10=>1, 11=>5, 12=>3, 13=>5, 14=>0
@@ -80,8 +80,8 @@ TEST_CASE("priority_queue pops highest priority first", "[inspectable_priority_q
   queue.push(std::make_unique<prio_payload>(13, 5));
   queue.push(std::make_unique<prio_payload>(14, 0));
 
-  // Highest priority first; equal priorities (11,13 both =5) keep insertion order.
-  REQUIRE(drain_ids(queue) == std::vector<int>{11, 13, 12, 10, 14});
+  // Lowest priority value first; equal priorities (11,13 both =5) keep insertion order.
+  REQUIRE(drain_ids(queue) == std::vector<int>{14, 10, 12, 11, 13});
 }
 
 TEST_CASE("priority_queue equal priorities preserve FIFO order", "[inspectable_priority_queue]")
@@ -93,20 +93,20 @@ TEST_CASE("priority_queue equal priorities preserve FIFO order", "[inspectable_p
   REQUIRE(drain_ids(queue) == std::vector<int>{0, 1, 2, 3, 4, 5});
 }
 
-TEST_CASE("priority_queue pop_back returns lowest priority", "[inspectable_priority_queue]")
+TEST_CASE("priority_queue pop_back returns highest priority", "[inspectable_priority_queue]")
 {
   inspectable_priority_queue<prio_payload> queue(by_field());
   queue.push(std::make_unique<prio_payload>(10, 1));
   queue.push(std::make_unique<prio_payload>(11, 5));
   queue.push(std::make_unique<prio_payload>(12, 3));
 
-  auto lowest = queue.pop_back();
-  REQUIRE(lowest != nullptr);
-  REQUIRE(lowest->id == 10);  // priority 1 is lowest
-
-  auto highest = queue.pop_front();
+  auto highest = queue.pop_back();
   REQUIRE(highest != nullptr);
-  REQUIRE(highest->id == 11);  // priority 5 is highest
+  REQUIRE(highest->id == 11);  // priority 5 is highest (last to run)
+
+  auto lowest = queue.pop_front();
+  REQUIRE(lowest != nullptr);
+  REQUIRE(lowest->id == 10);  // priority 1 is lowest (first to run)
 }
 
 TEST_CASE("priority_queue supports negative priorities", "[inspectable_priority_queue]")
@@ -115,10 +115,10 @@ TEST_CASE("priority_queue supports negative priorities", "[inspectable_priority_
   queue.push(std::make_unique<prio_payload>(10, -5));
   queue.push(std::make_unique<prio_payload>(11, 0));
   queue.push(std::make_unique<prio_payload>(12, -1));
-  REQUIRE(drain_ids(queue) == std::vector<int>{11, 12, 10});
+  REQUIRE(drain_ids(queue) == std::vector<int>{10, 12, 11});
 }
 
-TEST_CASE("priority_queue blocking pop returns highest priority", "[inspectable_priority_queue]")
+TEST_CASE("priority_queue blocking pop returns lowest priority", "[inspectable_priority_queue]")
 {
   inspectable_priority_queue<prio_payload> queue(by_field());
   queue.push(std::make_unique<prio_payload>(10, 1));
@@ -127,7 +127,7 @@ TEST_CASE("priority_queue blocking pop returns highest priority", "[inspectable_
 
   auto a = queue.pop();
   REQUIRE(a != nullptr);
-  REQUIRE(a->id == 11);
+  REQUIRE(a->id == 10);
   auto b = queue.pop();
   REQUIRE(b != nullptr);
   REQUIRE(b->id == 12);
@@ -137,7 +137,7 @@ TEST_CASE("priority_queue blocking pop returns highest priority", "[inspectable_
 // pop_if / mutable_pop_if honor priority-sorted iteration
 // =============================================================================
 
-TEST_CASE("priority_queue pop_if front_to_back scans highest priority first",
+TEST_CASE("priority_queue pop_if front_to_back scans lowest priority first",
           "[inspectable_priority_queue]")
 {
   inspectable_priority_queue<prio_payload> queue(by_field());
@@ -145,14 +145,15 @@ TEST_CASE("priority_queue pop_if front_to_back scans highest priority first",
   queue.push(std::make_unique<prio_payload>(11, 5));
   queue.push(std::make_unique<prio_payload>(12, 5));
 
-  // Both id 11 and 12 have priority 5; front_to_back returns the higher-ranked one first (11).
+  // Queue order is ascending [10(1), 11(5), 12(5)]; front_to_back reaches 11 (first priority-5
+  // entry, by insertion order among equals) before 12.
   auto match = queue.pop_if([](const prio_payload& p) { return p.priority == 5; }, true);
   REQUIRE(match != nullptr);
   REQUIRE(match->id == 11);
   REQUIRE(queue.size() == 2);
 }
 
-TEST_CASE("priority_queue pop_if back_to_front scans lowest priority first",
+TEST_CASE("priority_queue pop_if back_to_front scans highest priority first",
           "[inspectable_priority_queue]")
 {
   inspectable_priority_queue<prio_payload> queue(by_field());
@@ -160,7 +161,8 @@ TEST_CASE("priority_queue pop_if back_to_front scans lowest priority first",
   queue.push(std::make_unique<prio_payload>(11, 5));
   queue.push(std::make_unique<prio_payload>(12, 1));
 
-  // back_to_front finds the last (lowest-ranked) matching priority-5 entry: id 11.
+  // Queue order is ascending [12(1), 10(5), 11(5)]; back_to_front reaches the last priority-5
+  // entry (id 11) first.
   auto match = queue.pop_if([](const prio_payload& p) { return p.priority == 5; }, false);
   REQUIRE(match != nullptr);
   REQUIRE(match->id == 11);
@@ -200,7 +202,7 @@ TEST_CASE("priority_queue emplace inserts by priority", "[inspectable_priority_q
   REQUIRE(queue.emplace(11, 9));
   REQUIRE(queue.emplace(12, 4));
   REQUIRE(queue.size() == 3);
-  REQUIRE(drain_ids(queue) == std::vector<int>{11, 12, 10});
+  REQUIRE(drain_ids(queue) == std::vector<int>{10, 12, 11});
 }
 
 TEST_CASE("priority_queue drain removes all items", "[inspectable_priority_queue]")
