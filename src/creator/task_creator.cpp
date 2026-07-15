@@ -32,7 +32,8 @@
 #include <duckdb/parallel/thread_context.hpp>
 
 #include <algorithm>
-#include <limits>
+#include <format>
+#include <iostream>
 #include <optional>
 #include <unordered_map>
 
@@ -127,8 +128,10 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
 {
   // Partition the pipeline DAG into branches (linear chains between branch points) and give each
   // pipeline a scheduling priority. LOWER priority values are dispatched first by the pipeline-
-  // level priority queue, so a pipeline's priority ascends with its execution order (and lines up
-  // with pipeline ids). The rules (see query_index for the branch definition):
+  // level priority queue, so a pipeline's priority ascends with its execution order. The final
+  // priorities are compacted to a dense, contiguous 0..N-1 range (N = number of pipelines) so the
+  // assignment is easy to read off against the plan. The rules (see query_index for the branch
+  // definition):
   //   - Branches are ordered by plan order; an earlier branch is ALWAYS strictly lower (runs
   //     first) than a later one (guaranteed by a per-branch stride larger than any branch length).
   //   - Within a branch, FIFO ranks the head (closest to the scan) lowest; LIFO reverses it.
@@ -158,12 +161,25 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
     const exec::queue_priority base = static_cast<exec::queue_priority>(b) * stride;
     for (std::size_t pos = 0; pos < len; ++pos) {
       // FIFO: head (pos 0) gets the smallest offset so it runs first; LIFO reverses within-branch.
-      const exec::queue_priority within   = lifo ? static_cast<exec::queue_priority>(len - pos)
-                                                 : static_cast<exec::queue_priority>(pos + 1);
+      const exec::queue_priority within   = lifo ? static_cast<exec::queue_priority>(len - 1 - pos)
+                                                 : static_cast<exec::queue_priority>(pos);
       const exec::queue_priority priority = base + within;
       auto [it, inserted]                 = priorities.try_emplace(chain[pos], priority);
       if (!inserted) { it->second = std::min(it->second, priority); }
     }
+  }
+
+  // The strided values above are correct in relative order but sparse (short branches leave gaps).
+  // Compact them to a dense 0..N-1 range by ranking the assigned priorities: each branch occupies a
+  // disjoint value range and a shared endpoint's min comes from a single branch's range, so every
+  // pipeline's raw priority is distinct and the rank is a clean bijection preserving execution order.
+  std::vector<exec::queue_priority> sorted;
+  sorted.reserve(priorities.size());
+  for (const auto& [pipeline, priority] : priorities) { sorted.push_back(priority); }
+  std::sort(sorted.begin(), sorted.end());
+  for (auto& [pipeline, priority] : priorities) {
+    const auto rank = std::lower_bound(sorted.begin(), sorted.end(), priority) - sorted.begin();
+    priority        = static_cast<exec::queue_priority>(rank);
   }
   return priorities;
 }
