@@ -112,6 +112,17 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 
   auto pipeline_priorities = compute_pipeline_priorities(query);
 
+  // Log the computed per-pipeline priorities, sorted by pipeline id.
+  std::vector<std::pair<size_t, exec::queue_priority>> sorted_priorities;
+  sorted_priorities.reserve(pipeline_priorities.size());
+  for (const auto& [pipeline, priority] : pipeline_priorities) {
+    sorted_priorities.emplace_back(pipeline->get_pipeline_id(), priority);
+  }
+  std::sort(sorted_priorities.begin(), sorted_priorities.end());
+  for (const auto& [pipeline_id, priority] : sorted_priorities) {
+    SIRIUS_LOG_INFO("{} : {}", pipeline_id, priority);
+  }
+
   for (const auto& pipeline : pipelines) {
     pipeline->set_task_creator(this);
     auto source_operator = pipeline->get_source();
@@ -156,7 +167,8 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
   //     the branches that reach it, so it runs as soon as its earliest-needed branch wants it.
   std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority> priorities;
 
-  auto index    = planner::query_index::build_index(query);
+  auto options = planner::build_index_options{ . branch_order = planner::build_probe{} };
+  auto index    = planner::query_index::build_index(query, options);
   auto branches = index->get_branches();
   if (branches.empty()) { return priorities; }
 
