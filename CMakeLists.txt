@@ -149,20 +149,20 @@ endif()
 
 # CTrack is retained as an opt-in profiling dependency.
 if(BUILD_WITH_CTRACK)
-# --- ctrack (profiling instrumentation) --- #
-include(FetchContent)
-FetchContent_Declare(
-  ctrack
-  GIT_REPOSITORY https://github.com/Compaile/ctrack.git
-  GIT_TAG 6dfa9b0eef26507cfa9bc17ae4d817ab011a28f5 # v1.1.0
-  SOURCE_SUBDIR do-not-build)
-FetchContent_MakeAvailable(ctrack)
-if(NOT TARGET ctrack::ctrack)
-  add_library(ctrack::ctrack INTERFACE IMPORTED)
-  set_target_properties(
-    ctrack::ctrack PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                              "${ctrack_SOURCE_DIR}/include")
-endif()
+  # --- ctrack (profiling instrumentation) --- #
+  include(FetchContent)
+  FetchContent_Declare(
+    ctrack
+    GIT_REPOSITORY https://github.com/Compaile/ctrack.git
+    GIT_TAG 6dfa9b0eef26507cfa9bc17ae4d817ab011a28f5 # v1.1.0
+    SOURCE_SUBDIR do-not-build)
+  FetchContent_MakeAvailable(ctrack)
+  if(NOT TARGET ctrack::ctrack)
+    add_library(ctrack::ctrack INTERFACE IMPORTED)
+    set_target_properties(
+      ctrack::ctrack PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                "${ctrack_SOURCE_DIR}/include")
+  endif()
 
 endif()
 
@@ -306,6 +306,10 @@ set(EXTENSION_SOURCES
     src/exec/stream_bind_catalog.cpp
     src/exec/stream_plan_bindings.cpp
     src/exec/streaming_fragment.cpp
+    src/exec/thread_util.cpp
+    # Query lifecycle event bus (publisher + subscriber)
+    src/event/query_event_publisher.cpp
+    src/event/query_event_subscriber.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -702,11 +706,13 @@ set(TEST_SOURCES
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
+    test/cpp/event/test_query_event_publisher.cpp
     test/cpp/exec/test_semi_future.cpp
     test/cpp/exec/test_sirius_ffi_fragment.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_stream_session.cpp
     test/cpp/exec/test_streaming_fragment.cpp
+    test/cpp/exec/test_thread_util.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
     test/cpp/expression/test_ast_substitute.cpp
