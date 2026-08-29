@@ -58,7 +58,11 @@ EXECUTION_PROFILES = {
     "cold": {
         "ordering": "sequential",
         "cache_mode": "sirius",
-        "eviction": "idle",
+        # 'lru', not 'idle': the per-query reset_sirius_cache() below is what
+        # makes this profile cold, so the evictor does not also need to drop a
+        # chunk the moment nothing is reading it. 'idle' additionally retires
+        # chunks mid-query, which measures the evictor rather than a cold scan.
+        "eviction": "lru",
         "drop_os_cache_between": True,
         "reset_cache_between": True,
         "summary": (
@@ -82,7 +86,7 @@ EXECUTION_PROFILES = {
     "hot": {
         "ordering": "grouped",
         "cache_mode": "sirius",
-        "eviction": "idle",
+        "eviction": "lru",
         "drop_os_cache_between": False,
         "reset_cache_between": False,
         "summary": (
@@ -194,15 +198,13 @@ def setup_benchmark_dir(
           <engine>/q<N>/result.txt  (one repr(row) per line)
           sirius/q<N>/sirius.log    (post-run split of combined log)
 
-    If `name` is provided, the benchmark dir is `<output_root>/<name>` (no
-    timestamp); otherwise the default `tpch_<ts>_<execution>_<engine>_iter<N>` is used.
+    The benchmark dir is `<output_root>/tpch_<ts>_<execution>_<engine>_iter<N>`,
+    with `_<name>` appended when `name` is provided.
     """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     benchmark_name = f"tpch_{ts}_{execution}_{engine}_iter{iterations}"
     if name:
-        benchmark_name = f"tpch_{ts}_{name}"
-    else:
-        benchmark_name = f"tpch_{ts}_{mode}_{engine}_iter{iterations}"
+        benchmark_name += f"_{name}"
     benchmark_dir = os.path.join(output_root, benchmark_name)
     csv_dir = os.path.join(benchmark_dir, "csv")
     log_dir = os.path.join(benchmark_dir, "log_dir")
@@ -498,7 +500,7 @@ def can_drop_os_cache():
     return proc.returncode == 0
 
 
-def drop_os_cache():
+def drop_os_cache(source, data_source="parquet"):
     """Drop OS filesystem cache. Requires passwordless sudo per CLAUDE.md."""
     proc = subprocess.run(
         ["sudo", "-n", "/usr/bin/tee", "/proc/sys/vm/drop_caches"],
@@ -511,6 +513,12 @@ def drop_os_cache():
             "Failed to drop OS cache. Set up passwordless sudo as described "
             f"in test/tpch_performance/CLAUDE.md (stderr: {proc.stderr.strip()})"
         )
+
+    if data_source == "duckdb":
+        files = [source]
+    elif is_s3_source(source):
+        # Nothing local to fadvise -- the page cache drop above is all that applies.
+        files = []
     else:
         files = []
         for table in TPCH_TABLES:
@@ -713,12 +721,12 @@ def _run_one(
     _write_result(benchmark_dir, name, qnum, rows)
 
 
-def _flush_between_runs(con, profile, use_gpu):
+def _flush_between_runs(con, profile, use_gpu, source, data_source="parquet"):
     """Flush whatever this profile wants gone before a query run, including the
     first -- otherwise the first run would be the odd one out."""
     if profile["drop_os_cache_between"]:
         log("  Dropping OS page cache")
-        drop_os_cache()
+        drop_os_cache(source, data_source)
     if profile["reset_cache_between"] and use_gpu:
         # Sirius's own prefetching cache survives an OS cache drop -- it holds
         # its chunks in pinned host memory, not the page cache -- so a cold run
@@ -767,7 +775,7 @@ def run_grouped(
                             _execute_multi(con, emit_pin(qnum, source, data_source))
                             pinned = True
                         log(f"--- q{qnum} iter{it} engine={name} ---")
-                        _flush_between_runs(con, profile, use_gpu)
+                        _flush_between_runs(con, profile, use_gpu, source, data_source)
                         _run_one(
                             writer,
                             con,
@@ -823,7 +831,7 @@ def run_sequential(
                         pinned = True
                     for qnum in queries:
                         log(f"--- q{qnum} iter{it} engine={name} ---")
-                        _flush_between_runs(con, profile, use_gpu)
+                        _flush_between_runs(con, profile, use_gpu, source, data_source)
                         _run_one(
                             writer,
                             con,
@@ -1100,6 +1108,8 @@ def print_runtime_summary(runtime_csv):
         for row in csv.DictReader(f):
             eng = row["engine"]
             qname = row["query"]
+            if qname == "TOTAL":
+                continue
             it = int(row["iteration"])
             try:
                 rt = float(row["runtime_s"])

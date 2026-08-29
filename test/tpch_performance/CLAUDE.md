@@ -220,7 +220,7 @@ is kept beside it as `config.yml`.
 | *(omitted, default)* | *unchanged* | *unchanged* | back-to-back per query | nothing |
 | `cold` | `sirius` | `idle` | round-robin | drop OS cache **and** `CALL reset_sirius_cache()` |
 | `lukewarm` | `sirius` | `lru` | round-robin | nothing |
-| `hot` | `sirius` | `idle` | back-to-back per query | nothing |
+| `hot` | `sirius` | `lru` | back-to-back per query | nothing |
 
 **The config is only rewritten when `--execution` is passed.** Omit it and your YAML is used
 exactly as written — no `effective_config.yml` is produced and no sanity check runs.
