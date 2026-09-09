@@ -493,6 +493,41 @@ TEST_CASE("sirius_config rejects the removed REST max_read_split key",
   CHECK_THROWS(cfg.load_from_file(yaml.path()));
 }
 
+TEST_CASE("sirius_config selects uring remote independently of local IO", "[uring_remote][config]")
+{
+  auto cfg = load_scan_manager("uring_remote_config.yaml",
+                               scan_manager_yaml("      rest_n_reactors: 1\n"
+                                                 "      uring_remote:\n"
+                                                 "        enabled: true\n"
+                                                 "        max_connections: 256\n"
+                                                 "        queue_depth: 1024\n"
+                                                 "        receive_buffer_bytes: 256 KiB\n"
+                                                 "        max_header_bytes: 64 KiB\n"));
+  CHECK(cfg.uring_remote.enabled);
+  CHECK(cfg.uring_remote.max_connections == 256);
+  CHECK(cfg.uring_remote.queue_depth == 1024);
+  CHECK(cfg.uring_remote.receive_buffer_bytes == (256UL << 10));
+  CHECK_FALSE(cfg.uring_remote.allow_plaintext);
+  CHECK(cfg.rest.max_connections == 64);
+  CHECK(cfg.rest_n_reactors == 1);
+  CHECK_FALSE(scan_manager_config{}.uring_remote.enabled);
+}
+
+TEST_CASE("sirius_config rejects unsafe uring remote capacities and unknown keys",
+          "[uring_remote][config]")
+{
+  for (auto const* setting : {"max_connections: 0",
+                              "max_connections: 4097",
+                              "queue_depth: 1",
+                              "receive_buffer_bytes: 1 KiB",
+                              "max_header_bytes: 2 MiB",
+                              "typo: true"}) {
+    CHECK_THROWS(load_scan_manager(
+      "uring_remote_bad_config.yaml",
+      scan_manager_yaml(std::string{"      uring_remote:\n        "} + setting + '\n')));
+  }
+}
+
 TEST_CASE("sirius_config rejects the renamed local sub-config", "[scan_manager][config][backend]")
 {
   scoped_yaml yaml("sirius_local_node_removed.yaml",

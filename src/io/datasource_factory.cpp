@@ -23,6 +23,7 @@
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/rest/s3/static_credentials.hpp"
 #include "io/uring/uring_ioctx.hpp"
+#include "io/uring_remote/uring_remote_ioctx.hpp"
 #include "log/logging.hpp"
 #include "scan_manager/config.hpp"
 
@@ -150,6 +151,10 @@ factory_type make_rest_ioctx_factory(
       rest_cfg.tls_verify     = config.object_store.tls_verify;
       auto ctx                = std::make_shared<rest::rest_reactor::reactor_context>(
         std::move(rest_cfg), std::move(authorizer), host_mr);
+      if (config.uring_remote.enabled) {
+        return std::make_shared<uring_remote::uring_remote_ioctx>(
+          config.rest_n_reactors, std::move(ctx), config.uring_remote);
+      }
       return std::make_shared<rest::rest_ioctx>(config.rest_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_rest_ioctx_factory: construction failed: {}", e.what());

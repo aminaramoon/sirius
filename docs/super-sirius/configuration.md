@@ -385,6 +385,19 @@ those blocks stay owned through curl retries, the asynchronous H2D copy, and its
 CUDA completion event. Staging is therefore proportional to active device work
 instead of being reserved as one fixed bounce slot per connection.
 
+### `scan_manager.uring_remote` — S3 io_uring + kernel TLS (`io/uring_remote/config.hpp`)
+
+Set `enabled: true` to select `uring_remote_ioctx` for S3 data reads. This shares
+REST's host/device read scheduler and `rest_n_reactors`, but exposes a separate
+connection limit (default 256) for the kernel TLS transport. The curl REST default
+remains 64. `queue_depth` defaults to 1024 and must be at least twice
+`max_connections`. `receive_buffer_bytes` defaults to 256 KiB and `max_header_bytes`
+to 64 KiB. `allow_plaintext` defaults to false; HTTPS always requires verified
+kTLS RX and TX support.
+
+See [S3 with io_uring and kernel TLS](uring-remote.md) for all settings, the EC2
+example YAML, the private OpenSSL build, and test/benchmark commands.
+
 ### `scan_manager.kvikio` — kvikIO local-file backend (`io/kvikio/config.hpp`)
 
 Used only when `backend: kvikio` routes local files to the kvikIO

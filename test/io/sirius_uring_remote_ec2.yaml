@@ -1,0 +1,30 @@
+# Copy to a private file (chmod 600), set the bucket's endpoint/region, and fill
+# in the credentials below. Do not commit real credentials. The existing signer
+# does not load AWS environment variables or instance-role credentials itself.
+sirius:
+  executor:
+    scan_manager:
+      backend: sirius
+      rest_n_reactors: 1
+      uring_remote:
+        enabled: true
+        max_connections: 256
+        queue_depth: 1024
+        receive_buffer_bytes: 256 KiB
+        max_header_bytes: 64 KiB
+        allow_plaintext: false
+      rest:
+        request_timeout_s: 30
+        n_max_concurrent_scans: 32
+        merge_max_gap: 512 KiB
+        conn_max_age_s: 20
+        max_retry_attempts: 10
+        max_auth_retry_attempts: 3
+        footer_probe_bytes: 512 KiB
+      object_store:
+        endpoint: https://s3.us-east-1.amazonaws.com
+        region: us-east-1
+        access_key: ""
+        secret_key: ""
+        session_token: "" # Required for temporary STS credentials.
+        tls_verify: true

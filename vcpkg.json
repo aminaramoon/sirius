@@ -20,7 +20,8 @@
     "numactl",
     "liburing",
     "openssl",
-    "curl"
+    "curl",
+    "cpp-httplib"
   ],
   "overrides": [
     {

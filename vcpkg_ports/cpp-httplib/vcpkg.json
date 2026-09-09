@@ -1,0 +1,17 @@
+{
+  "dependencies": [
+    {
+      "host": true,
+      "name": "vcpkg-cmake"
+    },
+    {
+      "host": true,
+      "name": "vcpkg-cmake-config"
+    }
+  ],
+  "description": "Header-only HTTP parser for the Sirius io_uring S3 transport",
+  "homepage": "https://github.com/yhirose/cpp-httplib",
+  "license": "MIT",
+  "name": "cpp-httplib",
+  "version": "0.54.1"
+}

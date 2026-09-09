@@ -273,7 +273,7 @@ class engine {
     if (!opts.config_path.empty()) {
       sirius_config file_cfg;
       file_cfg.load_from_file(opts.config_path);
-      cfg.object_store = file_cfg.get_scan_manager_config().object_store;
+      cfg = file_cfg.get_scan_manager_config();
     }
     if (!opts.endpoint.empty()) { cfg.object_store.endpoint = opts.endpoint; }
     if (!opts.region.empty()) { cfg.object_store.region = opts.region; }
@@ -281,8 +281,10 @@ class engine {
     if (!opts.secret_key.empty()) { cfg.object_store.secret_key = opts.secret_key; }
     if (!opts.session_token.empty()) { cfg.object_store.session_token = opts.session_token; }
 
-    cfg.rest.max_connections = opts.max_nconnection;
-    cfg.rest_n_reactors      = opts.n_reactors;
+    cfg.rest.max_connections         = opts.max_nconnection;
+    cfg.uring_remote.max_connections = opts.max_nconnection;
+    cfg.uring_remote.queue_depth = std::max(cfg.uring_remote.queue_depth, 2 * opts.max_nconnection);
+    cfg.rest_n_reactors          = opts.n_reactors;
 
     cfg.cache.mode = io::cache::cache_mode::none;
     cfg.apply_cache_mode();

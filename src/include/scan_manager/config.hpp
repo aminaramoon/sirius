@@ -24,6 +24,7 @@
 #include "io/object_store_config.hpp"
 #include "io/rest/config.hpp"
 #include "io/uring/config.hpp"
+#include "io/uring_remote/config.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -188,6 +189,10 @@ struct scan_manager_config {
   /// Number of REST reactor worker threads for the S3/object-store IO path
   /// (each its own libcurl event loop + connection pool).
   std::size_t rest_n_reactors{2};
+
+  /// Opt-in kernel TLS + io_uring transport for S3. Uses rest_n_reactors and
+  /// the same logical read, retry, footer, and readahead settings as REST.
+  io::uring_remote::config uring_remote;
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:

@@ -33,6 +33,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -536,7 +537,14 @@ std::optional<size_t> content_range_total(std::string_view cr)
 // ---------------------------------------------------------------------------
 
 rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
-  : _ctx(std::move(ctx)), _tname(tname)
+  : rest_reactor(std::move(ctx), tname, {})
+{
+}
+
+rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx,
+                           std::string_view tname,
+                           remote_transport_factory transport_factory)
+  : _transport_factory(std::move(transport_factory)), _ctx(std::move(ctx)), _tname(tname)
 {
   if (!_ctx) { throw std::invalid_argument("rest_reactor: reactor_context must be non-null"); }
   _config = _ctx->cfg();
@@ -1023,8 +1031,18 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
   std::exception_ptr worker_error;
 
   try {
-    curl_multi_ptr multi{curl_multi_init()};
-    if (!multi) throw std::runtime_error("rest_reactor: curl_multi_init failed");
+    if (_transport_factory) {
+      // OpenSSL's handshake BIO can write without MSG_NOSIGNAL. Block SIGPIPE
+      // on this dedicated worker; its mask and pending signals die with it.
+      sigset_t signals;
+      sigemptyset(&signals);
+      sigaddset(&signals, SIGPIPE);
+      auto const rc = pthread_sigmask(SIG_BLOCK, &signals, nullptr);
+      if (rc != 0) throw std::system_error(rc, std::generic_category(), "blocking SIGPIPE");
+    }
+    auto transport = _transport_factory ? _transport_factory() : nullptr;
+    curl_multi_ptr multi{transport ? nullptr : curl_multi_init()};
+    if (!transport && !multi) throw std::runtime_error("rest_reactor: curl_multi_init failed");
 
     file_descriptor epoll_fd        = make_epoll_fd();
     file_descriptor curl_timer_fd   = make_timer_fd();
@@ -1032,16 +1050,18 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     file_descriptor upkeep_timer_fd = make_timer_fd();
     worker_state state{multi.get(), epoll_fd.get(), curl_timer_fd.get()};
 
-    SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_SOCKETFUNCTION, &rest_socket_cb));
-    SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_SOCKETDATA, &state));
-    SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_TIMERFUNCTION, &rest_timer_cb));
-    SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_TIMERDATA, &state));
-    SIRIUS_CURLM_CHECK(
-      curl_multi_setopt(multi.get(), CURLMOPT_PIPELINING, static_cast<long>(CURLPIPE_NOTHING)));
-    SIRIUS_CURLM_CHECK(curl_multi_setopt(
-      multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS, static_cast<long>(_config.max_connections)));
-    SIRIUS_CURLM_CHECK(curl_multi_setopt(
-      multi.get(), CURLMOPT_MAXCONNECTS, static_cast<long>(_config.max_connections)));
+    if (!transport) {
+      SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_SOCKETFUNCTION, &rest_socket_cb));
+      SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_SOCKETDATA, &state));
+      SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_TIMERFUNCTION, &rest_timer_cb));
+      SIRIUS_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_TIMERDATA, &state));
+      SIRIUS_CURLM_CHECK(
+        curl_multi_setopt(multi.get(), CURLMOPT_PIPELINING, static_cast<long>(CURLPIPE_NOTHING)));
+      SIRIUS_CURLM_CHECK(curl_multi_setopt(
+        multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS, static_cast<long>(_config.max_connections)));
+      SIRIUS_CURLM_CHECK(curl_multi_setopt(
+        multi.get(), CURLMOPT_MAXCONNECTS, static_cast<long>(_config.max_connections)));
+    }
 
     auto epoll_add = [&](int fd, std::uint32_t events) {
       epoll_event event{};
@@ -1056,9 +1076,10 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     epoll_add(curl_timer_fd.get(), EPOLLIN);
     epoll_add(retry_timer_fd.get(), EPOLLIN);
     epoll_add(upkeep_timer_fd.get(), EPOLLIN);
+    if (transport) epoll_add(transport->completion_fd(), EPOLLIN);
 
     auto const upkeep_ms = static_cast<long>(_config.upkeep_interval.count());
-    if (upkeep_ms > 0) {
+    if (!transport && upkeep_ms > 0) {
       itimerspec timer{};
       timer.it_value.tv_sec = timer.it_interval.tv_sec = upkeep_ms / 1000;
       timer.it_value.tv_nsec = timer.it_interval.tv_nsec = (upkeep_ms % 1000) * 1'000'000L;
@@ -1069,6 +1090,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     std::vector<io_slot> slots(_config.max_connections);
     slot_pool pool{_config.max_connections};
     for (std::size_t i = 0; i < slots.size(); ++i) {
+      if (transport) break;
       curl_easy_ptr handle{curl_easy_init()};
       if (!handle) throw std::runtime_error("rest_reactor: curl_easy_init failed");
       configure_easy_handle(handle.get(),
@@ -1087,6 +1109,17 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     warm_headers.reserve(_config.max_connections);
     auto prime_connections = [&](std::string const& bucket) {
       constexpr std::string_view warm_query = "list-type=2&max-keys=0";
+      if (transport) {
+        try {
+          transport->warmup(
+            _ctx->authorizer()->authorize_list(bucket, warm_query, presign_ttl(_config)));
+        } catch (remote_transport_error const&) {
+          throw;
+        } catch (std::exception const& error) {
+          SIRIUS_LOG_DEBUG("uring_remote: warmup failed: {}", error.what());
+        }
+        return;
+      }
       for (std::size_t i = 0; i < _config.max_connections; ++i) {
         try {
           auto auth = _ctx->authorizer()->authorize_list(bucket, warm_query, presign_ttl(_config));
@@ -1441,21 +1474,35 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         slot.req         = std::move(request);
         try {
           allocate_staging(*slot.req);
-          setup_easy(slot);
-          auto const status = curl_multi_add_handle(multi.get(), slot.easy.get());
-          if (status != CURLM_OK) {
-            throw std::runtime_error(std::string("rest_reactor: curl_multi_add_handle failed: ") +
-                                     curl_multi_strerror(status));
+          if (transport) {
+            slot.sink = buf_sink{slot.req->op->iovecs, slot.req->op->io_rng.size};
+            slot.hc.reset();
+            auto auth = _ctx->authorizer()->authorize(
+              slot.req->object, request_method::GET, presign_ttl(_config));
+            transport->submit(index, std::move(auth), slot.req->op->io_rng, slot.sink, slot.hc);
+          } else {
+            setup_easy(slot);
+            auto const status = curl_multi_add_handle(multi.get(), slot.easy.get());
+            if (status != CURLM_OK) {
+              throw std::runtime_error(std::string("rest_reactor: curl_multi_add_handle failed: ") +
+                                       curl_multi_strerror(status));
+            }
           }
           ++inflight;
+        } catch (remote_transport_error const&) {
+          throw;
         } catch (...) {
           slot.req->op->finish_error(std::current_exception());
           slot.reset();
         }
       }
+      if (transport) transport->flush();
     };
 
-    auto finish = [&](std::size_t index, CURLcode curl_status, long http_status) {
+    auto finish = [&](std::size_t index,
+                      CURLcode curl_status,
+                      long http_status,
+                      std::string const& detail = std::string{}) {
       auto& slot        = slots[index];
       auto& request     = *slot.req;
       auto& op          = *request.op;
@@ -1524,7 +1571,8 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       }
 
       auto const message =
-        curl_status != CURLE_OK
+        !detail.empty() ? detail
+        : curl_status != CURLE_OK
           ? std::string(curl_easy_strerror(curl_status))
           : (range_status ? std::string("short read") : "HTTP " + std::to_string(http_status));
       op.finish_error(std::make_exception_ptr(std::runtime_error(
@@ -1533,6 +1581,15 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     };
 
     auto process_completions = [&] {
+      if (transport) {
+        for (auto const& completion : transport->poll()) {
+          --inflight;
+          if (!finish(completion.slot, completion.error, completion.status, completion.detail)) {
+            slots[completion.slot].reset();
+          }
+        }
+        return;
+      }
       int queued = 0;
       while (auto* message = curl_multi_info_read(multi.get(), &queued)) {
         if (message->msg != CURLMSG_DONE) continue;
@@ -1565,6 +1622,10 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         failure != nullptr ? grouped_coordinator::error_type{failure}
                              : grouped_coordinator::error_type{canceled};
 
+      // io_uring retains caller iovecs until the operation's CQE is reaped.
+      // Drain the kernel before completing promises or releasing any staging.
+      if (transport) transport->shutdown();
+
       for (auto& copy : copying) {
         if (copy.req == nullptr) continue;
         try {
@@ -1588,7 +1649,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
 
       for (auto& slot : slots) {
         if (slot.req == nullptr) continue;
-        curl_multi_remove_handle(multi.get(), slot.easy.get());
+        if (!transport) curl_multi_remove_handle(multi.get(), slot.easy.get());
         slot.req->op->finish_error(terminal_error);
         slot.reset();
       }
@@ -1618,7 +1679,13 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       maybe_prime();
       submit();
       while (!stop_token.stop_requested()) {
-        auto const timeout_ms = copying.empty() ? -1 : 1;
+        auto timeout_ms = copying.empty() ? -1 : 1;
+        if (transport) {
+          auto const network_timeout = transport->timeout_ms();
+          if (network_timeout >= 0) {
+            timeout_ms = timeout_ms < 0 ? network_timeout : std::min(timeout_ms, network_timeout);
+          }
+        }
         auto const count =
           ::epoll_wait(epoll_fd.get(), events.data(), static_cast<int>(events.size()), timeout_ms);
         if (count < 0) {
@@ -1645,7 +1712,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
           } else if (fd == upkeep_timer_fd.get()) {
             drain_fd(upkeep_timer_fd.get());
             if (inflight == 0 && !slots.empty()) curl_easy_upkeep(slots.front().easy.get());
-          } else {
+          } else if (!transport) {
             int action      = 0;
             auto const mask = events[static_cast<std::size_t>(i)].events;
             if (mask & EPOLLIN) action |= CURL_CSELECT_IN;

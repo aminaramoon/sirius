@@ -211,6 +211,19 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, sirius::io::uring_remote::config& opt)
+{
+  yaml::reader r(node, "uring_remote");
+  r.optional("enabled", opt.enabled);
+  r.optional("max_connections", opt.max_connections);
+  r.optional("queue_depth", opt.queue_depth);
+  r.optional("receive_buffer_bytes", yaml::bytes(opt.receive_buffer_bytes));
+  r.optional("max_header_bytes", yaml::bytes(opt.max_header_bytes));
+  r.optional("allow_plaintext", opt.allow_plaintext);
+  r.reject_unknown();
+  opt.validate();
+}
+
 static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 {
   yaml::reader r(node, "uring");
@@ -283,6 +296,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
+  if (auto n = r.optional_node("uring_remote")) sirius::from_yaml(*n, opt.uring_remote);
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);

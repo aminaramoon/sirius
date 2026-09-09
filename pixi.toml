@@ -55,6 +55,7 @@ rust-src = "*"
 liburing = "*"
 openssl = "*"
 libcurl = "*"
+cpp-httplib = "=0.54.1"
 pnpm = "*"
 python = "3.*"
 pyarrow = ">=14"
@@ -64,6 +65,14 @@ pyarrow = ">=14"
 go-cgo = ">=1.25"
 
 [tasks]
+
+[tasks.build-ktls-openssl]
+description = "Build private OpenSSL with kernel TLS support for the uring S3 reactor."
+cmd = "bash scripts/build_ktls_openssl.sh"
+
+[tasks.test-uring-remote]
+description = "Run S3 io_uring tests including verified local kTLS HTTPS (no AWS or Docker)."
+cmd = "bash test/io/run_uring_remote_tests.sh"
 
 [tasks.clion-env]
 description = "Generate the Pixi environment file used by CLion."

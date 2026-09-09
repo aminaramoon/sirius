@@ -103,6 +103,11 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   void warmup(std::string_view bucket_url) noexcept override;
 
  protected:
+  explicit rest_ioctx(std::vector<std::unique_ptr<rest_reactor>> reactors)
+    : templated_ioctx<rest_reactor>(std::move(reactors))
+  {
+  }
+
   /// Backend hook invoked by @c ioctx::open_datasource: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
   /// Throws on a non-s3 scheme or a failed HEAD.

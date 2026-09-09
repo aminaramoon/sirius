@@ -19,6 +19,7 @@
 #include "io/cache/types.hpp"
 #include "io/rest/authorizer.hpp"
 #include "io/rest/config.hpp"
+#include "io/rest/remote_transport.hpp"
 #include "io/rest/types.hpp"
 #include "io/types.hpp"
 
@@ -244,7 +245,7 @@ class rest_reactor {
 
   explicit rest_reactor(std::shared_ptr<reactor_context> ctx,
                         std::string_view tname = "rest_reactor");
-  ~rest_reactor();
+  virtual ~rest_reactor();
 
   rest_reactor(rest_reactor const&)            = delete;
   rest_reactor& operator=(rest_reactor const&) = delete;
@@ -339,8 +340,15 @@ class rest_reactor {
     std::span<const cudf::io::text::byte_range_info> ranges,
     std::optional<size_t> alignment = std::nullopt);
 
+ protected:
+  rest_reactor(std::shared_ptr<reactor_context> ctx,
+               std::string_view tname,
+               remote_transport_factory transport_factory);
+
  private:
   void worker_loop(const std::stop_token& stop_token);
+
+  remote_transport_factory _transport_factory;
 
   // Shared services + tunables for the whole reactor pool; kept alive for this
   // reactor's lifetime (the authorizer is used on every request).

@@ -416,12 +416,13 @@ A backend is a *reactor* + *io_object* pair plugged into `templated_ioctx<Reacto
 
 `grouped_coordinator` owns the one future for the logical read. A reactor claims its physical slots, expands each prepared slice into backend-appropriate operations, and adds coordinator credits when one slice becomes several operations. Every physical operation settles exactly one credit; the first error stops new dispatch immediately; the future reports it only after every published operation drains safely. Cache callbacks publish only the chunks filled by that physical operation, before its coordinator credit settles, so an unrelated later failure does not discard completed cache data.
 
-Three backends ship:
+The available backends are:
 
 | Backend | ioctx | Reactor | Scheme | Notes |
 |---------|-------|---------|--------|-------|
 | io_uring | `uring::uring_ioctx = templated_ioctx<uring_reactor>` | `uring/uring_reactor.hpp` | local files | One `io_uring` + worker thread per reactor. The worker chooses 256 KiB–16 MiB operations; compatible operations use `O_DIRECT`, with buffered fallback for unsupported or misaligned remainders. |
 | REST / object store | `rest::rest_ioctx = templated_ioctx<rest_reactor>` | `rest/rest_reactor.hpp` | `s3://` | libcurl-multi over an epoll loop; the worker chooses 4–16 MiB GETs and benefits from parallel operations. See [S3 / Object-Store Backend](#s3--object-store-backend). |
+| io_uring / object store | `uring_remote::uring_remote_ioctx` | `uring_remote/uring_remote_reactor.hpp` | `s3://` | Opt-in kTLS RX/TX and io_uring GETs, sharing the REST read scheduler and device staging. See [setup and configuration](uring-remote.md). |
 | kvikio fallback | `kvikio_context` | (none) | any | Wraps kvikIO local/remote handles (GDS-capable for local files). It has no reactors or cache and consumes the shared prepared-slice hook eagerly and serially. |
 
 The scan manager builds one ioctx for the run: `uring_ioctx` when `backend` is `sirius`, otherwise the `kvikio_context` fallback (the registry can also resolve an `s3://` URL to the REST backend via `lookup`). A new backend is a reactor + io_object that satisfy the concepts, a `templated_ioctx` specialization, and a registry entry.

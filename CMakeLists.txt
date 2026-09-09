@@ -88,6 +88,46 @@ foreach(_sirius_link_flags CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS
 endforeach()
 
 # Dependencies
+set(SIRIUS_KTLS_OPENSSL_ROOT
+    ""
+    CACHE PATH
+          "Private enable-ktls OpenSSL prefix (pixi run build-ktls-openssl)")
+if(SIRIUS_KTLS_OPENSSL_ROOT)
+  get_filename_component(SIRIUS_KTLS_OPENSSL_ROOT "${SIRIUS_KTLS_OPENSSL_ROOT}"
+                         ABSOLUTE)
+  if(NOT EXISTS "${SIRIUS_KTLS_OPENSSL_ROOT}/lib/libssl.so")
+    message(FATAL_ERROR "Build kTLS OpenSSL first: pixi run build-ktls-openssl")
+  endif()
+  set(OPENSSL_ROOT_DIR
+      "${SIRIUS_KTLS_OPENSSL_ROOT}"
+      CACHE PATH "" FORCE)
+  set(OPENSSL_INCLUDE_DIR
+      "${SIRIUS_KTLS_OPENSSL_ROOT}/include"
+      CACHE PATH "" FORCE)
+  set(OPENSSL_SSL_LIBRARY
+      "${SIRIUS_KTLS_OPENSSL_ROOT}/lib/libssl.so"
+      CACHE FILEPATH "" FORCE)
+  set(OPENSSL_CRYPTO_LIBRARY
+      "${SIRIUS_KTLS_OPENSSL_ROOT}/lib/libcrypto.so"
+      CACHE FILEPATH "" FORCE)
+  include_directories(BEFORE "${SIRIUS_KTLS_OPENSSL_ROOT}/include")
+  list(PREPEND CMAKE_BUILD_RPATH "${SIRIUS_KTLS_OPENSSL_ROOT}/lib")
+  # Pixi injects an old-dtags RPATH to its non-kTLS OpenSSL before CMake's
+  # generated paths. It even overrides LD_LIBRARY_PATH. Let CMake order the
+  # dependency paths and use RUNPATH so the selected runtime can be honored.
+  foreach(_flags CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS
+                 CMAKE_MODULE_LINKER_FLAGS)
+    if(DEFINED ENV{CONDA_PREFIX})
+      string(REPLACE "-Wl,-rpath,$ENV{CONDA_PREFIX}/lib" "" ${_flags}
+                     "${${_flags}}")
+    endif()
+    string(REPLACE "-Wl,--disable-new-dtags" "-Wl,--enable-new-dtags" ${_flags}
+                   "${${_flags}}")
+    set(${_flags}
+        "${${_flags}}"
+        CACHE STRING "" FORCE)
+  endforeach()
+endif()
 find_package(cudf REQUIRED CONFIG)
 find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
 find_package(cuvs REQUIRED CONFIG)
@@ -114,6 +154,14 @@ find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(httplib 0.54.1 REQUIRED CONFIG)
+# Use only the header parser. The package target enables optional client TLS and
+# compression, which this transport does not use (and DuckDB vendors zstd).
+add_library(sirius_http_headers INTERFACE IMPORTED GLOBAL)
+get_target_property(_sirius_httplib_includes httplib::httplib
+                    INTERFACE_INCLUDE_DIRECTORIES)
+target_include_directories(sirius_http_headers SYSTEM
+                           INTERFACE ${_sirius_httplib_includes})
 find_package(ZLIB REQUIRED)
 
 # The static vcpkg build only exports cuvs::cuvs_static; conda's shared build
@@ -343,6 +391,8 @@ set(EXTENSION_SOURCES
     src/io/s3/sirius_httpfs.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
+    src/io/uring_remote/uring_remote_ioctx.cpp
+    src/io/uring_remote/uring_remote_reactor.cpp
     src/log/duckdb_sink.cpp
     src/log/level.cpp
     src/log/logging.cpp
@@ -641,12 +691,20 @@ target_link_libraries(
   PkgConfig::LIBURING
   PkgConfig::CURL
   OpenSSL::Crypto
+  OpenSSL::SSL
+  $<BUILD_INTERFACE:sirius_http_headers>
   absl::any_invocable
   kvikio::kvikio)
 
 target_link_libraries(
-  sirius_loadable_extension PkgConfig::LIBURING PkgConfig::CURL OpenSSL::Crypto
-  absl::any_invocable kvikio::kvikio)
+  sirius_loadable_extension
+  PkgConfig::LIBURING
+  PkgConfig::CURL
+  OpenSSL::Crypto
+  OpenSSL::SSL
+  $<BUILD_INTERFACE:sirius_http_headers>
+  absl::any_invocable
+  kvikio::kvikio)
 
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs
@@ -805,6 +863,7 @@ set(TEST_SOURCES
     test/cpp/io/test_templated_ioctx.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
+    test/cpp/io/uring_remote/test_uring_remote.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
     test/cpp/log/test_duckdb_sink.cpp
     test/cpp/log/test_logging.cpp
