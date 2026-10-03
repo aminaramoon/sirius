@@ -1331,8 +1331,11 @@ sirius_scan_manager::sirius_scan_manager(
     if (!_io_ctx) {
       throw std::runtime_error("[sirius_scan_manager] failed to create uring io_context");
     }
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
-                     _config.uring_n_reactors);
+    SIRIUS_LOG_DEBUG(
+      "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} "
+      "slices_per_pass={})",
+      _config.uring_n_reactors,
+      _config.uring.slices_per_pass);
   } else {
     if (_topology_index->gpu_ids().size() > 1) {
       throw std::runtime_error(
@@ -2081,6 +2084,15 @@ void sirius_scan_manager::reset(sirius::query_id_t query_id)
   // ~query_scan_manager_state then runs: dispatcher (already idle) first, then the coalescer,
   // then the providers.
   state->drain();
+  // Residency check: the readahead summary just logged says what the readahead
+  // did; the cache's per-cycle deltas say whether this query's chunks were
+  // already resident (hits) or had to be read (h2d loads + misses).
+  if (_io_ctx && _io_ctx->cache()) {
+    SIRIUS_LOG_INFO("[sirius_scan_manager] query {} cache cycle: {} claimed_MiB={}",
+                    query_id,
+                    _io_ctx->cache()->summary(),
+                    _io_ctx->cache()->claimed_bytes() >> 20);
+  }
 }
 
 void sirius_scan_manager::reset_all()

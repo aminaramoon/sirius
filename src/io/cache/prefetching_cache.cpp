@@ -34,8 +34,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <format>
 #include <latch>
@@ -119,7 +121,12 @@ cache_handle::~cache_handle()
   if (_req.consumer) { _req.consumer->mark_disposed(); }
 }
 
-cache_handle::cache_handle(cache_handle&& o) noexcept : _req(std::move(o._req)) { o._req = {}; }
+cache_handle::cache_handle(cache_handle&& o) noexcept
+  : _req(std::move(o._req)),
+    _demand_wait_ns(o._demand_wait_ns.exchange(0, std::memory_order_relaxed))
+{
+  o._req = {};
+}
 
 cache_handle& cache_handle::operator=(cache_handle&& o) noexcept
 {
@@ -127,6 +134,8 @@ cache_handle& cache_handle::operator=(cache_handle&& o) noexcept
     if (_req.consumer) { _req.consumer->mark_disposed(); }
     _req   = std::move(o._req);
     o._req = {};
+    _demand_wait_ns.store(o._demand_wait_ns.exchange(0, std::memory_order_relaxed),
+                          std::memory_order_relaxed);
   }
   return *this;
 }
@@ -271,6 +280,16 @@ prefetching_cache::prefetching_cache(
   if (_chunk_size > max_bytes) {
     throw std::invalid_argument(std::format(
       "prefetching_cache: chunk size {} exceeds the {}-byte maximum", _chunk_size, max_bytes));
+  }
+
+  // TEMP(phase0): bounded prefetch experiment, see _temp_prefetch_window_bytes.
+  if (auto const* raw = std::getenv("SIRIUS_PREFETCH_WINDOW_MIB"); raw != nullptr) {
+    char* end         = nullptr;
+    auto const parsed = std::strtoull(raw, &end, 10);
+    if (end != raw && parsed > 0) {
+      _temp_prefetch_window_bytes = static_cast<std::size_t>(parsed) << 20;
+      SIRIUS_LOG_INFO("prefetching_cache: TEMP SIRIUS_PREFETCH_WINDOW_MIB={}", parsed);
+    }
   }
 
   _evictor_thread = std::jthread([this](const std::stop_token& st) { evict_loop(st); },
@@ -656,7 +675,13 @@ void prefetching_cache::await_inflight_prefetch(const io_object& obj,
       return chunk->state.get_state() == chunk_state::loading;
     });
     if (has_loading_chunk && handle->is_prefetch_in_flight()) {
-      std::ignore = handle->wait_until_ready();
+      auto const wait_start = std::chrono::steady_clock::now();
+      std::ignore           = handle->wait_until_ready();
+      auto const waited     = std::chrono::steady_clock::now() - wait_start;
+      handle->_demand_wait_ns.fetch_add(
+        static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
+        std::memory_order_relaxed);
       return;
     }
   }
@@ -1183,7 +1208,13 @@ bool prefetching_cache::prefetch(cache_handle& handle, exec::invocable<void(bool
   try {
     prepared.reserve(req.chunks->size());
     claimed_chunks.reserve(req.chunks->size());
+    std::size_t claimed_bytes = 0;
     for (cached_chunk* c : *req.chunks) {
+      // TEMP(phase0): stop claiming once the window is full; unclaimed chunks stay
+      // `allocated`, so a later demand read claims and loads them itself.
+      if (_temp_prefetch_window_bytes != 0 && claimed_bytes >= _temp_prefetch_window_bytes) {
+        break;
+      }
       // Claim the chunk and preserve the promised fill as this prefetch's logical
       // range. The reactor owns any further physical chunking and alignment.
       chunk_fill fill;
@@ -1192,6 +1223,7 @@ bool prefetching_cache::prefetch(cache_handle& handle, exec::invocable<void(bool
         claimed_chunks.push_back(c);
         prepared.emplace_back(range{seg_lo, seg_hi - seg_lo},
                               host_buffer{std::vector<cached_chunk*>{c}});
+        claimed_bytes += seg_hi - seg_lo;
       }
     }
   } catch (...) {

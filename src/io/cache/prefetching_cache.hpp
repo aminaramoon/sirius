@@ -216,6 +216,14 @@ class cache_handle {
   /// The chunks of the underlying request.  Null when the handle is empty.
   [[nodiscard]] std::shared_ptr<const std::vector<cached_chunk*>> chunks() const noexcept;
 
+  /// Total time demand reads through this handle spent parked on its in-flight
+  /// prefetch (see @c prefetching_cache::await_inflight_prefetch).  Concurrent
+  /// waiters each contribute their own wait.
+  [[nodiscard]] std::uint64_t demand_wait_ns() const noexcept
+  {
+    return _demand_wait_ns.load(std::memory_order_relaxed);
+  }
+
   explicit operator bool() const noexcept;
 
  private:
@@ -224,6 +232,7 @@ class cache_handle {
   explicit cache_handle(prefetch_request req) noexcept;
 
   prefetch_request _req;
+  std::atomic<std::uint64_t> _demand_wait_ns{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -473,6 +482,11 @@ class prefetching_cache {
   std::shared_ptr<const sirius::memory::topology_index> const _topology_index;
 
   bool const _armed;
+
+  // TEMP(phase0): SIRIUS_PREFETCH_WINDOW_MIB -- when non-zero, one prefetch()
+  // claims only its first this-many bytes of chunks and leaves the rest
+  // `allocated` for demand reads to claim.  0 = legacy whole-split prefetch.
+  std::size_t _temp_prefetch_window_bytes{0};
 
   std::atomic<bool> _shutting_down{false};
 

@@ -226,6 +226,20 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
       opt.n_max_concurrent_scans_explicit = true;
     }
   }
+  {
+    // Read signed so a negative value is reported as such instead of wrapping.
+    std::optional<long long> slices;
+    r.optional("slices_per_pass", slices);
+    if (slices.has_value()) {
+      constexpr auto max_slices = sirius::io::uring::max_slices_per_pass;
+      if (*slices < 0 || static_cast<unsigned long long>(*slices) > max_slices) {
+        throw std::runtime_error(
+          "'uring.slices_per_pass': must be between 0 and " + std::to_string(max_slices) +
+          " (0 = no cap: fill every free staging slot), got " + std::to_string(*slices));
+      }
+      opt.slices_per_pass = static_cast<std::size_t>(*slices);
+    }
+  }
   r.reject_unknown();
 }
 

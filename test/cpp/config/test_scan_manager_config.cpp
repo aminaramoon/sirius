@@ -433,6 +433,46 @@ TEST_CASE("uring scan budget defaults off and honors an explicit value",
   CHECK(explicit_other.uring.n_max_concurrent_scans == other_explicit);
 }
 
+TEST_CASE("uring slices_per_pass defaults, accepts 0 to 64 and rejects the rest",
+          "[scan_manager][config][uring]")
+{
+  auto uring_yaml = [](std::string const& value) {
+    return scan_manager_yaml(
+      "      uring:\n"
+      "        slices_per_pass: " +
+      value + "\n");
+  };
+  auto slices_per_pass = [&](std::string const& name, std::string const& value) {
+    return load_scan_manager(name, uring_yaml(value)).uring.slices_per_pass;
+  };
+
+  // Omitted: the struct default, a per-pass cap of 8 slices.
+  CHECK(sirius::io::uring::config{}.slices_per_pass == 8);
+  auto const omitted = load_scan_manager("sirius_uring_spp_omitted.yaml",
+                                         scan_manager_yaml("      uring_n_reactors: 2\n"));
+  CHECK(omitted.uring.slices_per_pass == sirius::io::uring::config{}.slices_per_pass);
+
+  CHECK(slices_per_pass("sirius_uring_spp_one.yaml", "1") == 1);
+  CHECK(slices_per_pass("sirius_uring_spp_eight.yaml", "8") == 8);
+  CHECK(slices_per_pass("sirius_uring_spp_zero.yaml", "0") == 0);
+  CHECK(slices_per_pass("sirius_uring_spp_max.yaml", "64") ==
+        sirius::io::uring::max_slices_per_pass);
+
+  auto rejects = [](std::string const& name, std::string const& text, std::string const& what) {
+    scoped_yaml yaml(name, text);
+    sirius::sirius_config cfg;
+    CHECK_THROWS_WITH(cfg.load_from_file(yaml.path()), Catch::Matchers::ContainsSubstring(what));
+  };
+  rejects("sirius_uring_spp_negative.yaml", uring_yaml("-1"), "must be between 0 and 64");
+  rejects("sirius_uring_spp_too_big.yaml", uring_yaml("65"), "must be between 0 and 64");
+  rejects("sirius_uring_spp_word.yaml", uring_yaml("eight"), "uring.slices_per_pass");
+  // A misspelled sibling is still an unknown key.
+  rejects("sirius_uring_spp_typo.yaml",
+          scan_manager_yaml("      uring:\n"
+                            "        slices_per_pas: 8\n"),
+          "unknown config key: 'slices_per_pas'");
+}
+
 TEST_CASE("sirius_config reads max_readahead_scans", "[scan_manager][config][readahead]")
 {
   auto const unset = load_scan_manager("sirius_readahead_unset.yaml",

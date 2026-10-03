@@ -32,6 +32,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 namespace sirius::scan_manager {
@@ -65,7 +66,7 @@ void readahead_scan_manager::on_task_deployed(event::event_id_t,
   // thread that went to compute instead, which is capacity the executor is not
   // about to use.
   if (operator_type == op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
-  arm_prefetching();
+  arm_prefetching("task_deployed");
 }
 
 void readahead_scan_manager::on_memory_downgrade_for_task(
@@ -73,7 +74,7 @@ void readahead_scan_manager::on_memory_downgrade_for_task(
 {
   // The executor is spilling to make room, so the GPU does no work for the
   // duration and the device's IO path is unambiguously free.
-  arm_prefetching();
+  arm_prefetching("memory_downgrade_for_task");
 }
 
 void readahead_scan_manager::on_wait_for_memory_for_task(
@@ -81,14 +82,14 @@ void readahead_scan_manager::on_wait_for_memory_for_task(
 {
   // Parked waiting on memory somebody else holds: same idle GPU as a downgrade,
   // arrived at differently.
-  arm_prefetching();
+  arm_prefetching("wait_for_memory_for_task");
 }
 
 void readahead_scan_manager::on_task_queue_empty(event::event_id_t, event::timestamp_t) noexcept
 {
   // Nothing is waiting to be dispatched, so whatever the executor is doing it is
   // not about to read.  The strongest idle signal there is.
-  arm_prefetching();
+  arm_prefetching("task_queue_empty");
 }
 
 void readahead_scan_manager::start(prefetch_strategy strategy)
@@ -102,7 +103,18 @@ void readahead_scan_manager::start(prefetch_strategy strategy)
   // source.  After @ref stop the gate is shut for good and the event subscriber
   // is torn down, so a second worker could only spin without issuing anything.
   if (is_running() || _stop_source.stop_requested()) { return; }
-  _strategy = strategy;
+  _strategy   = strategy;
+  _started_at = std::chrono::steady_clock::now();
+  {
+    std::string strategy_name;
+    std::ignore = enum_to_string(_strategy, strategy_name);
+    SIRIUS_LOG_DEBUG(
+      "[readahead] started strategy={} budget={} operators={} t_ms={:.1f}",
+      strategy_name,
+      _budget,
+      _ordered_work_queues.size(),
+      std::chrono::duration<double, std::milli>(_started_at.time_since_epoch()).count());
+  }
   _prefetch_worker =
     std::jthread([this](const std::stop_token& st) { worker_loop(st); }, _stop_source.get_token());
   // Only now start draining the event-publisher mailbox: the hooks below arm
@@ -112,7 +124,7 @@ void readahead_scan_manager::start(prefetch_strategy strategy)
   // Eager does not wait to be invited: it reads ahead as far as the budget
   // allows from the moment there is anything to read.  Opportunistic stays
   // parked until one of the executor-idle signals below arms it.
-  if (_strategy == prefetch_strategy::eager) { arm_prefetching(); }
+  if (_strategy == prefetch_strategy::eager) { arm_prefetching("start(eager)"); }
 }
 
 void readahead_scan_manager::stop() noexcept
@@ -140,8 +152,11 @@ void readahead_scan_manager::stop() noexcept
     std::ignore = _gatekeeper.wait_for_all(std::chrono::milliseconds{200});
   }
   // One line per query, on the way down: the manager is per-query, so this is
-  // the last moment its counters describe a whole query and nothing else.
-  SIRIUS_LOG_INFO("[readahead] {}", summary());
+  // the last moment its counters describe a whole query and nothing else.  Only
+  // the first stop logs it; the destructor stops again after the query's drain.
+  if (!_summary_logged.exchange(true, std::memory_order_relaxed)) {
+    SIRIUS_LOG_INFO("[readahead] {}", summary());
+  }
 }
 
 std::string readahead_scan_manager::summary() const
@@ -431,7 +446,7 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
   }
 }
 
-void readahead_scan_manager::arm_prefetching()
+void readahead_scan_manager::arm_prefetching(std::string_view trigger)
 {
   // Once: reload() adds the budget to the count, so a second arming would
   // double it.  Adding rather than assigning is what keeps the tickets the
@@ -443,6 +458,12 @@ void readahead_scan_manager::arm_prefetching()
   // tickets, so the worker's acquire simply times out until this runs.
   if (_prefetching_started.exchange(true)) { return; }
   _gatekeeper.reload();
+  auto const now = std::chrono::steady_clock::now();
+  SIRIUS_LOG_DEBUG("[readahead] armed by {} {:.1f} ms after start (t_ms={:.1f} budget={})",
+                   trigger,
+                   std::chrono::duration<double, std::milli>(now - _started_at).count(),
+                   std::chrono::duration<double, std::milli>(now.time_since_epoch()).count(),
+                   _budget);
 }
 
 }  // namespace sirius::scan_manager

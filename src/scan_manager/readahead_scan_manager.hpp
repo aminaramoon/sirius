@@ -36,6 +36,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -291,7 +292,12 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
                             bool issued_io,
                             bool allocation_failed);
 
-  void arm_prefetching();
+  /// Hand the gatekeeper its budget, once.  @p trigger names the signal that
+  /// armed it, for the DEBUG arming line.
+  void arm_prefetching(std::string_view trigger);
+
+  /// When @ref start ran; the arming line reports its delay from here.
+  std::chrono::steady_clock::time_point _started_at{};
 
   /// This query's readahead outcomes; see @ref readahead_counters.
   readahead_counters _counters;
@@ -369,6 +375,9 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// tickets until armed, so existing this early costs nothing.
   gatekeeper _gatekeeper;
   std::atomic<bool> _prefetching_started{false};
+  /// Set by the first @ref stop: the query's drain and the destructor both stop
+  /// the manager, and only the first may log the per-query summary.
+  std::atomic<bool> _summary_logged{false};
   std::atomic<size_t> _cursor{0};
 
   /// Generation of fully-published `disposed` scan transitions. A preparation

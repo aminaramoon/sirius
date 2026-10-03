@@ -20,8 +20,11 @@
 #include <io/sirius_datasource.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <utility>
@@ -167,12 +170,18 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   /// them to disagree.
   ///
   /// Monotone, because stages only ever advance and a report that arrives late
-  /// must not walk one back.
+  /// must not walk one back.  The report that advances the stage also stamps
+  /// the split's timeline (see @ref timeline_point).
   void set_scan_stage(io::cache::scan_stage stage) noexcept
   {
     auto cur = _scan_stage.load(std::memory_order_relaxed);
-    while (stage > cur && !_scan_stage.compare_exchange_weak(
-                            cur, stage, std::memory_order_release, std::memory_order_relaxed)) {}
+    while (stage > cur) {
+      if (_scan_stage.compare_exchange_weak(
+            cur, stage, std::memory_order_release, std::memory_order_relaxed)) {
+        stamp_stage(stage);
+        return;
+      }
+    }
   }
 
   [[nodiscard]] io::cache::scan_stage get_scan_stage() const noexcept
@@ -203,6 +212,41 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   [[nodiscard]] bool give_back_readahead_ticket() noexcept
   {
     return _holds_readahead_ticket.exchange(false, std::memory_order_acq_rel);
+  }
+
+  // ---- timeline (diagnostics) ----------------------------------------------
+
+  /// Lifecycle instants recorded for the per-split DEBUG timeline that
+  /// @c scan_operator_input logs on disposal.  Consumer stages are stamped by
+  /// @ref set_scan_stage when they first advance; the producer side by
+  /// @ref prefetch.  One relaxed store each.
+  enum class timeline_point : std::uint8_t {
+    emitted,
+    prefetch_issued,
+    prefetch_settled,
+    queued,
+    preparing,
+    reading,
+    disposed,
+    count,
+  };
+
+  void stamp(timeline_point point) noexcept
+  {
+    _timeline[static_cast<std::size_t>(point)].store(
+      std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+  }
+
+  /// @c steady_clock ticks since its epoch when @p point was stamped; 0 if never.
+  [[nodiscard]] std::int64_t stamped_at(timeline_point point) const noexcept
+  {
+    return _timeline[static_cast<std::size_t>(point)].load(std::memory_order_relaxed);
+  }
+
+  /// True exactly once, so a split's timeline is reported at most once.
+  [[nodiscard]] bool take_timeline_report() noexcept
+  {
+    return !_timeline_reported.exchange(true, std::memory_order_relaxed);
   }
 
   /// Allocate staging buffers for this split's prefetch requests.  A chunk
@@ -238,6 +282,14 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   /// an IO completion thread, so it must be safe on either and must not block.
   void prefetch(sirius::exec::invocable<void(prefetch_outcome) noexcept> on_done)
   {
+    stamp(timeline_point::prefetch_issued);
+    // Stamp the settle through a weak reference: the completion can outlive the
+    // split, and must not keep it alive.
+    on_done = [self = weak_from_this(),
+               done = std::move(on_done)](prefetch_outcome out) mutable noexcept {
+      if (auto split = self.lock()) { split->stamp(timeline_point::prefetch_settled); }
+      done(out);
+    };
     if (_datasources.empty()) {
       // Nothing to read ahead of: an attempt that could never have issued.
       _prefetch_state.store(prefetch_state::attempted, std::memory_order_release);
@@ -335,11 +387,26 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     }
   };
 
+  void stamp_stage(io::cache::scan_stage stage) noexcept
+  {
+    switch (stage) {
+      case io::cache::scan_stage::queued: stamp(timeline_point::queued); break;
+      case io::cache::scan_stage::preparing: stamp(timeline_point::preparing); break;
+      case io::cache::scan_stage::reading: stamp(timeline_point::reading); break;
+      case io::cache::scan_stage::disposed: stamp(timeline_point::disposed); break;
+      case io::cache::scan_stage::none:
+      case io::cache::scan_stage::initialized: break;
+    }
+  }
+
   std::vector<fadvise_entry> _hints;
   std::vector<std::shared_ptr<sirius::io::sirius_datasource>> _datasources;
   std::atomic<prefetch_state> _prefetch_state{prefetch_state::idle};
   std::atomic<io::cache::scan_stage> _scan_stage{io::cache::scan_stage::none};
   std::atomic<bool> _holds_readahead_ticket{false};
+  std::array<std::atomic<std::int64_t>, static_cast<std::size_t>(timeline_point::count)>
+    _timeline{};
+  std::atomic<bool> _timeline_reported{false};
 };
 
 //===----------------------------------------------------------------------===//

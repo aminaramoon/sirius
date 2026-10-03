@@ -19,6 +19,12 @@
 #include "io/templated_ioctx.hpp"
 #include "io/uring/uring_reactor.hpp"
 
+#include <condition_variable>
+#include <mutex>
+#include <stop_token>
+#include <thread>
+#include <vector>
+
 namespace sirius::io::uring {
 
 // ---------------------------------------------------------------------------
@@ -38,6 +44,28 @@ class uring_ioctx : public templated_ioctx<uring_reactor> {
   uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx);
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::uring; }
+
+  /// Start the reactors, then the gauge sampler (see @ref reactor_gauges).
+  void start() override;
+
+  /// Stop the gauge sampler, then the reactors.
+  void shutdown() noexcept override;
+
+  /// One gauge snapshot per reactor, in reactor order.  Each call restarts the
+  /// reactors' max-inflight windows.
+  [[nodiscard]] std::vector<uring_reactor::gauges> reactor_gauges() noexcept;
+
+ private:
+  /// Logs one DEBUG line per busy reactor every sampling period.  The thread
+  /// only checks the log level while the sink is above DEBUG, so it costs a
+  /// timed wakeup and nothing else in normal runs.
+  void sample_gauges(std::stop_token const& stop_token);
+
+  std::mutex _sampler_mutex;
+  std::condition_variable_any _sampler_cv;
+  /// Declared last: its destructor stops and joins the sampler before the
+  /// members it reads go away.
+  std::jthread _gauge_sampler;
 };
 
 }  // namespace sirius::io::uring

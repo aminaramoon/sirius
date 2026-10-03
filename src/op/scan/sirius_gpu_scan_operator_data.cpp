@@ -29,6 +29,7 @@
 #include <scan_manager/readahead_scan_manager.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <numeric>
@@ -125,6 +126,7 @@ scan_operator_input::scan_operator_input(
 {
   auto const& stored = std::get<std::shared_ptr<scan_info>>(materialization_info);
   if (!stored) { return; }
+  stored->stamp(scan_info::timeline_point::emitted);
 
   if (preferred_device.has_value() && *preferred_device >= 0) {
     set_preferred_device_id(*preferred_device);
@@ -167,6 +169,88 @@ scan_operator_input::~scan_operator_input()
     // A destructor must not throw; a lost dispose costs a delayed refill, and
     // the next split's update recomputes the same state anyway.
   }
+  try {
+    log_split_timeline();
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
+    // Diagnostics only.
+  }
+}
+
+void scan_operator_input::log_split_timeline() const
+{
+  if (!has_scan_metadata()) { return; }
+  if (!sirius::log::get_sink()->should_log(sirius::log::level::debug)) { return; }
+  auto const& split = std::get<std::shared_ptr<scan_info>>(materialization_info);
+  if (!split->take_timeline_report()) { return; }
+
+  using point      = scan_info::timeline_point;
+  using steady     = std::chrono::steady_clock;
+  auto const to_ms = [](std::int64_t ticks) {
+    return std::chrono::duration<double, std::milli>(steady::duration{ticks}).count();
+  };
+  auto const emitted = split->stamped_at(point::emitted);
+  // Milliseconds since emission; -1 for a point the split never reached.
+  auto const since_emit = [&](point p) {
+    auto const at = split->stamped_at(p);
+    return at == 0 || emitted == 0 ? -1.0 : to_ms(at - emitted);
+  };
+
+  std::size_t bytes = 0;
+  for (auto const& hint : split->fadvise_hints()) {
+    for (auto const& range : hint.ranges) {
+      bytes += static_cast<std::size_t>(std::max<std::int64_t>(range.size(), 0));
+    }
+  }
+  std::size_t chunks     = 0;
+  std::uint64_t wait_ns  = 0;
+  auto const datasources = split->datasources();
+  for (auto const& ds : datasources) {
+    chunks += ds->cache_chunk_count();
+    wait_ns += ds->demand_wait_ns();
+  }
+
+  // How the prefetch (if any) related to the consumer: `ahead` settled before the
+  // executor began preparing the split, `behind` between preparing and reading,
+  // `late` after reading began (the read waited on it), `unsettled` never settled.
+  auto const settled   = split->stamped_at(point::prefetch_settled);
+  auto const preparing = split->stamped_at(point::preparing);
+  auto const reading   = split->stamped_at(point::reading);
+  char const* outcome  = "none";
+  switch (split->get_prefetch_state()) {
+    case scan_info::prefetch_state::idle: outcome = "none"; break;
+    case scan_info::prefetch_state::attempted: outcome = "no_io"; break;
+    case scan_info::prefetch_state::prefetched:
+      if (settled == 0) {
+        outcome = "unsettled";
+      } else if (preparing == 0 || settled <= preparing) {
+        outcome = "ahead";
+      } else if (reading == 0 || settled <= reading) {
+        outcome = "behind";
+      } else {
+        outcome = "late";
+      }
+      break;
+  }
+  auto const lead_ms = settled != 0 && reading != 0 ? to_ms(reading - settled) : 0.0;
+
+  SIRIUS_LOG_DEBUG(
+    "[split] op={} bytes={} chunks={} files={} outcome={} lead_ms={:.1f} wait_ms={:.1f} "
+    "t0_ms={:.1f} pf_issue={:.1f} pf_settle={:.1f} queued={:.1f} preparing={:.1f} reading={:.1f} "
+    "disposed={:.1f}",
+    _operator_id,
+    bytes,
+    chunks,
+    datasources.size(),
+    outcome,
+    lead_ms,
+    static_cast<double>(wait_ns) / 1e6,
+    to_ms(emitted),
+    since_emit(point::prefetch_issued),
+    since_emit(point::prefetch_settled),
+    since_emit(point::queued),
+    since_emit(point::preparing),
+    since_emit(point::reading),
+    since_emit(point::disposed));
 }
 
 scan_operator_input::scan_operator_input(

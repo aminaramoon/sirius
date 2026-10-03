@@ -22,6 +22,11 @@
 
 namespace sirius::io::uring {
 
+/// Largest accepted @c config::slices_per_pass: a reactor never owns more than
+/// this many staging slots (each in-flight operation holds at least one), so a
+/// larger cap could never take effect.
+inline constexpr std::size_t max_slices_per_pass = 64;
+
 struct config {
   /// How many scan tasks the readahead manager may keep in flight against this
   /// backend at once.  Zero disables readahead for it entirely.
@@ -43,6 +48,15 @@ struct config {
   /// When false, worker-planned operations use the buffered page-cache handle.
   /// Defaults to O_DIRECT when a physical operation satisfies its constraints.
   bool use_odirect{true};
+
+  /// How many slices of its active request a reactor may turn into physical
+  /// reads per loop pass before it waits for a completion; 0 means no cap (keep
+  /// going while every planned read finds a free staging slot).  With 1, a
+  /// single many-slice request (a whole-split prefetch, a wide demand read)
+  /// runs at a queue depth of 1-2 per reactor.  The default of 8 keeps such a
+  /// request deep without letting one pass claim every free slot ahead of the
+  /// requests queued behind it.
+  std::size_t slices_per_pass{8};
 
   /// O_DIRECT transfers whole pages, so a read is widened to a page boundary
   /// either way -- naming it lets the caller align once, up front, instead of

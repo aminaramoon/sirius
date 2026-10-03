@@ -87,6 +87,16 @@ constexpr auto POLL_INTERVAL_US =
   return saturating_add(value, alignment - remainder);
 }
 
+static_assert(max_slices_per_pass == MAX_NUM_SLOTS,
+              "config::slices_per_pass is validated against the reactor's slot cap");
+
+/// Per-pass expansion cap for @p configured (see config::slices_per_pass): 0 lifts
+/// the cap, leaving the free staging slots as the only bound.
+[[nodiscard]] constexpr std::size_t effective_slices_per_pass(std::size_t configured) noexcept
+{
+  return configured == 0 ? std::numeric_limits<std::size_t>::max() : configured;
+}
+
 [[nodiscard]] constexpr bool is_fixed_buffer_error(int errc) noexcept
 {
   return errc == EOPNOTSUPP || errc == EINVAL || errc == EFAULT || errc == ENOBUFS ||
@@ -463,9 +473,27 @@ uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx, std::string_v
   }
   _config           = _ctx->cfg();
   _bounce_slot_size = _ctx->host_memory_resource()->get_block_size();
+  _slices_per_pass  = effective_slices_per_pass(_config.slices_per_pass);
 }
 
 uring_reactor::~uring_reactor() { shutdown(); }
+
+uring_reactor::gauges uring_reactor::take_gauges() noexcept
+{
+  gauges out;
+  out.inflight_ops = _gauge_inflight.load(std::memory_order_relaxed);
+  // The worker raises the max with a plain load/store, so a reset racing it can
+  // lose one pass's peak; the window is diagnostic, not an exact accounting.
+  out.max_inflight_ops =
+    std::max(_gauge_max_inflight.exchange(0, std::memory_order_relaxed), out.inflight_ops);
+  out.pending_ops             = _gauge_pending.load(std::memory_order_relaxed);
+  out.active_remaining_slices = _gauge_active_slices.load(std::memory_order_relaxed);
+  out.queued_requests         = _requests.size_approx();
+  out.queued_bytes            = _queued_bytes.load(std::memory_order_relaxed);
+  out.requests_started        = _gauge_requests_started.load(std::memory_order_relaxed);
+  out.bytes_submitted         = _gauge_bytes_submitted.load(std::memory_order_relaxed);
+  return out;
+}
 
 void uring_reactor::start()
 {
@@ -719,6 +747,21 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     std::vector<std::unique_ptr<uring_io_op>> pending;
     std::unique_ptr<grouped_io_request> active;
     std::size_t inflight = 0;
+    // Gauge accumulators: worker-local, published by publish_gauges().
+    std::uint64_t requests_started = 0;
+    std::uint64_t bytes_submitted  = 0;
+
+    auto publish_gauges = [&]() noexcept {
+      constexpr auto relaxed = std::memory_order_relaxed;
+      auto const depth       = static_cast<std::uint32_t>(inflight);
+      _gauge_inflight.store(depth, relaxed);
+      if (depth > _gauge_max_inflight.load(relaxed)) { _gauge_max_inflight.store(depth, relaxed); }
+      _gauge_pending.store(static_cast<std::uint32_t>(pending.size()), relaxed);
+      _gauge_active_slices.store(
+        active != nullptr ? static_cast<std::uint32_t>(active->remaining_slices()) : 0U, relaxed);
+      _gauge_requests_started.store(requests_started, relaxed);
+      _gauge_bytes_submitted.store(bytes_submitted, relaxed);
+    };
 
     auto reset_slot = [&](io_slot& slot) noexcept { slot.reset(); };
 
@@ -906,9 +949,20 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
       submit_slots(submitted);
     };
 
+    // Slots whose SQE dispatch_pending() prepared but nobody has submitted yet.  Every
+    // entry owns a distinct slot, so the batch never exceeds slot_count and always fits
+    // the 2 x slot_count SQ.  It must be empty again before the worker waits: a timed
+    // wait may flush the SQ itself, publishing reads `inflight` does not count.
+    std::vector<int> prepared;
+    prepared.reserve(slot_count);
+    auto submit_prepared = [&]() {
+      if (prepared.empty()) return;
+      auto const count = prepared.size();
+      prepared.clear();
+      ring.submit(count, inflight);
+    };
+
     auto dispatch_pending = [&]() {
-      std::vector<int> submitted;
-      submitted.reserve(slot_count);
       while (!pending.empty()) {
         auto& candidate = pending.back();
         if (!candidate->request.coordinator->should_continue()) {
@@ -961,7 +1015,8 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
             break;
           }
           slot.prepare_sqe(sqe);
-          submitted.push_back(leader);
+          prepared.push_back(leader);
+          bytes_submitted += slot.op->request.io_rng.size;
         } catch (...) {
           if (slots[leader].op != nullptr) {
             settle_slot_error(slots[leader], std::current_exception());
@@ -970,7 +1025,6 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           }
         }
       }
-      submit_slots(submitted);
     };
 
     auto cancel_pending = [&](grouped_coordinator::error_type const& error) noexcept {
@@ -1001,8 +1055,18 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         }
 
         dispatch_pending();
+        submit_prepared();
 
-        if (pending.empty() && active != nullptr) {
+        // Expand up to _slices_per_pass slices of the active request (config::
+        // slices_per_pass), so one many-slice request can fill the free slots instead of
+        // adding one read per completion wait.  The first expansion is unconditional, as
+        // it always was; each further one needs every read planned so far to have found a
+        // slot and a slot still free, which bounds the pass by the slot count.  The batch
+        // goes to the kernel in one submit once the pass stops expanding.
+        for (std::size_t expanded = 0;
+             expanded < _slices_per_pass && pending.empty() && active != nullptr &&
+             (expanded == 0 || available_slots.approx_free() > 0);
+             ++expanded) {
           if (!active->coordinator->should_continue()) {
             cancel_active(canceled_error());
           } else if (!active->empty()) {
@@ -1042,16 +1106,19 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
             active.reset();
           }
         }
+        submit_prepared();
 
         if (active == nullptr && pending.empty()) {
           std::unique_ptr<grouped_io_request> next;
           if (_requests.try_dequeue(next)) {
             if (next == nullptr) break;
             active = std::move(next);
+            ++requests_started;
             continue;
           }
         }
 
+        publish_gauges();
         if (inflight != 0) {
           if (auto const error = ring.wait_for(POLL_INTERVAL); error != 0) {
             throw std::system_error(std::error_code{error, std::generic_category()},
@@ -1075,6 +1142,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           if (!_requests.wait_dequeue_timed(next, POLL_INTERVAL_US)) continue;
           if (next == nullptr) break;
           active = std::move(next);
+          ++requests_started;
         }
       }
     } catch (...) {

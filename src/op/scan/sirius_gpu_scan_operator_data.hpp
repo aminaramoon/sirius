@@ -319,6 +319,10 @@ class scan_operator_input : public op::operator_data {
   std::size_t conversion_destination_bytes{0};
 
  private:
+  /// One DEBUG `[split]` line with this split's lifecycle timeline (see
+  /// @c scan_info::timeline_point).  No-op unless DEBUG logging is enabled.
+  void log_split_timeline() const;
+
   /// Per-query readahead bookkeeping this split reports into; null when the
   /// producer does not track readahead.
   std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;

@@ -318,10 +318,10 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 4 uring reactors), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
-| `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
+| `uring_n_reactors` | int (**> 0**) | 4 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
@@ -359,6 +359,11 @@ Six optional nested sub-configs tune the individual backends, the cache, and the
 
 There are no static chunk-size or `readv`-fusion knobs. The worker chooses physical
 operation sizes dynamically from backlog pressure, available slots, and the pinned block size.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `n_max_concurrent_scans` | int | 0 | Readahead budget this backend publishes; `0` keeps the readahead off for local reads (see `max_readahead_scans` above). |
+| `slices_per_pass` | int (0-64) | 8 | Most slices of the active request a reactor turns into physical reads per loop pass before it waits for a completion. The default `8` keeps a single many-slice request (a whole-split prefetch, a wide demand read) at a queue depth of at least 8 per reactor without letting one pass claim every free slot. `0` = no cap: keep going while every planned read finds a free staging slot (each reactor has at most 64). `1` expands one slice per pass, which holds a whole-split prefetch or a wide demand read to a depth of 1-2 per reactor. Values outside 0-64 are rejected. |
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 

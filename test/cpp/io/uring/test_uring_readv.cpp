@@ -24,16 +24,22 @@
 #include <io/uring/types.hpp>
 #include <io/uring/uring_reactor.hpp>
 #include <sys/uio.h>
+#include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <type_traits>
@@ -91,6 +97,122 @@ bool canceled(sirius::exec::semi_future<std::size_t>&& future) noexcept
   } catch (...) {
   }
   return false;
+}
+
+/** The byte a @ref pattern_file holds at @p offset. */
+[[nodiscard]] std::uint8_t pattern_byte(std::size_t offset) noexcept
+{
+  return static_cast<std::uint8_t>((offset * 2654435761ULL) >> 11);
+}
+
+/** A temporary file of @p bytes filled with @ref pattern_byte, removed on scope exit. */
+class pattern_file {
+ public:
+  explicit pattern_file(std::size_t bytes)
+    : _path(std::filesystem::temp_directory_path() /
+            ("sirius_uring_spp_" + std::to_string(::getpid()) + "_" +
+             std::to_string(next_id.fetch_add(1)) + ".bin"))
+  {
+    std::vector<char> data(bytes);
+    for (std::size_t i = 0; i < bytes; ++i) {
+      data[i] = static_cast<char>(pattern_byte(i));
+    }
+    std::ofstream out(_path, std::ios::binary);
+    out.write(data.data(), static_cast<std::streamsize>(data.size()));
+    out.close();
+    REQUIRE(out);
+  }
+
+  ~pattern_file()
+  {
+    std::error_code ec;
+    std::filesystem::remove(_path, ec);
+  }
+
+  pattern_file(pattern_file const&)            = delete;
+  pattern_file& operator=(pattern_file const&) = delete;
+
+  [[nodiscard]] std::shared_ptr<sirius::io::io_object const> open() const
+  {
+    return uring_reactor::create_io_object(_path.string());
+  }
+
+ private:
+  static inline std::atomic<int> next_id{0};
+  std::filesystem::path _path;
+};
+
+/**
+ * A started reactor whose staging is 64 one-MiB slots (the slot cap), reading
+ * with @p slices_per_pass.
+ */
+class spp_reactor {
+ public:
+  static constexpr std::size_t block_size = 1UL << 20;
+  static constexpr std::size_t capacity   = 128UL << 20;
+
+  explicit spp_reactor(std::size_t slices_per_pass)
+    : _mr{0, _upstream, capacity, capacity, block_size, 64, 0},
+      _reactor{std::make_shared<uring_reactor::reactor_context>(config_for(slices_per_pass), &_mr),
+               ""}
+  {
+    _reactor.start();
+  }
+
+  ~spp_reactor() { _reactor.shutdown(); }
+
+  spp_reactor(spp_reactor const&)            = delete;
+  spp_reactor& operator=(spp_reactor const&) = delete;
+
+  [[nodiscard]] uring_reactor& get() noexcept { return _reactor; }
+
+ private:
+  [[nodiscard]] static sirius::io::uring::config config_for(std::size_t slices_per_pass)
+  {
+    sirius::io::uring::config cfg{};
+    cfg.slices_per_pass = slices_per_pass;
+    return cfg;
+  }
+
+  cucascade::memory::numa_region_pinned_host_memory_resource _upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource _mr;
+  uring_reactor _reactor;
+};
+
+/** One contiguous slice per element: file range and the destination offset it lands at. */
+[[nodiscard]] std::vector<range> slice_ranges(std::size_t count, std::size_t stride, bool ragged)
+{
+  std::vector<range> out;
+  out.reserve(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    // Odd slices of a ragged layout are unaligned at both ends, so they take the
+    // buffered fallback while their aligned neighbours may use O_DIRECT.
+    std::size_t const head = ragged && (i % 2 == 1) ? 7 : 0;
+    std::size_t const tail = ragged && (i % 2 == 1) ? 5 : 0;
+    out.push_back(range{i * stride + head, stride - head - tail});
+  }
+  return out;
+}
+
+/** Enqueue one grouped request reading @p ranges into @p destination at the same offsets. */
+[[nodiscard]] sirius::exec::semi_future<std::size_t> enqueue_ranges(
+  uring_reactor& reactor,
+  std::shared_ptr<sirius::io::io_object const> object,
+  std::vector<range> const& ranges,
+  std::uint8_t* destination)
+{
+  std::size_t bytes = 0;
+  std::vector<prepared_io_slice> slices;
+  slices.reserve(ranges.size());
+  for (auto const& r : ranges) {
+    slices.emplace_back(r, host_buffer{destination + r.offset});
+    bytes += r.size;
+  }
+  auto coordinator = std::make_shared<grouped_coordinator>(bytes, slices.size());
+  auto future      = coordinator->get_future();
+  reactor.enqueue(
+    grouped_io_request::create(std::move(object), std::move(slices), std::move(coordinator)));
+  return future;
 }
 
 }  // namespace
@@ -381,4 +503,147 @@ TEST_CASE("io_uring cancels rejected work outside the enqueue lock", "[uring_rea
   REQUIRE(watchdog.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
   CHECK(*outer_canceled);
   CHECK(*inner_canceled);
+}
+
+TEST_CASE("io_uring slices_per_pass sets how deep a single request queues",
+          "[uring_readv][slices_per_pass]")
+{
+  constexpr std::size_t n_slices = 64;
+  constexpr std::size_t stride   = 64UL << 10;
+  pattern_file const file{n_slices * stride};
+  auto const ranges = slice_ranges(n_slices, stride, false);
+
+  auto max_inflight = [&](std::size_t slices_per_pass) {
+    spp_reactor reactor{slices_per_pass};
+    aligned_bytes destination{n_slices * stride};
+    auto future = enqueue_ranges(reactor.get(), file.open(), ranges, destination.get());
+    CHECK(std::move(future).get(std::chrono::seconds(30)) == n_slices * stride);
+    // The worker publishes its depth after submitting and before reaping, so the
+    // window cannot miss the deepest pass.
+    return reactor.get().take_gauges().max_inflight_ops;
+  };
+
+  // One slice per pass: every pass submits one read and then waits for a completion.
+  CHECK(max_inflight(1) <= 2);
+  // A cap of 8 submits 8 reads in the very first pass.
+  CHECK(max_inflight(8) >= 8);
+  // No cap: the first pass fills the 64 free slots.
+  CHECK(max_inflight(0) >= 32);
+}
+
+TEST_CASE("io_uring slices_per_pass never changes the bytes read", "[uring_readv][slices_per_pass]")
+{
+  // More slices than slots, so the steady state (refilling slots freed by
+  // completions) runs too; odd slices are unaligned and take the buffered path.
+  constexpr std::size_t n_slices   = 200;
+  constexpr std::size_t stride     = 64UL << 10;
+  constexpr std::size_t total      = n_slices * stride;
+  constexpr std::uint8_t untouched = 0xA5;
+  pattern_file const file{total};
+  auto const ranges    = slice_ranges(n_slices, stride, true);
+  std::size_t expected = 0;
+  for (auto const& r : ranges) {
+    expected += r.size;
+  }
+
+  for (std::size_t const slices_per_pass : {std::size_t{1}, std::size_t{8}, std::size_t{0}}) {
+    CAPTURE(slices_per_pass);
+    spp_reactor reactor{slices_per_pass};
+    aligned_bytes destination{total};
+    std::memset(destination.get(), untouched, total);
+
+    auto future = enqueue_ranges(reactor.get(), file.open(), ranges, destination.get());
+    REQUIRE(std::move(future).get(std::chrono::seconds(30)) == expected);
+
+    // Every requested byte matches the file; every byte between slices is untouched.
+    std::size_t wrong = 0;
+    std::size_t next  = 0;
+    auto const* bytes = destination.get();
+    for (auto const& r : ranges) {
+      for (; next < r.offset; ++next) {
+        wrong += bytes[next] != untouched ? 1 : 0;
+      }
+      for (; next < r.end(); ++next) {
+        wrong += bytes[next] != pattern_byte(next) ? 1 : 0;
+      }
+    }
+    for (; next < total; ++next) {
+      wrong += bytes[next] != untouched ? 1 : 0;
+    }
+    CHECK(wrong == 0);
+  }
+}
+
+TEST_CASE("io_uring shutdown settles a large active request with an uncapped pass",
+          "[uring_readv][slices_per_pass]")
+{
+  // 65536 x 4 KiB slices (256 MiB, cycling over a 4 MiB file) take far longer to
+  // expand than it takes to call shutdown(), so the request is still active then.
+  static constexpr std::size_t file_bytes  = 4UL << 20;
+  static constexpr std::size_t slice_bytes = 4UL << 10;
+  static constexpr std::size_t n_slices    = 65536;
+  static constexpr std::size_t file_blocks = file_bytes / slice_bytes;
+
+  enum class settled_as { value, canceled, other_error };
+  struct outcome_t {
+    settled_as settled{settled_as::other_error};
+    bool started{false};
+    std::size_t queued_bytes{0};
+  };
+
+  auto file        = std::make_shared<pattern_file>(file_bytes);
+  auto destination = std::make_shared<aligned_bytes>(n_slices * slice_bytes);
+  auto outcome     = std::make_shared<outcome_t>();
+  auto finished    = std::make_shared<std::promise<void>>();
+  auto watchdog    = finished->get_future();
+
+  // Detached so a hung shutdown fails the watchdog instead of hanging the binary.
+  std::thread([file, destination, outcome, finished] {
+    spp_reactor reactor{0};
+
+    std::vector<prepared_io_slice> slices;
+    slices.reserve(n_slices);
+    for (std::size_t i = 0; i < n_slices; ++i) {
+      slices.emplace_back(range{(i % file_blocks) * slice_bytes, slice_bytes},
+                          host_buffer{destination->get() + i * slice_bytes});
+    }
+    auto coordinator = std::make_shared<grouped_coordinator>(n_slices * slice_bytes, n_slices);
+    auto future      = coordinator->get_future();
+    reactor.get().enqueue(
+      grouped_io_request::create(file->open(), std::move(slices), std::move(coordinator)));
+
+    // Shut down only once the worker has taken the request, so it is active.
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (reactor.get().take_gauges().requests_started != 0) {
+        outcome->started = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    reactor.get().shutdown();
+
+    // shutdown() joined the worker, which settles everything it owned on the way out.
+    auto result = std::move(future).get_try();
+    if (result.has_value()) {
+      outcome->settled = settled_as::value;
+    } else {
+      try {
+        std::move(result).get();
+      } catch (std::system_error const& error) {
+        if (error.code() == std::errc::operation_canceled) {
+          outcome->settled = settled_as::canceled;
+        }
+      } catch (...) {
+      }
+    }
+    outcome->queued_bytes = reactor.get().queued_bytes();
+    finished->set_value();
+  }).detach();
+
+  REQUIRE(watchdog.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+  CHECK(outcome->started);
+  // Either the reads beat the shutdown or the remainder was canceled; never another error.
+  CHECK(outcome->settled != settled_as::other_error);
+  CHECK(outcome->queued_bytes == 0);
 }

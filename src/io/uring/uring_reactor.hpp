@@ -34,6 +34,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -199,6 +200,24 @@ class uring_reactor {
     return _queued_bytes.load(std::memory_order_relaxed);
   }
 
+  /// Diagnostic view of the worker's depth and queueing.  The worker publishes
+  /// these with relaxed stores once per loop pass (right before it waits for a
+  /// completion), so every field is approximate and may be one pass stale.
+  struct gauges {
+    std::uint32_t inflight_ops{0};      ///< physical ops owned by the kernel
+    std::uint32_t max_inflight_ops{0};  ///< peak since the previous take_gauges()
+    std::uint32_t pending_ops{0};       ///< planned ops waiting for a staging slot
+    /// Slices of the active request not yet expanded into physical ops.
+    std::uint32_t active_remaining_slices{0};
+    std::size_t queued_requests{0};     ///< requests queued behind the active one
+    std::size_t queued_bytes{0};        ///< see @ref queued_bytes
+    std::uint64_t requests_started{0};  ///< cumulative requests taken off the queue
+    std::uint64_t bytes_submitted{0};   ///< cumulative physical bytes submitted
+  };
+
+  /// Snapshot the gauges and restart the @c max_inflight_ops window.
+  [[nodiscard]] gauges take_gauges() noexcept;
+
   /// Whether @p path can be served by this reactor.  Local-disk only:
   /// returns true iff the path refers to an existing, accessible file.
   [[nodiscard]] static bool supports(std::string_view path);
@@ -249,6 +268,18 @@ class uring_reactor {
   mutable std::mutex _enqueue_mutex;
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<bool> _accepting{false};
+
+  // Gauges (see @ref gauges): written only by the worker, read by take_gauges().
+  std::atomic<std::uint32_t> _gauge_inflight{0};
+  std::atomic<std::uint32_t> _gauge_max_inflight{0};
+  std::atomic<std::uint32_t> _gauge_pending{0};
+  std::atomic<std::uint32_t> _gauge_active_slices{0};
+  std::atomic<std::uint64_t> _gauge_requests_started{0};
+  std::atomic<std::uint64_t> _gauge_bytes_submitted{0};
+
+  /// config::slices_per_pass with 0 (no cap) mapped to SIZE_MAX; read once at
+  /// construction.
+  std::size_t _slices_per_pass{1};
 };
 
 }  // namespace sirius::io::uring
