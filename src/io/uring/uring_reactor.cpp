@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
@@ -492,7 +493,36 @@ uring_reactor::gauges uring_reactor::take_gauges() noexcept
   out.queued_bytes            = _queued_bytes.load(std::memory_order_relaxed);
   out.requests_started        = _gauge_requests_started.load(std::memory_order_relaxed);
   out.bytes_submitted         = _gauge_bytes_submitted.load(std::memory_order_relaxed);
+  for (std::size_t c = 0; c < 2; ++c) {
+    auto& src  = _gauge_queue_delay[c];
+    auto& dst  = out.queue_delay[c];
+    dst.count  = src.count.exchange(0, std::memory_order_relaxed);
+    dst.sum_ns = src.sum_ns.exchange(0, std::memory_order_relaxed);
+    dst.max_ns = src.max_ns.exchange(0, std::memory_order_relaxed);
+    for (std::size_t b = 0; b < queue_delay_buckets; ++b) {
+      dst.histogram[b] = src.histogram[b].exchange(0, std::memory_order_relaxed);
+    }
+  }
   return out;
+}
+
+void uring_reactor::record_queue_delay(grouped_io_request const& request) noexcept
+{
+  if (request.enqueued_at == std::chrono::steady_clock::time_point{}) return;
+  auto const ns          = static_cast<std::uint64_t>(std::max<std::int64_t>(
+    0,
+    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                         request.enqueued_at)
+      .count()));
+  constexpr auto relaxed = std::memory_order_relaxed;
+  auto& dst              = _gauge_queue_delay[request.cls == io_class::prefetch ? 1 : 0];
+  dst.count.fetch_add(1, relaxed);
+  dst.sum_ns.fetch_add(ns, relaxed);
+  // Only the worker raises the max; a racing take_gauges() reset can lose one sample's peak.
+  if (ns > dst.max_ns.load(relaxed)) dst.max_ns.store(ns, relaxed);
+  auto const bucket = std::min<std::size_t>(static_cast<std::size_t>(std::bit_width(ns / 1000)),
+                                            queue_delay_buckets - 1);
+  dst.histogram[bucket].fetch_add(1, relaxed);
 }
 
 void uring_reactor::start()
@@ -560,7 +590,8 @@ void uring_reactor::enqueue(std::unique_ptr<grouped_io_request> request) noexcep
 {
   if (request == nullptr) return;
 
-  auto const bytes = request->remaining_bytes();
+  auto const bytes     = request->remaining_bytes();
+  request->enqueued_at = std::chrono::steady_clock::now();
 
   bool enqueued = false;
   grouped_coordinator::error_type error{canceled_error()};
@@ -1070,6 +1101,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           if (!active->coordinator->should_continue()) {
             cancel_active(canceled_error());
           } else if (!active->empty()) {
+            if (active->not_started()) record_queue_delay(*active);
             auto const backlog =
               std::max(_queued_bytes.load(std::memory_order_relaxed), active->remaining_bytes());
             auto slice = active->take_front();

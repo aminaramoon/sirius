@@ -58,6 +58,20 @@ struct config {
   /// requests queued behind it.
   std::size_t slices_per_pass{8};
 
+  /// How many reactors, taken from the end of the pool, serve only prefetch
+  /// (readahead) reads; the others serve only demand reads.  A reactor runs
+  /// its queue in order, so without the split a small demand read can wait
+  /// behind gigabytes of whole-split prefetch on every reactor.  0 disables the
+  /// split: every read ranks among all reactors (see
+  /// templated_ioctx::next_reactor).  Must be below the reactor count; with a
+  /// single reactor it is ignored.  When not named in the config it is derived
+  /// by sirius_config: 1 when the uring readahead runs, else 0.
+  std::size_t prefetch_reactors{0};
+
+  /// Whether the config named @c prefetch_reactors explicitly, so an explicit
+  /// value (0 included) is never replaced by the derived default.
+  bool prefetch_reactors_explicit{false};
+
   /// O_DIRECT transfers whole pages, so a read is widened to a page boundary
   /// either way -- naming it lets the caller align once, up front, instead of
   /// every layer rediscovering it.  Reported even when @ref use_odirect is

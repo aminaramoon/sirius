@@ -364,6 +364,7 @@ operation sizes dynamically from backlog pressure, available slots, and the pinn
 |-----|------|---------|-------------|
 | `n_max_concurrent_scans` | int | 0 | Readahead budget this backend publishes; `0` keeps the readahead off for local reads (see `max_readahead_scans` above). |
 | `slices_per_pass` | int (0-64) | 8 | Most slices of the active request a reactor turns into physical reads per loop pass before it waits for a completion. The default `8` keeps a single many-slice request (a whole-split prefetch, a wide demand read) at a queue depth of at least 8 per reactor without letting one pass claim every free slot. `0` = no cap: keep going while every planned read finds a free staging slot (each reactor has at most 64). `1` expands one slice per pass, which holds a whole-split prefetch or a wide demand read to a depth of 1-2 per reactor. Values outside 0-64 are rejected. |
+| `prefetch_reactors` | int | derived | Reactors, taken from the end of the pool, that serve only prefetch (readahead) reads; the other reactors serve only demand reads, so a consumer's read never queues behind gigabytes of whole-split prefetch. When omitted it is `1` if the uring readahead runs (a cache plus a positive budget) and `0` otherwise; `0` = every read ranks among all reactors. Must be below `uring_n_reactors`; ignored with a warning when there is a single reactor. |
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 

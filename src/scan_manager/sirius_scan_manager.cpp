@@ -1333,9 +1333,10 @@ sirius_scan_manager::sirius_scan_manager(
     }
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} "
-      "slices_per_pass={})",
+      "slices_per_pass={} prefetch_reactors={})",
       _config.uring_n_reactors,
-      _config.uring.slices_per_pass);
+      _config.uring.slices_per_pass,
+      _config.uring.prefetch_reactors);
   } else {
     if (_topology_index->gpu_ids().size() > 1) {
       throw std::runtime_error(

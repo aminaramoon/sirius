@@ -37,7 +37,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <cstdlib>
 #include <exception>
 #include <format>
 #include <latch>
@@ -280,16 +279,6 @@ prefetching_cache::prefetching_cache(
   if (_chunk_size > max_bytes) {
     throw std::invalid_argument(std::format(
       "prefetching_cache: chunk size {} exceeds the {}-byte maximum", _chunk_size, max_bytes));
-  }
-
-  // TEMP(phase0): bounded prefetch experiment, see _temp_prefetch_window_bytes.
-  if (auto const* raw = std::getenv("SIRIUS_PREFETCH_WINDOW_MIB"); raw != nullptr) {
-    char* end         = nullptr;
-    auto const parsed = std::strtoull(raw, &end, 10);
-    if (end != raw && parsed > 0) {
-      _temp_prefetch_window_bytes = static_cast<std::size_t>(parsed) << 20;
-      SIRIUS_LOG_INFO("prefetching_cache: TEMP SIRIUS_PREFETCH_WINDOW_MIB={}", parsed);
-    }
   }
 
   _evictor_thread = std::jthread([this](const std::stop_token& st) { evict_loop(st); },
@@ -1208,13 +1197,7 @@ bool prefetching_cache::prefetch(cache_handle& handle, exec::invocable<void(bool
   try {
     prepared.reserve(req.chunks->size());
     claimed_chunks.reserve(req.chunks->size());
-    std::size_t claimed_bytes = 0;
     for (cached_chunk* c : *req.chunks) {
-      // TEMP(phase0): stop claiming once the window is full; unclaimed chunks stay
-      // `allocated`, so a later demand read claims and loads them itself.
-      if (_temp_prefetch_window_bytes != 0 && claimed_bytes >= _temp_prefetch_window_bytes) {
-        break;
-      }
       // Claim the chunk and preserve the promised fill as this prefetch's logical
       // range. The reactor owns any further physical chunking and alignment.
       chunk_fill fill;
@@ -1223,7 +1206,6 @@ bool prefetching_cache::prefetch(cache_handle& handle, exec::invocable<void(bool
         claimed_chunks.push_back(c);
         prepared.emplace_back(range{seg_lo, seg_hi - seg_lo},
                               host_buffer{std::vector<cached_chunk*>{c}});
-        claimed_bytes += seg_hi - seg_lo;
       }
     }
   } catch (...) {
@@ -1257,6 +1239,7 @@ bool prefetching_cache::prefetch(cache_handle& handle, exec::invocable<void(bool
     }};
     for (auto& slice : prepared) {
       slice.on_complete = completion;
+      slice.cls         = io_class::prefetch;
     }
   } catch (...) {
     return fail_setup();

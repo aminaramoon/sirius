@@ -240,6 +240,20 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
       opt.slices_per_pass = static_cast<std::size_t>(*slices);
     }
   }
+  {
+    // Signed for the same reason; the upper bound (below the reactor count) is
+    // checked in finalize_derived_config, where uring_n_reactors is known.
+    std::optional<long long> prefetch_reactors;
+    r.optional("prefetch_reactors", prefetch_reactors);
+    if (prefetch_reactors.has_value()) {
+      if (*prefetch_reactors < 0) {
+        throw std::runtime_error("'uring.prefetch_reactors': must be 0 or more, got " +
+                                 std::to_string(*prefetch_reactors));
+      }
+      opt.prefetch_reactors          = static_cast<std::size_t>(*prefetch_reactors);
+      opt.prefetch_reactors_explicit = true;
+    }
+  }
   r.reject_unknown();
 }
 
@@ -860,6 +874,39 @@ void sirius_config::finalize_derived_config()
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
   enforce_sirius_backend_for_multi_gpu();
+  derive_uring_prefetch_reactors();
+}
+
+void sirius_config::derive_uring_prefetch_reactors()
+{
+  auto& sm    = _scan_manager_config;
+  auto& uring = sm.uring;
+  // Prefetch isolation only pays when there is prefetch traffic: without the
+  // readahead the reserved reactors would sit idle and demand would lose their
+  // bandwidth.  With it on, one reactor (~5 GB/s) is enough to keep the
+  // readahead ahead of the executor while demand reads never queue behind it;
+  // measured on TPC-H SF1000 local parquet with 4 reactors, 1 beats both 0 and 2.
+  if (!uring.prefetch_reactors_explicit) {
+    auto const readahead_runs = sm.resolve_readahead(uring.n_max_concurrent_scans,
+                                                     scan_manager::prefetch_strategy::opportunistic)
+                                  .budget > 0;
+    uring.prefetch_reactors = readahead_runs && sm.uring_n_reactors > 1 ? 1 : 0;
+  }
+  if (uring.prefetch_reactors == 0) { return; }
+  if (sm.uring_n_reactors == 1) {
+    SIRIUS_LOG_WARN(
+      "sirius_config: uring.prefetch_reactors={} ignored: with a single uring reactor there is "
+      "none left for demand reads",
+      uring.prefetch_reactors);
+    uring.prefetch_reactors = 0;
+    return;
+  }
+  if (uring.prefetch_reactors >= sm.uring_n_reactors) {
+    throw std::runtime_error("'uring.prefetch_reactors': must be below uring_n_reactors (" +
+                             std::to_string(sm.uring_n_reactors) +
+                             ") so at least one reactor serves demand reads, got " +
+                             std::to_string(uring.prefetch_reactors));
+  }
 }
 
 void sirius_config::derive_rest_scan_budget()

@@ -200,6 +200,18 @@ class uring_reactor {
     return _queued_bytes.load(std::memory_order_relaxed);
   }
 
+  /// Log2 histogram of queue delays: bucket b counts delays d (microseconds) with
+  /// std::bit_width(d) == b, i.e. [2^(b-1), 2^b) us; the last bucket is open-ended.
+  static constexpr std::size_t queue_delay_buckets = 26;
+
+  /// One io_class's queue-delay window (see @ref gauges::queue_delay).
+  struct queue_delay_stats {
+    std::uint64_t count{0};
+    std::uint64_t sum_ns{0};
+    std::uint64_t max_ns{0};
+    std::array<std::uint32_t, queue_delay_buckets> histogram{};
+  };
+
   /// Diagnostic view of the worker's depth and queueing.  The worker publishes
   /// these with relaxed stores once per loop pass (right before it waits for a
   /// completion), so every field is approximate and may be one pass stale.
@@ -213,6 +225,9 @@ class uring_reactor {
     std::size_t queued_bytes{0};        ///< see @ref queued_bytes
     std::uint64_t requests_started{0};  ///< cumulative requests taken off the queue
     std::uint64_t bytes_submitted{0};   ///< cumulative physical bytes submitted
+    /// Queue delay (enqueue -> first slice expanded) of requests whose first slice
+    /// was expanded since the previous take_gauges(), per @ref io_class.
+    queue_delay_stats queue_delay[2]{};
   };
 
   /// Snapshot the gauges and restart the @c max_inflight_ops window.
@@ -276,6 +291,17 @@ class uring_reactor {
   std::atomic<std::uint32_t> _gauge_active_slices{0};
   std::atomic<std::uint64_t> _gauge_requests_started{0};
   std::atomic<std::uint64_t> _gauge_bytes_submitted{0};
+
+  /// Worker-side accumulators behind gauges::queue_delay; take_gauges() swaps them out.
+  struct queue_delay_atomics {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> sum_ns{0};
+    std::atomic<std::uint64_t> max_ns{0};
+    std::array<std::atomic<std::uint32_t>, queue_delay_buckets> histogram{};
+  };
+  queue_delay_atomics _gauge_queue_delay[2];
+  /// Record one request's queue delay (worker thread only).
+  void record_queue_delay(grouped_io_request const& request) noexcept;
 
   /// config::slices_per_pass with 0 (no cap) mapped to SIZE_MAX; read once at
   /// construction.

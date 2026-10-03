@@ -483,11 +483,6 @@ class prefetching_cache {
 
   bool const _armed;
 
-  // TEMP(phase0): SIRIUS_PREFETCH_WINDOW_MIB -- when non-zero, one prefetch()
-  // claims only its first this-many bytes of chunks and leaves the rest
-  // `allocated` for demand reads to claim.  0 = legacy whole-split prefetch.
-  std::size_t _temp_prefetch_window_bytes{0};
-
   std::atomic<bool> _shutting_down{false};
 
   std::atomic<uint32_t> _ticker{0};  // see prefetch_stats::snapshot for layout

@@ -473,6 +473,94 @@ TEST_CASE("uring slices_per_pass defaults, accepts 0 to 64 and rejects the rest"
           "unknown config key: 'slices_per_pas'");
 }
 
+TEST_CASE("uring prefetch_reactors derives from the readahead and validates against the pool",
+          "[scan_manager][config][uring][prefetch_reactors]")
+{
+  // `body` goes under scan_manager; `readahead` adds a cache and a uring budget.
+  auto yaml = [](std::string const& body, bool readahead) {
+    std::string text = body;
+    if (readahead) {
+      text +=
+        "      cache:\n"
+        "        mode: sirius\n";
+    }
+    return scan_manager_yaml(text);
+  };
+  auto uring        = [](std::string const& fields) { return "      uring:\n" + fields; };
+  auto const budget = std::string{"        n_max_concurrent_scans: 8\n"};
+
+  CHECK(sirius::io::uring::config{}.prefetch_reactors == 0);
+
+  SECTION("derived: 1 only when the uring readahead runs")
+  {
+    auto const off =
+      load_scan_manager("sirius_pr_off.yaml", yaml("      uring_n_reactors: 4\n", false));
+    CHECK_FALSE(off.uring.prefetch_reactors_explicit);
+    CHECK(off.uring.prefetch_reactors == 0);
+
+    // A cache but no uring budget: the local readahead stays off.
+    auto const cache_only =
+      load_scan_manager("sirius_pr_cache_only.yaml", yaml("      uring_n_reactors: 4\n", true));
+    CHECK(cache_only.uring.prefetch_reactors == 0);
+
+    auto const on = load_scan_manager("sirius_pr_on.yaml", yaml(uring(budget), true));
+    CHECK_FALSE(on.uring.prefetch_reactors_explicit);
+    CHECK(on.uring.prefetch_reactors == 1);
+
+    // max_readahead_scans: 0 turns the readahead, and so the isolation, off.
+    auto const vetoed = load_scan_manager(
+      "sirius_pr_vetoed.yaml", yaml("      max_readahead_scans: 0\n" + uring(budget), true));
+    CHECK(vetoed.uring.prefetch_reactors == 0);
+
+    // A single reactor has none to spare.
+    auto const single = load_scan_manager(
+      "sirius_pr_single.yaml", yaml("      uring_n_reactors: 1\n" + uring(budget), true));
+    CHECK(single.uring.prefetch_reactors == 0);
+  }
+
+  SECTION("explicit values win over the derivation")
+  {
+    auto const zero = load_scan_manager(
+      "sirius_pr_zero.yaml", yaml(uring(budget + "        prefetch_reactors: 0\n"), true));
+    CHECK(zero.uring.prefetch_reactors_explicit);
+    CHECK(zero.uring.prefetch_reactors == 0);
+
+    auto const two =
+      load_scan_manager("sirius_pr_two.yaml", yaml(uring("        prefetch_reactors: 2\n"), false));
+    CHECK(two.uring.prefetch_reactors_explicit);
+    CHECK(two.uring.prefetch_reactors == 2);
+
+    auto const three = load_scan_manager(
+      "sirius_pr_three.yaml",
+      yaml("      uring_n_reactors: 4\n" + uring("        prefetch_reactors: 3\n"), false));
+    CHECK(three.uring.prefetch_reactors == 3);
+
+    // With one reactor an explicit value is ignored (with a warning), not rejected.
+    auto const single = load_scan_manager(
+      "sirius_pr_single_explicit.yaml",
+      yaml("      uring_n_reactors: 1\n" + uring("        prefetch_reactors: 1\n"), false));
+    CHECK(single.uring.prefetch_reactors == 0);
+  }
+
+  SECTION("rejects a negative value and one that leaves no demand reactor")
+  {
+    auto rejects = [](std::string const& name, std::string const& text, std::string const& what) {
+      scoped_yaml file(name, text);
+      sirius::sirius_config cfg;
+      CHECK_THROWS_WITH(cfg.load_from_file(file.path()), Catch::Matchers::ContainsSubstring(what));
+    };
+    rejects("sirius_pr_negative.yaml",
+            yaml(uring("        prefetch_reactors: -1\n"), false),
+            "'uring.prefetch_reactors': must be 0 or more");
+    rejects("sirius_pr_all.yaml",
+            yaml("      uring_n_reactors: 4\n" + uring("        prefetch_reactors: 4\n"), false),
+            "must be below uring_n_reactors (4)");
+    rejects("sirius_pr_word.yaml",
+            yaml(uring("        prefetch_reactors: one\n"), false),
+            "uring.prefetch_reactors");
+  }
+}
+
 TEST_CASE("sirius_config reads max_readahead_scans", "[scan_manager][config][readahead]")
 {
   auto const unset = load_scan_manager("sirius_readahead_unset.yaml",

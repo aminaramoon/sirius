@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <span>
@@ -37,6 +38,7 @@ struct fake_config {
   [[nodiscard]] std::size_t merge_gap_size() const noexcept { return 0; }
 
   std::size_t n_max_concurrent_scans{0};
+  std::size_t prefetch_reactors{0};
 };
 
 class fake_object final : public sirius::io::io_object {
@@ -211,4 +213,99 @@ TEST_CASE("mixed dispatch reports failure for a dropped fragmented slice past EO
   CHECK(callback_count.load(std::memory_order_acquire) == 1);
   REQUIRE(future.is_ready());
   CHECK(std::move(future).get() == 0);
+}
+
+namespace {
+
+/// A pool of fake reactors with the given backlogs; the pool reads
+/// prefetch_reactors from the first reactor's config, as uring_ioctx does.
+struct reactor_pool {
+  reactor_pool(std::initializer_list<std::size_t> backlogs, std::size_t prefetch_reactors)
+  {
+    std::vector<std::unique_ptr<fake_reactor>> reactors;
+    for (auto const backlog : backlogs) {
+      reactors.push_back(std::make_unique<fake_reactor>(backlog));
+      reactors.back()->config.prefetch_reactors = prefetch_reactors;
+      raw.push_back(reactors.back().get());
+    }
+    context = std::make_unique<fake_context>(std::move(reactors));
+  }
+
+  /// Dispatch one request of @p n_slices slices of class @p cls; return how many
+  /// requests each reactor received from it.
+  std::vector<std::size_t> dispatch(sirius::io::io_class cls, std::size_t n_slices = 3)
+  {
+    std::vector<std::size_t> before;
+    for (auto* reactor : raw) {
+      before.push_back(reactor->requests.size());
+    }
+    std::vector<sirius::io::prepared_io_slice> slices;
+    for (std::size_t i = 0; i < n_slices; ++i) {
+      slices.emplace_back(sirius::io::range{i * 100, 40}, sirius::io::host_buffer{&byte});
+      slices.back().cls = cls;
+    }
+    static_cast<void>(context->mixed_readv_async_io(*object, std::move(slices)));
+    std::vector<std::size_t> received;
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+      received.push_back(raw[i]->requests.size() - before[i]);
+    }
+    return received;
+  }
+
+  std::vector<fake_reactor*> raw;
+  std::unique_ptr<fake_context> context;
+  std::shared_ptr<fake_object> object = std::make_shared<fake_object>("fake", 4096);
+  std::uint8_t byte{};
+};
+
+}  // namespace
+
+TEST_CASE("prefetch_reactors routes prefetch reads to the last K reactors and demand to the rest",
+          "[io][ioctx][prefetch_reactors]")
+{
+  using sirius::io::io_class;
+
+  SECTION("K = 1: prefetch goes to the last reactor even when it is the busiest")
+  {
+    reactor_pool pool{{1000, 10, 20, 5000}, 1};
+    for (int round = 0; round < 8; ++round) {
+      CHECK(pool.dispatch(io_class::prefetch) == std::vector<std::size_t>{0, 0, 0, 1});
+      // Demand ranks only among reactors 0-2: the two least busy of those.
+      CHECK(pool.dispatch(io_class::demand) == std::vector<std::size_t>{0, 1, 1, 0});
+    }
+    // A request carries the class of its slices.
+    CHECK(pool.raw[3]->requests.front()->cls == io_class::prefetch);
+    CHECK(pool.raw[1]->requests.front()->cls == io_class::demand);
+  }
+
+  SECTION("K = 2: prefetch fans out over the last two, demand over the first two")
+  {
+    reactor_pool pool{{30, 20, 1000, 2000}, 2};
+    for (int round = 0; round < 8; ++round) {
+      CHECK(pool.dispatch(io_class::prefetch) == std::vector<std::size_t>{0, 0, 1, 1});
+      CHECK(pool.dispatch(io_class::demand) == std::vector<std::size_t>{1, 1, 0, 0});
+      // A single-slice request goes to the least busy reactor of its partition.
+      CHECK(pool.dispatch(io_class::prefetch, 1) == std::vector<std::size_t>{0, 0, 1, 0});
+      CHECK(pool.dispatch(io_class::demand, 1) == std::vector<std::size_t>{0, 1, 0, 0});
+    }
+  }
+
+  SECTION("K at or above the reactor count leaves no demand partition: all reactors rank")
+  {
+    reactor_pool pool{{1000, 10, 20, 500}, 4};
+    CHECK(pool.dispatch(io_class::prefetch) == std::vector<std::size_t>{0, 1, 1, 0});
+    CHECK(pool.dispatch(io_class::demand) == std::vector<std::size_t>{0, 1, 1, 0});
+  }
+}
+
+TEST_CASE("prefetch_reactors = 0 ranks every class among all reactors",
+          "[io][ioctx][prefetch_reactors]")
+{
+  using sirius::io::io_class;
+  reactor_pool pool{{1000, 10, 20, 500}, 0};
+  for (int round = 0; round < 4; ++round) {
+    CHECK(pool.dispatch(io_class::prefetch) == std::vector<std::size_t>{0, 1, 1, 0});
+    CHECK(pool.dispatch(io_class::demand) == std::vector<std::size_t>{0, 1, 1, 0});
+  }
+  CHECK(pool.context->prefetch_reactor_count() == 0);
 }

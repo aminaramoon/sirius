@@ -25,6 +25,7 @@
 #include <exception>
 #include <format>
 #include <memory>
+#include <string>
 #include <tuple>
 
 namespace sirius::io::uring {
@@ -116,11 +117,28 @@ void uring_ioctx::sample_gauges(std::stop_token const& stop_token)
           i < previous.size() ? g.bytes_submitted - previous[i].bytes_submitted : std::uint64_t{0};
         bool const idle = g.max_inflight_ops == 0 && g.pending_ops == 0 &&
                           g.active_remaining_slices == 0 && g.queued_requests == 0 &&
-                          started == 0 && bytes == 0;
+                          started == 0 && bytes == 0 && g.queue_delay[0].count == 0 &&
+                          g.queue_delay[1].count == 0;
         if (idle) { continue; }
+        // Queue delay per io_class (d = demand, p = prefetch): count, sum/max in ms and the
+        // non-empty log2-us histogram buckets as bucket:count (see queue_delay_stats).
+        auto delay = [](uring_reactor::queue_delay_stats const& s, char const* tag) {
+          std::string hist;
+          for (std::size_t b = 0; b < s.histogram.size(); ++b) {
+            if (s.histogram[b] == 0) continue;
+            if (!hist.empty()) hist += ',';
+            hist += std::format("{}:{}", b, s.histogram[b]);
+          }
+          return std::format(" {0}q_n={1} {0}q_sum_ms={2:.1f} {0}q_max_ms={3:.1f} {0}q_hist={4}",
+                             tag,
+                             s.count,
+                             static_cast<double>(s.sum_ns) / 1e6,
+                             static_cast<double>(s.max_ns) / 1e6,
+                             hist.empty() ? "-" : hist);
+        };
         SIRIUS_LOG_DEBUG(
           "[uring_gauges] reactor={} inflight={} max_inflight={} pending_ops={} "
-          "active_slices={} queued_requests={} queued_MiB={} started={} MiB_s={:.0f}",
+          "active_slices={} queued_requests={} queued_MiB={} started={} MiB_s={:.0f}{}{}",
           i,
           g.inflight_ops,
           g.max_inflight_ops,
@@ -129,7 +147,9 @@ void uring_ioctx::sample_gauges(std::stop_token const& stop_token)
           g.queued_requests,
           g.queued_bytes >> 20,
           started,
-          seconds > 0 ? static_cast<double>(bytes) / static_cast<double>(1 << 20) / seconds : 0.0);
+          seconds > 0 ? static_cast<double>(bytes) / static_cast<double>(1 << 20) / seconds : 0.0,
+          delay(g.queue_delay[0], "d"),
+          delay(g.queue_delay[1], "p"));
       }
     } catch (...) {  // NOLINT(bugprone-empty-catch)
       // Diagnostics only: a failed format must not take the sampler down.

@@ -199,13 +199,15 @@ class spp_reactor {
   uring_reactor& reactor,
   std::shared_ptr<sirius::io::io_object const> object,
   std::vector<range> const& ranges,
-  std::uint8_t* destination)
+  std::uint8_t* destination,
+  sirius::io::io_class cls = sirius::io::io_class::demand)
 {
   std::size_t bytes = 0;
   std::vector<prepared_io_slice> slices;
   slices.reserve(ranges.size());
   for (auto const& r : ranges) {
     slices.emplace_back(r, host_buffer{destination + r.offset});
+    slices.back().cls = cls;
     bytes += r.size;
   }
   auto coordinator = std::make_shared<grouped_coordinator>(bytes, slices.size());
@@ -529,6 +531,49 @@ TEST_CASE("io_uring slices_per_pass sets how deep a single request queues",
   CHECK(max_inflight(8) >= 8);
   // No cap: the first pass fills the 64 free slots.
   CHECK(max_inflight(0) >= 32);
+}
+
+TEST_CASE("io_uring queue-delay gauge counts each request once, per io_class",
+          "[uring_readv][queue_delay]")
+{
+  using sirius::io::io_class;
+  constexpr std::size_t n_slices = 16;
+  constexpr std::size_t stride   = 64UL << 10;
+  pattern_file const file{n_slices * stride};
+  auto const ranges = slice_ranges(n_slices, stride, false);
+
+  spp_reactor reactor{8};
+  aligned_bytes prefetch_dst{n_slices * stride};
+  aligned_bytes demand_dst{n_slices * stride};
+  auto prefetch =
+    enqueue_ranges(reactor.get(), file.open(), ranges, prefetch_dst.get(), io_class::prefetch);
+  auto demand_a = enqueue_ranges(reactor.get(), file.open(), ranges, demand_dst.get());
+  auto demand_b = enqueue_ranges(reactor.get(), file.open(), ranges, demand_dst.get());
+  CHECK(std::move(prefetch).get(std::chrono::seconds(30)) == n_slices * stride);
+  CHECK(std::move(demand_a).get(std::chrono::seconds(30)) == n_slices * stride);
+  CHECK(std::move(demand_b).get(std::chrono::seconds(30)) == n_slices * stride);
+
+  auto const g    = reactor.get().take_gauges();
+  auto const& d   = g.queue_delay[static_cast<std::size_t>(io_class::demand)];
+  auto const& p   = g.queue_delay[static_cast<std::size_t>(io_class::prefetch)];
+  auto hist_total = [](auto const& s) {
+    std::uint64_t n = 0;
+    for (auto c : s.histogram)
+      n += c;
+    return n;
+  };
+  CHECK(d.count == 2);
+  CHECK(p.count == 1);
+  CHECK(hist_total(d) == d.count);
+  CHECK(hist_total(p) == p.count);
+  CHECK(d.max_ns <= d.sum_ns);
+  CHECK(d.max_ns * d.count >= d.sum_ns);
+
+  // The window resets: nothing new was expanded since the previous take.
+  auto const again = reactor.get().take_gauges();
+  CHECK(again.queue_delay[0].count == 0);
+  CHECK(again.queue_delay[1].count == 0);
+  CHECK(again.queue_delay[0].max_ns == 0);
 }
 
 TEST_CASE("io_uring slices_per_pass never changes the bytes read", "[uring_readv][slices_per_pass]")
