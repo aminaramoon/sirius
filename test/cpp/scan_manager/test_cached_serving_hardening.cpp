@@ -65,6 +65,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <io/ioctx_resolver.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
