@@ -16,9 +16,9 @@
 
 #include "op/scan/puffin_reader.hpp"
 
+#include "io/path_utils.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 
-#include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 
 // Vendored by DuckDB core and already on this target's include path; duckdb_static bundles its

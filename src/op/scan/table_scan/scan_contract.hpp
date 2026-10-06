@@ -52,8 +52,8 @@ struct scan_envelope;
 class reservation_provider;
 struct admission_decision;
 }  // namespace sirius::scan_manager
-namespace sirius::io {
-class sirius_datasource;
+namespace cucascade::io {
+class datasource;
 }
 
 namespace sirius::op::scan {
@@ -479,7 +479,7 @@ struct parquet_input_approval {
 };
 struct split_dependencies {
   std::shared_ptr<cudf::io::parquet::FileMetaData const> footer;
-  std::shared_ptr<io::sirius_datasource> datasource;
+  std::shared_ptr<cucascade::io::datasource> datasource;
   std::optional<uint64_t> checkpoint_iteration;
   std::shared_ptr<physical_profile_table> profiles;
   std::shared_ptr<parquet_input_approval const> parquet_approval;
