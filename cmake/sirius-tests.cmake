@@ -208,6 +208,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(parquet_benchmark)
@@ -247,6 +248,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(prefetch_benchmark)
@@ -289,6 +291,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(prefetch_hybrid_scan_benchmark)
@@ -328,6 +331,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(columnar_parquet_poc)
@@ -367,6 +371,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(retirer_benchmark)
@@ -407,6 +412,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(s3_throughput_test)
@@ -449,6 +455,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(s3_autotune_throughput_bench)
@@ -489,6 +496,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(range_prefetch_benchmark)
