@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include "io/path_utils.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
 
@@ -986,7 +987,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // bytes nothing consumes, and the open only needs the size; the exact
   // generation lookup below decides reuse. Mirrors describe_parquet.
   bool const footer_cached = io_ctx->metadata_store().get_metadata(file_path) != nullptr;
-  auto sirius_ds           = cucascade::io::open_datasource(
+  auto sirius_ds           = sirius::io::open_datasource(
     io_ctx,
     file_path,
     footer_cached ? cucascade::io::open_hint::generic : cucascade::io::open_hint::parquet_footer_probe);
