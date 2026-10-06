@@ -17,7 +17,7 @@
 #include "op/scan/table_scan/parquet_physical_profile.hpp"
 
 #include "io/parquet_helpers.hpp"
-#include "io/sirius_datasource.hpp"
+#include <cucascade/cudf/datasource.hpp>
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
 
@@ -280,7 +280,7 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
 }
 
 std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
-  io::sirius_datasource& source,
+  cucascade::io::datasource& source,
   scan_contract_id contract,
   std::string const& identity,
   cudf::io::parquet_reader_options const& options,

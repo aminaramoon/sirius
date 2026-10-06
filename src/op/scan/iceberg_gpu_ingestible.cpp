@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "io/path_utils.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "sirius/exception.hpp"
@@ -23,9 +24,8 @@
 
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>
-#include <io/io_errors.hpp>
-#include <io/sirius_datasource.hpp>
-#include <io/uri_parser.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
 #include <op/scan/parquet_batch_layout.hpp>
@@ -50,7 +50,7 @@ std::shared_ptr<iceberg_gpu_ingestible> make_ingestible(
 }
 
 iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestible_table_info> info)
-  : _core(std::move(info))
+  : _core(std::move(info), /*device_prefetch_allowed=*/false)
 {
   auto const& bind = static_cast<iceberg_ingestible_table_info const&>(table_info());
   _table_path      = bind.table_path;
@@ -179,7 +179,8 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
       if (!io_ctx)
         throw std::runtime_error("[iceberg_gpu_ingestible] no ioctx for Puffin file: " +
                                  dv->file_path);
-      auto datasource = io_ctx->open_datasource(dv->file_path, io::open_hint::generic);
+      auto datasource =
+        sirius::io::open_datasource(io_ctx, dv->file_path, cucascade::io::open_hint::generic);
       if (!datasource)
         throw std::runtime_error("[iceberg_gpu_ingestible] no datasource for Puffin file: " +
                                  dv->file_path);
@@ -194,7 +195,7 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
       throw;
     } catch (std::bad_alloc const&) {
       throw;
-    } catch (io::descriptor_mismatch_error const& error) {
+    } catch (cucascade::io::descriptor_mismatch_error const& error) {
       if (counters) ++counters->descriptor_mismatches;
       throw sirius::transparent::classified_execution_error(
         sirius::transparent::late_failure_cause::reader_io, error.what());
@@ -226,12 +227,12 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
         counters->iceberg_delete_corrupt_inputs.fetch_add(1, std::memory_order_relaxed);
     }
     throw;
-  } catch (io::descriptor_mismatch_error const& error) {
+  } catch (cucascade::io::descriptor_mismatch_error const& error) {
     if (counters) ++counters->descriptor_mismatches;
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
       std::string("[puffin] descriptor mismatch: ") + error.what());
-  } catch (io::object_changed_error const& error) {
+  } catch (cucascade::io::object_changed_error const& error) {
     if (counters) ++counters->iceberg_delete_identity_failures;
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io, error.what());

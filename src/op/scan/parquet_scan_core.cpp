@@ -24,8 +24,6 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
-#include <io/io_context.hpp>
-#include <io/io_errors.hpp>
 #include <io/parquet_helpers.hpp>
 #include <io/sirius_datasource.hpp>
 #include <io/uri_parser.hpp>
@@ -71,6 +69,9 @@
 #include <cucascade/memory/error.hpp>
 
 // cucascade
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 // duckdb
@@ -82,11 +83,6 @@
 #include <duckdb/planner/expression_iterator.hpp>
 #include <duckdb/planner/filter/conjunction_filter.hpp>
 #include <duckdb/planner/filter/null_filter.hpp>
-
-// uring_reactor MUST be included last among sirius headers: liburing.h,
-// pulled in transitively, defines a BLOCK_SIZE macro that collides with the
-// BLOCK_SIZE static member in <blockingconcurrentqueue.h>.
-#include <io/uring/uring_reactor.hpp>
 
 // standard library
 #include <algorithm>
@@ -446,8 +442,8 @@ class parquet_batch_coalescer : public batch_coalescer {
       _empty_split_fallback = fallback_file{
         file->file_metadata,
         file->file_path,
-        file->datasource ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
-                         : std::shared_ptr<io::sirius_datasource>{},
+        file->datasource ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
+                         : std::shared_ptr<cucascade::io::datasource>{},
         file->partition_values,
         file->disable_filter_pushdown,
         file->reader_options,
@@ -516,8 +512,8 @@ class parquet_batch_coalescer : public batch_coalescer {
           memory::saturating_add(slice.reserved_compressed_bytes, cur_comp);
       } else {
         auto slice_ds = file->datasource
-                                       ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
-                                       : std::shared_ptr<io::sirius_datasource>{};
+                                       ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
+                                       : std::shared_ptr<cucascade::io::datasource>{};
         _slices.emplace_back(file->file_metadata,
                              file->file_path,
                              std::move(cur_rgs),
@@ -663,7 +659,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   struct fallback_file {
     std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
     std::string file_path;
-    std::shared_ptr<io::sirius_datasource> datasource;
+    std::shared_ptr<cucascade::io::datasource> datasource;
     std::vector<std::string> partition_values;
     bool disable_filter_pushdown;
     std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
@@ -1044,7 +1040,7 @@ parquet_scan_core::stoppable_metadata_scan_task_t parquet_scan_core::next_split_
     } catch (duckdb::IOException const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
-    } catch (io::credential_error const& error) {
+    } catch (cucascade::io::credential_error const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
     } catch (std::system_error const& error) {
@@ -1080,7 +1076,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   auto stream = cudf::get_default_stream();
   if (_info->profiles->counters) _info->profiles->counters->parquet_phase(file_path, true);
 
-  // Resolve the file to a sirius_datasource (own io backend, prefetch cache and
+  // Resolve the file to a cucascade::io::datasource (own io backend, prefetch cache and
   // cached metadata). The parquet_footer_probe hint collapses the S3 footer read
   // to one suffix-range GET that resolves the size and stashes the footer, so
   // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
@@ -1141,7 +1137,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     throw;
   } catch (duckdb::IOException const&) {
     throw;
-  } catch (io::credential_error const&) {
+  } catch (cucascade::io::credential_error const&) {
     throw;
   } catch (std::system_error const&) {
     throw;
