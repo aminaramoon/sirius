@@ -36,6 +36,7 @@ class SingleFileBlockManager;
 
 namespace cucascade::memory {
 class memory_reservation_manager;
+class topology_index;
 }  // namespace cucascade::memory
 
 namespace sirius::exec {
@@ -47,7 +48,7 @@ class sirius_datasource;
 }  // namespace sirius::io
 
 namespace sirius::memory {
-class topology_index;
+using cucascade::memory::topology_index;
 }  // namespace sirius::memory
 
 namespace sirius::scan_manager {
