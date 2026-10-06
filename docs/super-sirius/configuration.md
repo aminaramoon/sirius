@@ -346,7 +346,7 @@ sub-config below.
 
 | Value | Effect |
 |-------|--------|
-| unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend reactor's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
+| unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
 | `0` | The readahead does not run, whatever the cache mode. |
 | `n > 0` | The readahead runs with a budget of `n`, whatever the cache mode. |
 
@@ -363,10 +363,8 @@ against the pipeline pool's width rather than the backend's depth — one prefet
 deployment is only useful while a pipeline thread could still pick up another scan. An explicit
 `max_readahead_scans` wins over that substitution.
 
-A query's local policy is selected from the serving backend publishing the widest budget.
-A runtime budget additionally accounts for every backend touched by each split across all
-queries. Demand reads borrow immediately; their debt pauses speculative prefetch. Events are
-routed by query ID. A failed cache allocation gets one eviction retry before speculation yields.
+Both are resolved against a single backend: the live one publishing the widest
+`n_max_concurrent_scans`, so the budget and the strategy always describe the same backend.
 
 Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
 
@@ -437,12 +435,12 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
 
-Two REST values are deliberately not YAML keys. **Connections per reactor** is
-fixed at 64 — the useful number is a property of one reactor thread, not of a
-deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
-each with its own thread to service them. **Physical GET size** is worker-owned:
-the reactor derives a target between 4 MiB and 16 MiB from its queued logical
-bytes and currently free connections. Large contiguous requests are balanced
+Two REST values are deliberately not YAML keys. **Connections per runner** are
+fixed at 64 — the useful number is a property of one runner thread, not of a
+deployment, and more concurrency comes from adding runners (`rest_n_reactors`),
+each with its own engine and connection pool. **Physical GET size** is runner-owned:
+each runner derives a target between 4 MiB and 16 MiB from the queued logical
+bytes and its currently free connections. Large contiguous requests are balanced
 under the 16 MiB ceiling. Fragmented cache fills are grouped only at whole
 cache-chunk boundaries so a chunk is never published before all of its bytes
 arrive.
@@ -746,7 +744,7 @@ per-pool extras.
 | `task_creator` | `executor.task_creator` | 1 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
-| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production + IO reactor management |
+| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO runner threads are separate: `uring_n_reactors`, `rest_n_reactors`) |
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
