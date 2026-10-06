@@ -16,6 +16,7 @@
  */
 
 // sirius
+#include "io/path_utils.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
 

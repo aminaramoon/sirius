@@ -19,6 +19,7 @@
 #include "transparent/replay_admission.hpp"
 
 // sirius
+#include "io/path_utils.hpp"
 #include "op/scan/owning_table_view.hpp"
 
 #include <cucascade/cudf/datasource.hpp>
@@ -479,10 +480,10 @@ duckdb_native_gpu_ingestible::next_split_provider_with_stop(io::ioctx_resolver r
     }
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-    auto split = std::make_unique<duckdb_native_scan_info>(
-      std::move(range.row_groups),
-      cucascade::io::open_datasource(io_ctx, _info->db_path),
-      _block_manager);
+    auto split =
+      std::make_unique<duckdb_native_scan_info>(std::move(range.row_groups),
+                                                sirius::io::open_datasource(io_ctx, _info->db_path),
+                                                _block_manager);
     std::vector<split_materializer_certificate> certificates;
     std::vector<split_dependencies> dependencies;
     certificates.reserve(split->row_groups.size());
