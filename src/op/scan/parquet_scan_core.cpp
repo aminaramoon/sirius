@@ -1044,6 +1044,9 @@ parquet_scan_core::stoppable_metadata_scan_task_t parquet_scan_core::next_split_
     } catch (cucascade::io::credential_error const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
+    } catch (cucascade::io::object_changed_error const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
     } catch (std::system_error const& error) {
       if (error.code() == std::errc::operation_canceled) { throw; }
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
@@ -1139,6 +1142,8 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   } catch (duckdb::IOException const&) {
     throw;
   } catch (cucascade::io::credential_error const&) {
+    throw;
+  } catch (cucascade::io::object_changed_error const&) {
     throw;
   } catch (std::system_error const&) {
     throw;
