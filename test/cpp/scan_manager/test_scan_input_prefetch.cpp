@@ -152,7 +152,9 @@ TEST_CASE("Deferred scan inputs initialize prefetch only when admitted",
   };
   temp_data_file file(8ull << 20);
   auto memory = initialize_memory_manager(1);
-  sirius_scan_manager manager{dispose_on_idle_config(), *memory, single_gpu_index_for_prefetch()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, dispose_on_idle_config(), *memory, single_gpu_index_for_prefetch()};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   auto ds = manager.create_datasource(file.path.string());
@@ -227,7 +229,9 @@ TEST_CASE("cache.eviction idle reclaims a disposed scan input's chunks",
 {
   temp_data_file file(8ull << 20);
   auto memory = initialize_memory_manager(1);
-  sirius_scan_manager manager{dispose_on_idle_config(), *memory, single_gpu_index_for_prefetch()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, dispose_on_idle_config(), *memory, single_gpu_index_for_prefetch()};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
