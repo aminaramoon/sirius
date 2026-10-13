@@ -51,6 +51,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -58,12 +59,12 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -75,6 +76,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/unsupported_optimizers.hpp"
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
@@ -134,7 +136,7 @@ extern "C" int cudaProfilerStop();
 
 namespace duckdb {
 
-constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
+constexpr char QUERY_LABEL_PARAM_KEY[] = "query_label";
 
 namespace {
 
@@ -155,7 +157,7 @@ void add_sirius_option(DBConfig& config,
 {
   if (visibility == option_visibility::internal && !test_options_enabled()) { return; }
   if (visibility == option_visibility::internal) { description = "TEST ONLY: " + description; }
-  config.AddExtensionOption(name, description, std::forward<Args>(args)...);
+  config.AddExtensionOption(Identifier(name), description, std::forward<Args>(args)...);
 }
 
 std::uint64_t count_narrowed_columns(
@@ -264,7 +266,7 @@ cpu_replay_result run_internal_cpu_fallback_query(ClientContext& context,
 unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
                                                TableFunctionBindInput& input,
                                                vector<LogicalType>& return_types,
-                                               vector<string>& names)
+                                               vector<Identifier>& names)
 {
   if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
     throw std::runtime_error("sirius_read_parquet expects a single non-null parquet URI");
@@ -289,8 +291,9 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
 
   auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
   return_types     = std::move(bind_result.return_types);
-  names            = std::move(bind_result.names);
-  return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows, return_types, names);
+  names            = StringsToIdentifiers(bind_result.names);
+  return make_uniq<SiriusReadParquetBindData>(
+    uri, bind_result.total_num_rows, return_types, IdentifiersToStrings(names));
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the
@@ -356,19 +359,20 @@ struct SiriusTableFunctionData : public TableFunctionData {
   // PreparedStatementData from these (parameterized execution is not
   // supported on this path, so no value_map is needed — same as the
   // transparent operator's minimal PreparedStatementData).
-  vector<string> bind_names;
+  vector<Identifier> bind_names;
   vector<LogicalType> bind_types;
   std::optional<std::string> query_label;
   //! Original options from the connection
-  ClientConfig original_config;
+  bool original_enable_optimizer;
 
   void PrepareConnection(ClientContext& context)
   {
     // First collect original options
-    original_config = context.config;
+    original_enable_optimizer = Settings::Get<EnableOptimizerSetting>(context);
     // The user might want to disable the optimizer of the new connection.
     // (connection-local ClientConfig — safe to toggle per execution)
-    context.config.enable_optimizer = enable_optimizer;
+    Settings::Set<EnableOptimizerSetting>(
+      context, SetScope::LOCAL, Value::BOOLEAN(enable_optimizer));
     // The old per-query DBConfig::disabled_optimizers save/modify/restore is
     // gone: that set is DB-global and read locklessly by every connection's
     // optimizer, so per-query mutation was an unprotected concurrent write.
@@ -379,14 +383,18 @@ struct SiriusTableFunctionData : public TableFunctionData {
   }
 
   // Reset configuration
-  void CleanupConnection(ClientContext& context) const { context.config = original_config; }
+  void CleanupConnection(ClientContext& context) const
+  {
+    Settings::Set<EnableOptimizerSetting>(
+      context, SetScope::LOCAL, Value::BOOLEAN(original_enable_optimizer));
+  }
 
   unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context, bool* read_only = nullptr)
   {
     PrepareConnection(context);
     unique_ptr<LogicalOperator> plan;
     try {
-      Parser parser(context.GetParserOptions());
+      Parser parser(context);
       parser.ParseQuery(query);
 
       Planner planner(context);
@@ -396,7 +404,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
 
       plan = std::move(planner.plan);
 
-      if (context.config.enable_optimizer) {
+      if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
         Optimizer optimizer(*planner.binder, context);
         plan = optimizer.Optimize(std::move(plan));
       }
@@ -406,7 +414,8 @@ struct SiriusTableFunctionData : public TableFunctionData {
       plan->ResolveOperatorTypes();
 
       ColumnBindingResolver resolver;
-      ColumnBindingResolver::Verify(*plan);
+      ColumnBindingResolver verifier(true);
+      verifier.VisitOperator(*plan);
       resolver.VisitOperator(*plan);
     } catch (...) {
       CleanupConnection(context);
@@ -433,7 +442,7 @@ static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPl
 unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& context,
                                                               TableFunctionBindInput& input,
                                                               vector<LogicalType>& return_types,
-                                                              vector<string>& names)
+                                                              vector<Identifier>& names)
 {
   auto result              = make_uniq<SiriusTableFunctionData>();
   result->query            = input.inputs[0].ToString();
@@ -476,7 +485,7 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
   // execution's window (GPUExecutionFunction) so every execution observes the
   // pin registry and configuration current at execute time — a plan built at
   // bind would carry pin-registry pointers a later unpin invalidates.
-  Parser parser(context.GetParserOptions());
+  Parser parser(context);
   parser.ParseQuery(result->query);
   Planner planner(context);
   planner.CreatePlan(std::move(parser.statements[0]));
@@ -578,7 +587,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
         gstate.sirius_iface =
           make_uniq<::sirius::sirius_interface>(context, data.query_label, session_label);
         gstate.res = gstate.sirius_iface->sirius_execute_query(
-          context, data.query, gpu_prepared, {}, window->query_id());
+          context, data.query, std::move(gpu_prepared), window->query_id());
         if (gstate.res->HasError()) {
           gpu_error = gstate.res->GetErrorObject();
           gstate.res.reset();
@@ -647,7 +656,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
       sirius::transparent::require_s3_cpu_replay(
         data.source_policy, data.cpu_fallback_query, gpu_error.RawMessage());
       D_ASSERT(!gstate.res && !gstate.finished);
-      if (injections && injections->interrupt_before_replay) context.interrupted = true;
+      if (injections && injections->interrupt_before_replay) context.Interrupt();
       auto const read_only = injections && injections->override_read_only
                                ? *injections->override_read_only
                                : statement_read_only;
@@ -704,7 +713,8 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Query plan:\n{}", plan->ToString());
 
   ColumnBindingResolver resolver;
-  resolver.Verify(*plan);
+  ColumnBindingResolver verifier(true);
+  verifier.VisitOperator(*plan);
   resolver.VisitOperator(*plan);
 
   plan->ResolveOperatorTypes();
@@ -715,7 +725,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
 static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
                                              TableFunctionBindInput& input,
                                              vector<LogicalType>& return_types,
-                                             vector<string>& names)
+                                             vector<Identifier>& names)
 {
   return_types.push_back(LogicalType::BOOLEAN);
   names.push_back("ok");
@@ -838,10 +848,10 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   // 'table_ref' is the (optionally schema/catalog-qualified) table name. Resolve it
   // through the catalog honoring the client's search path — so a bare name picks up
   // the current/USE'd database — yielding the same DataTable* a query-time scan binds.
-  auto const qname          = duckdb::QualifiedName::Parse(table_ref);
-  std::string const catalog = qname.catalog;  // empty => search path
-  std::string const schema  = !qname.schema.empty() ? qname.schema : schema_override;
-  std::string const& table  = qname.name;
+  auto const qname   = duckdb::QualifiedName::Parse(table_ref);
+  auto const catalog = qname.Catalog();  // empty => search path
+  auto const schema  = !qname.Schema().empty() ? qname.Schema() : Identifier(schema_override);
+  auto const& table  = qname.Name();
 
   // Non-template catalog lookup + Cast (mirroring the pipeline converter). The
   // templated Catalog::GetEntry<DuckTableEntry> would ODR-use DuckTableEntry::Name
@@ -906,9 +916,9 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   info->context = &context;
   info->db_path = canonical;
   // Match the scan path by deriving the cache identity from the resolved entry.
-  info->catalog_name           = entry.ParentCatalog().GetName();
-  info->schema_name            = entry.ParentSchema().name;
-  info->table_name             = entry.name;
+  info->catalog_name           = entry.ParentCatalog().GetName().GetIdentifierName();
+  info->schema_name            = entry.ParentSchema().name.GetIdentifierName();
+  info->table_name             = entry.name.GetIdentifierName();
   info->table_identity         = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
   info->approximate_batch_size = batch_size;
   // Full-schema names (logical order) so column_names() can derive the
@@ -936,7 +946,7 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
 unique_ptr<FunctionData> SiriusRegistration::PinTableBind(ClientContext& context,
                                                           TableFunctionBindInput& input,
                                                           vector<LogicalType>& return_types,
-                                                          vector<string>& names)
+                                                          vector<Identifier>& names)
 {
   auto result = make_uniq<PinTableFunctionData>();
 
@@ -1132,7 +1142,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // start_time domain, and pins usually target an ATTACHed .db (the catalog
     // resolved by build_duckdb_pin_info), so read the fence off that catalog's
     // DuckTransaction.
-    auto& pinned_catalog      = Catalog::GetCatalog(context, info->catalog_name);
+    auto& pinned_catalog      = Catalog::GetCatalog(context, Identifier(info->catalog_name));
     duckdb_pin_v_base         = DuckTransaction::Get(context, pinned_catalog).start_time;
     auto& attached_database   = info->storage->GetAttached();
     auto const* block_manager = dynamic_cast<SingleFileBlockManager const*>(
@@ -1431,7 +1441,7 @@ struct UnpinTableFunctionData : public TableFunctionData {
 unique_ptr<FunctionData> SiriusRegistration::UnpinTableBind(ClientContext& context,
                                                             TableFunctionBindInput& input,
                                                             vector<LogicalType>& return_types,
-                                                            vector<string>& names)
+                                                            vector<Identifier>& names)
 {
   auto result = make_uniq<UnpinTableFunctionData>();
 
@@ -1477,7 +1487,7 @@ struct ResetSiriusCacheFunctionData : public TableFunctionData {
 unique_ptr<FunctionData> SiriusRegistration::ResetSiriusCacheBind(ClientContext& context,
                                                                   TableFunctionBindInput& input,
                                                                   vector<LogicalType>& return_types,
-                                                                  vector<string>& names)
+                                                                  vector<Identifier>& names)
 {
   return_types.emplace_back(LogicalType::BOOLEAN);
   names.emplace_back("Success");
@@ -1555,7 +1565,7 @@ struct SiriusSetQueryLabelData : public TableFunctionData {
 static unique_ptr<FunctionData> SiriusSetQueryLabelBind(ClientContext& context,
                                                         TableFunctionBindInput& input,
                                                         vector<LogicalType>& return_types,
-                                                        vector<string>& names)
+                                                        vector<Identifier>& names)
 {
   if (input.inputs.empty() || input.inputs[0].IsNull()) {
     throw BinderException("sirius_set_query_label requires a non-NULL VARCHAR argument");
@@ -1606,7 +1616,7 @@ static unique_ptr<GlobalTableFunctionState> SiriusCreateAnnIndexInit(ClientConte
 static unique_ptr<FunctionData> SiriusCreateAnnIndexBind(ClientContext& context,
                                                          TableFunctionBindInput& input,
                                                          vector<LogicalType>& return_types,
-                                                         vector<string>& names)
+                                                         vector<Identifier>& names)
 {
   auto result = make_uniq<CreateAnnIndexData>();
 
@@ -1618,7 +1628,7 @@ static unique_ptr<FunctionData> SiriusCreateAnnIndexBind(ClientContext& context,
   result->column_name = input.inputs[1].ToString();
 
   for (auto& kv : input.named_parameters) {
-    auto const key = StringUtil::Lower(kv.first);
+    auto const key = StringUtil::Lower(kv.first.GetIdentifierName());
     if (kv.second.IsNull()) {
       throw BinderException("sirius_create_ann_index: named parameter '" + kv.first +
                             "' cannot be NULL");
@@ -1688,14 +1698,15 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
 
   // --- Resolve the vector column's fixed dimensionality from the catalog. ---
-  auto const qname          = QualifiedName::Parse(data.table_name);
-  std::string const catalog = qname.catalog;  // empty => search path
-  std::string const schema  = !qname.schema.empty() ? qname.schema : data.schema_name;
-  std::string const& table  = qname.name;
-  auto& entry_base = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
-  auto& entry      = entry_base.Cast<DuckTableEntry>();
-  auto& entry_catalog     = entry.ParentCatalog().GetName();
-  auto& entry_schema      = entry.ParentSchema().name;
+  auto const qname   = QualifiedName::Parse(data.table_name);
+  auto const catalog = qname.Catalog();  // empty => search path
+  auto const schema  = !qname.Schema().empty() ? qname.Schema() : Identifier(data.schema_name);
+  auto const& table  = qname.Name();
+  auto& entry_base   = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
+  auto& entry        = entry_base.Cast<DuckTableEntry>();
+  auto& entry_catalog     = entry.ParentCatalog().GetName().GetIdentifierName();
+  auto& entry_schema      = entry.ParentSchema().name.GetIdentifierName();
+  auto const& table_name  = entry.name.GetIdentifierName();
   auto const& columns     = entry.GetColumns();
   auto const schema_names = columns.GetColumnNames();
   auto const schema_types = columns.GetColumnTypes();
@@ -1738,7 +1749,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
     scan_mgr.find_pinned_entry_for_duckdb_table(
       entry_catalog,
       entry_schema,
-      entry.name,
+      table_name,
       {entry.oid, entry.GetStorage().GetRowGroupCollection()});
   sirius::scan_manager::pinned_entry const* pin = pin_owner.get();
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
@@ -1804,7 +1815,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 
   auto& index_cache      = sirius_ctx->get_cuvs_index_cache();
   std::string index_name = sirius::vss::build_ann_index_cache_key(
-    entry_catalog, entry_schema, entry.name, data.column_name, data.metric);
+    entry_catalog, entry_schema, table_name, data.column_name, data.metric);
 
   // Check if there's enough memory to build the index before releasing the current one
   auto reservation      = index_cache.reserve_index_memory(footprint, target_gpu);
@@ -1813,7 +1824,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   // Destructive path: not enough memory to hold all indexes so release the current one first
   if (!reservation) {
     removed_existing = index_cache.erase_by_column(
-                         entry_catalog, entry_schema, entry.name, data.column_name, metric) > 0;
+                         entry_catalog, entry_schema, table_name, data.column_name, metric) > 0;
     released_first = true;
     reservation    = index_cache.reserve_index_memory(footprint, target_gpu);
     if (!reservation) {
@@ -1821,7 +1832,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
       auto const avail = target_space->get_available_memory();
       std::string msg =
         "sirius_create_ann_index: not enough free GPU memory to build the index for '" +
-        entry.name + "." + data.column_name + "': need ~" + std::to_string(footprint >> 20) +
+        table_name + "." + data.column_name + "': need ~" + std::to_string(footprint >> 20) +
         " MiB, only ~" + std::to_string(avail >> 20) + " MiB free on GPU " +
         std::to_string(target_gpu) + ".";
       if (removed_existing) {
@@ -1829,7 +1840,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
       }
       // Look for indexes on this same column under other metrics to inform users
       auto const others =
-        index_cache.indexes_on_column(entry_catalog, entry_schema, entry.name, data.column_name);
+        index_cache.indexes_on_column(entry_catalog, entry_schema, table_name, data.column_name);
       if (!others.empty()) {
         std::size_t held_bytes = 0;
         std::string listed;
@@ -1871,7 +1882,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   } catch (std::exception const& e) {
     if (removed_existing) {
       throw InvalidInputException(
-        std::string("sirius_create_ann_index: failed to build the index for '") + entry.name + "." +
+        std::string("sirius_create_ann_index: failed to build the index for '") + table_name + "." +
         data.column_name +
         "' after the previous index was removed to make room, so this column and metric now has "
         "no index. Underlying error: " +
@@ -1884,7 +1895,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.kind           = ann_index_kind_from_type(data.index_type);
   meta.catalog_name   = entry_catalog;
   meta.schema_name    = entry_schema;
-  meta.table_name     = entry.name;
+  meta.table_name     = table_name;
   meta.table_identity = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
   meta.pin_snapshot   = pin->snapshot_identity;
   meta.column_name    = data.column_name;
@@ -1911,7 +1922,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 
   // Non-destructive path: remove the old one now that the new one is built
   if (!released_first) {
-    index_cache.erase_by_column(entry_catalog, entry_schema, entry.name, data.column_name, metric);
+    index_cache.erase_by_column(entry_catalog, entry_schema, table_name, data.column_name, metric);
   }
   index_cache.insert(
     std::move(index_name), std::move(meta), std::move(handle), std::move(build_stream));
@@ -1943,7 +1954,7 @@ static unique_ptr<GlobalTableFunctionState> SiriusDropAnnIndexInit(ClientContext
 static unique_ptr<FunctionData> SiriusDropAnnIndexBind(ClientContext& context,
                                                        TableFunctionBindInput& input,
                                                        vector<LogicalType>& return_types,
-                                                       vector<string>& names)
+                                                       vector<Identifier>& names)
 {
   auto result = make_uniq<DropAnnIndexData>();
 
@@ -1955,7 +1966,7 @@ static unique_ptr<FunctionData> SiriusDropAnnIndexBind(ClientContext& context,
   result->column_name = input.inputs[1].ToString();
 
   for (auto& kv : input.named_parameters) {
-    auto const key = StringUtil::Lower(kv.first);
+    auto const key = StringUtil::Lower(kv.first.GetIdentifierName());
     if (kv.second.IsNull()) {
       throw BinderException("sirius_drop_ann_index: named parameter '" + kv.first +
                             "' cannot be NULL");
@@ -1996,21 +2007,21 @@ static void SiriusDropAnnIndexFunction(ClientContext& context,
   // Hold the query-lifecycle slot while the registry is read and mutated
   duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
 
-  auto const qname          = QualifiedName::Parse(data.table_name);
-  std::string const catalog = qname.catalog;  // empty => search path
-  std::string const schema  = !qname.schema.empty() ? qname.schema : data.schema_name;
-  std::string const& table  = qname.name;
-  auto& entry_base = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
-  auto& entry      = entry_base.Cast<DuckTableEntry>();
-  auto& entry_catalog = entry.ParentCatalog().GetName();
-  auto& entry_schema  = entry.ParentSchema().name;
+  auto const qname   = QualifiedName::Parse(data.table_name);
+  auto const catalog = qname.Catalog();  // empty => search path
+  auto const schema  = !qname.Schema().empty() ? qname.Schema() : Identifier(data.schema_name);
+  auto const& table  = qname.Name();
+  auto& entry_base   = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
+  auto& entry        = entry_base.Cast<DuckTableEntry>();
+  auto& entry_catalog = entry.ParentCatalog().GetName().GetIdentifierName();
+  auto& entry_schema  = entry.ParentSchema().name.GetIdentifierName();
 
   std::optional<cuvs::distance::DistanceType> metric;
   if (data.has_metric) { metric = sirius::vss::ann_distance_type_from_metric(data.metric); }
 
-  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
-  std::size_t const removed =
-    index_cache.erase_by_column(entry_catalog, entry_schema, entry.name, data.column_name, metric);
+  auto& index_cache         = sirius_ctx->get_cuvs_index_cache();
+  std::size_t const removed = index_cache.erase_by_column(
+    entry_catalog, entry_schema, entry.name.GetIdentifierName(), data.column_name, metric);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BOOLEAN(removed > 0));
@@ -2056,7 +2067,7 @@ static std::vector<float> vector_search_query_floats(const Value& query)
 static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
                                                        TableFunctionBindInput& input,
                                                        vector<LogicalType>& return_types,
-                                                       vector<string>& names)
+                                                       vector<Identifier>& names)
 {
   auto result = make_uniq<SiriusVectorSearchBindData>();
   auto& req   = result->req;
@@ -2080,7 +2091,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   std::string schema_name       = "main";
   bool output_columns_specified = false;
   for (auto& kv : input.named_parameters) {
-    auto const key = StringUtil::Lower(kv.first);
+    auto const key = StringUtil::Lower(kv.first.GetIdentifierName());
     if (kv.second.IsNull()) {
       throw BinderException("sirius_knn_search: named parameter '" + kv.first + "' cannot be NULL");
     }
@@ -2128,15 +2139,16 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
 
   // Resolve the vector column's dimensionality and each output column's type
   // from the catalog so the return schema and the host reader agree.
-  auto const qname          = QualifiedName::Parse(req.table_name);
-  std::string const catalog = qname.catalog;
-  std::string const schema  = !qname.schema.empty() ? qname.schema : schema_name;
+  auto const qname   = QualifiedName::Parse(req.table_name);
+  auto const catalog = qname.Catalog();
+  auto const schema  = !qname.Schema().empty() ? qname.Schema() : Identifier(schema_name);
   auto& entry_base =
-    Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, qname.name);
-  auto& entry             = entry_base.Cast<DuckTableEntry>();
-  req.catalog             = entry.ParentCatalog().GetName();
-  req.schema              = entry.ParentSchema().name;
-  req.table_name          = entry.name;  // catalog-resolved name (matches query-side derivation)
+    Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, qname.Name());
+  auto& entry = entry_base.Cast<DuckTableEntry>();
+  req.catalog = entry.ParentCatalog().GetName().GetIdentifierName();
+  req.schema  = entry.ParentSchema().name.GetIdentifierName();
+  req.table_name =
+    entry.name.GetIdentifierName();  // catalog-resolved name (matches query-side derivation)
   req.table_identity      = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
   auto const& columns     = entry.GetColumns();
   auto const schema_names = columns.GetColumnNames();
@@ -2215,7 +2227,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   for (auto const& col : req.output_columns) {
     auto const& col_type = type_of(col);
     return_types.push_back(col_type);
-    names.push_back(col);
+    names.emplace_back(col);
     req.output_column_types.push_back(sirius::from_duckdb(col_type));
   }
   return_types.push_back(LogicalType::FLOAT);
@@ -2246,8 +2258,8 @@ static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext
   // Do not just refresh req's identity: its output types and vector dimension
   // were also fixed at bind time and may no longer describe the current table.
   auto const& req = bind_data.req;
-  auto& entry =
-    Catalog::GetEntry<TableCatalogEntry>(context, req.catalog, req.schema, req.table_name);
+  auto& entry     = Catalog::GetEntry<TableCatalogEntry>(
+    context, Identifier(req.catalog), Identifier(req.schema), Identifier(req.table_name));
   if (!entry.IsDuckTable() ||
       !req.table_identity.matches({entry.oid, entry.GetStorage().GetRowGroupCollection()})) {
     throw InvalidInputException(
@@ -2275,7 +2287,7 @@ static void SiriusVectorSearchFunction(ClientContext& context,
 static unique_ptr<FunctionData> SiriusSetSessionLabelBind(ClientContext& context,
                                                           TableFunctionBindInput& input,
                                                           vector<LogicalType>& return_types,
-                                                          vector<string>& names)
+                                                          vector<Identifier>& names)
 {
   if (input.inputs.empty() || input.inputs[0].IsNull()) {
     throw BinderException("sirius_set_session_label requires a non-NULL VARCHAR argument");
@@ -2318,8 +2330,10 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                               GPUExecutionFunction,
                               SiriusRegistration::GPUExecutionBind,
                               SiriusRegistration::GPUExecutionInitGlobal);
-  gpu_execution.named_parameters["enable_optimizer"]    = LogicalType::BOOLEAN;
-  gpu_execution.named_parameters[QUERY_LABEL_PARAM_KEY] = LogicalType::VARCHAR;
+  gpu_execution.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
+    options.Add("enable_optimizer", LogicalType::BOOLEAN);
+    options.Add(QUERY_LABEL_PARAM_KEY, LogicalType::VARCHAR);
+  });
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
 
@@ -2363,12 +2377,14 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   auto add_pin_table_overload = [&](vector<LogicalType> positional_args) {
     TableFunction pin_table(
       "pin_table", std::move(positional_args), PinTableFunction, PinTableBind);
-    pin_table.named_parameters["tier"]        = LogicalType::VARCHAR;
-    pin_table.named_parameters["name"]        = LogicalType::VARCHAR;
-    pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
-    pin_table.named_parameters["compression"] = LogicalType::BOOLEAN;
-    pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
-    pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
+    pin_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
+      options.Add("tier", LogicalType::VARCHAR);
+      options.Add("name", LogicalType::VARCHAR);
+      options.Add("cols", LogicalType::LIST(LogicalType::VARCHAR));
+      options.Add("compression", LogicalType::BOOLEAN);
+      options.Add("format", LogicalType::VARCHAR);
+      options.Add("schema_name", LogicalType::VARCHAR);
+    });
     pin_table_set.AddFunction(std::move(pin_table));
   };
   add_pin_table_overload({LogicalType::VARCHAR});
@@ -2387,10 +2403,12 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                                  SiriusCreateAnnIndexFunction,
                                  SiriusCreateAnnIndexBind,
                                  SiriusCreateAnnIndexInit);
-  create_ann_index.named_parameters["metric"]      = LogicalType::VARCHAR;
-  create_ann_index.named_parameters["index_type"]  = LogicalType::VARCHAR;
-  create_ann_index.named_parameters["n_lists"]     = LogicalType::BIGINT;
-  create_ann_index.named_parameters["schema_name"] = LogicalType::VARCHAR;
+  create_ann_index.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
+    options.Add("metric", LogicalType::VARCHAR);
+    options.Add("index_type", LogicalType::VARCHAR);
+    options.Add("n_lists", LogicalType::BIGINT);
+    options.Add("schema_name", LogicalType::VARCHAR);
+  });
   CreateTableFunctionInfo create_ann_index_info(create_ann_index);
   catalog.CreateTableFunction(transaction, create_ann_index_info);
 
@@ -2400,8 +2418,10 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                                SiriusDropAnnIndexFunction,
                                SiriusDropAnnIndexBind,
                                SiriusDropAnnIndexInit);
-  drop_ann_index.named_parameters["metric"]      = LogicalType::VARCHAR;
-  drop_ann_index.named_parameters["schema_name"] = LogicalType::VARCHAR;
+  drop_ann_index.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
+    options.Add("metric", LogicalType::VARCHAR);
+    options.Add("schema_name", LogicalType::VARCHAR);
+  });
   CreateTableFunctionInfo drop_ann_index_info(drop_ann_index);
   catalog.CreateTableFunction(transaction, drop_ann_index_info);
 
@@ -2412,13 +2432,15 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                               SiriusVectorSearchFunction,
                               SiriusVectorSearchBind,
                               SiriusVectorSearchInit);
-  vector_search.named_parameters["k"]              = LogicalType::BIGINT;
-  vector_search.named_parameters["output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
-  vector_search.named_parameters["metric"]         = LogicalType::VARCHAR;
-  vector_search.named_parameters["use_index"]      = LogicalType::BOOLEAN;
-  vector_search.named_parameters["n_probes"]       = LogicalType::BIGINT;
-  vector_search.named_parameters["index_type"]     = LogicalType::VARCHAR;
-  vector_search.named_parameters["schema_name"]    = LogicalType::VARCHAR;
+  vector_search.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
+    options.Add("k", LogicalType::BIGINT);
+    options.Add("output_columns", LogicalType::LIST(LogicalType::VARCHAR));
+    options.Add("metric", LogicalType::VARCHAR);
+    options.Add("use_index", LogicalType::BOOLEAN);
+    options.Add("n_probes", LogicalType::BIGINT);
+    options.Add("index_type", LogicalType::VARCHAR);
+    options.Add("schema_name", LogicalType::VARCHAR);
+  });
   CreateTableFunctionInfo vector_search_info(vector_search);
   catalog.CreateTableFunction(transaction, vector_search_info);
 
@@ -3569,6 +3591,8 @@ static void publish_transparent_optimizer_mask(DBConfig& config)
   // compressed shapes — neither is executable by the rebind path.
   updated.insert(OptimizerType::IN_CLAUSE);
   updated.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+  updated.insert(sirius::planner::unsupported_optimizers.begin(),
+                 sirius::planner::unsupported_optimizers.end());
   // LATE_MATERIALIZATION rewrites `ORDER BY ... LIMIT N` over a scan into a
   // self-RIGHT_SEMI_JOIN keyed on parquet virtual columns the Sirius scan path
   // drops (src/op/scan/scan_plan.cpp), so the join's key columns would not
