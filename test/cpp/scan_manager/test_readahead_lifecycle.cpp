@@ -39,6 +39,7 @@
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/kvikio/kvikio_context.hpp>
+#include <unistd.h>
 
 #include <array>
 #include <atomic>
