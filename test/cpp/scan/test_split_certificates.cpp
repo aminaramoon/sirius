@@ -584,10 +584,10 @@ TEST_CASE("File bounded cursors preserve batching and partial emission never fab
   } else {
     ingestible = make_ingestible(std::move(info));
   }
-  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
   auto work  = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
-  auto metadata = work({});
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+  auto metadata = work();
   auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
   REQUIRE(file.row_groups.size() > 1);
   CHECK(file.disable_filter_pushdown == iceberg);
@@ -1515,12 +1515,12 @@ TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
     info->delete_sets->emplace(intact, std::make_shared<iceberg_delete_set const>(intact));
   }
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   std::vector<std::unique_ptr<scan_info>> splits;
   auto coalescer = ingestible->create_batch_coalescer();
   for (auto const& path : {deleted, intact}) {
     auto work = ingestible->next_split_provider(
-      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(work);
     auto metadata = work({});
     REQUIRE(metadata->dependencies().size() == 1);
@@ -1579,11 +1579,11 @@ TEST_CASE("Iceberg per-file input distinguishes complete empty results from miss
     auto set = std::make_shared<iceberg_delete_set const>(path);
     info->delete_sets->emplace(path, set);
     auto ingestible = make_ingestible(std::move(info));
-    auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+    auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
     auto work       = ingestible->next_split_provider(
-      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
-    auto metadata = work({});
-    CHECK(metadata->dependencies().front().visibility == set);
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+    auto metadata = work();
+    CHECK(metadata->dependencies().front().delete_set == set);
     CHECK_FALSE(dynamic_cast<parquet_file_scan_info&>(*metadata).disable_filter_pushdown);
     auto coalescer = ingestible->create_batch_coalescer();
     CHECK(coalescer->push(std::move(metadata)).empty());
@@ -1724,9 +1724,9 @@ TEST_CASE("Iceberg materialization refuses missing or replaced delete dependenci
     info->delete_sets->emplace(key, std::make_shared<iceberg_delete_set const>(key, backing));
   }
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto work       = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto coalescer = ingestible->create_batch_coalescer();
   CHECK(coalescer->push(work({})).empty());
   auto batches = coalescer->flush();

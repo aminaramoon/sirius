@@ -512,9 +512,10 @@ class parquet_batch_coalescer : public batch_coalescer {
         slice.reserved_compressed_bytes =
           memory::saturating_add(slice.reserved_compressed_bytes, cur_comp);
       } else {
-        auto slice_ds = file->datasource
-                                       ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
-                                       : std::shared_ptr<cucascade::io::datasource>{};
+        auto slice_ds =
+          file->datasource
+                         ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
+                         : std::shared_ptr<cucascade::io::datasource>{};
         _slices.emplace_back(file->file_metadata,
                              file->file_path,
                              std::move(cur_rgs),

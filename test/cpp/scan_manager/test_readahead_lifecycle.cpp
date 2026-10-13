@@ -756,10 +756,10 @@ local_scan_query make_local_scan_query(sirius::query_id_t query_id)
   info->names               = {"c0"};
   info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
   info->column_ids.push_back(duckdb::ColumnIndex(0));
-  info->scan_output_arity = 1;
-  auto const contract_id  = static_cast<scan::scan_contract_id>(sirius::value_of(query_id)) + 1;
-  info->contract_id       = contract_id;
-  q.scan_op               = std::make_unique<scan::sirius_gpu_scan_operator>(
+  info->projected_output_count = 1;
+  auto const contract_id = static_cast<scan::scan_contract_id>(sirius::value_of(query_id)) + 1;
+  info->contract_id      = contract_id;
+  q.scan_op              = std::make_unique<scan::sirius_gpu_scan_operator>(
     duckdb::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::INTEGER)},
     0,
     scan::make_ingestible(std::move(info)),
@@ -777,7 +777,7 @@ local_scan_query make_local_scan_query(sirius::query_id_t query_id)
     q.telemetry->context(),
     query_id,
     sirius::telemetry::query_telemetry_info{
-      q.telemetry->engine_id(), q.telemetry->worker_id(), query_id});
+      quent::now_v7(), q.telemetry->worker_id().raw(), query_id});
   return q;
 }
 

@@ -479,8 +479,12 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   if (supplied_discovery)
     *supplied_discovery = std::move(discovery);
   else
-    info->delete_data = sirius::op::scan::load_delete_payload(
-      context, info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), snapshot_id, discovery);
+    info->delete_data =
+      sirius::op::scan::load_delete_payload(context,
+                                            info->table_path,
+                                            sirius_ctx->get_scan_manager().shared_io_ctx(),
+                                            snapshot_id,
+                                            discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();
@@ -689,9 +693,12 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       auto started = std::chrono::steady_clock::now();
       auto sid =
         static_cast<uint64_t>(c.scan->named_parameters.at("snapshot_from_id").GetValue<int64_t>());
-      c.info->delete_data = load_delete_payload(
-        context, c.info->table_path, sirius_ctx->get_scan_manager().io_ctx(), sid, *c.discovery);
-      auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+      c.info->delete_data = load_delete_payload(context,
+                                                c.info->table_path,
+                                                sirius_ctx->get_scan_manager().shared_io_ctx(),
+                                                sid,
+                                                *c.discovery);
+      auto us             = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - started)
                   .count();
       c.scan->read_views->record_delete_preparation(c.scan->contract_id, us);

@@ -23,7 +23,6 @@
  * generic duckdb_scan path) is currently disabled.
  */
 
-#include "io/sirius_datasource.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
@@ -32,6 +31,7 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -3238,7 +3238,7 @@ TEST_CASE_METHOD(
   auto discovery = sirius::op::scan::discover_from_manifests(
     *con->context, v2_path, std::move(*inventory.inventory));
   auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
-  auto data = sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, sid, discovery);
+  auto data  = sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, sid, discovery);
   REQUIRE(data);
   REQUIRE(data->positional_deletes.size() == 1);
   CHECK(data->positional_deletes.begin()->second == std::vector<int64_t>{1, 3});
