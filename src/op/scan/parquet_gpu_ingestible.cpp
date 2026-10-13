@@ -449,9 +449,10 @@ class parquet_batch_coalescer : public batch_coalescer {
         slice.reserved_compressed_bytes =
           memory::saturating_add(slice.reserved_compressed_bytes, cur_comp);
       } else {
-        auto slice_ds = file->datasource
-                                       ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
-                                       : std::shared_ptr<cucascade::io::datasource>{};
+        auto slice_ds =
+          file->datasource
+                         ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
+                         : std::shared_ptr<cucascade::io::datasource>{};
         _slices.emplace_back(file->file_metadata,
                              file->file_path,
                              std::move(cur_rgs),
@@ -992,10 +993,11 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // The store is keyed by the normalized path, so look up what the open uses.
   auto const normalized    = sirius::io::strip_file_scheme(file_path);
   bool const footer_cached = io_ctx->metadata_store().has_path(normalized);
-  auto sirius_ds           = sirius::io::open_datasource(
-    io_ctx,
-    normalized,
-    footer_cached ? cucascade::io::open_hint::generic : cucascade::io::open_hint::parquet_footer_probe);
+  auto sirius_ds =
+    sirius::io::open_datasource(io_ctx,
+                                normalized,
+                                footer_cached ? cucascade::io::open_hint::generic
+                                              : cucascade::io::open_hint::parquet_footer_probe);
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }
