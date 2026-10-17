@@ -621,6 +621,13 @@ These are cuCascade's; see `include/cucascade/io/cache/` and `src/io/cache/fs_ca
 - **Generations.** Cache entries are keyed by the io_object's cache id (path plus strong ETag for REST objects, path for local files) and shared-owned (`cache_generation`): the map holds one owner while a generation is current, and a `cache_handle`, an in-flight fill, a queued completion, or a cached-copy retirement holds another for as long as it may touch the generation's chunks. Admitting a newer generation of a path retires the older ones — they leave the map, keep serving their holders, and are reclaimed when the last owner releases. The evictor only borrows. `generation_count(path)` and `retired_generation_count()` expose the state. Datasources and handles must not outlive the `memory_reservation_manager`.
 - **Pin saturation.** A chunk at its maximum reader-pin count is treated as a miss rather than read unpinned, so the read falls back to a direct backend read and the chunk can never be evicted under a reader.
 
+Cache summaries report cumulative `global` counters and `last_cycle` deltas over a cache-wide
+interval between refreshes, not work attributed to one query. A refresh samples each counter
+once and advances the reporting baseline under one mutex; formatting and logging happen after
+releasing it. The scan manager logs that same captured report. Diagnostic `summary()` calls do
+not advance the baseline. Counter writers remain lock-free with respect to this mutex, so the
+five counters are individually sampled rather than an atomic snapshot of an entire read.
+
 ### Constants
 
 Header paths are relative to `cucascade/include/cucascade/`.
