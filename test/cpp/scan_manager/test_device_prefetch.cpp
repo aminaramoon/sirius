@@ -148,7 +148,7 @@ class scripted_context final : public cucascade::io::ioctx {
 
 /// Every read fails with @p message, settled before the read call returns.
 std::shared_ptr<scripted_context> failing_context(
-  std::string message = "injected device read failure")
+  std::string const& message = "injected device read failure")
 {
   return std::make_shared<scripted_context>([message](std::size_t) {
     return cucascade::exec::make_semi_future<std::size_t>(

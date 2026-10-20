@@ -512,7 +512,7 @@ bool readahead_scan_manager::try_issue_device(prefetch_candidate const& candidat
     outcome = tier->issuer->issue(
       task,
       [weak = weak_from_this(), op_id = candidate.operator_id, split = std::weak_ptr{task}](
-        device_prefetch_result result) noexcept {
+        device_prefetch_result const& result) noexcept {
         // weak, not shared: a completion firing after the query tore the manager down must not
         // resurrect it.
         if (auto self = weak.lock()) { self->on_device_prefetch_complete(op_id, split, result); }
