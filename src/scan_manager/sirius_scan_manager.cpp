@@ -3412,9 +3412,12 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
   // Worth warning rather than failing: the pin still populates the cache and
   // still serves reads either way, it is just not durable.
   if (_config.cache.dispose_on_idle) {
+    std::string policy;
+    (void)cucascade::io::cache::enum_to_string(_config.cache.eviction, policy);
     SIRIUS_LOG_WARN(
-      "[pin_table] cache.eviction is 'idle', so pinned parquet chunks are reclaimed as soon "
-      "as nothing is reading them; set eviction to 'lru' for a durable pin");
+      "[pin_table] cache.eviction is '{}', so pinned parquet chunks are reclaimed as soon "
+      "as nothing is reading them; set eviction to 'lru' for a durable pin",
+      policy);
   } else if (_config.cache.eviction_threshold_fraction < 1.0) {
     SIRIUS_LOG_WARN(
       "[pin_table] cache.eviction_threshold_fraction is {}, so the evictor starts before the "

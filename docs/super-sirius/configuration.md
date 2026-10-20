@@ -338,7 +338,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pools. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones (or `eager` whatever the backend when `device_prefetching_fraction > 0`). Values are lowercase. |
-| `device_prefetching_fraction` | double [0,1] | 0 | Device tier of the readahead. `0` turns it off: the readahead only stages bytes in the pinned host cache. A positive value lets the readahead read a split's byte ranges straight into GPU buffers on the split's assigned GPU, ahead of its scan task, as long as that GPU space's consumed memory after admitting the split (limit − available: reservations plus allocations, by anyone, the same measure cuCascade's downgrade check uses) stays at or below this fraction of the space's reservation limit (`memory_space::get_max_memory()`); a split that would exceed it, or whose reservation or allocation fails, falls back to the host tier and the device tier backs off on that GPU until one of its splits is disposed (or 100 ms pass). Prefetched device bytes are invisible to the downgrade executor until their scan consumes them, so keep this fraction times the GPU's `reservation_limit_fraction` at or below its `downgrade_stop_fraction` (0.6 by default; a higher value is accepted with a warning). Setting it also enables the readahead on a local backend that publishes no budget (`uring.n_max_concurrent_scans: 0`): the budget then defaults to the pipeline width, an unset `readahead_strategy` to `eager`, and `cache.mode: none` no longer disables the readahead (reads go through the reactor's own staging). On such a local backend the host tier (pinned-cache staging) therefore also runs, eagerly, for every split the device tier refuses, although uring publishes no host readahead budget. `max_readahead_scans` / `readahead_strategy` still win when set. |
+| `device_prefetching_fraction` | double [0,1] | 0 | Device tier of the readahead. `0` turns it off: the readahead only stages bytes in the pinned host cache. A positive value lets the readahead read a split's byte ranges straight into GPU buffers on the split's assigned GPU, ahead of its scan task, as long as that GPU space's consumed memory after admitting the split (limit − available: reservations plus allocations, by anyone, the same measure cuCascade's downgrade check uses) stays at or below this fraction of the space's reservation limit (`memory_space::get_max_memory()`); a split that would exceed it, or whose reservation or allocation fails, falls back to the host tier and the device tier backs off on that GPU until one of its splits is disposed (or 100 ms pass). Prefetched device bytes are invisible to the downgrade executor until their scan consumes them, so keep this fraction times the GPU's `reservation_limit_fraction` at or below its `downgrade_stop_fraction` (0.6 by default; a higher value is accepted with a warning). Setting it also enables the readahead on a local backend that publishes no budget (`uring.n_max_concurrent_scans: 0`): the budget then defaults to the pipeline width, an unset `readahead_strategy` to `eager`, and `cache.mode: none` no longer disables the readahead (reads go through the reactor's own staging). On such a local backend the host tier (pinned-cache staging) therefore also runs, eagerly, for every split the device tier refuses, although uring publishes no host readahead budget. `max_readahead_scans` / `readahead_strategy` still win when set. Pair with `cache.eviction: prefetch` under `cache.mode: cucs`. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
 sub-config below.
@@ -458,7 +458,7 @@ sirius:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `mode` | enum: `none`, `os`, `cucs` | `none` | Which cache the read path goes through. `sirius` is a deprecated alias of `cucs`, still accepted. Values are lowercase. |
-| `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the prefetching cache. Only meaningful under `mode: cucs`. Values are lowercase. |
+| `eviction` | enum: `idle`, `lru`, `prefetch` | `lru` | What retires an idle chunk from the prefetching cache. Only meaningful under `mode: cucs`. Values are lowercase. |
 | `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when pinned host-memory allocations (by any user) reach this fraction of capacity. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
 
@@ -471,13 +471,17 @@ pinned host allocations pass `eviction_threshold_fraction`; `eviction: idle` dro
 it goes idle, making the cache a prefetch staging area sized for the reads in flight rather
 than for reuse.
 
+`eviction: prefetch` behaves like `idle` and additionally lets the readahead's device tier
+(`device_prefetching_fraction`) release a split's staging chunks as soon as its bytes have landed on
+the GPU, rather than when the split's scan task finishes; without a device tier it is `idle`.
+
 Those two knobs derive the settings below, which are therefore **not** individually settable from YAML:
 
 | Derived setting | Derived from |
 |-----------------|--------------|
 | `uring.use_odirect` | `mode` — true for everything but `os` |
 | whether the prefetching cache is armed | `mode` — only under `cucs` |
-| `dispose_on_idle` | `eviction` — true under `idle` |
+| `dispose_on_idle` | `eviction` — true under `idle` and `prefetch` |
 | the readahead's default budget | `mode` — the readahead does not run under `none` unless `device_prefetching_fraction > 0`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
 
 ### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
