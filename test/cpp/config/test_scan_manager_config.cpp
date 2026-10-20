@@ -669,30 +669,34 @@ TEST_CASE("sirius_config reads readahead_strategy", "[scan_manager][config][read
 
 TEST_CASE("backend string_to_enum accepts known backends", "[scan_manager][config][backend]")
 {
-  io_backend b = io_backend::kvikio;
+  io_backend b{};
 
   REQUIRE(string_to_enum("native", b));
   CHECK(b == io_backend::native);
 
-  REQUIRE(string_to_enum("kvikio", b));
-  CHECK(b == io_backend::kvikio);
-
   // Deprecated spelling of `native`, still accepted.
-  b = io_backend::kvikio;
+  b = io_backend{};
   REQUIRE(string_to_enum("sirius", b));
+  CHECK(b == io_backend::native);
+
+  // The removed kvikIO backend, still accepted as `native`.
+  b = io_backend{};
+  REQUIRE(string_to_enum("kvikio", b));
   CHECK(b == io_backend::native);
 }
 
 TEST_CASE("backend string_to_enum rejects unknown backends", "[scan_manager][config][backend]")
 {
-  io_backend b = io_backend::kvikio;
+  io_backend b = io_backend::native;
 
   CHECK_FALSE(string_to_enum("", b));
   CHECK_FALSE(string_to_enum("NATIVE", b));
   CHECK_FALSE(string_to_enum("SIRIUS", b));
+  CHECK_FALSE(string_to_enum("KVIKIO", b));
   CHECK_FALSE(string_to_enum("uring", b));
+  CHECK_FALSE(string_to_enum("cufile", b));
   CHECK_FALSE(string_to_enum("true", b));
-  CHECK(b == io_backend::kvikio);
+  CHECK(b == io_backend::native);
 }
 
 TEST_CASE("backend enum_to_string returns canonical names", "[scan_manager][config][backend]")
@@ -701,8 +705,6 @@ TEST_CASE("backend enum_to_string returns canonical names", "[scan_manager][conf
 
   REQUIRE(enum_to_string(io_backend::native, out));
   CHECK(out == "native");
-  REQUIRE(enum_to_string(io_backend::kvikio, out));
-  CHECK(out == "kvikio");
 }
 
 TEST_CASE("scan_manager_config defaults to the native backend", "[scan_manager][config][backend]")
@@ -721,7 +723,6 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
   cfg.cache.mode            = cache_mode::os;
   cfg.cache.eviction        = eviction_policy::idle;
   cfg.object_store.endpoint = "http://object-store.test:9000";
-  cfg.kvikio.task_size      = std::size_t{8} << 20;
   cfg.rest.max_connections  = 17;
 
   auto const io = cfg.to_io_config();
@@ -730,7 +731,6 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
   CHECK(io.rest_n_reactors == 5);
   // A non-default value in each copied sub-config survives the copy.
   CHECK(io.object_store.endpoint == "http://object-store.test:9000");
-  CHECK(io.kvikio.task_size == std::optional<std::size_t>{std::size_t{8} << 20});
   CHECK(io.rest.max_connections == 17);
   CHECK(io.cache.eviction == eviction_policy::idle);
   // Sirius's uring default (readahead off) reaches cuCascade unchanged.
@@ -741,17 +741,10 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
   // The cache-derived knobs are refreshed even though apply_cache_mode() was not called.
   CHECK_FALSE(io.uring.use_odirect);
   CHECK(io.cache.dispose_on_idle);
-
-  cfg.backend = io_backend::kvikio;
-  CHECK(cfg.to_io_config().backend == cucascade::io::io_backend::kvikio);
 }
 
 TEST_CASE("sirius_config reads the backend from YAML", "[scan_manager][config][backend]")
 {
-  auto const kvikio = load_scan_manager("sirius_backend_kvikio.yaml",
-                                        single_gpu_scan_manager_yaml("      backend: kvikio\n"));
-  CHECK(kvikio.backend == io_backend::kvikio);
-
   auto const native = load_scan_manager("sirius_backend_native.yaml",
                                         single_gpu_scan_manager_yaml("      backend: native\n"));
   CHECK(native.backend == io_backend::native);
@@ -767,6 +760,46 @@ TEST_CASE("sirius_config accepts the deprecated sirius backend as native",
   auto const cfg = load_scan_manager("sirius_backend_sirius_alias.yaml",
                                      single_gpu_scan_manager_yaml("      backend: sirius\n"));
   CHECK(cfg.backend == io_backend::native);
+}
+
+namespace {
+
+std::size_t count_warnings(sirius::test::scoped_recording_log_sink const& logs,
+                           std::string_view needle)
+{
+  std::size_t warnings = 0;
+  for (auto const& record : logs.records()) {
+    if (record.message.find(needle) != std::string::npos) {
+      ++warnings;
+      CHECK(record.level == sirius::log::level::warn);
+    }
+  }
+  return warnings;
+}
+
+}  // namespace
+
+TEST_CASE("sirius_config loads the removed kvikio backend as native with a warning",
+          "[scan_manager][config][backend]")
+{
+  sirius::test::scoped_recording_log_sink logs{"warn"};
+  auto const cfg = load_scan_manager("sirius_backend_kvikio.yaml",
+                                     single_gpu_scan_manager_yaml("      backend: kvikio\n"));
+  CHECK(cfg.backend == io_backend::native);
+  CHECK(cfg.to_io_config().backend == cucascade::io::io_backend::native);
+  CHECK(count_warnings(logs, "'scan_manager.backend: kvikio' is deprecated") == 1);
+}
+
+TEST_CASE("sirius_config accepts and ignores the removed kvikio block with a warning",
+          "[scan_manager][config][backend]")
+{
+  sirius::test::scoped_recording_log_sink logs{"warn"};
+  auto const cfg = load_scan_manager("sirius_backend_kvikio_block.yaml",
+                                     single_gpu_scan_manager_yaml("      kvikio:\n"
+                                                                  "        task_size: 8MiB\n"
+                                                                  "        compat_mode: on\n"));
+  CHECK(cfg.backend == io_backend::native);
+  CHECK(count_warnings(logs, "'scan_manager.kvikio' is deprecated and ignored") == 1);
 }
 
 TEST_CASE("sirius_config rejects an invalid backend", "[scan_manager][config][backend]")

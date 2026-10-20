@@ -25,6 +25,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -136,7 +137,7 @@ std::string strip_file_scheme_for_registry(std::string const& path)
 
 bool is_local_backend(std::optional<io_context_type> type)
 {
-  return type.has_value() && (*type == io_context_type::uring || *type == io_context_type::kvikio);
+  return type.has_value() && *type == io_context_type::uring;
 }
 
 scan_manager_config make_s3_scan_config(std::string endpoint,
@@ -460,7 +461,7 @@ class range_s3_server {
 
 }  // namespace
 
-TEST_CASE("io_context_registry routes full paths before the kvikio catch-all", "[s3][routing]")
+TEST_CASE("io_context_registry routes full paths to their own backends", "[s3][routing]")
 {
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::native);
@@ -477,9 +478,7 @@ TEST_CASE("io_context_registry routes full paths before the kvikio catch-all", "
   CHECK(registry.lookup_path(stripped) != io_context_type::restful);
 }
 
-TEST_CASE(
-  "io_context_registry routes local paths by backend and S3 reads to kvikio under backend=kvikio",
-  "[s3][routing]")
+TEST_CASE("io_context_registry routes local paths to uring under backend=native", "[s3][routing]")
 {
   scan_manager_fixture fixture;
   auto const local_path = make_regular_file();
@@ -489,17 +488,6 @@ TEST_CASE(
       .to_io_config(),
     *fixture.memory};
   CHECK(native_registry.lookup_path(local_path.string()) == io_context_type::uring);
-
-  io_context_registry fallback_registry{
-    make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::kvikio)
-      .to_io_config(),
-    *fixture.memory};
-  CHECK(fallback_registry.lookup_path(local_path.string()) == io_context_type::kvikio);
-  CHECK(fallback_registry.lookup_path(local_path.string()) != io_context_type::uring);
-  // backend=kvikio also takes s3:// READS off the REST backend — kvikIO's
-  // RemoteHandle serves them; LIST/glob still uses the REST ioctx, obtained by
-  // type rather than by path.
-  CHECK(fallback_registry.lookup_path("s3://bucket/key.parquet") == io_context_type::kvikio);
 }
 
 TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx", "[s3][routing]")
@@ -604,28 +592,6 @@ TEST_CASE("scan_manager create_datasource normalizes file URI paths before routi
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
   CHECK(datasource->io_ctx()->type() == io_context_type::uring);
-}
-
-TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio", "[s3][routing]")
-{
-  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
-  scan_manager_fixture fixture;
-  sirius::exec::query_lifecycle_registry scan_lifecycle;
-  sirius_scan_manager manager{
-    scan_lifecycle,
-    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::kvikio),
-    *fixture.memory,
-    fixture.topology};
-
-  auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
-
-  REQUIRE(datasource != nullptr);
-  REQUIRE(datasource->io_ctx() != nullptr);
-  CHECK(datasource->io_ctx()->type() == io_context_type::kvikio);
-  CHECK(datasource->size() == 4096);
-
-  std::vector<std::uint8_t> buffer(128, std::uint8_t{0xAB});
-  CHECK(datasource->host_read(0, buffer.size(), buffer.data()) == buffer.size());
 }
 
 TEST_CASE("scan_manager re-primes routed S3 cache on every query", "[s3][routing]")
@@ -919,7 +885,9 @@ TEST_CASE("scan_manager teardown resolves an in-flight S3 read", "[s3][routing]"
 
   auto fixture = std::make_unique<scan_manager_fixture>();
   auto cfg     = make_s3_scan_config(server->endpoint(), sirius::scan_manager::io_backend::native);
-  auto manager = std::make_unique<sirius_scan_manager>(cfg, *fixture->memory, fixture->topology);
+  auto scan_lifecycle = std::make_shared<sirius::exec::query_lifecycle_registry>();
+  auto manager        = std::make_unique<sirius_scan_manager>(
+    *scan_lifecycle, cfg, *fixture->memory, fixture->topology);
   auto datasource = manager->create_datasource("s3://teardown-bucket/object.bin");
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
@@ -934,10 +902,11 @@ TEST_CASE("scan_manager teardown resolves an in-flight S3 read", "[s3][routing]"
   // Tear down on a worker so a hang fails the test instead of blocking it.
   std::promise<void> completed;
   auto teardown = completed.get_future();
-  std::thread worker([datasource = std::move(datasource),
-                      manager    = std::move(manager),
-                      fixture    = std::move(fixture),
-                      completed  = std::move(completed)]() mutable {
+  std::thread worker([scan_lifecycle = std::move(scan_lifecycle),
+                      datasource     = std::move(datasource),
+                      manager        = std::move(manager),
+                      fixture        = std::move(fixture),
+                      completed      = std::move(completed)]() mutable {
     datasource.reset();
     manager.reset();
     fixture.reset();
@@ -970,12 +939,11 @@ TEST_CASE("scan_manager teardown resolves an in-flight S3 read", "[s3][routing]"
   CHECK(weak_ctx.expired());
 }
 
-TEST_CASE("backend=kvikio without an object store rejects s3 paths with a clear error",
-          "[s3][routing]")
+TEST_CASE("backend=native without an object store declines s3 paths and says why", "[s3][routing]")
 {
   scan_manager_fixture fixture;
   scan_manager_config cfg{};
-  cfg.backend                 = sirius::scan_manager::io_backend::kvikio;
+  cfg.backend                 = sirius::scan_manager::io_backend::native;
   cfg.thread_pool.num_threads = 1;
   cfg.uring_n_reactors        = 1;
   cfg.cache.mode              = cucascade::io::cache::cache_mode::none;
@@ -983,13 +951,22 @@ TEST_CASE("backend=kvikio without an object store rejects s3 paths with a clear 
   REQUIRE(cfg.object_store.access_key.empty());
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
-  REQUIRE_THROWS_WITH(manager.create_datasource("s3://unconfigured-bucket/key.parquet"),
-                      Catch::Matchers::ContainsSubstring("object store not configured"));
+  // No backend can serve the path, so the datasource is null (callers map that
+  // to their own error); the cause is logged once, as a WARN.
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    CHECK(manager.create_datasource("s3://unconfigured-bucket/key.parquet") == nullptr);
+    auto const records = logs.records();
+    CHECK(std::ranges::any_of(records, [](auto const& record) {
+      return record.level == sirius::log::level::warn &&
+             record.message.find("object store not configured") != std::string::npos;
+    }));
+  }
 
-  // Local paths are still served by kvikIO on the same manager.
+  // Local paths are still served by uring on the same manager.
   auto const local_path = make_regular_file();
   auto local            = manager.create_datasource(local_path.string());
   REQUIRE(local != nullptr);
   REQUIRE(local->io_ctx() != nullptr);
-  CHECK(local->io_ctx()->type() == io_context_type::kvikio);
+  CHECK(local->io_ctx()->type() == io_context_type::uring);
 }

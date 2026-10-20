@@ -7,6 +7,7 @@
 
 #include "catch.hpp"
 #include "io/s3/sirius_httpfs.hpp"
+#include "op/scan/field_id_mapping.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "scan_manager/config.hpp"
@@ -18,6 +19,10 @@
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
+
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/cuda_stream.hpp>
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/io_context.hpp>
@@ -778,15 +783,6 @@ cucascade::io::rest::rest_ioctx& require_rest_ioctx(s3_sql_fixture& fixture, std
     require_sirius_context(fixture).get_scan_manager().create_datasource(uri));
 }
 
-void require_kvikio_ioctx(s3_sql_fixture& fixture, std::string const& uri)
-{
-  auto& sirius_ctx = require_sirius_context(fixture);
-  auto datasource  = sirius_ctx.get_scan_manager().create_datasource(uri);
-  REQUIRE(datasource != nullptr);
-  REQUIRE(datasource->io_ctx() != nullptr);
-  REQUIRE(datasource->io_ctx()->type() == cucascade::io::io_context_type::kvikio);
-}
-
 void require_s3_keys_listed(s3_sql_fixture& fixture,
                             s3_test_env const& env,
                             std::vector<std::string_view> const& expected_keys)
@@ -1241,33 +1237,6 @@ TEST_CASE("transparent read_parquet over S3 scans through Sirius REST",
     CHECK(rest.type() == cucascade::io::io_context_type::restful);
     compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
   }
-}
-
-TEST_CASE("transparent read_parquet over S3 routes to kvikio when backend is kvikio",
-          "[s3][integration][sql][transparent]")
-{
-  auto env = load_s3_test_env();
-  if (should_skip_s3_env(env)) { return; }
-
-  sirius_memory_limits limits;
-  limits.backend = sirius::scan_manager::io_backend::kvikio;
-  s3_sql_fixture fixture(*env, limits);
-  set_gpu_execution(fixture.con, true);
-
-  // kvikIO serves S3 reads through RemoteHandle; LIST still uses REST.
-  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
-  require_kvikio_ioctx(fixture, uri);
-
-  auto result =
-    require_query_ok(fixture.con, "SELECT count(*) FROM read_parquet(" + sql_quote(uri) + ")");
-  REQUIRE(result->RowCount() == 1);
-  CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 25);
-
-  auto const s3_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
-                        s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
-  auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
-                           local_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
-  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
 }
 
 TEST_CASE("SIRIUS_S3 CREATE SECRET credentials are scoped and refreshed for Sirius scans",
@@ -3442,14 +3411,6 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) return;
   auto limits = large_sirius_memory_limits("sirius");
-  bool bulk   = true;
-  SECTION("REST bulk") {}
-  SECTION("kvikIO general")
-  {
-    limits.backend    = sirius::scan_manager::io_backend::kvikio;
-    limits.cache_mode = "none";
-    bulk              = false;
-  }
   s3_sql_fixture fixture(*env, limits);
   sirius::test::scratch_dir directory("s3_d7_mixed");
   set_gpu_execution(fixture.con, false);
@@ -3487,34 +3448,32 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
   auto local_source = manager.create_datasource((directory.path() / "a.parquet").string());
   REQUIRE(local_source);
   CHECK_FALSE(local_source->prefers_bulk_io());
-  if (bulk) {
-    // Give pin_table pristine paths. The ordinary local scan above has warmed
-    // a.parquet and b.parquet, so using those paths would only exercise a
-    // metadata cache hit rather than the pin-first footer producer.
-    for (auto file : {"a.parquet", "b.parquet"}) {
-      std::filesystem::copy_file(directory.path() / file,
-                                 directory.path() / (std::string("pin-") + file));
-    }
-    auto pin_glob    = directory.file_literal("pin-*.parquet");
-    auto cold_source = manager.create_datasource(directory.file("pin-a.parquet"));
-    REQUIRE(cold_source);
-    CHECK(cold_source->metadata() == nullptr);
-    require_query_ok(fixture.con,
-                     "CALL pin_table(" + pin_glob +
-                       ", name='schema_validation_pin', format='parquet', tier='parquet')");
-    CHECK(cold_source->metadata() != nullptr);
-    auto local_before = sirius::test::get_transparent_execution_stats(fixture.con);
-    auto pinned = require_query_ok(fixture.con, "SELECT x FROM read_parquet(" + pin_glob + ")");
-    auto pinned_rows = collect_rows(*pinned);
-    std::sort(pinned_rows.begin(), pinned_rows.end());
-    CHECK(pinned_rows == expected);
-    CHECK(pinned->GetTypes() == local->GetTypes());
-    auto local_after = sirius::test::get_transparent_execution_stats(fixture.con);
-    CHECK(local_after.successful_rebinds == local_before.successful_rebinds + 1);
-    CHECK(local_after.executions == local_before.executions + 1);
-    CHECK(local_after.runtime_fallbacks == local_before.runtime_fallbacks);
-    CHECK(local_after.split_physical_rejections == local_before.split_physical_rejections);
+  // Give pin_table pristine paths. The ordinary local scan above has warmed
+  // a.parquet and b.parquet, so using those paths would only exercise a
+  // metadata cache hit rather than the pin-first footer producer.
+  for (auto file : {"a.parquet", "b.parquet"}) {
+    std::filesystem::copy_file(directory.path() / file,
+                               directory.path() / (std::string("pin-") + file));
   }
+  auto pin_glob    = directory.file_literal("pin-*.parquet");
+  auto cold_source = manager.create_datasource(directory.file("pin-a.parquet"));
+  REQUIRE(cold_source);
+  CHECK(cold_source->metadata() == nullptr);
+  require_query_ok(fixture.con,
+                   "CALL pin_table(" + pin_glob +
+                     ", name='schema_validation_pin', format='parquet', tier='parquet')");
+  CHECK(cold_source->metadata() != nullptr);
+  auto local_before = sirius::test::get_transparent_execution_stats(fixture.con);
+  auto pinned       = require_query_ok(fixture.con, "SELECT x FROM read_parquet(" + pin_glob + ")");
+  auto pinned_rows  = collect_rows(*pinned);
+  std::sort(pinned_rows.begin(), pinned_rows.end());
+  CHECK(pinned_rows == expected);
+  CHECK(pinned->GetTypes() == local->GetTypes());
+  auto local_after = sirius::test::get_transparent_execution_stats(fixture.con);
+  CHECK(local_after.successful_rebinds == local_before.successful_rebinds + 1);
+  CHECK(local_after.executions == local_before.executions + 1);
+  CHECK(local_after.runtime_fallbacks == local_before.runtime_fallbacks);
+  CHECK(local_after.split_physical_rejections == local_before.split_physical_rejections);
   auto query    = "SELECT x FROM " + s3_parquet_glob_scan(*env, "schema-validation/*.parquet");
   auto counters = require_sirius_context(fixture).physical_counters();
   std::mutex hits_mutex;
@@ -3550,9 +3509,9 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
       auto uri    = s3_uri(env->bucket, std::string("schema-validation/") + file);
       auto source = manager.create_datasource(uri);
       REQUIRE(source);
-      CHECK(source->prefers_bulk_io() == bulk);
-      if (bulk) CHECK(source->metadata() != nullptr);
-      if (attempt == 1 && bulk) {
+      CHECK(source->prefers_bulk_io());
+      CHECK(source->metadata() != nullptr);
+      if (attempt == 1) {
         std::lock_guard lock(hits_mutex);
         CHECK(hits[uri] > 0);
       }
@@ -3818,22 +3777,13 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
   CHECK(opened_path == remote + "/dv_bounded/data/a.puffin");
 }
 
-TEST_CASE("S3 mapped Parquet normalizes IDs on bulk and general readers",
+TEST_CASE("S3 mapped Parquet normalizes IDs on the bulk reader",
           "[s3][integration][field_id_mapping]")
 {
   using namespace sirius::op::scan;
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) return;
-  auto limits = large_sirius_memory_limits("sirius");
-  bool bulk   = true;
-  SECTION("REST bulk") {}
-  SECTION("kvikIO general")
-  {
-    limits.backend    = sirius::scan_manager::io_backend::kvikio;
-    limits.cache_mode = "none";
-    bulk              = false;
-  }
-  s3_sql_fixture fixture(*env, limits);
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("cucs"));
   sirius::test::scratch_dir directory("s3_field_id_mapping");
   set_gpu_execution(fixture.con, false);
   require_query_ok(fixture.con,
@@ -3845,7 +3795,7 @@ TEST_CASE("S3 mapped Parquet normalizes IDs on bulk and general readers",
   auto uri    = s3_uri(env->bucket, "field-id-mapping/data.parquet");
   auto source = require_sirius_context(fixture).get_scan_manager().create_datasource(uri);
   REQUIRE(source);
-  REQUIRE(source->prefers_bulk_io() == bulk);
+  REQUIRE(source->prefers_bulk_io());
   auto options  = cudf::io::parquet_reader_options::builder().build();
   auto resolved = resolve_parquet_metadata_with_identity(*source, 71, uri, options);
   materialization_program program{

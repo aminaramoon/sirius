@@ -1414,8 +1414,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
 
   // Every tier materializes through the scan manager's ioctx rather than cuDF's bundled
   // file_source factory, which uses kvikIO internally and binds to a single CUDA context.
-  // That is mandatory on multi-GPU, where sirius_config::enforce_native_backend_for_multi_gpu()
-  // forces backend=native; with backend=kvikio (single-GPU only) the ioctx is a kvikio_context.
+  // That is mandatory on multi-GPU.
   if (data.args.tier == "host") {
     // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
     // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local

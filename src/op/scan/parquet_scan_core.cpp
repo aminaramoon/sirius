@@ -1016,7 +1016,7 @@ parquet_scan_core::stoppable_metadata_scan_task_t parquet_scan_core::next_split_
   auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
 
-  // Route each file to its own backend (s3:// -> rest, local -> uring/kvikio) so a
+  // Route each file to its own backend (s3:// -> rest, local -> uring) so a
   // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
   // per file; row-group chunking and file bundling happen downstream in
   // parquet_batch_coalescer.
