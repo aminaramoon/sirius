@@ -371,20 +371,16 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   }
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
+  r.optional("backend", opt.backend);
   {
-    // Read as a string so the removed kvikIO backend can be reported: `kvikio`
-    // still loads (as `native`) so existing configs keep working.
-    std::optional<std::string> backend;
-    r.optional("backend", backend);
-    if (backend.has_value()) {
-      if (!scan_manager::string_to_enum(std::string_view{*backend}, opt.backend)) {
-        throw std::runtime_error("'backend': invalid enum value '" + *backend + "'");
-      }
-      if (*backend == "kvikio") {
-        SIRIUS_LOG_WARN(
-          "'scan_manager.backend: kvikio' is deprecated: the kvikIO backend was removed from "
-          "cuCascade; using the native backend");
-      }
+    // `kvikio` names the removed kvikIO backend; it still loads (as `native`) so
+    // existing configs keep working, but is reported.
+    std::optional<std::string> backend_name;
+    r.optional("backend", backend_name);
+    if (backend_name == "kvikio") {
+      SIRIUS_LOG_WARN(
+        "'scan_manager.backend: kvikio' is deprecated: the kvikIO backend was removed from "
+        "cuCascade; using the native backend");
     }
   }
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});

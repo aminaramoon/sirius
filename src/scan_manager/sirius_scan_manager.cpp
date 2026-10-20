@@ -2362,9 +2362,8 @@ sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
       return {.cause = "invalid uring configuration (check uring.n_max_concurrent_scans)",
               .by_configuration = false};
     case cucascade::io::io_context_type::cufile:
-      return {
-        .cause = "cuFile backend could not be constructed (check cufile.* settings / libcufile)",
-        .by_configuration = false};
+      return {.cause = "cuFile backend could not be constructed (libcufile / GDS unavailable?)",
+              .by_configuration = false};
     case cucascade::io::io_context_type::s3rdma: break;
   }
   return {.cause = "the io registry has no factory for this backend", .by_configuration = false};

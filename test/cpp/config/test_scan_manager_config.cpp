@@ -807,7 +807,9 @@ TEST_CASE("sirius_config rejects an invalid backend", "[scan_manager][config][ba
   scoped_yaml yaml("sirius_backend_invalid.yaml", scan_manager_yaml("      backend: uring\n"));
 
   sirius::sirius_config cfg;
-  CHECK_THROWS(cfg.load_from_file(yaml.path()));
+  CHECK_THROWS_WITH(
+    cfg.load_from_file(yaml.path()),
+    Catch::Matchers::ContainsSubstring("'scan_manager.backend': invalid enum value 'uring'"));
 }
 
 TEST_CASE("sirius_config rejects the removed use_sirius_datasource key",
@@ -852,7 +854,7 @@ TEST_CASE("sirius_config rejects the renamed local sub-config", "[scan_manager][
   CHECK_THROWS(cfg.load_from_file(yaml.path()));
 }
 
-TEST_CASE("sirius_config forces the native backend for multi-GPU",
+TEST_CASE("kvikio backend on multi-GPU loads as native",
           "[scan_manager][config][backend][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
