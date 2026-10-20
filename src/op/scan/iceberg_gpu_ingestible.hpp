@@ -131,6 +131,12 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
     expression_query_policy policy = {}) override;
 
+ protected:
+  /// Iceberg splits are not read ahead onto the GPU: position-matched deletes need file-order rows
+  /// from a pushdown-suppressed decode, and the device route has not been validated for that
+  /// pipeline.  They keep reading through the base route.
+  [[nodiscard]] bool device_prefetch_allowed() const noexcept override { return false; }
+
  private:
   parquet_scan_core _core;
   /// Resolves which scanned file each manifest-side key refers to, once. A mismatch would

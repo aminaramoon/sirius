@@ -487,7 +487,7 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
       auto provider = warmer->next_split_provider(
         [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
       REQUIRE(provider);
-      REQUIRE(provider());
+      REQUIRE(provider({}));
       REQUIRE(cucascade::io::open_datasource(ioctx, path)->metadata());
     }
   }
@@ -586,7 +586,7 @@ TEST_CASE("File bounded cursors preserve batching and partial emission never fab
   auto ioctx = sirius::test::make_test_local_ioctx();
   auto work  = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
-  auto metadata = work();
+  auto metadata = work({});
   auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
   REQUIRE(file.row_groups.size() > 1);
   CHECK(file.disable_filter_pushdown == iceberg);
@@ -966,7 +966,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto provider = ingestible->next_split_provider(
            [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
-    auto range = provider();
+    auto range = provider({});
     ++input_ranges;
     REQUIRE(range);
     auto const* native_range = dynamic_cast<duckdb_native_scan_info const*>(range.get());
@@ -1098,7 +1098,7 @@ TEST_CASE("An all-pruned native scan keeps its contract on the empty fallback sp
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto provider = ingestible->next_split_provider(
            [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
-    auto emitted = coalescer->push(provider());
+    auto emitted = coalescer->push(provider({}));
     CHECK_FALSE(coalescer->first_retained_time());
     CHECK_FALSE(coalescer->partial_emit());
     for (auto& split : emitted) {
@@ -1163,8 +1163,8 @@ TEST_CASE("Execution rebuilds foreign footer provenance before schema access",
 {
   auto info    = parquet_info(81);
   auto path    = info->resolved_file_paths.front();
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
-  auto source  = ioctx->open_datasource(path);
+  auto ioctx   = sirius::test::make_test_local_ioctx();
+  auto source  = cucascade::io::open_datasource(ioctx, path);
   auto foreign = std::make_shared<parquet_metadata>(nullptr,
                                                     64,
                                                     parquet_encryption_evidence{},
@@ -1175,7 +1175,7 @@ TEST_CASE("Execution rebuilds foreign footer provenance before schema access",
   REQUIRE(source->store_metadata(foreign));
   auto ingestible = make_ingestible(std::move(info));
   auto provider   = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto split = provider({});
   REQUIRE(split != nullptr);
 }
@@ -1220,7 +1220,7 @@ TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
   SECTION("foreign metadata owner")
   {
     auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
-    approval->metadata_owner         = std::make_shared<sirius::io::io_object_metadata>();
+    approval->metadata_owner         = std::make_shared<cucascade::io::io_object_metadata>();
     dependencies[0].parquet_approval = std::move(approval);
   }
   SECTION("missing object identity")
@@ -1381,7 +1381,7 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
   auto ioctx      = sirius::test::make_test_local_ioctx();
   auto provider   = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
-  auto split = provider();
+  auto split = provider({});
   auto required =
     check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range);
   REQUIRE_NOTHROW(validate_split_for_gpu(81, required, {}, *split));
@@ -1551,7 +1551,11 @@ TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
     auto const iceberg_set = std::dynamic_pointer_cast<iceberg_delete_set const>(set);
     REQUIRE(iceberg_set);
     CHECK(iceberg_set->positions.empty() == (i == 1));
-    CHECK(dynamic_cast<parquet_split_info const&>(*splits[i]).disable_filter_pushdown == (i == 0));
+    auto const& split = dynamic_cast<parquet_split_info const&>(*splits[i]);
+    CHECK(split.disable_filter_pushdown == (i == 0));
+    // Iceberg splits never take the device-tier readahead, with or without deletes.
+    CHECK_FALSE(split.device_prefetch_allowed);
+    CHECK_FALSE(split.supports_device_prefetch());
   }
   coalescer.reset();
   ingestible.reset();
@@ -1581,8 +1585,8 @@ TEST_CASE("Iceberg per-file input distinguishes complete empty results from miss
     auto ioctx      = sirius::test::make_test_local_ioctx();
     auto work       = ingestible->next_split_provider(
       [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
-    auto metadata = work();
-    CHECK(metadata->dependencies().front().delete_set == set);
+    auto metadata = work({});
+    CHECK(metadata->dependencies().front().visibility == set);
     CHECK_FALSE(dynamic_cast<parquet_file_scan_info&>(*metadata).disable_filter_pushdown);
     auto coalescer = ingestible->create_batch_coalescer();
     CHECK(coalescer->push(std::move(metadata)).empty());
