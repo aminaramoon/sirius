@@ -206,8 +206,8 @@ struct memory_prefetcher_config {
  *
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
  * to @c uring_ioctx and @c s3:// URLs (reads, LIST and glob) to the REST backend.
- * Reads go through @c cucascade::io::datasource. Multi-GPU forces
- * @ref io_backend::native.
+ * Reads go through @c cucascade::io::datasource. @ref io_backend::native is
+ * the only backend, so multi-GPU needs no backend override.
  *
  * The backend sub-configs are cuCascade's own structs; @ref to_io_config hands
  * them to the @c cucascade::io::io_context_registry.

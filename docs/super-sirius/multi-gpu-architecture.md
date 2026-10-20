@@ -201,7 +201,7 @@ The probe runs once at startup per (src, dst) pair: allocate small buffers on ea
 
 ## Multi-GPU-Safe Parquet I/O
 
-Multi-GPU parquet reads, local and `s3://`, go through cuCascade's native backends (uring / REST) and stay **off cudf's bundled `file_source` factory**. That factory uses kvikIO, which binds the file handle to whichever CUDA context was active at construction time. In multi-GPU execution that's a hidden source of corruption — a file_handle bound to GPU 0 will silently funnel reads through GPU 0 even when the consumer is on GPU 1. cuCascade's own kvikIO backend has been removed, so `backend: native` is the only backend; `sirius_config::enforce_native_backend_for_multi_gpu()` still forces `scan_manager_config::backend = io_backend::native` whenever more than one GPU memory space is configured.
+Multi-GPU parquet reads, local and `s3://`, go through cuCascade's native backends (uring / REST) and stay **off cudf's bundled `file_source` factory**. That factory uses kvikIO, which binds the file handle to whichever CUDA context was active at construction time. In multi-GPU execution that's a hidden source of corruption — a file_handle bound to GPU 0 will silently funnel reads through GPU 0 even when the consumer is on GPU 1. cuCascade's own kvikIO backend has been removed, so `backend: native` is the only backend. What keeps multi-GPU reads device-correct is the routing in `sirius::io::open_datasource` (below), not the backend setting. `sirius_config::enforce_native_backend_for_multi_gpu()` is kept as a guard for a future exposed cuFile backend; with one `io_backend` value it never overrides anything today.
 
 The native path:
 
@@ -244,7 +244,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | HYG-02 invariant: 0 new `rmm::cuda_stream_default` in `src/` outside `legacy/` | grep gate | Default-stream usage breaks per-task-device contract under SCHED-RR |
 | Accumulated Bloom contributions fold into an exclusive per-GPU partial stream (`cudaStreamWaitEvent` on a transient event) instead of waiting on the host | `src/cuda/sirius_dynamic_bloom_filter.cu` (`accumulated_bloom_builder::enqueue_add`) | Every later copy out of, or free of, a partial array is ordered after all inserts into it, with no per-task host sync |
 | Accumulated Bloom publication uses peer DMA only and requires `probe_peer_dma_works` for every ordered pair of replica GPUs | `src/op/dynamic_filter/dynamic_filter_publisher.cpp` (`try_begin_accumulation`) | The chunk pipeline issues direct `cudaMemcpyPeerAsync` copies; hardware without working peer DMA skips the optional filter |
-| Multi-GPU parquet reads resolve to the native backends (`cucascade::io::datasource` over uring / REST), not cudf's `file_source` | Managed reads open through `sirius::io::open_datasource`; `sirius_config::enforce_native_backend_for_multi_gpu()` forces `backend: native` when >1 GPU is configured | Any file-path datasource via cudf silently uses kvikIO, which binds to a single CUDA context |
+| Multi-GPU parquet reads resolve to the native backends (`cucascade::io::datasource` over uring / REST), not cudf's `file_source` | Managed reads open through `sirius::io::open_datasource`, which routes each path to a cuCascade native ioctx; `sirius_config::enforce_native_backend_for_multi_gpu()` is only a guard kept for a future exposed cuFile backend | Any file-path datasource via cudf silently uses kvikIO, which binds to a single CUDA context |
 
 ## Hardware Caveats
 

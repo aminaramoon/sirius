@@ -404,9 +404,11 @@ struct sirius_config {
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.backend to @c io_backend::native (the
-  /// native backend is required for multi-GPU IO routing). Emits a WARNING when
-  /// the override takes effect. Called from @ref finalize_derived_config.
+  /// force @c _scan_manager_config.backend to @c io_backend::native. Today
+  /// @c native is the only backend, so this never overrides anything (and never
+  /// warns); it is kept as a guard for a future exposed cuFile backend.
+  /// Multi-GPU device correctness comes from @c sirius::io::open_datasource
+  /// routing, not from this check. Called from @ref finalize_derived_config.
   void enforce_native_backend_for_multi_gpu();
 
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a

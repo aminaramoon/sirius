@@ -409,7 +409,7 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
 
 Two REST values are deliberately not YAML keys. **Connections per reactor** are
-fixed at 64 per endpoint — the useful number is a property of one reactor thread, not of a
+fixed at 64 per reactor per endpoint — the useful number is a property of one reactor thread, not of a
 deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
 each with its own thread and connection pools. **Physical GET size** is reactor-owned:
 each request's GETs are sized between 1 MiB and 32 MiB (`rest::config`
