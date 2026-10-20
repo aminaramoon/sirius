@@ -678,3 +678,312 @@ TEST_CASE_METHOD(issuer_fixture,
   CHECK(after + 1 * MiB >= baseline);
   CHECK(after <= baseline + 1 * MiB);
 }
+
+// ---- through the readahead worker ---------------------------------------------------------------
+
+namespace {
+
+using cucascade::io::cache::scan_stage;
+using sirius::scan_manager::device_prefetch_options;
+using sirius::scan_manager::prefetch_outcome_kind;
+using sirius::scan_manager::readahead_scan_manager;
+
+/// A readahead over one scan operator (operator id 1) whose device tier runs on the fixture's
+/// memory manager.
+struct readahead_fixture : issuer_fixture {
+  std::shared_ptr<sirius::event::query_event_publisher> publisher =
+    std::make_shared<sirius::event::query_event_publisher>();
+  sirius::test::single_scan_query query;
+
+  [[nodiscard]] device_prefetch_options options(double fraction = 1.0) const
+  {
+    return {.fraction = fraction, .memory = memory.get()};
+  }
+
+  [[nodiscard]] std::shared_ptr<readahead_scan_manager> readahead(device_prefetch_options opts,
+                                                                  std::size_t budget = 2)
+  {
+    auto manager = std::make_shared<readahead_scan_manager>(*publisher, budget, nullptr, opts);
+    manager->prepare_for_query(query.get());
+    return manager;
+  }
+
+  [[nodiscard]] static std::shared_ptr<device_split> on_gpu0(
+    std::vector<scan::scan_info::fadvise_entry> hints)
+  {
+    auto split = std::make_shared<device_split>(std::move(hints));
+    split->set_preferred_device(0);
+    return split;
+  }
+};
+
+std::uint64_t outcomes(readahead_scan_manager const& m, prefetch_outcome_kind kind)
+{
+  return m.counters().outcome(kind);
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(readahead_fixture,
+                 "the worker lands a split on the device ahead of its consumer",
+                 "[scan_manager][device_prefetch][readahead]")
+{
+  auto ra    = readahead(options());
+  auto split = on_gpu0(two_ranges(local_datasource()));
+  ra->register_scan_task(split, 1);
+  ra->start();
+  REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 1; }));
+
+  auto ranges = split->prefetched();
+  REQUIRE(ranges != nullptr);
+  CHECK(ranges->current() == scan::prefetched_ranges::state::ready);
+  CHECK(ranges->device_id() == 0);
+  CHECK(split->get_prefetch_state() == prefetch_state::prefetched);
+  CHECK(ra->counters().device_attempts.load() == 1);
+  CHECK(ra->counters().device_bytes.load() == 3 * MiB);
+  CHECK(outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 0);
+
+  ra->stop();
+  CHECK(eventually([&] { return ra->available_tickets() == 2; }));
+  auto const line = ra->summary();
+  INFO(line);
+  CHECK(line.find("device[prefetched=1 ") != std::string::npos);
+  CHECK(line.find(" MiB=3 ") != std::string::npos);
+  CHECK(line.find(" parked=1]") != std::string::npos);
+
+  ranges.reset();
+  split.reset();
+  ra.reset();
+  tier->view().synchronize();
+}
+
+TEST_CASE_METHOD(readahead_fixture,
+                 "memory pressure puts the device in back-off and the host tier runs",
+                 "[scan_manager][device_prefetch][readahead]")
+{
+  auto hog = space->make_reservation_or_null(space->get_max_memory() - 1 * MiB);
+  REQUIRE(hog != nullptr);
+  auto opts    = options();
+  opts.backoff = std::chrono::hours(1);
+  auto ra      = readahead(opts);
+  auto first   = on_gpu0(two_ranges(local_datasource()));
+  auto second  = on_gpu0(two_ranges(local_datasource()));
+
+  ra->register_scan_task(first, 1);
+  ra->start();
+  REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 1; }));
+  CHECK(ra->counters().device_skipped_memory.load() == 1);
+  CHECK(ra->counters().device_attempts.load() == 1);
+
+  ra->register_scan_task(second, 1);
+  REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 2; }));
+  CHECK(ra->counters().device_skipped_backoff.load() == 1);
+  CHECK(ra->counters().device_attempts.load() == 1);
+  CHECK(first->prefetched() == nullptr);
+  CHECK(second->prefetched() == nullptr);
+
+  ra->stop();
+  CHECK(ra->available_tickets() == 2);
+}
+
+TEST_CASE_METHOD(readahead_fixture,
+                 "a disposal on the device ends the back-off",
+                 "[scan_manager][device_prefetch][readahead]")
+{
+  auto hog = space->make_reservation_or_null(space->get_max_memory() - 1 * MiB);
+  REQUIRE(hog != nullptr);
+  auto opts    = options();
+  opts.backoff = std::chrono::hours(1);
+  auto ra      = readahead(opts);
+  auto ds      = local_datasource();
+  auto refused = on_gpu0(two_ranges(ds));
+  auto waiting = on_gpu0(two_ranges(ds));
+  auto landed  = on_gpu0(two_ranges(ds));
+
+  ra->register_scan_task(refused, 1);
+  ra->start();
+  REQUIRE(eventually([&] { return ra->counters().device_skipped_memory.load() == 1; }));
+
+  // The memory is back, but only a disposal (or the timer) ends the back-off.
+  hog.reset();
+  ra->register_scan_task(waiting, 1);
+  REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 2; }));
+  CHECK(ra->counters().device_skipped_backoff.load() == 1);
+
+  ra->update_scan_state(1, refused.get(), scan_stage::disposed);
+  ra->register_scan_task(landed, 1);
+  REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 1; }));
+  CHECK(ra->counters().device_attempts.load() == 2);
+  CHECK(landed->prefetched() != nullptr);
+
+  ra->stop();
+  landed.reset();
+  ra.reset();
+  tier->view().synchronize();
+}
+
+TEST_CASE_METHOD(readahead_fixture,
+                 "an oversized split does not trigger back-off",
+                 "[scan_manager][device_prefetch][readahead]")
+{
+  // A 4 MiB budget parks at most 2 MiB: the 3 MiB split is too large, the 1 MiB one is not.
+  auto ra =
+    readahead(options(static_cast<double>(4 * MiB) / static_cast<double>(space->get_max_memory())));
+  auto ds        = local_datasource();
+  auto oversized = on_gpu0(two_ranges(ds));
+  auto normal    = on_gpu0({{ds, {byte_range(0, 1 * MiB)}}});
+
+  ra->register_scan_task(oversized, 1);
+  ra->register_scan_task(normal, 1);
+  ra->start();
+  REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 1; }));
+  CHECK(ra->counters().device_skipped_too_large.load() == 1);
+  CHECK(ra->counters().device_skipped_backoff.load() == 0);
+  CHECK(ra->counters().device_attempts.load() == 2);
+  CHECK(oversized->prefetched() == nullptr);
+  CHECK(normal->prefetched() != nullptr);
+
+  ra->stop();
+  normal.reset();
+  ra.reset();
+  tier->view().synchronize();
+}
+
+TEST_CASE_METHOD(readahead_fixture,
+                 "the parked window refuses the third split",
+                 "[scan_manager][device_prefetch][readahead]")
+{
+  auto opts              = options();
+  opts.max_parked_splits = 2;
+  auto ra                = readahead(opts);
+  auto ds                = local_datasource();
+  std::vector<std::shared_ptr<device_split>> splits{
+    on_gpu0(two_ranges(ds)), on_gpu0(two_ranges(ds)), on_gpu0(two_ranges(ds))};
+  for (auto const& split : splits) {
+    ra->register_scan_task(split, 1);
+  }
+  ra->start();
+  REQUIRE(eventually([&] {
+    return outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 2 &&
+           outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 1;
+  }));
+  CHECK(ra->counters().device_skipped_window.load() == 1);
+  CHECK(ra->counters().device_skipped_backoff.load() == 0);
+  CHECK(splits[0]->prefetched() != nullptr);
+  CHECK(splits[1]->prefetched() != nullptr);
+  CHECK(splits[2]->prefetched() == nullptr);
+
+  ra->stop();
+  splits.clear();
+  ra.reset();
+  tier->view().synchronize();
+}
+
+TEST_CASE_METHOD(readahead_fixture,
+                 "prefetch eviction mode releases the host staging once the device copy landed",
+                 "[scan_manager][device_prefetch][readahead]")
+{
+  auto cfg           = sirius::test::dispose_on_idle_config();
+  cfg.cache.eviction = cucascade::io::cache::eviction_policy::prefetch;
+  cfg.apply_cache_mode();
+  // Declared before the datasource: the manager owns the cached ioctx it reads through.
+  sirius::exec::query_lifecycle_registry lifecycle;
+  sirius::scan_manager::sirius_scan_manager manager{
+    lifecycle, cfg, *memory, sirius::test::single_gpu_index_for_prefetch()};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+
+  bool release = false;
+  SECTION("released as soon as the device copy landed") { release = true; }
+  SECTION("kept until the split dies") { release = false; }
+
+  auto ds = manager.create_datasource(file.path.string());
+  REQUIRE(ds->uses_fs_cache());
+  auto hints = two_ranges(ds);
+  ds->fadvise(hints.front().ranges, 0);
+  REQUIRE(ds->prepare_prefetch(false) == cucascade::io::prepare_result::prepared);
+  auto const claimed = cache->claimed_bytes();
+  REQUIRE(claimed > 0);
+
+  auto opts                 = options();
+  opts.release_host_staging = release;
+  auto ra                   = readahead(opts);
+  auto split                = on_gpu0(std::move(hints));
+  ra->register_scan_task(split, 1);
+  ra->start();
+  REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 1; }));
+  REQUIRE(split->prefetched() != nullptr);
+  CHECK(split->prefetched()->current() == scan::prefetched_ranges::state::ready);
+  INFO("cache: " << cache->summary());
+
+  if (release) {
+    CHECK(sirius::test::claimed_after_sweep(*cache, claimed, std::chrono::milliseconds(5000)) == 0);
+    // Released while the split is alive and its consumer has not started.
+    CHECK(split->get_scan_stage() == scan_stage::none);
+  } else {
+    CHECK(sirius::test::claimed_after_sweep(*cache, claimed, std::chrono::milliseconds(300)) > 0);
+  }
+
+  ra->stop();
+  split.reset();
+  ds.reset();
+  cache->evict(1);
+  CHECK(sirius::test::claimed_after_sweep(*cache, claimed, std::chrono::milliseconds(5000)) == 0);
+  ra.reset();
+  tier->view().synchronize();
+}
+
+TEST_CASE_METHOD(readahead_fixture,
+                 "without a host cache the device tier works and the host tier never spins",
+                 "[scan_manager][device_prefetch][readahead]")
+{
+  auto ds = local_datasource();
+  REQUIRE_FALSE(ds->uses_fs_cache());
+
+  SECTION("device tier on")
+  {
+    auto opts              = options();
+    opts.max_parked_splits = 1;
+    auto ra                = readahead(opts);
+    auto landed            = on_gpu0(two_ranges(ds));
+    ra->register_scan_task(landed, 1);
+    ra->start();
+    REQUIRE(
+      eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 1; }));
+    REQUIRE(landed->prefetched() != nullptr);
+    CHECK(landed->prefetched()->current() == scan::prefetched_ranges::state::ready);
+    CHECK(landed->get_prefetch_state() == prefetch_state::prefetched);
+
+    // The window is full while the first split is unconsumed, so the second falls through to
+    // the host tier, which has nowhere to stage and gives up at once.
+    auto refused      = on_gpu0(two_ranges(ds));
+    auto const before = std::chrono::steady_clock::now();
+    ra->register_scan_task(refused, 1);
+    REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 1; },
+                       std::chrono::seconds(1)));
+    CHECK(std::chrono::steady_clock::now() - before < std::chrono::seconds(1));
+    CHECK(ra->counters().device_skipped_window.load() == 1);
+    CHECK(ra->counters().memory_retries.load() == 0);
+    CHECK(refused->prefetched() == nullptr);
+
+    ra->stop();
+    CHECK(eventually([&] { return ra->available_tickets() == 2; }));
+    landed.reset();
+    ra.reset();
+    tier->view().synchronize();
+  }
+
+  SECTION("device tier off: unchanged")
+  {
+    auto ra    = readahead(device_prefetch_options{});
+    auto split = on_gpu0(two_ranges(ds));
+    ra->register_scan_task(split, 1);
+    ra->start();
+    REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 1; },
+                       std::chrono::seconds(1)));
+    CHECK(ra->counters().memory_retries.load() == 0);
+    CHECK(ra->counters().device_attempts.load() == 0);
+    ra->stop();
+    CHECK(ra->available_tickets() == 2);
+  }
+}

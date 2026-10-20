@@ -20,6 +20,7 @@
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "planner/query_index.hpp"
 #include "scan_manager/config.hpp"
+#include "scan_manager/device_prefetch.hpp"
 #include "scan_manager/gatekeeper.hpp"
 #include "scan_manager/shared_scan_budget.hpp"
 
@@ -43,8 +44,14 @@
 #include <unordered_map>
 #include <vector>
 
+namespace cucascade::memory {
+class memory_reservation_manager;
+class memory_space;
+}  // namespace cucascade::memory
+
 namespace sirius::op::scan {
 class scan_info;
+struct device_stream;
 struct physical_check_counters;
 }  // namespace sirius::op::scan
 
@@ -80,6 +87,18 @@ enum class prefetch_outcome_kind : std::uint8_t {
   /// prefetching cache to issue into (@c cache.mode: os, whose readahead has no
   /// pinned cache to fill).  Neither a win nor a miss.
   nothing_to_issue,
+
+  // ---- device tier (one per attempt the device tier issued) -----------------
+  // Judged like the host kinds, at completion, against the consumer's stage.
+
+  /// The device copy landed before the consumer started reading the split.
+  device_prefetched,
+  /// The device copy landed while the consumer was already reading (waiting on) the split.
+  device_wait_for_prefetch,
+  /// The device copy landed after the split was disposed or gone: nobody will read it.
+  device_wasted,
+  /// A device read failed (an IO error or a short read); the consumer reads for itself.
+  device_failed,
 
   /// Not an outcome -- the enumerator count, so the counters can be an array
   /// indexed by kind.  Keep it last, and add new kinds above it: a new kind then
@@ -136,6 +155,44 @@ struct readahead_counters {
   /// over-subscribed until the ticket came back.  A quiet readahead with a high
   /// count here was crowded out; one with a low count simply had nothing to do.
   std::atomic<std::uint64_t> borrowed{0};
+
+  // ---- device tier pacing ---------------------------------------------------
+  /// Candidates handed to a device tier's issuer.
+  std::atomic<std::uint64_t> device_attempts{0};
+  /// Refused for want of device memory (reservation, usage floor, or allocation);
+  /// each one put the GPU in back-off.
+  std::atomic<std::uint64_t> device_skipped_memory{0};
+  /// Not attempted because the split's GPU was in back-off.
+  std::atomic<std::uint64_t> device_skipped_backoff{0};
+  /// Not attempted: no preferred GPU, no tier for it, or a split that cannot decode
+  /// from device copies.
+  std::atomic<std::uint64_t> device_skipped_unsupported{0};
+  /// Larger than the GPU's parked window could ever hold.
+  std::atomic<std::uint64_t> device_skipped_too_large{0};
+  /// The GPU's parked window was full.
+  std::atomic<std::uint64_t> device_skipped_window{0};
+  /// Logical bytes the device tier landed (successful attempts only).
+  std::atomic<std::uint64_t> device_bytes{0};
+};
+
+/// What the readahead's device tier runs with.  Disabled (fraction 0 or no memory manager) means
+/// the worker never touches a GPU and behaves exactly as before the device tier existed.
+struct device_prefetch_options {
+  /// Usage ceiling: after admitting a split, a GPU space's consumed memory stays at or below this
+  /// fraction of its reservation limit (scan_manager.device_prefetching_fraction).
+  double fraction{0.0};
+  cucascade::memory::memory_reservation_manager* memory{nullptr};
+  /// cache.eviction == prefetch under cache.mode cucs: release a split's host staging as soon as
+  /// its device copy landed.
+  bool release_host_staging{false};
+  /// Per-GPU parked window; 0 derives max(2, 2 x pipeline_width / n_gpus).
+  std::size_t max_parked_splits{0};
+  std::size_t pipeline_width{0};
+  /// How long a GPU stays in back-off after a memory refusal, unless one of its splits is
+  /// disposed first.
+  std::chrono::milliseconds backoff{100};
+
+  [[nodiscard]] bool enabled() const noexcept { return fraction > 0.0 && memory != nullptr; }
 };
 
 /// Per-query readahead for GPU scans.
@@ -145,6 +202,13 @@ struct readahead_counters {
 /// only moves forward -- an operator is left behind once its producer has closed
 /// and its queue is drained -- spending a @ref gatekeeper ticket on each prefetch
 /// it issues and getting it back when that IO settles.
+///
+/// Each attempt runs in two phases.  Phase 1, the device tier (only with
+/// @ref device_prefetch_options::enabled), reads the split's byte ranges straight into
+/// buffers on the split's preferred GPU; phase 2, the host tier, stages them in the pinned
+/// host cache.  Phase 2 runs whenever phase 1 does not issue: the split cannot decode from
+/// device copies, its GPU is in back-off after a memory refusal, the split is too large for
+/// the GPU's parked window or the window is full.
 ///
 /// Held by @c shared_ptr (splits report into it from their own threads) and
 /// inherits @c enable_shared_from_this so an in-flight prefetch completion can
@@ -160,23 +224,14 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// between the readahead and the executor.  Zero means the backend opts out,
   /// and @ref start is then a no-op: there is no point running a worker that may
   /// never issue anything.
+  ///
+  /// @p device configures the device tier.  When enabled, one tier is built per GPU space
+  /// of @p device.memory: a dedicated non-blocking stream, a parked window and an issuer.
+  /// Nothing else is allocated on a GPU until a split is admitted.
   readahead_scan_manager(event::query_event_publisher& publisher,
                          std::size_t budget,
-                         std::shared_ptr<shared_scan_budget> shared_budget = nullptr,
-                         std::optional<std::size_t> budget_override        = std::nullopt,
-                         std::shared_ptr<op::scan::physical_check_counters> physical_counters = {})
-    : event::query_event_subscriber(publisher,
-                                    {event::event_type::task_deployed,
-                                     event::event_type::task_queue_empty,
-                                     event::event_type::memory_downgrade_for_task,
-                                     event::event_type::wait_for_memory_for_task}),
-      _budget(budget),
-      _gatekeeper(static_cast<int>(budget)),
-      _physical_counters(std::move(physical_counters)),
-      _shared_budget(std::move(shared_budget)),
-      _budget_override(budget_override)
-  {
-  }
+                         std::shared_ptr<op::scan::physical_check_counters> physical_counters = {},
+                         device_prefetch_options device                                       = {});
   /// Stops and joins both workers -- the prefetch worker and the event subscriber.
   ~readahead_scan_manager() override;
   readahead_scan_manager(readahead_scan_manager const&)            = delete;
@@ -285,7 +340,19 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// @c fs_cache::summary uses.  Safe to call at any time; the
   /// counters are relaxed atomics and a concurrent update only means the line
   /// is a moment stale.
+  ///
+  /// The line ends with the device tier's group, printed even when the tier is off:
+  /// @code
+  /// device[prefetched=N wait_for_prefetch=N wasted=N failed=N consumed=N wrong_gpu=N
+  ///        skipped[memory=N backoff=N unsupported=N too_large=N window=N]
+  ///        MiB=N wait_ms=N parked=N]
+  /// @endcode
+  /// consumed, wrong_gpu, wait_ms (consumers' wait on a pending copy) and parked (live) are
+  /// summed over the GPUs' parked windows; MiB is the bytes landed.
   [[nodiscard]] std::string summary() const;
+
+  /// Tickets not out right now: the budget once every IO settled and returned its ticket.
+  [[nodiscard]] int available_tickets() const { return _gatekeeper.available(); }
 
  private:
   /// One split picked for prefetching, with the operator it was emitted under.
@@ -321,6 +388,45 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
                        bool covered);
 
   void arm_prefetching();
+
+  /// One GPU's device tier.  Built at construction and never resized, so any thread may look
+  /// one up; the back-off fields are the worker's alone.
+  struct device_tier {
+    cucascade::memory::memory_space* space{nullptr};
+    std::shared_ptr<op::scan::device_stream> stream;  ///< dedicated; shared with its prefetches
+    std::shared_ptr<device_window> window;            ///< shared with the release hooks
+    std::unique_ptr<device_prefetch_issuer> issuer;
+    /// Bumped by update_scan_state(disposed) for splits preferring this GPU.
+    std::atomic<std::uint64_t> disposals{0};
+    bool in_backoff{false};
+    std::uint64_t backoff_disposals{0};
+    std::chrono::steady_clock::time_point backoff_until{};
+  };
+
+  /// The tier of GPU @p device, or null when there is none.
+  [[nodiscard]] device_tier* tier_for(int device) const noexcept;
+  /// A memory refusal: skip phase 1 on this GPU until one of its splits is disposed or the
+  /// back-off timer runs out.
+  void enter_backoff(device_tier& tier) noexcept;
+  /// Whether @p tier is still in back-off; clears it once a disposal was reported or the timer
+  /// ran out.  Worker thread only.
+  [[nodiscard]] bool in_backoff(device_tier& tier) noexcept;
+  /// Phase 1 for @p candidate.  True when the device reads were issued, which hands the
+  /// candidate's ticket to the completion; false leaves the ticket with the caller.
+  [[nodiscard]] bool try_issue_device(prefetch_candidate const& candidate);
+  /// Classify and record one settled device prefetch, release the host staging under
+  /// @ref device_prefetch_options::release_host_staging, and hand its ticket back.  Runs on
+  /// whichever thread settled the last read, so it never blocks and never throws.
+  void on_device_prefetch_complete(std::size_t operator_id,
+                                   std::weak_ptr<op::scan::scan_info> const& split,
+                                   device_prefetch_result const& result) noexcept;
+
+  device_prefetch_options _device;
+  /// Indexed by device id; null where the memory manager has no GPU space.  Empty when the
+  /// device tier is off.
+  std::vector<std::unique_ptr<device_tier>> _tiers;
+  /// The parked window every tier was built with.
+  std::size_t _max_parked_splits{0};
 
   /// This query's readahead outcomes; see @ref readahead_counters.
   readahead_counters _counters;

@@ -957,3 +957,137 @@ TEST_CASE("scan inputs populate the cache without a readahead manager",
   second_input.reset();
   manager.reset(query_id);
 }
+
+// ===========================================================================
+// the device tier's phase 1
+// ===========================================================================
+
+namespace {
+
+using sirius::scan_manager::device_prefetch_options;
+using sirius::scan_manager::prefetch_outcome_kind;
+
+/// A split that can decode from device copies, placed on GPU 0.
+struct placed_device_split : sirius::op::scan::scan_info {
+  explicit placed_device_split(std::vector<fadvise_entry> hints = {})
+    : sirius::op::scan::scan_info(std::move(hints))
+  {
+    set_preferred_device(0);
+  }
+  [[nodiscard]] bool supports_device_prefetch() const noexcept override { return true; }
+};
+
+template <class Condition>
+bool eventually(Condition condition, std::chrono::seconds timeout = std::chrono::seconds(10))
+{
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  while (!condition()) {
+    if (std::chrono::steady_clock::now() >= deadline) { return false; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+/// A memory manager whose whole pinned host capacity can be reserved, so a reservation can
+/// leave the prefetching cache nothing to allocate.
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager>
+initialize_memory_manager_with_reservable_host()
+{
+  sirius::converter_registry::reset_for_testing();
+  reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(2ull << 30)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_numa_region_capacity(1ull << 30)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(1.0);
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  sirius::converter_registry::initialize();
+  return manager;
+}
+
+}  // namespace
+
+TEST_CASE("the summary carries a device group even when the tier is off",
+          "[scan_manager][readahead][counters]")
+{
+  auto sm = make_event_publisher();
+  readahead_scan_manager m{*sm, 4};
+  auto const line = m.summary();
+  INFO(line);
+  std::string const group =
+    "device[prefetched=0 wait_for_prefetch=0 wasted=0 failed=0 consumed=0 wrong_gpu=0 "
+    "skipped[memory=0 backoff=0 unsupported=0 too_large=0 window=0] MiB=0 wait_ms=0 parked=0]";
+  REQUIRE(line.size() >= group.size());
+  CHECK(line.substr(line.size() - group.size()) == group);
+}
+
+TEST_CASE("device options without a memory manager are disabled", "[scan_manager][readahead]")
+{
+  auto memory = initialize_memory_manager(1);
+  CHECK_FALSE(device_prefetch_options{}.enabled());
+  CHECK_FALSE(device_prefetch_options{.fraction = 0.6}.enabled());
+  CHECK_FALSE(device_prefetch_options{.fraction = 0.0, .memory = memory.get()}.enabled());
+  CHECK(device_prefetch_options{.fraction = 0.6, .memory = memory.get()}.enabled());
+
+  // Disabled, phase 1 never runs: not even an unsupported split is counted.
+  single_scan_query query;
+  auto sm = make_event_publisher();
+  auto m  = std::make_shared<readahead_scan_manager>(
+    *sm, 2, nullptr, device_prefetch_options{.fraction = 0.6});
+  m->prepare_for_query(query.get());
+  auto split = std::make_shared<placed_device_split>();
+  m->register_scan_task(split, 1);
+  m->start();
+  REQUIRE(eventually(
+    [&] { return m->counters().outcome(prefetch_outcome_kind::nothing_to_issue) == 1; }));
+  m->stop();
+  CHECK(m->counters().device_attempts.load() == 0);
+  CHECK(m->counters().device_skipped_unsupported.load() == 0);
+}
+
+TEST_CASE("phase 1 runs once per candidate, not once per host retry", "[scan_manager][readahead]")
+{
+  auto memory = initialize_memory_manager_with_reservable_host();
+  temp_data_file file(8ull << 20);
+  // No pool reservation of its own: every staging chunk comes out of the host space.
+  auto cfg                                  = sirius::test::dispose_on_idle_config();
+  cfg.cache.min_prefetching_budget_fraction = 0.0;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius::scan_manager::sirius_scan_manager manager{
+    scan_lifecycle, cfg, *memory, sirius::test::single_gpu_index_for_prefetch()};
+  REQUIRE(manager.io_ctx()->cache() != nullptr);
+
+  // Host-pool pressure: the rest of the host space is reserved, so the split's staging chunks
+  // can never be allocated and the host tier keeps retrying.
+  auto* host = memory->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  REQUIRE(host != nullptr);
+  auto hog = host->make_reservation_or_null(host->get_available_memory());
+  REQUIRE(hog != nullptr);
+
+  auto ds = manager.create_datasource(file.path.string());
+  REQUIRE(ds != nullptr);
+  std::vector<cudf::io::text::byte_range_info> ranges{{0, 4ll << 20}};
+  ds->fadvise(ranges, 0);
+  REQUIRE(ds->prepare_prefetch(false) == cucascade::io::prepare_result::allocation_failed);
+  auto split = std::make_shared<placed_device_split>(
+    std::vector<sirius::op::scan::scan_info::fadvise_entry>{{ds, ranges}});
+
+  // The device tier refuses the split as too large, which does not back off: a phase 1 inside
+  // the host retry loop would be attempted again on every retry.
+  single_scan_query query;
+  auto sm = make_event_publisher();
+  auto m  = std::make_shared<readahead_scan_manager>(
+    *sm, 2, nullptr, device_prefetch_options{.fraction = 1e-9, .memory = memory.get()});
+  m->prepare_for_query(query.get());
+  m->register_scan_task(split, 1);
+  m->start();
+  REQUIRE(eventually([&] { return m->counters().memory_retries.load() >= 3; }));
+  CHECK(m->counters().device_attempts.load() == 1);
+  CHECK(m->counters().device_skipped_too_large.load() == 1);
+
+  m->stop();
+  CHECK(m->counters().outcome(prefetch_outcome_kind::skipped_memory_pressure) == 1);
+  CHECK(m->counters().device_attempts.load() == 1);
+}

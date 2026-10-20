@@ -19,14 +19,20 @@
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/prefetched_ranges.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "planner/query.hpp"
 #include "planner/query_index.hpp"
 
 #include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <exception>
@@ -36,8 +42,53 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace sirius::scan_manager {
+
+readahead_scan_manager::readahead_scan_manager(
+  event::query_event_publisher& publisher,
+  std::size_t budget,
+  std::shared_ptr<op::scan::physical_check_counters> physical_counters,
+  device_prefetch_options device)
+  : event::query_event_subscriber(publisher,
+                                  {event::event_type::task_deployed,
+                                   event::event_type::task_queue_empty,
+                                   event::event_type::memory_downgrade_for_task,
+                                   event::event_type::wait_for_memory_for_task}),
+    _device(device),
+    _physical_counters(std::move(physical_counters)),
+    _budget(budget),
+    _gatekeeper(static_cast<int>(budget))
+{
+  if (!_device.enabled()) { return; }
+  using cucascade::memory::Tier;
+  auto const spaces   = _device.memory->get_memory_spaces_for_tier(Tier::GPU);
+  auto const n_spaces = std::max<std::size_t>(spaces.size(), 1);
+  _max_parked_splits  = _device.max_parked_splits > 0
+                          ? _device.max_parked_splits
+                          : std::max<std::size_t>(2, 2 * _device.pipeline_width / n_spaces);
+  for (auto const* listed : spaces) {
+    if (listed == nullptr || listed->get_device_id() < 0) { continue; }
+    auto const id = listed->get_device_id();
+    auto* space   = _device.memory->get_memory_space(Tier::GPU, id);
+    if (space == nullptr) { continue; }
+    // A GPU whose stream cannot be created keeps its splits on the host tier.
+    try {
+      auto tier    = std::make_unique<device_tier>();
+      tier->space  = space;
+      tier->stream = op::scan::device_stream::create(id);
+      tier->window = std::make_shared<device_window>();
+      tier->issuer = std::make_unique<device_prefetch_issuer>(
+        *space, tier->stream, tier->window, _device.fraction, _max_parked_splits);
+      auto const index = static_cast<std::size_t>(id);
+      if (_tiers.size() <= index) { _tiers.resize(index + 1); }
+      _tiers[index] = std::move(tier);
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN("[readahead] device tier on GPU {} disabled: {}", id, e.what());
+    }
+  }
+}
 
 readahead_scan_manager::~readahead_scan_manager() { stop(); }
 
@@ -119,6 +170,19 @@ void readahead_scan_manager::start(prefetch_strategy strategy)
   // is torn down, so a second worker could only spin without issuing anything.
   if (is_running() || _stop_source.stop_requested()) { return; }
   _strategy = strategy;
+  if (_device.enabled()) {
+    std::string gpus;
+    for (std::size_t id = 0; id < _tiers.size(); ++id) {
+      if (!_tiers[id]) { continue; }
+      gpus += std::format("{}{}", gpus.empty() ? "" : ",", id);
+    }
+    SIRIUS_LOG_INFO(
+      "[readahead] device tier: fraction={:.2f} gpus=[{}] max_parked={} release_host_staging={}",
+      _device.fraction,
+      gpus,
+      _max_parked_splits,
+      _device.release_host_staging);
+  }
   _prefetch_worker =
     std::jthread([this](const std::stop_token& st) { worker_loop(st); }, _stop_source.get_token());
   // Only now start draining the event-publisher mailbox: the hooks below arm
@@ -171,12 +235,27 @@ std::string readahead_scan_manager::summary() const
   auto const behind     = outcome(kind::skipped_fell_behind);
   auto const nothing    = outcome(kind::nothing_to_issue);
 
+  std::uint64_t consumed  = 0;
+  std::uint64_t wrong_gpu = 0;
+  std::uint64_t wait_ns   = 0;
+  std::uint64_t parked    = 0;
+  for (auto const& tier : _tiers) {
+    if (!tier) { continue; }
+    consumed += load(tier->window->consumed);
+    wrong_gpu += load(tier->window->wrong_device);
+    wait_ns += load(tier->window->wait_ns);
+    parked += load(tier->window->parked_splits);
+  }
+
   return std::format(
     "issued={}[prefetched={} wait_for_prefetch={}] "
     "skipped={}[memory_pressure={} fell_behind={} nothing_to_issue={}] "
     "candidates={}[dropped_expired={} dropped_fell_behind={}] "
     "operators_drained={} pacing[memory_retries={} idle_polls={} gate_timeouts={}] "
-    "executor_reads={}[borrowed={}]",
+    "executor_reads={}[borrowed={}] "
+    "device[prefetched={} wait_for_prefetch={} wasted={} failed={} consumed={} wrong_gpu={} "
+    "skipped[memory={} backoff={} unsupported={} too_large={} window={}] "
+    "MiB={} wait_ms={} parked={}]",
     prefetched + waited,
     prefetched,
     waited,
@@ -192,7 +271,21 @@ std::string readahead_scan_manager::summary() const
     load(_counters.idle_polls),
     load(_counters.gate_timeouts),
     load(_counters.cold_read_tickets),
-    load(_counters.borrowed));
+    load(_counters.borrowed),
+    outcome(kind::device_prefetched),
+    outcome(kind::device_wait_for_prefetch),
+    outcome(kind::device_wasted),
+    outcome(kind::device_failed),
+    consumed,
+    wrong_gpu,
+    load(_counters.device_skipped_memory),
+    load(_counters.device_skipped_backoff),
+    load(_counters.device_skipped_unsupported),
+    load(_counters.device_skipped_too_large),
+    load(_counters.device_skipped_window),
+    load(_counters.device_bytes) >> 20,
+    wait_ns / 1'000'000,
+    parked);
 }
 
 bool readahead_scan_manager::is_running() const noexcept
@@ -261,6 +354,12 @@ void readahead_scan_manager::update_scan_state(std::size_t,
   if (stage == cucascade::io::cache::scan_stage::disposed) {
     // The read is over, so give the ticket back -- paying down any debt first.
     if (split->give_back_readahead_ticket()) { _gatekeeper.release(); }
+    // A disposal frees memory on the split's GPU, which ends that GPU's device back-off.
+    if (auto const device = split->preferred_device()) {
+      if (auto* tier = tier_for(*device)) {
+        tier->disposals.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
     {
       std::lock_guard lock(_disposable_mutex);
       ++_disposable_generation;
@@ -364,6 +463,137 @@ void readahead_scan_manager::on_prefetch_complete(split_key const& split,
   _gatekeeper.release();
 }
 
+readahead_scan_manager::device_tier* readahead_scan_manager::tier_for(int device) const noexcept
+{
+  if (device < 0 || static_cast<std::size_t>(device) >= _tiers.size()) { return nullptr; }
+  return _tiers[static_cast<std::size_t>(device)].get();
+}
+
+void readahead_scan_manager::enter_backoff(device_tier& tier) noexcept
+{
+  tier.in_backoff        = true;
+  tier.backoff_disposals = tier.disposals.load(std::memory_order_relaxed);
+  tier.backoff_until     = std::chrono::steady_clock::now() + _device.backoff;
+}
+
+bool readahead_scan_manager::in_backoff(device_tier& tier) noexcept
+{
+  if (!tier.in_backoff) { return false; }
+  if (tier.disposals.load(std::memory_order_relaxed) != tier.backoff_disposals ||
+      std::chrono::steady_clock::now() >= tier.backoff_until) {
+    tier.in_backoff = false;
+    return false;
+  }
+  return true;
+}
+
+bool readahead_scan_manager::try_issue_device(prefetch_candidate const& candidate)
+{
+  auto const& task  = candidate.task;
+  auto const device = task->preferred_device();
+  auto* tier        = device ? tier_for(*device) : nullptr;
+  if (tier == nullptr || !task->supports_device_prefetch()) {
+    _counters.device_skipped_unsupported.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (in_backoff(*tier)) {
+    _counters.device_skipped_backoff.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  _counters.device_attempts.fetch_add(1, std::memory_order_relaxed);
+
+  auto outcome = device_prefetch_issue::error;
+  try {
+    outcome = tier->issuer->issue(
+      task,
+      [weak = weak_from_this(), op_id = candidate.operator_id, split = std::weak_ptr{task}](
+        device_prefetch_result result) noexcept {
+        // weak, not shared: a completion firing after the query tore the manager down must not
+        // resurrect it.
+        if (auto self = weak.lock()) { self->on_device_prefetch_complete(op_id, split, result); }
+      });
+  } catch (std::exception const& e) {
+    // Building the callback may allocate; issue() itself reports failures as outcomes.
+    SIRIUS_LOG_WARN("[readahead] device prefetch attempt abandoned: {}", e.what());
+    return false;
+  }
+
+  switch (outcome) {
+    case device_prefetch_issue::issued: return true;
+    case device_prefetch_issue::memory:
+      _counters.device_skipped_memory.fetch_add(1, std::memory_order_relaxed);
+      enter_backoff(*tier);
+      return false;
+    case device_prefetch_issue::too_large:
+      _counters.device_skipped_too_large.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    case device_prefetch_issue::window_full:
+      _counters.device_skipped_window.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    case device_prefetch_issue::unsupported:
+      _counters.device_skipped_unsupported.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    // The host tier's first check records an overtaken split itself.
+    case device_prefetch_issue::fell_behind:
+    case device_prefetch_issue::no_ranges:
+    case device_prefetch_issue::error: return false;
+  }
+  return false;
+}
+
+void readahead_scan_manager::on_device_prefetch_complete(
+  std::size_t,
+  std::weak_ptr<op::scan::scan_info> const& split,
+  device_prefetch_result const& result) noexcept
+{
+  using cucascade::io::cache::scan_stage;
+  using kind      = prefetch_outcome_kind;
+  auto const task = split.lock();
+  if (!result.ok) {
+    // Back to attempted, so the consumer's own read is charged a ticket.
+    if (task) {
+      std::ignore =
+        task->compare_exchange_prefetch_state(op::scan::scan_info::prefetch_state::prefetched,
+                                              op::scan::scan_info::prefetch_state::attempted);
+    }
+    _counters.record(kind::device_failed);
+  } else {
+    _counters.device_bytes.fetch_add(result.bytes, std::memory_order_relaxed);
+    auto const stage = task ? task->get_scan_stage() : scan_stage::disposed;
+    _counters.record(!task || stage == scan_stage::disposed ? kind::device_wasted
+                     : stage == scan_stage::reading         ? kind::device_wait_for_prefetch
+                                                            : kind::device_prefetched);
+  }
+
+  // The split's bytes are on the device, so its host staging will not be read again: dispose
+  // the cache requests now (the handles' consumer stage only; the split's own stage belongs to
+  // its consumer) and kick each evictor once, without waiting for it.
+  if (result.ok && _device.release_host_staging && task) {
+    std::array<cucascade::io::cache::fs_cache*, 4> kicked{};
+    std::size_t n_kicked = 0;
+    auto const kick      = [&](cucascade::io::cache::fs_cache* cache) {
+      if (std::find(kicked.begin(), kicked.begin() + n_kicked, cache) !=
+          kicked.begin() + n_kicked) {
+        return;
+      }
+      if (n_kicked < kicked.size()) { kicked[n_kicked++] = cache; }
+      cache->evict(std::max<std::size_t>(result.bytes, 1));
+    };
+    for (auto const& ds : task->datasources()) {
+      // Releasing staging early is an optimisation: a failure here must not escape.
+      try {
+        if (!ds || !ds->uses_fs_cache()) { continue; }
+        ds->update(scan_stage::disposed);
+        if (auto* cache = ds->io_ctx()->cache()) { kick(cache); }
+      } catch (...) {
+      }
+    }
+  }
+
+  // Pairs with the acquire in worker_loop: exactly once per issued device attempt.
+  _gatekeeper.release();
+}
+
 void readahead_scan_manager::worker_loop(const std::stop_token& st)
 {
   // Bounds how long a stop can go unnoticed if it races the wait; a stop that
@@ -371,10 +601,26 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
   constexpr auto k_slot_wait = std::chrono::milliseconds{100};
   // Back-off when the order has nothing to prefetch right now.
   constexpr auto k_idle_wait = std::chrono::milliseconds{10};
+  // Bound the wait for a disposal notification. The timeout is also a recovery
+  // path for a coalesced or missed notification.
+  constexpr auto k_memory_retry = std::chrono::milliseconds{25};
 
-  enum class issue_result { issued, finished, memory_pressure };
-  auto try_issue =
-    [&](prefetch_candidate const& candidate, bool delayed_retry, bool& slot_transferred) {
+  // Prepare a candidate and, if that succeeds, issue its IO.  Returns whether
+  // the prefetch was issued -- which is also whether the completion has taken
+  // ownership of the slot.
+  auto try_issue = [&](prefetch_candidate const& candidate) {
+    // Phase 1, the device tier: once per candidate, never once per host retry.  The ticket is
+    // still ours unless it issued.
+    //
+    // The device tier may run this manager although no backend of the query has an fs_cache.
+    // The host loop then finds nothing to stage (prepare_for_prefetching returns {0, 0, 0}) and
+    // records nothing_to_issue without entering the memory-retry wait: it must never assume a
+    // cache exists, and a phase-1 refusal is not retried.
+    if (_device.enabled() && try_issue_device(candidate)) { return true; }
+
+    // Phase 2, the host tier.
+    bool evict_on_failure = false;
+    while (!st.stop_requested()) {
       if (candidate.task->has_fallen_behind()) {
         _counters.record(prefetch_outcome_kind::skipped_fell_behind);
         return issue_result::finished;
