@@ -20,6 +20,8 @@
 #include <helper/logical_type.hpp>
 #include <memory/size_arithmetic.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/parquet_materialize.hpp>
+#include <op/scan/prefetched_ranges.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/table_scan/parquet_physical_profile.hpp>
@@ -228,6 +230,20 @@ class parquet_split_info : public scan_info {
   /// Whether the scan plan needs post-decode assembly (hive partition
   /// injection or column reordering). Mirrors @c needs_output_assembly(*plan).
   bool needs_assembly = false;
+  /// Stamped by the coalescer from parquet_gpu_ingestible::device_prefetch_allowed(); false for
+  /// iceberg splits (position-matched deletes need file-order rows from a pushdown-suppressed
+  /// decode; the device route is not validated for that pipeline in this change).
+  bool device_prefetch_allowed{true};
+
+  /// Allowed, at least one slice, every slice with a datasource, row groups and column-chunk
+  /// ranges, and no user virtual columns (that path decodes per row group through read_parquet).
+  [[nodiscard]] bool supports_device_prefetch() const noexcept override;
+
+  /// Map a device-tier prefetch (entries parallel to fadvise_hints(): the slices with a datasource
+  /// and ranges, in rg_slices order) onto rg_slices: one span list per slice, empty for a slice
+  /// without ranges.  nullopt when the entries do not line up (count, chunks per slice, sizes).
+  [[nodiscard]] std::optional<std::vector<prefetched_chunk_spans>> prefetched_spans_per_slice(
+    std::span<prefetched_ranges::device_ranges const> entries) const noexcept;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {
@@ -429,6 +445,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   {
     return _filter_analysis;
   }
+
+ protected:
+  /// Whether this ingestible's splits may be read ahead onto a GPU by the readahead's device tier
+  /// and decoded from there; stamped on every split as parquet_split_info::device_prefetch_allowed.
+  [[nodiscard]] virtual bool device_prefetch_allowed() const noexcept { return true; }
 
  private:
   /// Read one file's footer, prune its row groups against the file's byte ranges

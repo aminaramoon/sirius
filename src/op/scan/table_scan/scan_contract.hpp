@@ -211,6 +211,10 @@ struct physical_check_counters {
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};
   std::atomic<uint64_t> iceberg_inventory_bytes_peak{0};
+  /// Parquet splits decoded from a device-tier prefetch, and device-route decodes that failed
+  /// (other than out of memory) and were read again through the general route.
+  std::atomic<uint64_t> device_route_decodes{0};
+  std::atomic<uint64_t> device_route_fallbacks{0};
 
   // Installed before a test query, cleared only after its workers have joined.
   // true = before footer processing, false = after successful cuDF decode.

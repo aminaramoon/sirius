@@ -1495,7 +1495,11 @@ TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
     auto const& set = splits[i]->dependencies().front().delete_set;
     REQUIRE(set);
     CHECK(set->positions.empty() == (i == 1));
-    CHECK(dynamic_cast<parquet_split_info const&>(*splits[i]).disable_filter_pushdown == (i == 0));
+    auto const& split = dynamic_cast<parquet_split_info const&>(*splits[i]);
+    CHECK(split.disable_filter_pushdown == (i == 0));
+    // Iceberg splits never take the device-tier readahead, with or without deletes.
+    CHECK_FALSE(split.device_prefetch_allowed);
+    CHECK_FALSE(split.supports_device_prefetch());
   }
   coalescer.reset();
   ingestible.reset();

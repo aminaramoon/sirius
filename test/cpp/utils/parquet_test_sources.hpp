@@ -22,8 +22,6 @@
  *        parquet materialize routes.
  */
 
-#include <catch.hpp>
-
 #include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -35,6 +33,7 @@
 
 #include <cuda/stream>
 
+#include <catch.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/io_context.hpp>
