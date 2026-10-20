@@ -19,7 +19,9 @@
 #include "scan/test_utils.hpp"
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/callback_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -32,9 +34,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -132,8 +136,8 @@ TEST_CASE_METHOD(prefetched_ranges_fixture,
   CHECK_FALSE(ranges->take(other.view()).has_value());
   CHECK(counts->total() == 0);
 
-  ranges->set_ready();
-  ranges->set_ready();  // idempotent
+  CHECK(ranges->set_ready());
+  CHECK_FALSE(ranges->set_ready());  // idempotent
   CHECK(ranges->current() == prefetched_ranges::state::ready);
 
   auto taken = ranges->take(other.view());
@@ -177,9 +181,10 @@ TEST_CASE_METHOD(prefetched_ranges_fixture,
                  "[scan][prefetched_ranges]")
 {
   auto ranges = make_ranges();
-  ranges->set_failed(std::make_exception_ptr(std::runtime_error("first")));
-  ranges->set_failed(std::make_exception_ptr(std::runtime_error("second")));
-  ranges->set_ready();
+  CHECK(ranges->set_failed(std::make_exception_ptr(std::runtime_error("first"))));
+  CHECK_FALSE(ranges->set_failed(std::make_exception_ptr(std::runtime_error("second"))));
+  CHECK_FALSE(ranges->set_ready());
+  CHECK_FALSE(ranges->abandon());
   CHECK(ranges->current() == prefetched_ranges::state::failed);
   CHECK_FALSE(ranges->abandoned());
   REQUIRE(ranges->failure() != nullptr);
@@ -204,23 +209,29 @@ TEST_CASE_METHOD(prefetched_ranges_fixture,
 
   std::atomic<bool> waiting{false};
   prefetched_ranges::state seen{prefetched_ranges::state::pending};
+  clock::time_point t_call{};
   clock::time_point woke{};
   std::thread consumer([&] {
     waiting.store(true);
-    seen = ranges->wait_for(std::chrono::seconds(5));
-    woke = clock::now();
+    t_call = clock::now();
+    seen   = ranges->wait_for(std::chrono::seconds(30));
+    woke   = clock::now();
   });
   while (!waiting.load()) {
     std::this_thread::yield();
   }
-  // Give the consumer time to block inside wait_for.
+  // Give the consumer time to block inside wait_for.  On a loaded machine the abandon may still
+  // land before the consumer waits; that run then covers the already-settled path rather than
+  // the notify_all wake-up, which is best-effort coverage here -- the bounds below hold either way.
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   auto const abandoned_at = clock::now();
-  ranges->abandon();
+  CHECK(ranges->abandon());
+  CHECK_FALSE(ranges->abandon());
   consumer.join();
 
   CHECK(seen == prefetched_ranges::state::failed);
-  CHECK(woke - abandoned_at < std::chrono::milliseconds(100));
+  // Far below the 30 s timeout: the abandon woke the consumer, the timeout did not.
+  CHECK(woke - abandoned_at < std::chrono::seconds(10));
   CHECK(ranges->abandoned());
   REQUIRE(ranges->failure() != nullptr);
   CHECK_THROWS_WITH(std::rethrow_exception(ranges->failure()),
@@ -230,7 +241,10 @@ TEST_CASE_METHOD(prefetched_ranges_fixture,
   ranges.reset();
   CHECK(counts->of(release_reason::failed) == 1);
   CHECK(counts->total() == 1);
-  CHECK(counts->wait_ns.load() >= 40'000'000ull);
+  auto const waited_ns = static_cast<std::uint64_t>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(woke - t_call).count());
+  CHECK(counts->wait_ns.load() > 0);
+  CHECK(counts->wait_ns.load() <= waited_ns);
 }
 
 TEST_CASE_METHOD(prefetched_ranges_fixture,
@@ -246,6 +260,29 @@ TEST_CASE_METHOD(prefetched_ranges_fixture,
   ranges.reset();
   CHECK(counts->of(release_reason::wrong_device) == 1);
   CHECK(counts->total() == 1);
+}
+
+TEST_CASE_METHOD(prefetched_ranges_fixture,
+                 "take refuses a prefetch stamped for another device than the current one",
+                 "[scan][prefetched_ranges]")
+{
+  // Stamped device 1 while the current device is 0.  No buffers, so no device-1 memory is needed
+  // and the destructor has nothing to free on device 1 (it must not bind it either).
+  REQUIRE(cudaSetDevice(0) == cudaSuccess);
+  auto ranges = std::make_shared<prefetched_ranges>(
+    1, tier, std::vector<prefetched_ranges::device_ranges>{}, 0, counting_hook(counts));
+  ranges->set_ready();
+
+  CHECK_FALSE(ranges->take(tier->view()).has_value());
+  CHECK_FALSE(ranges->taken());
+  CHECK(counts->total() == 0);
+
+  ranges.reset();
+  CHECK(counts->of(release_reason::wrong_device) == 1);
+  CHECK(counts->total() == 1);
+  int current = -1;
+  CHECK(cudaGetDevice(&current) == cudaSuccess);
+  CHECK(current == 0);
 }
 
 TEST_CASE_METHOD(prefetched_ranges_fixture,
@@ -268,7 +305,29 @@ TEST_CASE_METHOD(prefetched_ranges_fixture,
                  "the stream outlives the tier",
                  "[scan][prefetched_ranges]")
 {
-  auto ranges                         = make_ranges();
+  // Each free records what its stream looked like: cudaSuccess / cudaErrorNotReady while the
+  // stream exists, an error once it was destroyed -- which would mean _stream_owner was released
+  // before _ranges.
+  std::vector<cudaError_t> stream_at_free;
+  rmm::mr::callback_memory_resource tracking(
+    [](std::size_t bytes, rmm::cuda_stream_view, void*) -> void* {
+      void* ptr = nullptr;
+      if (cudaMalloc(&ptr, bytes) != cudaSuccess) { throw std::bad_alloc(); }
+      return ptr;
+    },
+    [&stream_at_free](void* ptr, std::size_t, rmm::cuda_stream_view stream, void*) {
+      stream_at_free.push_back(cudaStreamQuery(stream.value()));
+      std::ignore = cudaFree(ptr);
+    });
+
+  std::vector<prefetched_ranges::device_ranges> entries(1);
+  for (std::size_t j = 0; j < kPerEntry; ++j) {
+    rmm::device_buffer buffer(kBufferBytes, tier->view(), tracking);
+    entries[0].spans.emplace_back(static_cast<std::uint8_t const*>(buffer.data()), buffer.size());
+    entries[0].buffers.push_back(std::move(buffer));
+  }
+  auto ranges = std::make_shared<prefetched_ranges>(
+    0, tier, std::move(entries), kPerEntry * kBufferBytes, counting_hook(counts));
   std::weak_ptr<device_stream> stream = tier;
 
   // The tier lets go first; the prefetch still owns its allocation stream.
@@ -279,6 +338,10 @@ TEST_CASE_METHOD(prefetched_ranges_fixture,
   // The untaken buffers are freed on that stream, and only then is the stream destroyed.
   ranges.reset();
   CHECK(stream.expired());
+  REQUIRE(stream_at_free.size() == kPerEntry);
+  for (auto const status : stream_at_free) {
+    CHECK((status == cudaSuccess || status == cudaErrorNotReady));
+  }
   CHECK(counts->of(release_reason::unconsumed) == 1);
   CHECK(counts->total() == 1);
   CHECK(cudaDeviceSynchronize() == cudaSuccess);

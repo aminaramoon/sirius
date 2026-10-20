@@ -18,6 +18,9 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <cuda_runtime_api.h>
+
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -36,11 +39,29 @@ std::shared_ptr<device_stream> device_stream::create(int device)
   return owner;
 }
 
+namespace {
+
+/// Binds @p device into @p bind (left empty when the switch fails).  Destructors use it: a failed
+/// device switch must not terminate the process, and the frees that follow are still attempted.
+void try_bind_device(std::optional<rmm::cuda_set_device_raii>& bind, int device) noexcept
+{
+  try {
+    bind.emplace(rmm::cuda_device_id{device});
+  } catch (...) {
+    bind.reset();
+  }
+}
+
+}  // namespace
+
 device_stream::~device_stream()
 {
   if (!stream) { return; }
-  // A stream belongs to the device it was created on; destroy it there.
-  rmm::cuda_set_device_raii bind{rmm::cuda_device_id{device}};
+  // A stream belongs to the device it was created on; destroy it there, after the work still
+  // queued on it (stream-ordered frees of the buffers it allocated) has finished.
+  std::optional<rmm::cuda_set_device_raii> bind;
+  try_bind_device(bind, device);
+  stream->synchronize_no_throw();
   stream.reset();
 }
 
@@ -69,9 +90,11 @@ prefetched_ranges::~prefetched_ranges()
                                                                       : release_reason::unconsumed;
     fire_release(reason);
   }
+  if (_ranges.empty()) { return; }
   // Frees are stream-ordered on each buffer's stream -- the allocation stream, still alive
   // because _stream_owner is destroyed after this body -- and belong to the buffers' device.
-  rmm::cuda_set_device_raii bind{rmm::cuda_device_id{_device_id}};
+  std::optional<rmm::cuda_set_device_raii> bind;
+  try_bind_device(bind, _device_id);
   _ranges.clear();
 }
 
@@ -80,6 +103,10 @@ bool prefetched_ranges::settle(state next, std::exception_ptr error, bool abando
   {
     std::lock_guard lock(_mutex);
     if (_state != state::pending) { return false; }
+    if (abandoned) {
+      error = std::make_exception_ptr(
+        std::runtime_error("device prefetch abandoned: consumer overtook the readahead"));
+    }
     _state     = next;
     _failure   = std::move(error);
     _abandoned = abandoned;
@@ -88,20 +115,14 @@ bool prefetched_ranges::settle(state next, std::exception_ptr error, bool abando
   return true;
 }
 
-void prefetched_ranges::set_ready() noexcept { settle(state::ready, nullptr, false); }
+bool prefetched_ranges::set_ready() noexcept { return settle(state::ready, nullptr, false); }
 
-void prefetched_ranges::set_failed(std::exception_ptr error) noexcept
+bool prefetched_ranges::set_failed(std::exception_ptr error) noexcept
 {
-  settle(state::failed, std::move(error), false);
+  return settle(state::failed, std::move(error), false);
 }
 
-void prefetched_ranges::abandon() noexcept
-{
-  settle(state::failed,
-         std::make_exception_ptr(
-           std::runtime_error("device prefetch abandoned: consumer overtook the readahead")),
-         true);
-}
+bool prefetched_ranges::abandon() noexcept { return settle(state::failed, nullptr, true); }
 
 prefetched_ranges::state prefetched_ranges::wait_for(std::chrono::milliseconds timeout) const
 {
@@ -145,6 +166,12 @@ void prefetched_ranges::flag_wrong_device() noexcept
 std::optional<std::vector<prefetched_ranges::device_ranges>> prefetched_ranges::take(
   rmm::cuda_stream_view consumer_stream)
 {
+  // The returned buffers are freed on the caller's current device: refuse any other.
+  int current_device = -1;
+  if (cudaGetDevice(&current_device) != cudaSuccess || current_device != _device_id) {
+    flag_wrong_device();
+    return std::nullopt;
+  }
   std::vector<device_ranges> out;
   {
     std::lock_guard lock(_mutex);
@@ -184,6 +211,8 @@ void prefetched_ranges::fire_release(release_reason reason) noexcept
   if (!_on_release) { return; }
   _on_release(release_event{
     .reason = reason, .bytes = _total_bytes, .wait_ns = _wait_ns.load(std::memory_order_relaxed)});
+  // Drop the hook's captures (the per-device window) now rather than with this object.
+  _on_release = nullptr;
 }
 
 }  // namespace sirius::op::scan
