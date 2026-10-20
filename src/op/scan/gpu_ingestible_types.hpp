@@ -257,9 +257,10 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     return _prefetched;
   }
 
-  /// Consume the slot: the caller now owns the only split-side reference.  Const: split-owned
-  /// bookkeeping reached through the const scan_info the consumer is handed (like the readahead
-  /// ticket flag); the slot members are mutable.
+  /// Consume the slot: the caller now owns the only split-side reference.  Const because the
+  /// consumer only has a const view (materialize_metadata_to_table takes `scan_info const&`); the
+  /// slot is split-owned bookkeeping like the readahead ticket flag, so its members are mutable
+  /// and no const_cast is needed.
   [[nodiscard]] std::shared_ptr<prefetched_ranges> take_prefetched_ranges() const noexcept
   {
     std::lock_guard lock(_prefetched_mutex);

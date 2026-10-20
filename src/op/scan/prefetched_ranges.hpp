@@ -101,19 +101,24 @@ class prefetched_ranges {
   prefetched_ranges& operator=(prefetched_ranges const&) = delete;
 
   // ---- producer side (readahead worker / IO completion thread; noexcept, host-only) ----
+  //
+  // Each transition leaves pending at most once and returns whether this call made it.  The
+  // caller must hold a reference (shared_ptr) for the duration of the call: a waiter woken by the
+  // transition may drop its own reference right away.  The producer and the waiter both do.
 
   /// pending -> ready; idempotent.
-  void set_ready() noexcept;
+  bool set_ready() noexcept;
   /// pending -> failed; keeps the first error.
-  void set_failed(std::exception_ptr error) noexcept;
+  bool set_failed(std::exception_ptr error) noexcept;
   /// pending -> failed with "device prefetch abandoned: consumer overtook the readahead" and the
   /// abandoned flag, so a consumer already waiting wakes at once and reads for itself.
-  void abandon() noexcept;
+  bool abandon() noexcept;
 
   // ---- consumer side (pipeline thread) ----
 
   /// Blocks until the state leaves pending or @p timeout passes; returns the state seen and
-  /// accumulates the time spent for the release event.
+  /// accumulates the time spent for the release event.  The caller must hold a reference
+  /// (shared_ptr) while it waits.
   [[nodiscard]] state wait_for(std::chrono::milliseconds timeout) const;
   [[nodiscard]] state current() const noexcept;
   [[nodiscard]] std::exception_ptr failure() const noexcept;
@@ -127,6 +132,12 @@ class prefetched_ranges {
   /// deallocation stream to it.  Only when ready, exactly once, and not flagged wrong_device
   /// (otherwise nullopt).  Fires the hook with reason consumed.  The returned spans stay valid
   /// while the returned buffers live.
+  ///
+  /// Device contract: the calling thread's current device must be device_id() both here and when
+  /// the returned buffers are destroyed -- rmm::device_buffer's destructor frees on the current
+  /// device without binding its own.  Check device_id() first and flag_wrong_device() on a
+  /// mismatch; as a guard, a call made on another current device flags wrong_device itself and
+  /// returns nullopt.
   [[nodiscard]] std::optional<std::vector<device_ranges>> take(
     rmm::cuda_stream_view consumer_stream);
   [[nodiscard]] bool taken() const noexcept;
@@ -140,6 +151,7 @@ class prefetched_ranges {
   /// Exactly once (the _released exchange decides who reports).
   void fire_release(release_reason reason) noexcept;
   /// Leaves pending for @p next under the mutex; false when the state had already left it.
+  /// With @p abandoned the abandon error is built here, only when the transition happens.
   bool settle(state next, std::exception_ptr error, bool abandoned) noexcept;
 
   int _device_id;
