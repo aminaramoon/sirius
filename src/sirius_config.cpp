@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -389,7 +390,12 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("readahead_strategy", opt.readahead_strategy);
   r.optional(
     "device_prefetching_fraction", opt.device_prefetching_fraction, yaml::fraction<double>{});
-  r.optional("device_prefetch_max_splits", opt.device_prefetch_max_splits);
+  {
+    // Read signed, so a negative count is rejected instead of wrapping to a huge window.
+    auto max_splits = static_cast<std::int64_t>(opt.device_prefetch_max_splits);
+    r.optional("device_prefetch_max_splits", max_splits, yaml::greater_than<std::int64_t>{-1});
+    opt.device_prefetch_max_splits = static_cast<std::size_t>(max_splits);
+  }
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (r.optional_node("kvikio")) {

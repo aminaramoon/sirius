@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <exception>
 #include <format>
@@ -197,6 +198,8 @@ void readahead_scan_manager::start(prefetch_strategy strategy)
 
 void readahead_scan_manager::stop() noexcept
 {
+  // Joining the worker from the worker would deadlock: see the class comment.
+  assert(_prefetch_worker.get_id() != std::this_thread::get_id());
   // First, so no hook can be dispatched into this object -- or re-arm the
   // prefetching we are about to tear down -- while the rest of teardown runs.
   event::query_event_subscriber::stop();
@@ -206,17 +209,15 @@ void readahead_scan_manager::stop() noexcept
   // only buy a prefetch that is about to be abandoned.
   _gatekeeper.stop();
   if (_prefetch_worker.joinable()) { _prefetch_worker.join(); }
-  // Give in-flight prefetches a moment to return their tickets, so the summary
-  // below describes a settled query.  Draining is about tickets coming back
-  // rather than going out, so the stop above does not cut it short -- but it is
-  // bounded anyway: an IO that never completes must not hold up teardown.
-  //
-  // Only worth waiting on if the gate was ever armed.  Unarmed it holds no
-  // tickets to hand out and so has none outstanding, but it still reads as
-  // undrained (nothing was ever handed out to come back), and waiting on that
-  // would spend the full timeout for nothing.
-  if (_prefetching_started.load(std::memory_order_relaxed)) {
-    std::ignore = _gatekeeper.wait_for_all(std::chrono::milliseconds{200});
+  // Give in-flight device prefetches a moment to return their tickets, so the summary
+  // below describes a settled query (the stopped gatekeeper gives up every wait at once,
+  // so it cannot drain for us).  Bounded: an IO that never completes must not hold up
+  // teardown.
+  constexpr auto k_device_drain = std::chrono::milliseconds{200};
+  auto const deadline           = std::chrono::steady_clock::now() + k_device_drain;
+  while (_device_inflight.load(std::memory_order_acquire) > 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
   // One line per query, on the way down: the manager is per-query, so this is
   // the last moment its counters describe a whole query and nothing else.
@@ -355,9 +356,11 @@ void readahead_scan_manager::update_scan_state(std::size_t,
     // The read is over, so give the ticket back -- paying down any debt first.
     if (split->give_back_readahead_ticket()) { _gatekeeper.release(); }
     // A disposal frees memory on the split's GPU, which ends that GPU's device back-off.
-    if (auto const device = split->preferred_device()) {
-      if (auto* tier = tier_for(*device)) {
-        tier->disposals.fetch_add(1, std::memory_order_relaxed);
+    if (!_tiers.empty()) {
+      if (auto const device = split->preferred_device()) {
+        if (auto* tier = tier_for(*device)) {
+          tier->disposals.fetch_add(1, std::memory_order_relaxed);
+        }
       }
     }
     {
@@ -502,6 +505,8 @@ bool readahead_scan_manager::try_issue_device(prefetch_candidate const& candidat
   }
   _counters.device_attempts.fetch_add(1, std::memory_order_relaxed);
 
+  // Before issue(): the completion may run, and lower it, before issue() returns.
+  _device_inflight.fetch_add(1, std::memory_order_relaxed);
   auto outcome = device_prefetch_issue::error;
   try {
     outcome = tier->issuer->issue(
@@ -514,10 +519,14 @@ bool readahead_scan_manager::try_issue_device(prefetch_candidate const& candidat
       });
   } catch (std::exception const& e) {
     // Building the callback may allocate; issue() itself reports failures as outcomes.
+    _device_inflight.fetch_sub(1, std::memory_order_release);
     SIRIUS_LOG_WARN("[readahead] device prefetch attempt abandoned: {}", e.what());
     return false;
   }
 
+  if (outcome != device_prefetch_issue::issued) {
+    _device_inflight.fetch_sub(1, std::memory_order_release);
+  }
   switch (outcome) {
     case device_prefetch_issue::issued: return true;
     case device_prefetch_issue::memory:
@@ -567,7 +576,9 @@ void readahead_scan_manager::on_device_prefetch_complete(
 
   // The split's bytes are on the device, so its host staging will not be read again: dispose
   // the cache requests now (the handles' consumer stage only; the split's own stage belongs to
-  // its consumer) and kick each evictor once, without waiting for it.
+  // its consumer) and kick each evictor once, without waiting for it.  The cache behind
+  // io_ctx()->cache() is alive here: it is shut down only with the scan manager, after every
+  // query drained, and the split being alive means its query is still running.
   if (result.ok && _device.release_host_staging && task) {
     std::array<cucascade::io::cache::fs_cache*, 4> kicked{};
     std::size_t n_kicked = 0;
@@ -592,6 +603,8 @@ void readahead_scan_manager::on_device_prefetch_complete(
 
   // Pairs with the acquire in worker_loop: exactly once per issued device attempt.
   _gatekeeper.release();
+  // After the release: stop() waits on this for the ticket.
+  _device_inflight.fetch_sub(1, std::memory_order_release);
 }
 
 void readahead_scan_manager::worker_loop(const std::stop_token& st)

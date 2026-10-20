@@ -212,7 +212,10 @@ struct device_prefetch_options {
 ///
 /// Held by @c shared_ptr (splits report into it from their own threads) and
 /// inherits @c enable_shared_from_this so an in-flight prefetch completion can
-/// find the manager again without keeping it alive.
+/// find the manager again without keeping it alive.  @ref stop must run before the
+/// owner drops the last reference: a completion takes a transient strong reference
+/// while it runs, and if that one became the last, the destructor would run on an IO
+/// or worker thread and join the worker from inside it.
 class readahead_scan_manager : public std::enable_shared_from_this<readahead_scan_manager>,
                                public event::query_event_subscriber {
  public:
@@ -320,6 +323,9 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   /// Request the worker to stop and join it.  Terminal: subsequent @ref start
   /// calls are no-ops.  Safe to call when not started, and safe to call twice.
+  /// Never from the worker thread itself (it joins the worker).  Waits, bounded,
+  /// for issued device prefetches to settle, so their tickets are back and the
+  /// summary describes a settled query.
   void stop() noexcept;
 
   /// The rule behind @ref prefetch_outcome_kind, a pure function so it can be
@@ -352,7 +358,7 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   [[nodiscard]] std::string summary() const;
 
   /// Tickets not out right now: the budget once every IO settled and returned its ticket.
-  [[nodiscard]] int available_tickets() const { return _gatekeeper.available(); }
+  [[nodiscard]] int available_tickets_for_testing() const { return _gatekeeper.available(); }
 
  private:
   /// One split picked for prefetching, with the operator it was emitted under.
@@ -427,6 +433,10 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   std::vector<std::unique_ptr<device_tier>> _tiers;
   /// The parked window every tier was built with.
   std::size_t _max_parked_splits{0};
+  /// Device attempts handed to an issuer and not yet settled: raised before issue(), lowered
+  /// when it did not issue or when the completion has released the ticket.  @ref stop waits on
+  /// it, because the gatekeeper's own drain is cut short once the gate is stopped.
+  std::atomic<int> _device_inflight{0};
 
   /// This query's readahead outcomes; see @ref readahead_counters.
   readahead_counters _counters;

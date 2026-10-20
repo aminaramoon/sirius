@@ -144,45 +144,45 @@ std::uint64_t outcomes(readahead_scan_manager const& m, prefetch_outcome_kind ki
 
 }  // namespace
 
-TEST_CASE_METHOD(two_gpu_fixture,
-                 "two splits stamped on GPU 0 and GPU 1 land on their own devices",
-                 "[multi_gpu][scan_manager][device_prefetch]")
+TEST_CASE("two splits stamped on GPU 0 and GPU 1 land on their own devices",
+          "[multi_gpu][scan_manager][device_prefetch]")
 {
+  // Skip before building the fixture: it constructs a two-GPU memory manager.
   if (!sirius::test::has_gpus(2)) { return; }
-  auto ra    = readahead();
-  auto first = on_gpu(0);
-  auto other = on_gpu(1);
+  two_gpu_fixture fx;
+  auto ra    = fx.readahead();
+  auto first = fx.on_gpu(0);
+  auto other = fx.on_gpu(1);
   ra->register_scan_task(first, 1);
   ra->register_scan_task(other, 1);
   ra->start();
   REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 2; }));
   CHECK(ra->counters().device_attempts.load() == 2);
 
-  require_landed_on(*first, 0);
-  require_landed_on(*other, 1);
+  two_gpu_fixture::require_landed_on(*first, 0);
+  two_gpu_fixture::require_landed_on(*other, 1);
 
   ra->stop();
-  CHECK(eventually([&] { return ra->available_tickets() == 2; }));
+  CHECK(eventually([&] { return ra->available_tickets_for_testing() == 2; }));
   auto const line = ra->summary();
   INFO(line);
   CHECK(line.find(" consumed=2 ") != std::string::npos);
   CHECK(line.find(" parked=0]") != std::string::npos);
 }
 
-TEST_CASE_METHOD(two_gpu_fixture,
-                 "back-off on GPU 0 does not suppress GPU 1",
-                 "[multi_gpu][scan_manager][device_prefetch]")
+TEST_CASE("back-off on GPU 0 does not suppress GPU 1", "[multi_gpu][scan_manager][device_prefetch]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
-  auto* space0 = memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  two_gpu_fixture fx;
+  auto* space0 = fx.memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space0 != nullptr);
   auto hog = space0->make_reservation_or_null(space0->get_max_memory() - 1 * MiB);
   REQUIRE(hog != nullptr);
 
-  auto ra      = readahead(std::chrono::hours(1));
-  auto refused = on_gpu(0);
-  auto waiting = on_gpu(0);
-  auto landed  = on_gpu(1);
+  auto ra      = fx.readahead(std::chrono::hours(1));
+  auto refused = fx.on_gpu(0);
+  auto waiting = fx.on_gpu(0);
+  auto landed  = fx.on_gpu(1);
 
   ra->register_scan_task(refused, 1);
   ra->start();
@@ -199,7 +199,7 @@ TEST_CASE_METHOD(two_gpu_fixture,
   CHECK(ra->counters().device_skipped_backoff.load() == 1);
   CHECK(refused->prefetched() == nullptr);
   CHECK(waiting->prefetched() == nullptr);
-  require_landed_on(*landed, 1);
+  two_gpu_fixture::require_landed_on(*landed, 1);
 
   ra->stop();
 }
