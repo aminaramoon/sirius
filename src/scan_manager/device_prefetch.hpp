@@ -17,7 +17,6 @@
 #pragma once
 
 #include "exec/invocable.hpp"
-#include "op/scan/prefetched_ranges.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -31,6 +30,7 @@ class memory_space;
 
 namespace sirius::op::scan {
 class scan_info;
+struct device_stream;
 }  // namespace sirius::op::scan
 
 namespace sirius::scan_manager {
@@ -42,7 +42,9 @@ namespace sirius::scan_manager {
 /// A prefetch counts as parked from the moment the issuer installs it until its release hook
 /// fires (at take() or at destruction).  On destruction the hook fires before the buffers are
 /// freed, so for that short span the window already admits new bytes that the reservation
-/// accounting does not yet see released -- a brief over-admission bounded by one split.
+/// accounting does not yet see released -- a brief over-admission bounded by one split.  An
+/// attempt that was not issued reports once and leaves nothing parked: as unconsumed when the
+/// split's slot was occupied, as failed when it was abandoned.
 struct device_window {
   std::atomic<std::size_t> parked_splits{0};
   std::atomic<std::size_t> parked_bytes{0};  ///< reserved (256-aligned) bytes parked
@@ -59,7 +61,7 @@ enum class device_prefetch_issue : std::uint8_t {
   unsupported,  ///< the split cannot consume device copies
   no_ranges,    ///< nothing to read (no hints / zero bytes)
   fell_behind,  ///< the consumer reached the split first (before or right after install)
-  too_large,    ///< bytes_reserved > fraction x limit; no back-off
+  too_large,    ///< bytes_reserved > the window's byte cap (fraction x limit / 2); no back-off
   window_full,  ///< the per-device parked window is full; no back-off
   memory,       ///< reservation refused, floor violated, or allocation OOM -> caller backs off
   error,        ///< a host-side failure before anything was submitted (logged); no back-off
@@ -77,12 +79,13 @@ struct device_prefetch_result {
 /// inline, so its buffers are never freed under it).
 ///
 /// Admission, with bytes_reserved = the split's ranges each rounded up to the allocation
-/// alignment: refused as too_large when bytes_reserved exceeds fraction x the space's reservation
-/// limit; as window_full when the parked window already holds max_parked_splits splits or would
-/// exceed half that budget; as memory when the reservation is refused or would leave less than
-/// (1 - fraction) x limit available.
+/// alignment and budget = fraction x the space's reservation limit: too_large when bytes_reserved
+/// exceeds the window's byte cap, budget / 2 (it could never be parked); window_full when the
+/// window holds max_parked_splits splits or would exceed its byte cap; memory when the reservation
+/// is refused or would leave less than (1 - fraction) x limit available.
 class device_prefetch_issuer {
  public:
+  /// @p fraction is clamped to [0, 1].
   device_prefetch_issuer(cucascade::memory::memory_space& space,
                          std::shared_ptr<op::scan::device_stream const> stream,
                          std::shared_ptr<device_window> window,
@@ -93,7 +96,8 @@ class device_prefetch_issuer {
   /// prefetch_state is `prefetched`, the window counts it, and @p on_done runs exactly once (on an
   /// IO thread, or inline before this returns).  On every other value nothing stays installed on
   /// the split (an installed slot was abandoned, so no consumer can wait on it) and @p on_done is
-  /// never called.
+  /// never called.  Host-side failures return `error` rather than throw.  The caller keeps
+  /// @p split alive for the call.
   [[nodiscard]] device_prefetch_issue issue(
     std::shared_ptr<op::scan::scan_info> const& split,
     sirius::exec::invocable<void(device_prefetch_result) noexcept> on_done);
@@ -102,6 +106,11 @@ class device_prefetch_issuer {
   [[nodiscard]] device_window const& window() const noexcept { return *_window; }
 
  private:
+  /// issue() without its catch-all: may throw before anything was submitted.
+  [[nodiscard]] device_prefetch_issue try_issue(
+    std::shared_ptr<op::scan::scan_info> const& split,
+    sirius::exec::invocable<void(device_prefetch_result) noexcept> on_done);
+
   cucascade::memory::memory_space& _space;
   std::shared_ptr<op::scan::device_stream const> _stream;
   std::shared_ptr<device_window> _window;

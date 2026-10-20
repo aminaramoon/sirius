@@ -29,12 +29,13 @@
 #include <catch.hpp>
 #include <unistd.h>
 
-#include <atomic>
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <system_error>
+#include <vector>
 
 namespace sirius::test {
 
@@ -84,22 +85,22 @@ inline std::string sql_literal(std::string const& value)
 
 /// A uniquely-named scratch directory, removed on destruction.
 ///
-/// The name mixes @p tag, the pid and a process-local counter. The directory is
-/// cleared before use rather than merely created: pids are reused (pid 1 in a
-/// container makes that likely), and create_directories accepts an existing
-/// directory, so a previous run's files could otherwise be read in place of the
-/// ones about to be written.
+/// Created by mkdtemp under the temp directory, so the name is new and the
+/// directory is empty and owned by this process: nothing a previous run or
+/// another process left behind can be read in place of the files about to be
+/// written, and nothing at a predictable path is removed first.
 class scratch_dir {
  public:
   explicit scratch_dir(std::string const& tag)
   {
-    static std::atomic<unsigned> counter{0};
-    _path = std::filesystem::temp_directory_path() /
-            ("sirius_test_" + tag + "_" + std::to_string(::getpid()) + "_" +
-             std::to_string(counter.fetch_add(1)));
-    std::error_code ec;
-    std::filesystem::remove_all(_path, ec);
-    std::filesystem::create_directories(_path);
+    auto const pattern =
+      (std::filesystem::temp_directory_path() / ("sirius_test_" + tag + "_XXXXXX")).string();
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back('\0');
+    if (::mkdtemp(name.data()) == nullptr) {
+      throw std::system_error(errno, std::generic_category(), "mkdtemp " + pattern);
+    }
+    _path = name.data();
   }
 
   /// Best-effort: a destructor is noexcept, so a directory that cannot be
