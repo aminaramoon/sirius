@@ -338,7 +338,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pools. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones (or `eager` whatever the backend when `device_prefetching_fraction > 0`). Values are lowercase. |
-| `device_prefetching_fraction` | double [0,1] | 0 | Device tier of the readahead. `0` turns it off: the readahead only stages bytes in the pinned host cache. A positive value lets the readahead read a split's byte ranges straight into GPU buffers on the split's assigned GPU, ahead of its scan task, as long as that GPU space's consumed memory after admitting the split (limit − available: reservations plus allocations, by anyone, the same measure cuCascade's downgrade check uses) stays at or below this fraction of the space's reservation limit (`memory_space::get_max_memory()`); a split whose reservation is refused, that would take the space past this ceiling, or whose buffers cannot be allocated falls back to the host tier, and only these memory refusals make the device tier back off on that GPU until one of its splits is disposed (or 100 ms pass); a split too large for the GPU's parked window, or one that arrives while the window is full (see `device_prefetch_max_splits`), also falls back to the host tier but does not back off. Prefetched device bytes are invisible to the downgrade executor until their scan consumes them, so keep this fraction times the GPU's `reservation_limit_fraction` at or below its `downgrade_stop_fraction` (0.6 by default; a higher value is accepted with a warning). Setting it also enables the readahead on a local backend that publishes no budget (`uring.n_max_concurrent_scans: 0`): the budget then defaults to the pipeline width, an unset `readahead_strategy` to `eager`, and `cache.mode: none` no longer disables the readahead (reads go through the reactor's own staging). On such a local backend the host tier (pinned-cache staging) therefore also runs, eagerly, for every split the device tier refuses, although uring publishes no host readahead budget. `max_readahead_scans` / `readahead_strategy` still win when set. Pair with `cache.eviction: prefetch` under `cache.mode: cucs`. |
+| `device_prefetching_fraction` | double [0,1] | 0 | Device tier of the readahead. `0` turns it off: the readahead only stages bytes in the pinned host cache. A positive value lets the readahead read a split's byte ranges straight into GPU buffers on the split's assigned GPU, ahead of its scan task, as long as that GPU space's consumed memory after admitting the split (limit − available: reservations plus allocations, by anyone, the same measure cuCascade's downgrade check uses) stays at or below this fraction of the space's reservation limit (`memory_space::get_max_memory()`); a split whose reservation is refused, that would take the space past this ceiling, or whose buffers cannot be allocated falls back to the host tier, and only these memory refusals make the device tier back off on that GPU until one of its splits is disposed (or 100 ms pass); a split too large for the GPU's parked window, or one that arrives while the window is full (see `device_prefetch_max_splits`), also falls back to the host tier but does not back off. Prefetched device bytes are invisible to the downgrade executor until their scan consumes them, so keep this fraction times the GPU's `reservation_limit_fraction` at or below its `downgrade_stop_fraction` (0.6 by default; a higher value is accepted with a warning). Setting it also enables the readahead on a local backend that publishes no budget (`uring.n_max_concurrent_scans: 0`): the budget then defaults to the pipeline width, an unset `readahead_strategy` to `eager`, and `cache.mode: none` no longer disables the readahead (reads go through the reactor's own staging). On such a local backend the host tier (pinned-cache staging) therefore also runs, eagerly, for every split the device tier refuses, although uring publishes no host readahead budget. `max_readahead_scans` / `readahead_strategy` still win when set. Works without a host cache — under `cache.mode: none`/`os`, or a `cucs` cache that failed to build, the host tier records `nothing_to_issue` for the splits the device tier refuses. Pair with `cache.eviction: prefetch` under `cache.mode: cucs`. See [Device-tier readahead](#device-tier-readahead). |
 | `device_prefetch_max_splits` | int | 0 | Splits the device tier may hold landed on one GPU before their scan tasks consume them (its parked window). `0` derives `max(2, 2 × pipeline threads / GPUs)`. The parked bytes are capped at half of the `device_prefetching_fraction` budget as well; a split refused by either cap falls back to the host tier without backing off. Ignored when `device_prefetching_fraction` is 0. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
@@ -367,6 +367,58 @@ deployment is only useful while a pipeline thread could still pick up another sc
 
 Both are resolved against a single backend: the live one publishing the widest
 `n_max_concurrent_scans`, so the budget and the strategy always describe the same backend.
+
+#### Device-tier readahead
+
+`device_prefetching_fraction`, `device_prefetch_max_splits` and `cache.eviction: prefetch` together
+configure the readahead's device tier, which reads a split's column chunks straight into GPU
+buffers ahead of its scan task; the mechanism, its fallbacks and the parquet consumer are described
+in [scan.md](scan.md#device-tier-readahead), the memory accounting in
+[memory-management.md](memory-management.md#device-prefetch-bytes). A typical setup:
+
+```yaml
+sirius:
+  executor:
+    scan_manager:
+      max_readahead_scans: 8            # optional; the pipeline width when the backend publishes none
+      readahead_strategy: eager         # the default once device_prefetching_fraction > 0
+      device_prefetching_fraction: 0.6  # x reservation_limit_fraction <= the GPU's downgrade_stop_fraction
+      device_prefetch_max_splits: 0     # 0 = max(2, 2 x pipeline threads / GPUs)
+      cache:
+        mode: cucs
+        eviction: prefetch              # idle, plus early release of device-prefetched staging
+```
+
+Each query logs one `[readahead]` line when it ends; its last group, printed even with the device
+tier off, describes the device tier:
+
+```
+device[prefetched=N wait_for_prefetch=N wasted=N failed=N consumed=N wrong_gpu=N
+       skipped[memory=N backoff=N unsupported=N too_large=N window=N] MiB=N wait_ms=N parked=N]
+```
+
+| Field | Meaning |
+|-------|---------|
+| `prefetched` | Device copies that landed before their scan task started reading the split. |
+| `wait_for_prefetch` | Device copies that landed while the scan task was already waiting on them. |
+| `wasted` | Device copies that landed after their split was disposed or gone. |
+| `failed` | Device reads that failed or came back short; the task read for itself. |
+| `consumed` | Landed copies a scan task took and decoded from. |
+| `wrong_gpu` | Landed copies discarded because the task ran on another GPU than the split's preferred one. |
+| `skipped[memory]` | Splits refused for device memory (reservation, usage ceiling or allocation); each one starts a back-off on that GPU. |
+| `skipped[backoff]` | Splits not attempted because their GPU was in back-off. |
+| `skipped[unsupported]` | Splits with no preferred GPU, or whose format cannot decode from device copies (iceberg, DuckDB-native, insert deltas). |
+| `skipped[too_large]` | Splits larger than half the device budget, which the parked window could never hold. |
+| `skipped[window]` | Splits refused because the GPU's parked window was full. |
+| `MiB` | Bytes the device tier landed. |
+| `wait_ms` | Time scan tasks spent waiting on a pending device copy. |
+| `parked` | Device prefetches still held by their splits (pending or landed, not yet consumed or freed) when the line was logged. |
+
+Every refused split falls through to the host tier. `prefetched + wait_for_prefetch > 0` shows the
+tier ran, `consumed` close to that sum shows the scans used it, and a large `skipped[window]`
+means the window rather than the fraction is the throttle. The parquet consumer's own outcomes
+are counted as `device_route_decodes` and `device_route_fallbacks` in the transparent-execution
+stats.
 
 Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
 

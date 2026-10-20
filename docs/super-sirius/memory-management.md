@@ -90,6 +90,14 @@ Wraps RMM device memory resource. On each allocation:
 
 Conversions that land data on the HOST tier draw down a caller-owned reservation instead of double-committing host capacity: the caller obtains a reservation with `make_reservation_or_null(size)` and passes it to the reservation-taking `convert_to`/`clone_to` overloads, so the converter's allocation is charged against capacity the caller already holds. If the reservation cannot be made, the call falls back — with a warning — to the `memory_space*` overload (no reservation; the converter may OOM). Call sites: `lock_or_prepare_batch` in `src/pipeline/batch_lock_utils.hpp` and the materialized result collector (`src/op/sirius_physical_result_collector.cpp`). The `memory_space*` overloads remain the path for GPU/DISK targets and viability probes.
 
+### Device prefetch bytes
+
+The readahead's [device tier](scan.md#device-tier-readahead) (`scan_manager.device_prefetching_fraction > 0`) allocates GPU memory for scan tasks that have not run yet, outside any task reservation:
+
+- **Admission.** The readahead worker reserves the split's column-chunk bytes (each range rounded up to the 256-byte allocation alignment, which is what the adaptor tracks) with `make_reservation_or_null`, then admits the split only if the space's consumed memory (limit − available: reservations plus allocations by anyone, the measure the downgrade check uses) stays at or below the fraction of the space's reservation limit. It attaches the reservation to its own thread (`attach_reservation_to_tracker` on the tier's stream) only while it allocates the buffers, then detaches it (`reset_stream_reservation`): the reservation's unallocated remainder is released and the allocated bytes stay counted on the space until they are freed.
+- **Release.** The consuming scan task frees the buffers on its own thread after the decode. The free is charged to that task's reservation and corrected when the reservation is released — the same mechanism every cross-task batch handoff relies on — so the space transiently over-reports by one split's compressed bytes per running consuming task. Two side effects: that task's recorded peak is understated by the same amount, and its reservation estimate still budgets the compressed bytes it no longer reads for the task's lifetime. A split that is never consumed frees its buffers when it is destroyed.
+- **Exposure.** Landed-but-unconsumed bytes cannot be reclaimed by any reservation or by the downgrade executor. The fraction, the per-split cap (half the admission budget), the per-GPU parked window (`device_prefetch_max_splits` splits and half the admission budget in bytes) and the back-off after a refusal bound them. Keep `device_prefetching_fraction × reservation_limit_fraction ≤ downgrade_stop_fraction` of the GPU tier; `sirius_config` warns otherwise.
+
 ## Downgrade Executor
 
 **File:** `src/downgrade/downgrade_executor.hpp`, `src/downgrade/downgrade_executor.cpp`

@@ -264,8 +264,8 @@ struct scan_manager_config {
   /// it to pin one strategy whatever the backend.
   std::optional<prefetch_strategy> readahead_strategy{};
 
-  /// Device tier of the readahead (see docs/super-sirius/configuration.md,
-  /// "Scan Manager & IO Configuration"): the readahead may read a split's byte
+  /// Device tier of the readahead (see docs/super-sirius/scan.md, "Device-tier
+  /// readahead", and configuration.md): the readahead may read a split's byte
   /// ranges straight into device buffers on the split's GPU, ahead of its scan
   /// task, as long as the GPU space's consumed memory after admitting the
   /// split -- limit minus available, reservations plus allocations by anyone,
