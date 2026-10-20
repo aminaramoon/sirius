@@ -32,6 +32,7 @@
 #include "scan_manager/gatekeeper.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "utils/readahead_test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cucascade/cudf/datasource.hpp>
@@ -439,45 +440,7 @@ TEST_CASE("a returning ticket wakes a waiter", "[scan_manager][gatekeeper]")
 // worker lifecycle
 // ===========================================================================
 
-namespace {
-/// Minimal concrete scan carrying only the operator id the readahead keys its
-/// work queue on.
-struct test_scan : sirius::op::sirius_physical_operator {
-  test_scan()
-    : sirius::op::sirius_physical_operator(sirius::op::SiriusPhysicalOperatorType::GPU_SCAN, {}, 0)
-  {
-    operator_id = 1;
-  }
-};
-
-/// A query with one GPU_SCAN operator, which is what it takes to park the
-/// worker: with no work queues at all it runs out of order and exits on its
-/// own, and a worker that is already gone hides everything a second start does.
-class single_scan_query {
- public:
-  single_scan_query()
-  {
-    auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(_ctx);
-    _build.set_pipeline_source(*pipeline, *_scan);
-    auto const id = sirius::make_query_id(1);
-    _query        = std::make_unique<sirius::planner::query>(
-      std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{pipeline},
-      _telemetry->context(),
-      id,
-      sirius::telemetry::query_telemetry_info{quent::now_v7(), _telemetry->worker_id().raw(), id});
-  }
-
-  [[nodiscard]] const sirius::planner::query& get() const { return *_query; }
-
- private:
-  std::shared_ptr<const sirius::telemetry::telemetry_context> _telemetry =
-    sirius::test::make_test_telemetry_context();
-  sirius::pipeline::pipeline_build_context _ctx{nullptr, true};
-  sirius::pipeline::sirius_pipeline_build_state _build;
-  std::unique_ptr<test_scan> _scan = std::make_unique<test_scan>();
-  std::unique_ptr<sirius::planner::query> _query;
-};
-}  // namespace
+using sirius::test::single_scan_query;
 
 TEST_CASE("a zero budget means the backend opted out and no worker runs",
           "[scan_manager][readahead]")
@@ -934,32 +897,9 @@ TEST_CASE("a requested cache that failed to build turns the readahead off",
 // scan inputs fill the cache on their own
 // ===========================================================================
 
+using sirius::test::temp_data_file;
+
 namespace {
-
-/// A real on-disk file, so the uring backend opens it and the cache sizes its
-/// slot table from a genuine object size.
-struct temp_data_file {
-  std::filesystem::path path;
-
-  explicit temp_data_file(std::size_t bytes)
-  {
-    path = std::filesystem::temp_directory_path() /
-           ("sirius_readahead_lifecycle_" + std::to_string(::getpid()) + "_" +
-            std::to_string(reinterpret_cast<std::uintptr_t>(this)));
-    std::ofstream out(path, std::ios::binary);
-    std::vector<char> data(bytes, 'z');
-    out.write(data.data(), static_cast<std::streamsize>(bytes));
-  }
-
-  ~temp_data_file()
-  {
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
-  }
-
-  temp_data_file(temp_data_file const&)            = delete;
-  temp_data_file& operator=(temp_data_file const&) = delete;
-};
 
 /// Pull `global[... <name>=N ...]` out of fs_cache::summary().
 std::uint64_t global_counter(std::string const& summary, std::string const& name)

@@ -151,6 +151,7 @@ set(TEST_SOURCES
     test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_s3_config_scopes.cpp
+    test/cpp/scan_manager/test_device_prefetch.cpp
     test/cpp/scan_manager/test_scan_input_prefetch.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp

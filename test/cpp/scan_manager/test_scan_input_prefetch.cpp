@@ -28,6 +28,7 @@
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_connector.hpp"
+#include "utils/readahead_test_utils.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
 
@@ -58,85 +59,11 @@
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
 
-namespace {
-
-std::shared_ptr<const sirius::memory::topology_index> single_gpu_index_for_prefetch()
-{
-  cucascade::memory::system_topology_info topology;
-  topology.num_gpus = 1;
-  cucascade::memory::gpu_topology_info gpu;
-  gpu.id        = 0;
-  gpu.numa_node = 0;
-  topology.gpus.push_back(std::move(gpu));
-  return std::make_shared<sirius::memory::topology_index>(topology, std::vector<int>{0});
-}
-
-/// A real on-disk file, so the uring backend opens it and the cache sizes its
-/// slot table from a genuine object size.
-struct temp_data_file {
-  std::filesystem::path path;
-
-  explicit temp_data_file(std::size_t bytes)
-  {
-    path = std::filesystem::temp_directory_path() /
-           ("sirius_scan_input_prefetch_" + std::to_string(::getpid()) + "_" +
-            std::to_string(reinterpret_cast<std::uintptr_t>(this)));
-    std::ofstream out(path, std::ios::binary);
-    std::vector<char> data(bytes, 'z');
-    out.write(data.data(), static_cast<std::streamsize>(bytes));
-  }
-
-  ~temp_data_file()
-  {
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
-  }
-
-  temp_data_file(temp_data_file const&)            = delete;
-  temp_data_file& operator=(temp_data_file const&) = delete;
-};
-
-/// `cache.mode: cucs` with `cache.eviction: idle`.
-scan_manager_config dispose_on_idle_config()
-{
-  scan_manager_config cfg;
-  cfg.thread_pool.num_threads = 3;
-  cfg.uring_n_reactors        = 1;
-  cfg.cache.mode              = cucascade::io::cache::cache_mode::cucs;
-  cfg.cache.eviction          = cucascade::io::cache::eviction_policy::idle;
-  cfg.apply_cache_mode();
-  return cfg;
-}
-
-/// Pull `global[... evictions=N ...]` out of fs_cache::summary().
-std::uint64_t evictions_from(std::string const& summary)
-{
-  std::smatch m;
-  static std::regex const re(R"(global\[[^\]]*evictions=(\d+))");
-  if (!std::regex_search(summary, m, re)) { return 0; }
-  return std::stoull(m[1].str());
-}
-
-/// Poll until claimed_bytes() drops below @p before; the evictor is a background thread.
-std::size_t claimed_after_sweep(cucascade::io::cache::fs_cache& cache,
-                                std::size_t before,
-                                std::chrono::milliseconds budget)
-{
-  // The evictor may release the disposed request's chunks over several passes:
-  // keep polling until everything is reclaimed or the budget runs out, and
-  // return the lowest value seen so a partial sweep is still reported.
-  auto const deadline = std::chrono::steady_clock::now() + budget;
-  auto lowest         = before;
-  while (std::chrono::steady_clock::now() < deadline) {
-    auto const now = cache.claimed_bytes();
-    lowest         = std::min(lowest, now);
-    if (now == 0) { return 0; }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-  return std::min(lowest, cache.claimed_bytes());
-}
-
-}  // namespace
+using sirius::test::claimed_after_sweep;
+using sirius::test::dispose_on_idle_config;
+using sirius::test::evictions_from;
+using sirius::test::single_gpu_index_for_prefetch;
+using sirius::test::temp_data_file;
 
 TEST_CASE("Deferred scan inputs initialize prefetch only when admitted",
           "[cache][scan][scan_preparation]")
