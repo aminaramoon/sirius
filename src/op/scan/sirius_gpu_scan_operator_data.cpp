@@ -152,6 +152,9 @@ void scan_operator_input::initialize_prefetch()
   if (!has_scan_metadata()) return;
   auto const& stored    = std::get<std::shared_ptr<scan_info>>(materialization_info);
   auto preferred_device = get_preferred_device_id();
+  // Stamped before registration for the same reason as the hints below: the
+  // readahead worker reads it the moment the split is published.
+  stored->set_preferred_device(preferred_device);
 
   // Hint BEFORE publishing.  Registration below is what makes this split
   // eligible for prefetching, and the readahead worker can act on it the moment

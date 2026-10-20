@@ -29,6 +29,7 @@ target_sources(
           scan/gpu_ingestible.cpp
           scan/parquet_gpu_ingestible.cpp
           scan/parquet_materialize.cpp
+          scan/prefetched_ranges.cpp
           scan/duckdb_native_gpu_ingestible.cpp
           scan/table_scan/bound_read_view.cpp
           scan/table_scan/parquet_physical_profile.cpp

@@ -19,6 +19,7 @@
 #include "event/query_event_publisher.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/prefetched_ranges.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
@@ -38,12 +39,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <stdexcept>
 #include <stop_token>
@@ -265,4 +268,87 @@ TEST_CASE("cache.eviction idle reclaims a disposed scan input's chunks",
   auto const after = claimed_after_sweep(*cache, claimed, std::chrono::milliseconds(5000));
   CHECK(evictions_from(cache->summary()) > 0);
   CHECK(after < claimed);
+}
+
+TEST_CASE("scan inputs stamp the preferred device on their scan_info before publication",
+          "[cache][scan][scan_preparation]")
+{
+  using sirius::op::scan::scan_info;
+  using sirius::op::scan::scan_operator_input;
+  auto publisher = std::make_shared<sirius::event::query_event_publisher>();
+
+  SECTION("a placed split carries its device by the time it is published")
+  {
+    auto info = std::make_shared<scan_info>();
+    // No operator is registered, so registration -- the publication -- throws; the stamp must
+    // already be there when it does.
+    auto readahead = std::make_shared<sirius::scan_manager::readahead_scan_manager>(*publisher, 1);
+    auto input     = std::make_unique<scan_operator_input>(
+      info, readahead, 0, 0, scan_operator_input::prefetch_start::deferred);
+    CHECK_FALSE(info->preferred_device().has_value());
+    CHECK_THROWS_AS(input->initialize_prefetch(), std::out_of_range);
+    CHECK(info->preferred_device() == std::optional<int>{0});
+  }
+
+  SECTION("a split nobody placed stays unplaced")
+  {
+    auto info  = std::make_shared<scan_info>();
+    auto input = std::make_unique<scan_operator_input>(
+      info, nullptr, 0, std::nullopt, scan_operator_input::prefetch_start::deferred);
+    CHECK_FALSE(info->preferred_device().has_value());
+    REQUIRE_NOTHROW(input->initialize_prefetch());
+    CHECK_FALSE(info->preferred_device().has_value());
+  }
+}
+
+TEST_CASE("the prefetched slot is set once and taken once", "[cache][scan][scan_preparation]")
+{
+  using sirius::op::scan::prefetched_ranges;
+  using sirius::op::scan::scan_info;
+  using release_reason = prefetched_ranges::release_reason;
+
+  // Empty prefetches: the slot only moves ownership, so no device memory is needed.
+  auto unconsumed = std::make_shared<std::atomic<int>>(0);
+  auto make       = [&] {
+    return std::make_shared<prefetched_ranges>(
+      0,
+      nullptr,
+      std::vector<prefetched_ranges::device_ranges>{},
+      0,
+      [unconsumed](prefetched_ranges::release_event event) noexcept {
+        if (event.reason == release_reason::unconsumed) { unconsumed->fetch_add(1); }
+      });
+  };
+
+  scan_info info;
+  CHECK(info.prefetched() == nullptr);
+  CHECK_FALSE(info.supports_device_prefetch());
+  CHECK_FALSE(info.set_prefetched_ranges(nullptr));
+  CHECK(info.prefetched() == nullptr);
+
+  auto first = make();
+  auto* raw  = first.get();
+  CHECK(info.set_prefetched_ranges(std::move(first)));
+  CHECK(info.prefetched().get() == raw);
+
+  // A second install is refused and its argument dropped.
+  CHECK_FALSE(info.set_prefetched_ranges(make()));
+  CHECK(unconsumed->load() == 1);
+  CHECK(info.prefetched().get() == raw);
+
+  auto const& view = info;
+  auto taken       = view.take_prefetched_ranges();
+  CHECK(taken.get() == raw);
+  CHECK(taken.use_count() == 1);
+  CHECK(view.take_prefetched_ranges() == nullptr);
+  CHECK(info.prefetched() == nullptr);
+  view.discard_prefetched_ranges();  // an empty slot is a no-op
+
+  taken.reset();
+  CHECK(unconsumed->load() == 2);
+
+  CHECK(info.set_prefetched_ranges(make()));
+  view.discard_prefetched_ranges();
+  CHECK(info.prefetched() == nullptr);
+  CHECK(unconsumed->load() == 3);
 }

@@ -25,14 +25,19 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #pragma once
 
 namespace sirius::op::scan {
+
+class prefetched_ranges;
 
 //===----------------------------------------------------------------------===//
 // ingestible_table_info
@@ -212,6 +217,63 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     return _holds_readahead_ticket.exchange(false, std::memory_order_acq_rel);
   }
 
+  // ---- device tier -----------------------------------------------------------
+
+  /// The GPU this split was balanced onto, stamped by scan_operator_input::initialize_prefetch
+  /// before publication; nullopt for a split nobody placed.  A hint: the task creator may re-pin
+  /// the task, so a consumer verifies the device of any prefetch before using it.
+  void set_preferred_device(std::optional<int> device) noexcept
+  {
+    _preferred_device.store(device.value_or(-1), std::memory_order_release);
+  }
+
+  [[nodiscard]] std::optional<int> preferred_device() const noexcept
+  {
+    auto const d = _preferred_device.load(std::memory_order_acquire);
+    return d >= 0 ? std::optional<int>{d} : std::nullopt;
+  }
+
+  /// Whether this format can decode from device-resident copies of its hint ranges (parquet,
+  /// unless its ingestible opted out).  The base says no.
+  [[nodiscard]] virtual bool supports_device_prefetch() const noexcept { return false; }
+
+  /// Publish a device-tier prefetch; false (argument dropped) when one is already installed or
+  /// @p ranges is null.
+  bool set_prefetched_ranges(std::shared_ptr<prefetched_ranges> ranges) noexcept
+  {
+    std::lock_guard lock(_prefetched_mutex);
+    if (_prefetched || !ranges) { return false; }
+    _prefetched = std::move(ranges);
+    return true;
+  }
+
+  /// Peek without consuming (diagnostics, tests).
+  [[nodiscard]] std::shared_ptr<prefetched_ranges> prefetched() const noexcept
+  {
+    std::lock_guard lock(_prefetched_mutex);
+    return _prefetched;
+  }
+
+  /// Consume the slot: the caller now owns the only split-side reference.  Const: split-owned
+  /// bookkeeping reached through the const scan_info the consumer is handed (like the readahead
+  /// ticket flag); the slot members are mutable.
+  [[nodiscard]] std::shared_ptr<prefetched_ranges> take_prefetched_ranges() const noexcept
+  {
+    std::lock_guard lock(_prefetched_mutex);
+    return std::exchange(_prefetched, nullptr);
+  }
+
+  /// Drop the slot's reference.  Released outside the lock: the last reference frees device
+  /// memory.
+  void discard_prefetched_ranges() const noexcept { std::ignore = take_prefetched_ranges(); }
+
+  /// Producer-side correction after a device prefetch was issued (state prefetched) but
+  /// abandoned or failed: back to attempted so the consumer's own read charges a ticket.
+  void set_prefetch_state(prefetch_state state) noexcept
+  {
+    _prefetch_state.store(state, std::memory_order_release);
+  }
+
   /// Allocate staging buffers for this split's prefetch requests.  A chunk
   /// without one cannot be claimed for loading, so a prefetch issued over it
   /// reads nothing and settles `ready` having done nothing -- and the reader
@@ -381,6 +443,9 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   std::atomic<prefetch_state> _prefetch_state{prefetch_state::idle};
   std::atomic<cucascade::io::cache::scan_stage> _scan_stage{cucascade::io::cache::scan_stage::none};
   std::atomic<bool> _holds_readahead_ticket{false};
+  std::atomic<int> _preferred_device{-1};
+  mutable std::mutex _prefetched_mutex;
+  mutable std::shared_ptr<prefetched_ranges> _prefetched;
 
   scan_contract_id contract_id_ = 0;
   std::vector<split_materializer_certificate> certificates_;
