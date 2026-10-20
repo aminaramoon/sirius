@@ -1046,12 +1046,13 @@ void sirius_config::warn_device_prefetching_fraction() const
     auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
     if (gpu == nullptr) { continue; }
     auto const ceiling = fraction * gpu->reservation_limit_fraction;
-    if (ceiling <= gpu->downgrade_stop_fraction) { continue; }
+    // Tolerate rounding in the product: a ceiling equal to the stop fraction does not warn.
+    if (ceiling <= gpu->downgrade_stop_fraction + 1e-9) { continue; }
     SIRIUS_LOG_WARN(
-      "sirius_config: scan_manager.device_prefetching_fraction ({:.2f}) of GPU {}'s reservation "
-      "limit ({:.2f} of capacity) is {:.2f} of capacity, above its downgrade_stop_fraction "
-      "({:.2f}); device-prefetched bytes cannot be spilled, so the readahead may hold the GPU "
-      "inside the downgrade band",
+      "sirius_config: scan_manager.device_prefetching_fraction ({:.3f}) of GPU {}'s reservation "
+      "limit ({:.3f} of capacity) is {:.3f} of capacity, above its downgrade_stop_fraction "
+      "({:.3f}); device-prefetched bytes may keep the GPU above its downgrade_stop_fraction, "
+      "where the downgrade executor cannot spill them",
       fraction,
       gpu->device_id,
       gpu->reservation_limit_fraction,

@@ -807,7 +807,8 @@ TEST_CASE("device_prefetching_fraction rejects values outside [0,1]",
       "sirius_device_prefetch_invalid.yaml",
       scan_manager_yaml(std::string{"      device_prefetching_fraction: "} + value + "\n"));
     sirius::sirius_config cfg;
-    CHECK_THROWS(cfg.load_from_file(yaml.path()));
+    CHECK_THROWS_WITH(cfg.load_from_file(yaml.path()),
+                      Catch::Matchers::ContainsSubstring("device_prefetching_fraction"));
   }
 
   scan_manager_config cfg;

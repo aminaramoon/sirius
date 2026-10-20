@@ -156,6 +156,22 @@ TEST_CASE("the readahead budget follows the cache mode when unset", "[scan_manag
                        prefetch_strategy::opportunistic);
     CHECK(plan.strategy == prefetch_strategy::opportunistic);
     CHECK(plan.budget == pipeline_width);
+    // ... and an explicit opportunistic over a zero backend budget gets the pipeline width too.
+    plan = device_plan(cache_mode::cucs,
+                       0,
+                       prefetch_strategy::eager,
+                       pipeline_width,
+                       prefetch_strategy::opportunistic);
+    CHECK(plan.strategy == prefetch_strategy::opportunistic);
+    CHECK(plan.budget == pipeline_width);
+
+    // cache.mode os resolves exactly as cucs does.
+    plan = device_plan(cache_mode::os, 0, prefetch_strategy::opportunistic, pipeline_width);
+    CHECK(plan.budget == pipeline_width);
+    CHECK(plan.strategy == prefetch_strategy::eager);
+    plan = device_plan(cache_mode::os, backend_budget, prefetch_strategy::eager, pipeline_width);
+    CHECK(plan.budget == backend_budget);
+    CHECK(plan.strategy == prefetch_strategy::eager);
 
     // Without the device tier a zero backend budget still keeps the readahead off.
     scan_manager_config off;
@@ -230,7 +246,11 @@ TEST_CASE("explicit readahead settings override the selected backend policy",
 
   // The device tier does not override an explicit budget, zero (off) included.
   cfg.device_prefetching_fraction = 0.6;
-  cfg.max_readahead_scans         = 0;
+  CHECK(cfg.resolve_readahead(4, sirius::scan_manager::prefetch_strategy::opportunistic).budget ==
+        3);
+  CHECK(cfg.resolve_readahead(0, sirius::scan_manager::prefetch_strategy::opportunistic).budget ==
+        3);
+  cfg.max_readahead_scans = 0;
   CHECK(cfg.resolve_readahead(4, sirius::scan_manager::prefetch_strategy::opportunistic).budget ==
         0);
 }
