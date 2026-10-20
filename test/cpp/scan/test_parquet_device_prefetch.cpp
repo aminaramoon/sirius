@@ -162,7 +162,9 @@ struct x_below_3000 {
   cudf::ast::operation expression{cudf::ast::ast_operator::LESS, column, value};
 };
 
-bool tables_equal(cudf::table_view lhs, cudf::table_view rhs, ::cuda::stream_ref stream)
+bool tables_equal(cudf::table_view const& lhs,
+                  cudf::table_view const& rhs,
+                  ::cuda::stream_ref stream)
 {
   return sirius::test::expect_tables_equivalent_impl(lhs, rhs, stream);
 }
