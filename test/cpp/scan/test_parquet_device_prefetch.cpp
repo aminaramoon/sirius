@@ -780,20 +780,24 @@ TEST_CASE_METHOD(consumer_fixture,
   auto prefetch       = landed(0);
   install(prefetch);
 
-  // Lands only after the consumer took the slot, so the consumer is (about to be) waiting.
-  std::thread producer([prefetch, this] {
+  // Lands only after the consumer emptied the slot -- its last step before it waits -- so the
+  // consumer took the prefetch while it was still pending.
+  std::atomic<bool> consumer_took{false};
+  std::thread producer([prefetch, &consumer_took, this] {
     auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (split->prefetched() != nullptr && std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    consumer_took.store(split->prefetched() == nullptr);
     prefetch->set_ready();
   });
   auto const decoded = materialize();
   producer.join();
   prefetch.reset();
 
+  REQUIRE(consumer_took.load());
   CHECK(counters->device_route_decodes.load() == 1);
+  CHECK(counters->device_route_fallbacks.load() == 0);
   CHECK(counts->of(release_reason::consumed) == 1);
   CHECK(tables_equal(decoded.table.view(), baseline.table.view(), stream));
 }
@@ -860,9 +864,10 @@ TEST_CASE_METHOD(filtered_consumer_fixture,
   prefetch->set_ready();
   install(std::move(prefetch));
   auto const decoded = materialize();
-  // Decoded from the device when the staged chunks cover the filter column, else read again
-  // through the general route -- never misread.
-  CHECK(counters->device_route_decodes.load() + counters->device_route_fallbacks.load() == 1);
+  // The split's ranges come from the reader options, which read the filter column too: the staged
+  // chunks cover it, so the split decodes from the device.
+  CHECK(counters->device_route_decodes.load() == 1);
+  CHECK(counters->device_route_fallbacks.load() == 0);
   CHECK(counts->of(release_reason::consumed) == 1);
   CHECK(decoded.state == baseline.state);
   CHECK(tables_equal(decoded.table.view(), baseline.table.view(), stream));

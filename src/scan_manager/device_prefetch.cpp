@@ -18,6 +18,7 @@
 
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/prefetched_ranges.hpp"
 
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
@@ -35,9 +36,10 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
+#include <algorithm>
+#include <cassert>
 #include <mutex>
 #include <new>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -115,18 +117,20 @@ struct completion {
       std::lock_guard lock(_mutex);
       error = _first_error;
     }
-    if (keep_alive) {
+    auto ranges = std::move(keep_alive);
+    if (ranges) {
       if (error) {
-        std::ignore = keep_alive->set_failed(error);
+        std::ignore = ranges->set_failed(error);
       } else {
-        std::ignore = keep_alive->set_ready();
+        std::ignore = ranges->set_ready();
       }
     }
+    // Before on_done: once it ran, the fan-in no longer keeps the buffers alive.
+    ranges.reset();
     if (_on_done) {
       _on_done(device_prefetch_result{.bytes = _bytes_logical, .ok = !error, .error = error});
+      _on_done = nullptr;
     }
-    // Last: a reference dropped here may be the last one and free the buffers.
-    keep_alive.reset();
   }
 
   std::atomic<std::size_t> _remaining;
@@ -177,7 +181,8 @@ class slot_guard {
 };
 
 /// The release hook of one attempt: decrements exactly what the issuer added to @p window when it
-/// installed the attempt, and books where the buffers went.  Atomics only (D14.6).
+/// installed the attempt, and books where the buffers went.  Atomics only: it runs on whichever
+/// thread drops the attempt's last reference.
 prefetched_ranges::release_hook make_release_hook(std::shared_ptr<device_window> window,
                                                   std::size_t bytes_reserved)
 {
@@ -220,15 +225,31 @@ device_prefetch_issuer::device_prefetch_issuer(
   : _space(space),
     _stream(std::move(stream)),
     _window(std::move(window)),
-    _fraction(fraction),
+    _fraction(fraction >= 0.0 ? std::min(fraction, 1.0) : 0.0),  // NaN -> 0
     _max_parked_splits(max_parked_splits)
 {
+  assert(fraction >= 0.0 && fraction <= 1.0);
 }
 
 int device_prefetch_issuer::device_id() const noexcept { return _space.get_device_id(); }
 
 device_prefetch_issue device_prefetch_issuer::issue(std::shared_ptr<scan_info> const& split,
                                                     done_callback on_done)
+{
+  // try_issue() submits under its own catch: whatever reaches here was thrown before submission.
+  try {
+    return try_issue(split, std::move(on_done));
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN("[readahead] device prefetch on GPU {} not issued: {}", device_id(), e.what());
+  } catch (...) {
+    SIRIUS_LOG_WARN("[readahead] device prefetch on GPU {} not issued: unknown exception",
+                    device_id());
+  }
+  return device_prefetch_issue::error;
+}
+
+device_prefetch_issue device_prefetch_issuer::try_issue(std::shared_ptr<scan_info> const& split,
+                                                        done_callback on_done)
 {
   // 1. What the split would read: per hint the logical bytes, and the reservation, which is what
   //    the allocator will track (every buffer rounded up to the allocation alignment).
@@ -256,15 +277,17 @@ device_prefetch_issue device_prefetch_issuer::issue(std::shared_ptr<scan_info> c
   }
   if (bytes_logical == 0) { return device_prefetch_issue::no_ranges; }
 
-  // 2. A split larger than the whole admission budget would never fit: refuse, no back-off.
-  auto const limit  = _space.get_max_memory();
-  auto const budget = _fraction * static_cast<double>(limit);
-  if (static_cast<double>(bytes_reserved) > budget) { return device_prefetch_issue::too_large; }
+  // 2. The parked window holds at most half the admission budget, so a split above that would
+  //    never be admitted, not even into an empty window: refuse, no back-off.
+  auto const limit      = _space.get_max_memory();
+  auto const budget     = _fraction * static_cast<double>(limit);
+  auto const window_cap = budget / 2;
+  if (static_cast<double>(bytes_reserved) > window_cap) { return device_prefetch_issue::too_large; }
 
   // 3. The parked window.  Relaxed loads: a racing release only makes the check conservative.
   if (_window->parked_splits.load(std::memory_order_relaxed) >= _max_parked_splits ||
       static_cast<double>(_window->parked_bytes.load(std::memory_order_relaxed) + bytes_reserved) >
-        budget / 2) {
+        window_cap) {
     return device_prefetch_issue::window_full;
   }
 
@@ -405,16 +428,17 @@ device_prefetch_issue device_prefetch_issuer::issue(std::shared_ptr<scan_info> c
     cucascade::exec::semi_future<std::size_t> f;
     try {
       auto io_ctx = ds.io_ctx();
-      f           = ds.uses_fs_cache()
-                      ? io_ctx->cache()->device_read_ranges_async(ds.get_io_object(),
-                                                        slices[k],
-                                                        stream.value(),
-                                                        nullptr,
-                                                        cucascade::io::io_priority::low)
-                      : io_ctx->device_readv_async_io(
-                ds.get_io_object(), slices[k], stream.value(), cucascade::io::io_priority::low);
+      // Read once: shutdown_cache() may reset it between a check and the call.
+      auto* cache = io_ctx->can_use_fs_cache() ? io_ctx->cache() : nullptr;
+      if (cache != nullptr) {
+        f = cache->device_read_ranges_async(
+          ds.get_io_object(), slices[k], stream.value(), nullptr, cucascade::io::io_priority::low);
+      } else {
+        f = io_ctx->device_readv_async_io(
+          ds.get_io_object(), slices[k], stream.value(), cucascade::io::io_priority::low);
+      }
     } catch (...) {
-      // Both forms report IO errors through the future; a throw means nothing was submitted.
+      // Both reads report failures through the future once submitted: a throw means nothing was.
       fan_in->arrive(k, read_result{std::current_exception()});
       continue;
     }

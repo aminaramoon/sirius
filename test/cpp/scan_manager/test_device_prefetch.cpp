@@ -44,6 +44,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <future>
 #include <memory>
 #include <optional>
@@ -81,10 +82,17 @@ std::vector<scan::scan_info::fadvise_entry> two_ranges(
   return {{ds, {byte_range(0, 1 * MiB), byte_range(3 * MiB, 2 * MiB)}}};
 }
 
-/// An ioctx whose every read fails, reported through the returned future.
-class failing_context final : public cucascade::io::ioctx {
+using read_future = cucascade::exec::semi_future<std::size_t>;
+
+/// An ioctx with no storage behind it whose reads settle as the test scripts them: every read
+/// returns the future @p respond makes from the logical bytes it asked for.  Nothing is written
+/// into the destination buffers.
+class scripted_context final : public cucascade::io::ioctx {
  public:
-  ~failing_context() override { pre_destroy(); }
+  using responder = std::function<read_future(std::size_t requested)>;
+
+  explicit scripted_context(responder respond) : _respond(std::move(respond)) {}
+  ~scripted_context() override { pre_destroy(); }
 
   [[nodiscard]] cucascade::io::io_context_type type() const noexcept override
   {
@@ -113,12 +121,19 @@ class failing_context final : public cucascade::io::ioctx {
     throw std::runtime_error("injected device read failure");
   }
 
-  cucascade::exec::semi_future<std::size_t> mixed_readv_async_io(
+  read_future mixed_readv_async_io(
     cucascade::io::io_object const&,
-    std::vector<cucascade::io::prepared_io_slice>&&) noexcept override
+    std::vector<cucascade::io::prepared_io_slice>&& slices) noexcept override
   {
-    return cucascade::exec::make_semi_future<std::size_t>(
-      std::make_exception_ptr(std::runtime_error("injected device read failure")));
+    try {
+      std::size_t requested = 0;
+      for (auto const& slice : slices) {
+        requested += slice.rng.size;
+      }
+      return _respond(requested);
+    } catch (...) {
+      return cucascade::exec::make_semi_future<std::size_t>(std::current_exception());
+    }
   }
 
  protected:
@@ -126,7 +141,59 @@ class failing_context final : public cucascade::io::ioctx {
   {
     return std::make_shared<sirius::test::bulk_object>(std::move(path), kFileBytes);
   }
+
+ private:
+  responder _respond;
 };
+
+/// Every read fails with @p message, settled before the read call returns.
+std::shared_ptr<scripted_context> failing_context(
+  std::string message = "injected device read failure")
+{
+  return std::make_shared<scripted_context>([message](std::size_t) {
+    return cucascade::exec::make_semi_future<std::size_t>(
+      std::make_exception_ptr(std::runtime_error(message)));
+  });
+}
+
+/// Every read reports the bytes it asked for, settled before the read call returns.
+std::shared_ptr<scripted_context> instant_context()
+{
+  return std::make_shared<scripted_context>([](std::size_t requested) {
+    return cucascade::exec::make_semi_future<std::size_t>(requested);
+  });
+}
+
+/// One read that stays in flight until the test opens the gate.
+struct read_gate {
+  cucascade::exec::promise<std::size_t> promise;
+  std::atomic<std::size_t> requested{0};
+  std::atomic<int> reads{0};
+
+  /// Completes the read with the bytes it asked for.
+  void open() { promise.set_value(requested.load()); }
+};
+
+std::shared_ptr<scripted_context> gated_context(std::shared_ptr<read_gate> const& gate)
+{
+  return std::make_shared<scripted_context>([gate](std::size_t requested) {
+    gate->requested.store(requested);
+    gate->reads.fetch_add(1);
+    return gate->promise.get_semi_future();
+  });
+}
+
+/// Release hooks run on whichever thread drops the last reference: poll for their effects.
+template <class Condition>
+bool eventually(Condition condition, std::chrono::seconds timeout = std::chrono::seconds(5))
+{
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  while (!condition()) {
+    if (std::chrono::steady_clock::now() >= deadline) { return false; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
 
 /// What on_done reported, and whether it ran at all.
 struct done_probe {
@@ -286,13 +353,21 @@ TEST_CASE_METHOD(issuer_fixture,
                  "a split too large for the fraction is refused without back-off",
                  "[scan_manager][device_prefetch]")
 {
+  double fraction = 0.0;
+  SECTION("larger than the whole budget") { fraction = 1e-9; }
+  SECTION("larger than the parked window's half of the budget")
+  {
+    // A 4 MiB budget parks at most 2 MiB: the 3 MiB split fits the budget, never the window.
+    fraction = static_cast<double>(4 * MiB) / static_cast<double>(space->get_max_memory());
+  }
   auto split  = std::make_shared<device_split>(two_ranges(local_datasource()));
-  auto issuer = this->issuer(1e-9);
+  auto issuer = this->issuer(fraction);
   done_probe done;
   CHECK(issuer.issue(split, done.callback()) == device_prefetch_issue::too_large);
   CHECK(split->prefetched() == nullptr);
   CHECK(split->get_prefetch_state() == prefetch_state::idle);
   CHECK(window->parked_splits.load() == 0);
+  CHECK(done.calls->load() == 0);
 }
 
 TEST_CASE_METHOD(issuer_fixture,
@@ -317,6 +392,35 @@ TEST_CASE_METHOD(issuer_fixture,
   CHECK(space->get_available_memory() == available);
 }
 
+TEST_CASE_METHOD(issuer_fixture,
+                 "a reservation that would break the usage floor is a memory refusal",
+                 "[scan_manager][device_prefetch]")
+{
+  // With fraction 0.5 at least half the limit must stay available.  Leave the floor plus 1 MiB:
+  // the 3 MiB reservation itself is granted, but would take the space below the floor.
+  auto const limit     = space->get_max_memory();
+  auto const available = space->get_available_memory();
+  auto const floor     = static_cast<std::size_t>(0.5 * static_cast<double>(limit));
+  REQUIRE(available > floor + 1 * MiB);
+  auto hog = space->make_reservation_or_null(available - floor - 1 * MiB);
+  REQUIRE(hog != nullptr);
+  REQUIRE(space->get_available_memory() < floor + 3 * MiB);
+  REQUIRE(space->make_reservation_or_null(3 * MiB) != nullptr);
+
+  auto split  = std::make_shared<device_split>(two_ranges(local_datasource()));
+  auto issuer = this->issuer(0.5);
+  done_probe done;
+  CHECK(issuer.issue(split, done.callback()) == device_prefetch_issue::memory);
+  CHECK(split->prefetched() == nullptr);
+  CHECK(split->get_prefetch_state() == prefetch_state::idle);
+  CHECK(window->parked_splits.load() == 0);
+  CHECK(window->parked_bytes.load() == 0);
+  CHECK(done.calls->load() == 0);
+
+  hog.reset();
+  CHECK(space->get_available_memory() == available);
+}
+
 TEST_CASE_METHOD(issuer_fixture, "a full window refuses", "[scan_manager][device_prefetch]")
 {
   auto ds     = local_datasource();
@@ -335,9 +439,33 @@ TEST_CASE_METHOD(issuer_fixture, "a full window refuses", "[scan_manager][device
 
   // The first split dies unconsumed: its slot releases the window.
   first.reset();
+  CHECK(eventually([&] { return window->unconsumed.load() == 1; }));
+  CHECK(window->parked_splits.load() == 0);
+  CHECK(window->parked_bytes.load() == 0);
+  tier->view().synchronize();
+}
+
+TEST_CASE_METHOD(issuer_fixture,
+                 "a split whose slot is occupied is not issued",
+                 "[scan_manager][device_prefetch]")
+{
+  auto split    = std::make_shared<device_split>(two_ranges(local_datasource()));
+  auto occupant = std::make_shared<scan::prefetched_ranges>(
+    0, tier, std::vector<scan::prefetched_ranges::device_ranges>{}, 0, nullptr);
+  REQUIRE(split->set_prefetched_ranges(occupant));
+
+  auto issuer = this->issuer();
+  done_probe done;
+  CHECK(issuer.issue(split, done.callback()) == device_prefetch_issue::error);
+  CHECK(split->prefetched() == occupant);
+  CHECK(split->get_prefetch_state() == prefetch_state::idle);
+  CHECK(done.calls->load() == 0);
   CHECK(window->parked_splits.load() == 0);
   CHECK(window->parked_bytes.load() == 0);
   CHECK(window->unconsumed.load() == 1);
+  CHECK(window->failed.load() == 0);
+
+  split->discard_prefetched_ranges();
   tier->view().synchronize();
 }
 
@@ -358,19 +486,19 @@ TEST_CASE_METHOD(issuer_fixture,
 namespace {
 
 /// Falls behind on the second check -- the one after the slot is installed -- and only once a
-/// consumer has taken the slot, so that consumer is waiting when the issuer abandons.
+/// consumer took the slot and is about to wait on it, so the issuer abandons under that consumer.
 struct overtaken_split final : device_split {
   using device_split::device_split;
   mutable std::atomic<int> checks{0};
+  std::atomic<bool> consumer_waiting{false};  ///< set by the consumer just before wait_for()
 
   [[nodiscard]] bool has_fallen_behind() const noexcept override
   {
     if (checks.fetch_add(1) == 0) { return false; }
     auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (prefetched() != nullptr && std::chrono::steady_clock::now() < deadline) {
+    while (!consumer_waiting.load() && std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
     return true;
   }
 };
@@ -386,7 +514,6 @@ TEST_CASE_METHOD(issuer_fixture,
 
   std::optional<scan::prefetched_ranges::state> seen;
   bool abandoned = false;
-  std::chrono::steady_clock::duration waited{};
   std::thread consumer([&] {
     auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     std::shared_ptr<scan::prefetched_ranges> taken;
@@ -395,10 +522,9 @@ TEST_CASE_METHOD(issuer_fixture,
       if (!taken) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
     }
     if (!taken) { return; }
-    auto const start = std::chrono::steady_clock::now();
-    seen             = taken->wait_for(std::chrono::seconds(5));
-    waited           = std::chrono::steady_clock::now() - start;
-    abandoned        = taken->abandoned();
+    split->consumer_waiting.store(true);
+    seen      = taken->wait_for(std::chrono::seconds(30));
+    abandoned = taken->abandoned();
   });
 
   done_probe done;
@@ -410,8 +536,6 @@ TEST_CASE_METHOD(issuer_fixture,
   REQUIRE(seen.has_value());
   CHECK(*seen == scan::prefetched_ranges::state::failed);
   CHECK(abandoned);
-  // Woken by the abandon, not by the timeout.
-  CHECK(waited < std::chrono::seconds(1));
   CHECK(split->get_prefetch_state() == prefetch_state::attempted);
   CHECK(split->prefetched() == nullptr);
   CHECK(window->parked_splits.load() == 0);
@@ -441,8 +565,9 @@ TEST_CASE_METHOD(issuer_fixture, "a short read is a failure", "[scan_manager][de
 
   ranges.reset();
   split->discard_prefetched_ranges();
-  CHECK(window->failed.load() == 1);
+  CHECK(eventually([&] { return window->failed.load() == 1; }));
   CHECK(window->parked_splits.load() == 0);
+  CHECK(window->parked_bytes.load() == 0);
   tier->view().synchronize();
 }
 
@@ -450,9 +575,8 @@ TEST_CASE_METHOD(issuer_fixture,
                  "an errored read is a failure, never a throw",
                  "[scan_manager][device_prefetch]")
 {
-  auto failing = std::make_shared<failing_context>();
   std::shared_ptr<cucascade::io::datasource> ds =
-    cucascade::io::open_datasource(failing, file.path.string());
+    cucascade::io::open_datasource(failing_context(), file.path.string());
   auto split  = std::make_shared<device_split>(two_ranges(ds));
   auto issuer = this->issuer();
   done_probe done;
@@ -467,6 +591,65 @@ TEST_CASE_METHOD(issuer_fixture,
   auto ranges = split->prefetched();
   REQUIRE(ranges != nullptr);
   CHECK(ranges->current() == scan::prefetched_ranges::state::failed);
+  tier->view().synchronize();
+}
+
+TEST_CASE_METHOD(issuer_fixture,
+                 "one errored hint fails the prefetch once every hint arrived",
+                 "[scan_manager][device_prefetch]")
+{
+  auto const path = file.path.string();
+  auto issuer     = this->issuer();
+  done_probe done;
+
+  SECTION("the errored read settles inline, the good one later")
+  {
+    auto gate  = std::make_shared<read_gate>();
+    auto split = std::make_shared<device_split>(std::vector<scan::scan_info::fadvise_entry>{
+      {cucascade::io::open_datasource(failing_context(), path), {byte_range(0, 1 * MiB)}},
+      {cucascade::io::open_datasource(gated_context(gate), path), {byte_range(3 * MiB, 2 * MiB)}}});
+    REQUIRE(issuer.issue(split, done.callback()) == device_prefetch_issue::issued);
+    REQUIRE(gate->reads.load() == 1);
+    // The second hint is still in flight: nothing is settled or reported yet.
+    CHECK(done.calls->load() == 0);
+    auto ranges = split->prefetched();
+    REQUIRE(ranges != nullptr);
+    CHECK(ranges->current() == scan::prefetched_ranges::state::pending);
+
+    gate->open();
+    auto const result = done.wait();
+    CHECK_FALSE(result.ok);
+    CHECK(result.bytes == 3 * MiB);
+    REQUIRE(result.error != nullptr);
+    CHECK(message_of(result.error) == "injected device read failure");
+    CHECK(ranges->current() == scan::prefetched_ranges::state::failed);
+    CHECK_FALSE(ranges->abandoned());
+  }
+
+  SECTION("every read settles inline: reported once, with the first error, before issue returns")
+  {
+    auto split = std::make_shared<device_split>(std::vector<scan::scan_info::fadvise_entry>{
+      {cucascade::io::open_datasource(instant_context(), path), {byte_range(0, 1 * MiB)}},
+      {cucascade::io::open_datasource(failing_context("first failure"), path),
+       {byte_range(1 * MiB, 1 * MiB)}},
+      {cucascade::io::open_datasource(failing_context("second failure"), path),
+       {byte_range(3 * MiB, 1 * MiB)}}});
+    REQUIRE(issuer.issue(split, done.callback()) == device_prefetch_issue::issued);
+    CHECK(done.calls->load() == 1);
+    auto const result = done.wait();
+    CHECK_FALSE(result.ok);
+    CHECK(result.bytes == 3 * MiB);
+    REQUIRE(result.error != nullptr);
+    CHECK(message_of(result.error) == "first failure");
+    REQUIRE(split->prefetched() != nullptr);
+    CHECK(split->prefetched()->current() == scan::prefetched_ranges::state::failed);
+  }
+
+  // The split died with its section: the failed prefetch was released once, as failed.
+  CHECK(done.calls->load() == 1);
+  CHECK(eventually([&] { return window->failed.load() == 1; }));
+  CHECK(window->parked_splits.load() == 0);
+  CHECK(window->unconsumed.load() == 0);
   tier->view().synchronize();
 }
 
