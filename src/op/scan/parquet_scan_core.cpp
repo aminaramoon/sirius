@@ -26,8 +26,6 @@
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
 #include <io/parquet_helpers.hpp>
-#include <io/sirius_datasource.hpp>
-#include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 #include <memory/size_arithmetic.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
@@ -113,8 +111,8 @@ namespace sirius::op::scan {
 
 namespace {
 
-/// The message of @p error for a log line; never throws.
-std::string describe_failure(std::exception_ptr const& error) noexcept
+/// The message of @p error for a log line.  Only building the string can throw.
+std::string describe_failure(std::exception_ptr const& error)
 {
   if (!error) { return "no error recorded"; }
   try {
@@ -770,7 +768,9 @@ filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
 //===----------------------------------------------------------------------===//
 bool parquet_split_info::supports_device_prefetch() const noexcept
 {
-  if (!device_prefetch_allowed || rg_slices.empty()) { return false; }
+  // A field-ID mapping rewrites the decoded columns; the device route has not been validated
+  // for it.
+  if (!device_prefetch_allowed || field_mapping || rg_slices.empty()) { return false; }
   if (plan && plan->has_user_virtual_columns()) { return false; }
   if (_column_chunk_ranges.size() != rg_slices.size()) { return false; }
   for (std::size_t i = 0; i < rg_slices.size(); ++i) {
@@ -783,7 +783,7 @@ bool parquet_split_info::supports_device_prefetch() const noexcept
 }
 
 std::optional<std::vector<prefetched_chunk_spans>> parquet_split_info::prefetched_spans_per_slice(
-  std::span<prefetched_ranges::device_ranges const> entries) const noexcept
+  std::span<prefetched_ranges::device_ranges const> entries) const
 {
   // Mirrors parquet_fadvise_entries: an entry exists exactly for each slice with a datasource
   // and non-empty ranges, in slice order.
@@ -837,8 +837,9 @@ bool parquet_ingestible_table_info::has_requested_user_virtual_columns() const
 //===----------------------------------------------------------------------===//
 // parquet_gpu_ingestible — construction
 //===----------------------------------------------------------------------===//
-parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_info> info)
-  : _info(std::move(info))
+parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_info> info,
+                                     bool device_prefetch_allowed)
+  : _info(std::move(info)), _device_prefetch_allowed(device_prefetch_allowed)
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
 
@@ -1101,7 +1102,7 @@ parquet_scan_core::stoppable_metadata_scan_task_t parquet_scan_core::next_split_
       throw;
     } catch (transparent::classified_execution_error const&) {
       throw;
-    } catch (io::descriptor_mismatch_error const& error) {
+    } catch (cucascade::io::descriptor_mismatch_error const& error) {
       if (_info->profiles && _info->profiles->counters) {
         _info->profiles->counters->descriptor_mismatches.fetch_add(1, std::memory_order_relaxed);
       }
@@ -1111,9 +1112,6 @@ parquet_scan_core::stoppable_metadata_scan_task_t parquet_scan_core::next_split_
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
     } catch (cucascade::io::credential_error const& error) {
-      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
-                                                    error.what());
-    } catch (cucascade::io::object_changed_error const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
     } catch (std::system_error const& error) {
@@ -1137,7 +1135,7 @@ parquet_scan_core::stoppable_metadata_scan_task_t parquet_scan_core::next_split_
 std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   std::string const& file_path,
   std::size_t file_index,
-  std::shared_ptr<io::ioctx> const& io_ctx,
+  std::shared_ptr<cucascade::io::ioctx> const& io_ctx,
   std::stop_token stop)
 {
   if (stop.stop_requested())
@@ -1158,13 +1156,18 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   // Probe only when the footer will actually be read: once the metadata store
   // holds this file's parsed footer, a suffix GET would download bytes nothing
   // consumes, and the open only needs the size. Mirrors describe_parquet.
-  bool const footer_cached = io_ctx->metadata_store().has_path(file_path);
-  std::shared_ptr<io::sirius_datasource> sirius_ds;
+  // The store is keyed by the normalized path, so look up what the open uses.
+  auto const normalized    = sirius::io::strip_file_scheme(file_path);
+  bool const footer_cached = io_ctx->metadata_store().has_path(normalized);
+  std::shared_ptr<cucascade::io::datasource> sirius_ds;
   {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-    sirius_ds = io_ctx->open_datasource(
-      file_path, footer_cached ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
+    sirius_ds = sirius::io::open_datasource(io_ctx,
+                                            normalized,
+                                            footer_cached
+                                              ? cucascade::io::open_hint::generic
+                                              : cucascade::io::open_hint::parquet_footer_probe);
   }
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
@@ -1212,8 +1215,6 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     throw;
   } catch (cucascade::io::credential_error const&) {
     throw;
-  } catch (cucascade::io::object_changed_error const&) {
-    throw;
   } catch (std::system_error const&) {
     throw;
   } catch (duckdb::InterruptException const&) {
@@ -1222,7 +1223,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     throw;
   } catch (std::logic_error const&) {
     throw;
-  } catch (io::object_changed_error const&) {
+  } catch (cucascade::io::object_changed_error const&) {
     // Preserve the typed identity failure for the outer task handler.
     throw;
   } catch (std::exception const& error) {
@@ -2044,7 +2045,8 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
   std::vector<prefetched_chunk_spans> prefetched_spans;
   if (auto p = split.take_prefetched_ranges()) {
     constexpr auto k_device_prefetch_wait = std::chrono::seconds{60};  // >= 2x the REST timeout
-    if (all_slices_pruned || _plan->has_user_virtual_columns() || !split.device_prefetch_allowed) {
+    if (all_slices_pruned || _plan->has_user_virtual_columns() || !split.device_prefetch_allowed ||
+        split.field_mapping) {
       // Not decodable from device spans: released unconsumed below.
     } else if (p->device_id() != mem_space.get_device_id()) {
       // Checked before waiting: the task was re-pinned to another GPU after the readahead
@@ -2057,13 +2059,14 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
     } else {
       switch (p->wait_for(k_device_prefetch_wait)) {
         case prefetched_ranges::state::ready:
-          if (auto taken = p->take(rmm::cuda_stream_view{stream.get()})) {
+          // Checked before taking: a prefetch that cannot be used is released unconsumed.
+          if (!split.prefetched_spans_per_slice(p->peek())) {
+            SIRIUS_LOG_WARN(
+              "[parquet_scan] device prefetch does not line up with the split; reading");
+          } else if (auto taken = p->take(rmm::cuda_stream_view{stream.get()})) {
             device_ranges = std::move(*taken);  // freed on `stream` when this scope ends
             if (auto mapped = split.prefetched_spans_per_slice(device_ranges)) {
               prefetched_spans = std::move(*mapped);
-            } else {
-              SIRIUS_LOG_WARN(
-                "[parquet_scan] device prefetch does not line up with the split; reading");
             }
           } else {
             SIRIUS_LOG_DEBUG(
@@ -2187,6 +2190,12 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
         cudf::io::read_parquet(std::move(cudf_sources), std::move(metadatas), opts, stream, mr_ref)
           .tbl);
     };
+    // Before a fallback read: free the device copies first (stream-ordered behind whatever was
+    // enqueued on `stream`), so the read does not run with both resident.
+    auto drop_device_copies = [&]() noexcept {
+      prefetched_spans.clear();
+      device_ranges.clear();
+    };
     // Several files: the device route refuses schema drift the way the bulk route does; today's
     // general route is what those splits get, so decide before choosing the route.
     bool from_device = !prefetched_spans.empty();
@@ -2196,7 +2205,7 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
       } catch (std::exception const& e) {
         SIRIUS_LOG_WARN("[parquet_scan] device prefetch skipped: {}", e.what());
         from_device = false;
-        prefetched_spans.clear();
+        drop_device_copies();
       }
     }
     if (from_device) {
@@ -2204,21 +2213,39 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
         table = materialize_parquet(
           sources, opts, split.column_chunk_byte_ranges(), prefetched_spans, stream, mr_ref);
         if (counters) { counters->device_route_decodes.fetch_add(1, std::memory_order_relaxed); }
-      } catch (rmm::out_of_memory const&) {
-        throw;                             // the scheduler's retry needs it
+      } catch (std::bad_alloc const&) {
+        throw;  // rmm::out_of_memory among them: the scheduler's retry needs it
       } catch (std::exception const& e) {  // prefetched_mismatch, cudf::logic_error, ...
         SIRIUS_LOG_WARN(
           "[parquet_scan] device-route decode failed ({}); reading through the general route",
           e.what());
         if (counters) { counters->device_route_fallbacks.fetch_add(1, std::memory_order_relaxed); }
-        prefetched_spans.clear();
+        drop_device_copies();
         table = read_general();
       }
-    } else if (!all_slices_pruned && prefers_bulk_materialize(sources, opts)) {
-      table = materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
     } else {
-      table = read_general();
+      drop_device_copies();
+      if (!all_slices_pruned && prefers_bulk_materialize(sources, opts)) {
+        // The bulk route checks the chunks it fetched against the reader the way the device route
+        // does; a mismatch is read again through the general route.
+        try {
+          table =
+            materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
+        } catch (prefetched_mismatch const& e) {
+          SIRIUS_LOG_WARN(
+            "[parquet_scan] bulk read does not match the reader ({}); reading through the general "
+            "route",
+            e.what());
+          table = read_general();
+        }
+      } else {
+        table = read_general();
+      }
     }
+    // The decode is enqueued on `stream`: free the device copies now, stream-ordered behind it,
+    // rather than holding them through assembly.
+    prefetched_spans.clear();
+    device_ranges.clear();
     if (split.field_mapping) {
       auto rows = table->num_rows();
       table = split.field_mapping->apply(owning_table_view(std::move(table)), rows, stream, mr_ref)

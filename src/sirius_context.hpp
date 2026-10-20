@@ -419,12 +419,8 @@ class SiriusContext : public ClientContextState {
     std::array<uint64_t, semantic_reason_count> split_physical_rejections{};
     uint64_t parquet_type_mismatch_observed = 0;
     uint64_t parquet_type_refusals          = 0;
-    uint64_t metadata_cache_entries = 0, metadata_cache_hits = 0, metadata_cache_misses = 0;
-    uint64_t metadata_cache_replacements = 0, metadata_cache_bypasses = 0;
-    uint64_t metadata_cache_joined = 0, metadata_cache_builds = 0;
-    uint64_t metadata_cache_failures = 0, metadata_cache_cancelled_waiters = 0;
-    uint64_t metadata_cache_stale           = 0;
-    uint64_t metadata_provenance_mismatches = 0;
+    uint64_t device_route_decodes           = 0;  ///< parquet splits decoded from a device prefetch
+    uint64_t device_route_fallbacks         = 0;  ///< device-route decodes retried generally
     std::unordered_map<uint64_t, uint64_t> scan_lowerings;
   };
 

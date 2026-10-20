@@ -135,9 +135,10 @@ class prefetched_mismatch : public std::runtime_error {
 /// As above, with @p prefetched: one entry per source, in @p sources order.  When every entry is
 /// non-empty the table is decoded straight from those spans by the hybrid scan reader, whatever
 /// the backend prefers.  The spans must outlive the call.  Each source's spans are checked against
-/// the reader's own column-chunk enumeration under @p options (one span per chunk, same sizes);
-/// a mismatch throws @ref prefetched_mismatch before any decode work.  An empty @p prefetched is
-/// the behaviour of the overload above.
+/// the reader's own column-chunk enumeration under @p options (one span per chunk, same sizes,
+/// and -- when @p ranges has a non-empty entry for the source -- read from the same file
+/// offsets); a mismatch throws @ref prefetched_mismatch before any decode work.  An empty
+/// @p prefetched is the behaviour of the overload above.
 ///
 /// @throws std::invalid_argument when @p prefetched is non-empty but fails
 ///         @ref can_materialize_from_prefetched.

@@ -64,7 +64,7 @@ inline void require_ok(std::unique_ptr<duckdb::QueryResult> result)
 /// An empty scratch directory under the system temp directory, named after @p tag.
 inline std::filesystem::path fresh_tmp_dir(std::string const& tag)
 {
-  auto dir = std::filesystem::temp_directory_path() / ("sirius_pr6_schema_" + tag);
+  auto dir = std::filesystem::temp_directory_path() / ("sirius_parquet_src_" + tag);
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
   std::filesystem::create_directories(dir);

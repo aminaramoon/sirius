@@ -132,13 +132,21 @@ TEST_CASE_METHOD(prefetched_ranges_fixture,
   CHECK(ranges->device_id() == 0);
   CHECK(ranges->total_bytes() == kEntries * kPerEntry * kBufferBytes);
 
-  // Not ready yet: nothing to take, and the attempt does not consume the object.
+  // Not ready yet: nothing to take or peek at, and the attempt does not consume the object.
   CHECK_FALSE(ranges->take(other.view()).has_value());
+  CHECK(ranges->peek().empty());
   CHECK(counts->total() == 0);
 
   CHECK(ranges->set_ready());
   CHECK_FALSE(ranges->set_ready());  // idempotent
   CHECK(ranges->current() == prefetched_ranges::state::ready);
+
+  // Peeking shows the entries in place without consuming them.
+  auto const peeked = ranges->peek();
+  REQUIRE(peeked.size() == kEntries);
+  CHECK(peeked[0].spans.front().data() == addresses.front());
+  CHECK_FALSE(ranges->taken());
+  CHECK(counts->total() == 0);
 
   auto taken = ranges->take(other.view());
   REQUIRE(taken.has_value());
@@ -167,6 +175,7 @@ TEST_CASE_METHOD(prefetched_ranges_fixture,
   }
 
   CHECK_FALSE(ranges->take(other.view()).has_value());
+  CHECK(ranges->peek().empty());
   ranges.reset();
   CHECK(counts->of(release_reason::consumed) == 1);
   CHECK(counts->total() == 1);

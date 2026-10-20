@@ -193,6 +193,15 @@ std::optional<std::vector<prefetched_ranges::device_ranges>> prefetched_ranges::
   return out;
 }
 
+std::span<prefetched_ranges::device_ranges const> prefetched_ranges::peek() const noexcept
+{
+  std::lock_guard lock(_mutex);
+  if (_state != state::ready || _taken || _wrong_device.load(std::memory_order_acquire)) {
+    return {};
+  }
+  return _ranges;
+}
+
 bool prefetched_ranges::taken() const noexcept
 {
   std::lock_guard lock(_mutex);
