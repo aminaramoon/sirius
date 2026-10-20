@@ -387,6 +387,8 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
+  r.optional(
+    "device_prefetching_fraction", opt.device_prefetching_fraction, yaml::fraction<double>{});
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (r.optional_node("kvikio")) {
@@ -1047,6 +1049,32 @@ void sirius_config::finalize_derived_config()
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
   enforce_native_backend_for_multi_gpu();
+  warn_device_prefetching_fraction();
+}
+
+void sirius_config::warn_device_prefetching_fraction() const
+{
+  // The fraction is of each GPU space's reservation limit, the downgrade
+  // thresholds are of its capacity: compare both as fractions of capacity.
+  auto const fraction = _scan_manager_config.device_prefetching_fraction;
+  if (fraction <= 0.0) { return; }
+  for (auto const& space : _memory_space_configs) {
+    auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+    if (gpu == nullptr) { continue; }
+    auto const ceiling = fraction * gpu->reservation_limit_fraction;
+    if (ceiling <= gpu->downgrade_stop_fraction) { continue; }
+    SIRIUS_LOG_WARN(
+      "sirius_config: scan_manager.device_prefetching_fraction ({:.2f}) of GPU {}'s reservation "
+      "limit ({:.2f} of capacity) is {:.2f} of capacity, above its downgrade_stop_fraction "
+      "({:.2f}); device-prefetched bytes cannot be spilled, so the readahead may hold the GPU "
+      "inside the downgrade band",
+      fraction,
+      gpu->device_id,
+      gpu->reservation_limit_fraction,
+      ceiling,
+      gpu->downgrade_stop_fraction);
+    return;
+  }
 }
 
 void sirius_config::derive_rest_scan_budget()

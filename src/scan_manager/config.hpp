@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -38,6 +39,11 @@ namespace sirius::scan_manager {
 /// one worker thread each);
 /// counted in the scan-manager sizing budget below.
 inline constexpr std::size_t default_uring_n_reactors = 4;
+
+/// Readahead budget the device tier falls back to when the serving backend
+/// publishes none and the pipeline width is not stamped (see
+/// @ref scan_manager_config::resolve_readahead).
+inline constexpr std::size_t default_device_readahead_budget = 4;
 
 /// Sirius's default uring backend config: cuCascade's struct defaults with
 /// readahead off (@c n_max_concurrent_scans = 0).  cuCascade's own default is
@@ -244,15 +250,39 @@ struct scan_manager_config {
   /// with a cache on, the budget is the backend reactor's own
   /// @c n_max_concurrent_scans (see @ref resolve_readahead); with
   /// @c cache.mode of @c none there is nothing to read ahead into and the
-  /// readahead does not run.  Set it to @c 0 to turn the readahead off even
-  /// with a cache on, or to a positive count to override the backend's budget.
+  /// readahead does not run.  With @ref device_prefetching_fraction above 0 the
+  /// device tier is somewhere to read into, so @c none no longer turns the
+  /// readahead off, and a backend that publishes no budget gets the pipeline
+  /// width instead.  Set it to @c 0 to turn the readahead off even with a cache
+  /// on, or to a positive count to override the backend's budget.
   std::optional<std::size_t> max_readahead_scans{};
 
   /// When the readahead issues.  Unset (the default) takes the serving
   /// backend's own preference — @c eager for an object store, @c opportunistic
-  /// for a local (uring) device (see @ref prefetch_strategy).  Set it to pin one
-  /// strategy whatever the backend.
+  /// for a local (uring) device (see @ref prefetch_strategy), or @c eager
+  /// whatever the backend when @ref device_prefetching_fraction is above 0.  Set
+  /// it to pin one strategy whatever the backend.
   std::optional<prefetch_strategy> readahead_strategy{};
+
+  /// Device tier of the readahead (see docs/super-sirius/configuration.md,
+  /// "Scan Manager & IO Configuration"): the readahead may read a split's byte
+  /// ranges straight into device buffers on the split's GPU, ahead of its scan
+  /// task, as long as the GPU space's consumed memory after admitting the
+  /// split -- limit minus available, reservations plus allocations by anyone,
+  /// the measure cuCascade's downgrade check uses -- stays at or below this
+  /// fraction of the space's reservation limit
+  /// (@c memory_space::get_max_memory()).  0 (the default) turns the device
+  /// tier off: the readahead only stages bytes in the pinned host cache.
+  /// Prefetched device bytes are invisible to the downgrade executor until
+  /// their scan consumes them, so keep this fraction of the reservation limit
+  /// at or below @c downgrade_stop_fraction of the capacity.
+  double device_prefetching_fraction{0.0};
+
+  /// Whether the readahead's device tier is on (@ref device_prefetching_fraction above 0).
+  [[nodiscard]] bool device_prefetching_enabled() const noexcept
+  {
+    return device_prefetching_fraction > 0.0;
+  }
 
   /// Scans the executor can have running at once — the pipeline pool's width.
   /// The budget @c opportunistic schedules against, since one prefetch per
@@ -314,23 +344,41 @@ struct scan_manager_config {
   /// backend serving the scans — its @c n_max_concurrent_scans and the
   /// preference implied by its reactor type — and are what an unset
   /// @ref max_readahead_scans / @ref readahead_strategy defers to.
+  ///
+  /// With the device tier on (@ref device_prefetching_enabled) three unset
+  /// defaults change: the strategy becomes @c eager, @c cache.mode @c none no
+  /// longer turns the readahead off, and a backend budget of zero becomes the
+  /// pipeline width (or @ref default_device_readahead_budget).  With it off the
+  /// result is exactly the backend/cache-driven plan.
   [[nodiscard]] readahead_plan resolve_readahead(std::size_t backend_budget,
                                                  prefetch_strategy backend_strategy) const noexcept
   {
-    readahead_plan plan{.budget = 0, .strategy = readahead_strategy.value_or(backend_strategy)};
+    // With a device tier the readahead hides IO behind the executor's compute
+    // and the fraction is its throttle, so an unset strategy runs eager; without
+    // one the backend decides.
+    readahead_plan plan{.budget   = 0,
+                        .strategy = readahead_strategy.value_or(device_prefetching_enabled()
+                                                                  ? prefetch_strategy::eager
+                                                                  : backend_strategy)};
     // An explicit budget is the whole answer, zero (off) included.
     if (max_readahead_scans.has_value()) {
       plan.budget = *max_readahead_scans;
       return plan;
     }
-    // Without a cache the readahead has nowhere to read into: a prefetched
-    // chunk would be dropped before its scan ever asked for it.
-    if (!cache.enabled()) { return plan; }
-    // A backend budget of zero is the backend opting out of readahead entirely
-    // (see default_uring_config).  Honor it even under the
-    // opportunistic strategy, which would otherwise substitute the pipeline
-    // width and run a readahead the backend asked not to have.
-    if (backend_budget == 0) { return plan; }
+    // Without a cache the host tier has nowhere to read into: a prefetched
+    // chunk would be dropped before its scan ever asked for it.  The device
+    // tier reads into its own buffers.
+    if (!cache.enabled() && !device_prefetching_enabled()) { return plan; }
+    if (backend_budget == 0) {
+      // A backend budget of zero is the backend opting out of host readahead
+      // (see default_uring_config).  Honor it even under the opportunistic
+      // strategy, which would otherwise substitute the pipeline width and run a
+      // readahead the backend asked not to have.  The device tier is a
+      // different trade, so it gets the executor's width instead.
+      if (!device_prefetching_enabled()) { return plan; }
+      plan.budget = pipeline_width > 0 ? pipeline_width : default_device_readahead_budget;
+      return plan;
+    }
     // Opportunistic schedules against what the executor can run, not what the
     // device can queue: one prefetch per non-scan deployment is only useful
     // while a pipeline thread could still pick up another scan.
@@ -345,6 +393,10 @@ struct scan_manager_config {
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)
 {
   (void)config.preparation.resolve(config.thread_pool.num_threads);
+  // Written as a negated range check so NaN is rejected too.
+  if (!(config.device_prefetching_fraction >= 0.0 && config.device_prefetching_fraction <= 1.0)) {
+    throw std::invalid_argument("scan_manager.device_prefetching_fraction must be within [0, 1]");
+  }
   return config;
 }
 }  // namespace sirius::scan_manager

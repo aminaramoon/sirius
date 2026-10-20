@@ -31,7 +31,9 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -778,6 +780,82 @@ std::size_t count_warnings(sirius::test::scoped_recording_log_sink const& logs,
 }
 
 }  // namespace
+
+TEST_CASE("device_prefetching_fraction defaults to 0 and parses from YAML",
+          "[scan_manager][config][device_prefetch]")
+{
+  CHECK(scan_manager_config{}.device_prefetching_fraction == 0.0);
+  CHECK_FALSE(scan_manager_config{}.device_prefetching_enabled());
+
+  auto const unset = load_scan_manager("sirius_device_prefetch_unset.yaml",
+                                       scan_manager_yaml("      rest_n_reactors: 1\n"));
+  CHECK(unset.device_prefetching_fraction == 0.0);
+  CHECK_FALSE(unset.device_prefetching_enabled());
+
+  auto const set = load_scan_manager("sirius_device_prefetch_set.yaml",
+                                     scan_manager_yaml("      device_prefetching_fraction: 0.6\n"));
+  CHECK(set.device_prefetching_fraction == 0.6);
+  CHECK(set.device_prefetching_enabled());
+}
+
+TEST_CASE("device_prefetching_fraction rejects values outside [0,1]",
+          "[scan_manager][config][device_prefetch]")
+{
+  for (auto const* value : {"1.5", "-0.1"}) {
+    INFO("device_prefetching_fraction: " << value);
+    scoped_yaml yaml(
+      "sirius_device_prefetch_invalid.yaml",
+      scan_manager_yaml(std::string{"      device_prefetching_fraction: "} + value + "\n"));
+    sirius::sirius_config cfg;
+    CHECK_THROWS(cfg.load_from_file(yaml.path()));
+  }
+
+  scan_manager_config cfg;
+  cfg.device_prefetching_fraction = 1.5;
+  CHECK_THROWS_AS(sirius::scan_manager::validate_scan_manager_config(cfg), std::invalid_argument);
+  cfg.device_prefetching_fraction = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS_AS(sirius::scan_manager::validate_scan_manager_config(cfg), std::invalid_argument);
+  cfg.device_prefetching_fraction = 0.6;
+  CHECK_NOTHROW(sirius::scan_manager::validate_scan_manager_config(cfg));
+}
+
+TEST_CASE("device_prefetching_fraction above the GPU downgrade stop warns",
+          "[scan_manager][config][device_prefetch]")
+{
+  constexpr std::string_view needle = "scan_manager.device_prefetching_fraction";
+  // The GPU block defaults to reservation_limit_fraction 1.0 and downgrade_stop_fraction 0.6.
+  auto const yaml = [](std::string const& memory, std::string const& fraction) {
+    return "sirius:\n"
+           "  topology:\n"
+           "    num_gpus: 1\n" +
+           memory +
+           "  executor:\n"
+           "    scan_manager:\n"
+           "      device_prefetching_fraction: " +
+           fraction + "\n";
+  };
+
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    (void)load_scan_manager("sirius_device_prefetch_at_stop.yaml", yaml("", "0.6"));
+    CHECK(count_warnings(logs, needle) == 0);
+  }
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    (void)load_scan_manager("sirius_device_prefetch_above_stop.yaml", yaml("", "0.7"));
+    CHECK(count_warnings(logs, needle) == 1);
+  }
+  {
+    // The fraction is of the reservation limit: 1.0 x 0.5 of capacity stays below the stop.
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    (void)load_scan_manager("sirius_device_prefetch_scaled.yaml",
+                            yaml("  memory:\n"
+                                 "    gpu:\n"
+                                 "      reservation_limit_fraction: 0.5\n",
+                                 "1.0"));
+    CHECK(count_warnings(logs, needle) == 0);
+  }
+}
 
 TEST_CASE("sirius_config loads the removed kvikio backend as native with a warning",
           "[scan_manager][config][backend]")
