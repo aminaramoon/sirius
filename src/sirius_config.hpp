@@ -398,7 +398,8 @@ struct sirius_config {
 
   /// Apply the knobs derived from the rest of the configuration: the readahead
   /// scan budgets, the @c pipeline_width stamp, the multi-GPU backend
-  /// override and the uring prefetch reactors, in that order. Called by
+  /// override, the uring prefetch reactors and the device-prefetching
+  /// fraction warning, in that order. Called by
   /// parsed_sirius_config::resolve after memory capacities and operator
   /// defaults are resolved.
   void finalize_derived_config();
@@ -417,6 +418,13 @@ struct sirius_config {
   /// thread to stay ahead of demand. Called from
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
+
+  /// Log one WARN when @c scan_manager.device_prefetching_fraction, taken as a
+  /// fraction of a GPU space's capacity (fraction x reservation_limit_fraction),
+  /// exceeds that space's @c downgrade_stop_fraction: device-prefetched bytes are
+  /// invisible to the downgrade executor.  Only GPU spaces are compared, and the
+  /// first offending one is reported.  Called from @ref finalize_derived_config.
+  void warn_device_prefetching_fraction() const;
 
   cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;

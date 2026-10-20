@@ -327,7 +327,8 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pools. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
-| `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
+| `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones (or `eager` whatever the backend when `device_prefetching_fraction > 0`). Values are lowercase. |
+| `device_prefetching_fraction` | double [0,1] | 0 | Device tier of the readahead. `0` turns it off: the readahead only stages bytes in the pinned host cache. A positive value lets the readahead read a split's byte ranges straight into GPU buffers on the split's assigned GPU, ahead of its scan task, as long as that GPU space's consumed memory after admitting the split (limit − available: reservations plus allocations, by anyone, the same measure cuCascade's downgrade check uses) stays at or below this fraction of the space's reservation limit (`memory_space::get_max_memory()`); a split that would exceed it, or whose reservation or allocation fails, falls back to the host tier and the device tier backs off on that GPU until one of its splits is disposed (or 100 ms pass). Prefetched device bytes are invisible to the downgrade executor until their scan consumes them, so keep this fraction times the GPU's `reservation_limit_fraction` at or below its `downgrade_stop_fraction` (0.6 by default; a higher value is accepted with a warning). Setting it also enables the readahead on a local backend that publishes no budget (`uring.n_max_concurrent_scans: 0`): the budget then defaults to the pipeline width, an unset `readahead_strategy` to `eager`, and `cache.mode: none` no longer disables the readahead (reads go through the reactor's own staging). On such a local backend the host tier (pinned-cache staging) therefore also runs, eagerly, for every split the device tier refuses, although uring publishes no host readahead budget. `max_readahead_scans` / `readahead_strategy` still win when set. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
 sub-config below.
@@ -336,7 +337,7 @@ sub-config below.
 
 | Value | Effect |
 |-------|--------|
-| unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
+| unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. With `device_prefetching_fraction > 0`, `mode: none` no longer turns it off, and a backend that publishes no budget (`n_max_concurrent_scans: 0`) gets the pipeline width instead. |
 | `0` | The readahead does not run, whatever the cache mode. |
 | `n > 0` | The readahead runs with a budget of `n`, whatever the cache mode. |
 
@@ -344,7 +345,7 @@ sub-config below.
 
 | Value | Effect |
 |-------|--------|
-| unset (default) | The serving backend's preference — `eager` for REST, `opportunistic` for uring. |
+| unset (default) | The serving backend's preference — `eager` for REST, `opportunistic` for uring — or `eager` whatever the backend when `device_prefetching_fraction > 0`. |
 | `eager` | Every wake-up fills every free slot in the budget. An object-store round trip is dead time no matter what else is running, so only queue depth hides it. |
 | `opportunistic` | One prefetch each time the executor deploys a task that is *not* a scan, i.e. only while the device is not already busy with the executor's own reads. A local device read competes with those, so issuing one mid-scan reorders the queue rather than adding throughput. |
 
@@ -467,7 +468,7 @@ Those two knobs derive the settings below, which are therefore **not** individua
 | `uring.use_odirect` | `mode` — true for everything but `os` |
 | whether the prefetching cache is armed | `mode` — only under `cucs` |
 | `dispose_on_idle` | `eviction` — true under `idle` |
-| the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
+| the readahead's default budget | `mode` — the readahead does not run under `none` unless `device_prefetching_fraction > 0`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
 
 ### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
 
