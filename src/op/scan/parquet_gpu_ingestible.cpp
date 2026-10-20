@@ -105,8 +105,8 @@ namespace sirius::op::scan {
 
 namespace {
 
-/// The message of @p error for a log line; never throws.
-std::string describe_failure(std::exception_ptr const& error) noexcept
+/// The message of @p error for a log line.  Only building the string can throw.
+std::string describe_failure(std::exception_ptr const& error)
 {
   if (!error) { return "no error recorded"; }
   try {
@@ -733,7 +733,7 @@ bool parquet_split_info::supports_device_prefetch() const noexcept
 }
 
 std::optional<std::vector<prefetched_chunk_spans>> parquet_split_info::prefetched_spans_per_slice(
-  std::span<prefetched_ranges::device_ranges const> entries) const noexcept
+  std::span<prefetched_ranges::device_ranges const> entries) const
 {
   // Mirrors parquet_fadvise_entries: an entry exists exactly for each slice with a datasource
   // and non-empty ranges, in slice order.
@@ -1862,13 +1862,14 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     } else {
       switch (p->wait_for(k_device_prefetch_wait)) {
         case prefetched_ranges::state::ready:
-          if (auto taken = p->take(rmm::cuda_stream_view{stream.get()})) {
+          // Checked before taking: a prefetch that cannot be used is released unconsumed.
+          if (!split.prefetched_spans_per_slice(p->peek())) {
+            SIRIUS_LOG_WARN(
+              "[parquet_scan] device prefetch does not line up with the split; reading");
+          } else if (auto taken = p->take(rmm::cuda_stream_view{stream.get()})) {
             device_ranges = std::move(*taken);  // freed on `stream` when this scope ends
             if (auto mapped = split.prefetched_spans_per_slice(device_ranges)) {
               prefetched_spans = std::move(*mapped);
-            } else {
-              SIRIUS_LOG_WARN(
-                "[parquet_scan] device prefetch does not line up with the split; reading");
             }
           } else {
             SIRIUS_LOG_DEBUG(
@@ -1986,6 +1987,12 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
         cudf::io::read_parquet(std::move(cudf_sources), std::move(metadatas), opts, stream, mr_ref)
           .tbl);
     };
+    // Before a fallback read: free the device copies first (stream-ordered behind whatever was
+    // enqueued on `stream`), so the read does not run with both resident.
+    auto drop_device_copies = [&]() noexcept {
+      prefetched_spans.clear();
+      device_ranges.clear();
+    };
     // Several files: the device route refuses schema drift the way the bulk route does; today's
     // general route is what those splits get, so decide before choosing the route.
     bool from_device = !prefetched_spans.empty();
@@ -1995,7 +2002,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
       } catch (std::exception const& e) {
         SIRIUS_LOG_WARN("[parquet_scan] device prefetch skipped: {}", e.what());
         from_device = false;
-        prefetched_spans.clear();
+        drop_device_copies();
       }
     }
     if (from_device) {
@@ -2003,20 +2010,34 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
         table = materialize_parquet(
           sources, opts, split.column_chunk_byte_ranges(), prefetched_spans, stream, mr_ref);
         if (counters) { counters->device_route_decodes.fetch_add(1, std::memory_order_relaxed); }
-      } catch (rmm::out_of_memory const&) {
-        throw;                             // the scheduler's retry needs it
+      } catch (std::bad_alloc const&) {
+        throw;  // rmm::out_of_memory among them: the scheduler's retry needs it
       } catch (std::exception const& e) {  // prefetched_mismatch, cudf::logic_error, ...
         SIRIUS_LOG_WARN(
           "[parquet_scan] device-route decode failed ({}); reading through the general route",
           e.what());
         if (counters) { counters->device_route_fallbacks.fetch_add(1, std::memory_order_relaxed); }
-        prefetched_spans.clear();
+        drop_device_copies();
         table = read_general();
       }
-    } else if (!all_slices_pruned && prefers_bulk_materialize(sources, opts)) {
-      table = materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
     } else {
-      table = read_general();
+      drop_device_copies();
+      if (!all_slices_pruned && prefers_bulk_materialize(sources, opts)) {
+        // The bulk route checks the chunks it fetched against the reader the way the device route
+        // does; a mismatch is read again through the general route.
+        try {
+          table =
+            materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
+        } catch (prefetched_mismatch const& e) {
+          SIRIUS_LOG_WARN(
+            "[parquet_scan] bulk read does not match the reader ({}); reading through the general "
+            "route",
+            e.what());
+          table = read_general();
+        }
+      } else {
+        table = read_general();
+      }
     }
     // The decode is enqueued on `stream`: free the device copies now, stream-ordered behind it,
     // rather than holding them through assembly.

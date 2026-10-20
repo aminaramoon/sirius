@@ -33,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -106,7 +107,10 @@ class prefetched_ranges {
   // caller must hold a reference (shared_ptr) for the duration of the call: a waiter woken by the
   // transition may drop its own reference right away.  The producer and the waiter both do.
 
-  /// pending -> ready; idempotent.
+  /// pending -> ready; idempotent.  Call only once every write into the buffers is
+  /// host-observed complete (or the allocation stream was synchronized after them): a consumer
+  /// reads the bytes on its own stream right after ready, and take() only rebinds the
+  /// deallocation stream -- it does not order the consumer's stream after the allocation stream.
   bool set_ready() noexcept;
   /// pending -> failed; keeps the first error.
   bool set_failed(std::exception_ptr error) noexcept;
@@ -140,6 +144,10 @@ class prefetched_ranges {
   /// returns nullopt.
   [[nodiscard]] std::optional<std::vector<device_ranges>> take(
     rmm::cuda_stream_view consumer_stream);
+  /// The entries take() would move out, without taking them (the hook does not fire): empty
+  /// unless ready, untaken and not flagged wrong_device.  For the single consumer, which may
+  /// check them before committing to take(); valid until take() or destruction.
+  [[nodiscard]] std::span<device_ranges const> peek() const noexcept;
   [[nodiscard]] bool taken() const noexcept;
 
   [[nodiscard]] std::size_t total_bytes() const noexcept { return _total_bytes; }

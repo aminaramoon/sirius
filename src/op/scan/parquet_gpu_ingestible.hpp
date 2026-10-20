@@ -242,8 +242,9 @@ class parquet_split_info : public scan_info {
   /// Map a device-tier prefetch (entries parallel to fadvise_hints(): the slices with a datasource
   /// and ranges, in rg_slices order) onto rg_slices: one span list per slice, empty for a slice
   /// without ranges.  nullopt when the entries do not line up (count, chunks per slice, sizes).
+  /// The spans point into @p entries' span vectors.
   [[nodiscard]] std::optional<std::vector<prefetched_chunk_spans>> prefetched_spans_per_slice(
-    std::span<prefetched_ranges::device_ranges const> entries) const noexcept;
+    std::span<prefetched_ranges::device_ranges const> entries) const;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {

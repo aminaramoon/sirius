@@ -25,7 +25,9 @@
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/local_ioctx.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 #include "utils/parquet_test_sources.hpp"
+#include "utils/table_filter_test_utils.hpp"
 #include "utils/test_validation_utility.hpp"
 #include "utils/utils.hpp"
 
@@ -45,9 +47,11 @@
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -57,6 +61,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -92,9 +97,11 @@ fs::path write_rows(duckdb::Connection& con,
   return path;
 }
 
-/// Two parquet files with the same schema and different values.
+/// Two parquet files with the same schema and different values, in a directory of their own
+/// (test shards run in parallel processes).
 struct parquet_files {
-  fs::path dir = sirius::test::fresh_tmp_dir("device_prefetch");
+  sirius::test::scratch_dir scratch{"device_prefetch"};
+  fs::path dir = scratch.path();
   fs::path first;
   fs::path second;
 
@@ -485,11 +492,18 @@ struct release_counts {
   }
 };
 
-/// One single-file parquet split built by the real split provider and coalescer over a local
-/// uring ioctx, and the ingestible that decodes it.
+/// How the consumer fixture's scan is set up.
+struct consumer_shape {
+  bool two_files                 = false;  ///< a second same-schema file bundled into the split
+  bool filename_column           = false;  ///< also project the `filename` virtual column
+  bool filter_outside_projection = false;  ///< `y < 21000` with y not projected: 3000 rows/file
+};
+
+/// One parquet split built by the real split provider and coalescer over a local uring ioctx,
+/// and the ingestible that decodes it.
 struct consumer_fixture {
-  fs::path dir = sirius::test::fresh_tmp_dir("device_prefetch_consumer");
-  fs::path file;
+  sirius::test::scratch_dir scratch{"device_prefetch_consumer"};
+  std::vector<fs::path> files;
   std::shared_ptr<scan::physical_check_counters> counters =
     std::make_shared<scan::physical_check_counters>();
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
@@ -503,32 +517,62 @@ struct consumer_fixture {
   scan::parquet_split_info* split = nullptr;
   rmm::cuda_stream stream;
 
-  consumer_fixture()
+  consumer_fixture() : consumer_fixture(consumer_shape{}) {}
+
+  explicit consumer_fixture(consumer_shape shape)
   {
     REQUIRE(space != nullptr);
     {
       auto [db_owner, con] = sirius::make_test_db_and_connection();
-      file                 = write_rows(con, dir, "device_prefetch_consumer", 0);
+      files.push_back(write_rows(con, scratch.path(), "device_prefetch_consumer", 0));
+      if (shape.two_files) {
+        files.push_back(write_rows(con, scratch.path(), "device_prefetch_consumer_2", 1'000'000));
+      }
     }
-    auto info                 = std::make_unique<scan::parquet_ingestible_table_info>();
-    info->contract_id         = 53;
-    info->resolved_file_paths = {file.string()};
-    info->names               = {"x", "y", "z"};
+    auto info         = std::make_unique<scan::parquet_ingestible_table_info>();
+    info->contract_id = 53;
+    for (auto const& path : files) {
+      info->resolved_file_paths.push_back(path.string());
+    }
+    info->names = {"x", "y", "z"};
     info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
     info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
     info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::VARCHAR));
     info->column_ids.push_back(duckdb::ColumnIndex(0));
     info->column_ids.push_back(duckdb::ColumnIndex(2));
-    info->projected_output_count = 2;
+    if (shape.filename_column) {
+      info->column_ids.push_back(
+        duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME));
+      info->virtual_columns = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
+                                "filename",
+                                sirius::logical_type::make(sirius::type_id::VARCHAR),
+                                scan::scan_plan::parquet_virtual_column_kind::FILENAME}};
+    }
+    info->projected_output_count = info->column_ids.size();
+    if (shape.filter_outside_projection) {
+      // Filter columns follow the projected outputs in column_ids.
+      info->column_ids.push_back(duckdb::ColumnIndex(1));
+      auto filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+      filters->PushFilter(duckdb::ProjectionIndex(info->column_ids.size() - 1),
+                          sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                                        duckdb::Value::INTEGER(21000)));
+      info->table_filters = std::move(filters);
+    }
     info->approximate_batch_size = std::size_t{1} << 30;
     info->profiles->counters     = counters;
     ingestible                   = scan::make_ingestible(std::move(info));
 
-    auto task = ingestible->next_split_provider(
-      [this](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
-    REQUIRE(task);
+    // One metadata task per file; the coalescer bundles them into one split.
     auto coalescer = ingestible->create_batch_coalescer();
-    auto batches   = coalescer->push(task());
+    std::vector<std::unique_ptr<scan::scan_info>> batches;
+    for (std::size_t i = 0; i < files.size(); ++i) {
+      auto task = ingestible->next_split_provider(
+        [this](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+      REQUIRE(task);
+      for (auto& batch : coalescer->push(task())) {
+        batches.push_back(std::move(batch));
+      }
+    }
     for (auto& batch : coalescer->flush()) {
       batches.push_back(std::move(batch));
     }
@@ -536,8 +580,12 @@ struct consumer_fixture {
     owned_split = std::move(batches.front());
     split       = dynamic_cast<scan::parquet_split_info*>(owned_split.get());
     REQUIRE(split != nullptr);
-    REQUIRE(split->rg_slices.size() == 1);
-    REQUIRE(split->rg_slices.front().row_group_indices.size() == k_row_groups);
+    REQUIRE(split->rg_slices.size() == files.size());
+    // The filter's statistics keep the first two row groups (rows 0..4095) of each file.
+    auto const kept = shape.filter_outside_projection ? std::size_t{2} : std::size_t{k_row_groups};
+    for (auto const& slice : split->rg_slices) {
+      REQUIRE(slice.row_group_indices.size() == kept);
+    }
   }
 
   scan::filtered_table materialize()
@@ -551,10 +599,10 @@ struct consumer_fixture {
   {
     std::vector<prefetched_ranges::device_ranges> entries;
     std::size_t total = 0;
-    auto source       = cudf::io::datasource::create(file.string());
     auto const ranges = split->column_chunk_byte_ranges();
     for (std::size_t i = 0; i < split->rg_slices.size(); ++i) {
       if (!split->rg_slices[i].datasource || ranges[i].empty()) { continue; }
+      auto source = cudf::io::datasource::create(std::string{split->rg_slices[i].file_path});
       auto staged = sirius::test::stage_column_chunks(*source, ranges[i], tier->view());
       for (auto const& range : ranges[i]) {
         total += static_cast<std::size_t>(range.size());
@@ -689,7 +737,133 @@ TEST_CASE_METHOD(consumer_fixture,
     auto const decoded = materialize();
     CHECK(counters->device_route_decodes.load() == 0);
     CHECK(counters->device_route_fallbacks.load() == 0);
-    CHECK(counts->of(release_reason::consumed) == 1);
+    CHECK(counts->of(release_reason::unconsumed) == 1);
+    CHECK(counts->of(release_reason::consumed) == 0);
     CHECK(tables_equal(decoded.table.view(), baseline.table.view(), stream));
   }
+}
+
+TEST_CASE_METHOD(consumer_fixture,
+                 "a prefetch the split cannot decode from is released unconsumed",
+                 "[scan][parquet][device_prefetch]")
+{
+  auto prefetch = landed(0);
+  prefetch->set_ready();
+  install(std::move(prefetch));
+
+  SECTION("the split opted out of the device route")
+  {
+    split->device_prefetch_allowed = false;
+    auto const decoded             = materialize();
+    CHECK(counts->of(release_reason::unconsumed) == 1);
+    CHECK(counters->device_route_decodes.load() == 0);
+    CHECK(decoded.table.num_rows() == k_rows);
+  }
+
+  SECTION("every row group was pruned")
+  {
+    for (auto& slice : split->rg_slices) {
+      slice.row_group_indices.clear();
+    }
+    auto const decoded = materialize();
+    CHECK(counts->of(release_reason::unconsumed) == 1);
+    CHECK(counters->device_route_decodes.load() == 0);
+    CHECK(decoded.table.num_rows() == 0);
+  }
+}
+
+TEST_CASE_METHOD(consumer_fixture,
+                 "a consumer waiting on a pending prefetch decodes it once it lands",
+                 "[scan][parquet][device_prefetch]")
+{
+  auto const baseline = materialize();
+  auto prefetch       = landed(0);
+  install(prefetch);
+
+  // Lands only after the consumer took the slot, so the consumer is (about to be) waiting.
+  std::thread producer([prefetch, this] {
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (split->prefetched() != nullptr && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    prefetch->set_ready();
+  });
+  auto const decoded = materialize();
+  producer.join();
+  prefetch.reset();
+
+  CHECK(counters->device_route_decodes.load() == 1);
+  CHECK(counts->of(release_reason::consumed) == 1);
+  CHECK(tables_equal(decoded.table.view(), baseline.table.view(), stream));
+}
+
+namespace {
+
+struct two_file_consumer_fixture : consumer_fixture {
+  two_file_consumer_fixture() : consumer_fixture(consumer_shape{.two_files = true}) {}
+};
+
+struct filename_consumer_fixture : consumer_fixture {
+  filename_consumer_fixture() : consumer_fixture(consumer_shape{.filename_column = true}) {}
+};
+
+struct filtered_consumer_fixture : consumer_fixture {
+  filtered_consumer_fixture() : consumer_fixture(consumer_shape{.filter_outside_projection = true})
+  {
+  }
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(two_file_consumer_fixture,
+                 "a two-file split decodes from its device prefetch",
+                 "[scan][parquet][device_prefetch]")
+{
+  CHECK(split->supports_device_prefetch());
+  auto const baseline = materialize();
+  REQUIRE(baseline.table.num_rows() == 2 * k_rows);
+
+  auto prefetch = landed(0);
+  prefetch->set_ready();
+  install(std::move(prefetch));
+  auto const decoded = materialize();
+  CHECK(counters->device_route_decodes.load() == 1);
+  CHECK(counters->device_route_fallbacks.load() == 0);
+  CHECK(counts->of(release_reason::consumed) == 1);
+  CHECK(tables_equal(decoded.table.view(), baseline.table.view(), stream));
+}
+
+TEST_CASE_METHOD(filename_consumer_fixture,
+                 "a prefetch for a scan with user virtual columns is released unconsumed",
+                 "[scan][parquet][device_prefetch]")
+{
+  CHECK_FALSE(split->supports_device_prefetch());
+  auto const baseline = materialize();
+
+  auto prefetch = landed(0);
+  prefetch->set_ready();
+  install(std::move(prefetch));
+  auto const decoded = materialize();
+  CHECK(counts->of(release_reason::unconsumed) == 1);
+  CHECK(counters->device_route_decodes.load() == 0);
+  CHECK(tables_equal(decoded.table.view(), baseline.table.view(), stream));
+}
+
+TEST_CASE_METHOD(filtered_consumer_fixture,
+                 "a filter column outside the projection reads correctly through the ingestible",
+                 "[scan][parquet][device_prefetch]")
+{
+  auto const baseline = materialize();
+
+  auto prefetch = landed(0);
+  prefetch->set_ready();
+  install(std::move(prefetch));
+  auto const decoded = materialize();
+  // Decoded from the device when the staged chunks cover the filter column, else read again
+  // through the general route -- never misread.
+  CHECK(counters->device_route_decodes.load() + counters->device_route_fallbacks.load() == 1);
+  CHECK(counts->of(release_reason::consumed) == 1);
+  CHECK(decoded.state == baseline.state);
+  CHECK(tables_equal(decoded.table.view(), baseline.table.view(), stream));
 }

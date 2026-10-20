@@ -1527,6 +1527,10 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     physical_counters_->type_mismatches.load(std::memory_order_relaxed);
   snapshot.parquet_type_refusals =
     physical_counters_->type_refusals.load(std::memory_order_relaxed);
+  snapshot.device_route_decodes =
+    physical_counters_->device_route_decodes.load(std::memory_order_relaxed);
+  snapshot.device_route_fallbacks =
+    physical_counters_->device_route_fallbacks.load(std::memory_order_relaxed);
   for (std::size_t i = 0; i < snapshot.split_physical_rejections.size(); ++i)
     snapshot.split_physical_rejections[i] =
       physical_counters_->rejections[i].load(std::memory_order_relaxed);
