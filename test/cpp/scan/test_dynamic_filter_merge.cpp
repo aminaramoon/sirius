@@ -3039,8 +3039,14 @@ TEST_CASE("consumer passes a batch on another device through without filtering o
   SECTION("the batch's memory space names another device")
   {
     // The program is prepared for the current device, so only the batch's memory space differs.
+    // No stream can belong to the fictitious device, so the batch records an unknown (null)
+    // writer, which cuCascade does not check against the space's device.
     auto const space = make_space_naming_device(other_device);
-    auto batch       = batch_for(*space);
+    auto batch       = cucascade::data_batch::make(sirius::get_next_batch_id(),
+                                             std::make_unique<cucascade::gpu_table_representation>(
+                                               std::make_unique<cudf::table>(input->view(), stream),
+                                               *space,
+                                               ::cuda::stream_ref{cudaStream_t{nullptr}}));
     auto program     = prepare_identity(consumer, input->view());
     REQUIRE(program.has_value());
     auto source = batch->to_read_only();
