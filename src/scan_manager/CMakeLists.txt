@@ -1,6 +1,7 @@
 target_sources(
   sirius_objects
-  PRIVATE preparation_coordinator.cpp
+  PRIVATE device_prefetch.cpp
+          preparation_coordinator.cpp
           preparation.cpp
           preparation_ledger.cpp
           late_mat_resolver.cpp

@@ -197,8 +197,9 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
 
   /// The consumer has reached this split -- it is preparing to read it, or
   /// already reading -- so a prefetch started now would only duplicate the IO
-  /// the executor is doing for itself.
-  [[nodiscard]] bool has_fallen_behind() const noexcept
+  /// the executor is doing for itself.  Virtual so a test can have the consumer
+  /// overtake the readahead at an exact point of an attempt.
+  [[nodiscard]] virtual bool has_fallen_behind() const noexcept
   {
     return get_scan_stage() >= cucascade::io::cache::scan_stage::preparing;
   }
@@ -276,6 +277,15 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   void set_prefetch_state(prefetch_state state) noexcept
   {
     _prefetch_state.store(state, std::memory_order_release);
+  }
+
+  /// @ref set_prefetch_state only while the state is still @p expected; true when this call
+  /// moved it to @p desired.  A correction made this way cannot overwrite a state another writer
+  /// published in between.
+  bool compare_exchange_prefetch_state(prefetch_state expected, prefetch_state desired) noexcept
+  {
+    return _prefetch_state.compare_exchange_strong(
+      expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
   }
 
   /// Allocate staging buffers for this split's prefetch requests.  A chunk
