@@ -969,7 +969,7 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
 
-  // Route each file to its own backend (s3:// -> rest, local -> uring/kvikio) so a
+  // Route each file to its own backend (s3:// -> rest, local -> uring) so a
   // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
   // per file; row-group chunking and file bundling happen downstream in
   // parquet_batch_coalescer.

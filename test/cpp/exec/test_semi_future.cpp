@@ -132,44 +132,38 @@ TEST_CASE("semi_future timed get times out when the promise is not fulfilled",
 
 TEST_CASE("semi_future timed and untimed waiters on one core both wake", "[exec][semi_future]")
 {
-  auto core = std::make_shared<cucascade::exec::detail::core<int>>();
-  semi_future<int> untimed{std::make_unique<cucascade::exec::detail::leaf_state<int>>(core)};
-  semi_future<int> timed{std::make_unique<cucascade::exec::detail::leaf_state<int>>(core)};
+  // Two semi_futures can no longer share one core, so the two waiters park on
+  // the core directly: one untimed, one with a deadline.
+  cucascade::exec::detail::core<int> core;
 
   std::atomic<int> entered{0};
   std::atomic<bool> untimed_woke{false};
-  int timed_value = 0;
-  std::exception_ptr untimed_error;
-  std::exception_ptr timed_error;
+  bool timed_ready = false;
+  int timed_value  = 0;
 
   std::thread untimed_thread([&] {
     entered.fetch_add(1, std::memory_order_release);
-    try {
-      untimed.wait();
-      untimed_woke.store(true, std::memory_order_release);
-    } catch (...) {
-      untimed_error = std::current_exception();
-    }
+    core.wait();
+    untimed_woke.store(true, std::memory_order_release);
   });
   std::thread timed_thread([&] {
     entered.fetch_add(1, std::memory_order_release);
-    try {
-      timed_value = std::move(timed).get(500ms);
-    } catch (...) {
-      timed_error = std::current_exception();
-    }
+    timed_ready = core.wait_until(std::chrono::steady_clock::now() + 500ms);
   });
 
   wait_until_count(entered, 2);
   std::this_thread::sleep_for(20ms);
-  core->set_try(try_t<int>(77));
+  core.set_try(try_t<int>(77));
 
   untimed_thread.join();
   timed_thread.join();
 
-  rethrow_if_set(untimed_error);
-  rethrow_if_set(timed_error);
   CHECK(untimed_woke.load(std::memory_order_acquire));
+  REQUIRE(timed_ready);
+  REQUIRE(core.ready());
+  auto result = core.steal();
+  REQUIRE(result.has_value());
+  timed_value = std::move(result).value();
   CHECK(timed_value == 77);
 }
 

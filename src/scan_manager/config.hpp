@@ -23,12 +23,6 @@
 
 #include <cucascade/io/config.hpp>
 
-// cuCascade declares kvikio_config (scan_manager_config::kvikio, which to_io_config()
-// copies) only when built with cuDF, and so kvikIO; Sirius always is.
-#ifndef CUCASCADE_HAS_KVIKIO
-#error "Sirius requires cuCascade built with kvikIO (CUCASCADE_HAS_KVIKIO)"
-#endif
-
 #include <algorithm>
 #include <cstddef>
 #include <optional>
@@ -118,18 +112,17 @@ inline bool enum_to_string(prefetch_strategy s, std::string& out)
 enum class io_backend {
   /// cuCascade's native IO stack: uring for local paths, REST for @c s3:// URLs.
   native,
-  /// The kvikIO backend (drives @c kvikio::FileHandle directly).
-  kvikio,
 };
 
 /// Parse a @ref io_backend from its lowercase YAML spelling.  @c "sirius" is the
-/// deprecated spelling of @c "native" and is still accepted.
+/// deprecated spelling of @c "native" and is still accepted.  @c "kvikio" names
+/// the removed kvikIO backend and also maps to @c native (the YAML reader warns).
 inline bool string_to_enum(std::string_view sv, io_backend& out)
 {
   static const std::unordered_map<std::string_view, io_backend> map = {
     {"native", io_backend::native},
     {"sirius", io_backend::native},  // deprecated alias
-    {"kvikio", io_backend::kvikio},
+    {"kvikio", io_backend::native},  // removed backend, deprecated alias
   };
   auto it = map.find(sv);
   if (it != map.end()) {
@@ -144,7 +137,6 @@ inline bool enum_to_string(io_backend b, std::string& s)
 {
   switch (b) {
     case io_backend::native: s = "native"; return true;
-    case io_backend::kvikio: s = "kvikio"; return true;
   }
   return false;
 }
@@ -213,11 +205,8 @@ struct memory_prefetcher_config {
  * @brief Configuration for the scan_manager.
  *
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
- * to @c uring_ioctx and @c s3:// URLs to the REST backend, @ref io_backend::kvikio
- * routes local paths AND @c s3:// reads to @c kvikio_context (kvikIO's own remote
- * file support); object-store LIST / glob stays on the REST backend either way.
- * Reads go through @c cucascade::io::datasource either way; the kvikio backend
- * drives @c kvikio::FileHandle / @c kvikio::RemoteHandle directly. Multi-GPU forces
+ * to @c uring_ioctx and @c s3:// URLs (reads, LIST and glob) to the REST backend.
+ * Reads go through @c cucascade::io::datasource. Multi-GPU forces
  * @ref io_backend::native.
  *
  * The backend sub-configs are cuCascade's own structs; @ref to_io_config hands
@@ -230,7 +219,6 @@ struct memory_prefetcher_config {
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
- *  - @c kvikio  — kvikIO backend tunables (backend=kvikio: local and s3:// reads).
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -246,7 +234,7 @@ struct scan_manager_config {
   std::size_t uring_n_reactors{default_uring_n_reactors};
 
   /// Number of REST reactors for the S3/object-store IO path (each its own
-  /// libcurl event loop + connection pool).
+  /// io_uring ring + HTTP/1.1 connection pools).
   std::size_t rest_n_reactors{2};
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
@@ -282,11 +270,6 @@ struct scan_manager_config {
   /// worker-owned.
   cucascade::io::rest::config rest{};
 
-  /// kvikIO backend tunables (backend=kvikio serves local and @c s3:// reads with
-  /// it).  Every field is optional; unset leaves kvikIO's own env-seeded default
-  /// in place.
-  cucascade::io::kvikio_config kvikio{};
-
   /// The read path's caching configuration: mode, eviction policy and the
   /// prefetching cache's tunables.  One block, rather than a mode here and the
   /// tunables in a sibling one.
@@ -313,13 +296,11 @@ struct scan_manager_config {
   [[nodiscard]] cucascade::io::io_config to_io_config() const
   {
     cucascade::io::io_config out{};
-    out.backend          = backend == io_backend::kvikio ? cucascade::io::io_backend::kvikio
-                                                         : cucascade::io::io_backend::native;
+    out.backend          = cucascade::io::io_backend::native;
     out.uring_n_reactors = uring_n_reactors;
     out.rest_n_reactors  = rest_n_reactors;
     out.uring            = uring;
     out.rest             = rest;
-    out.kvikio           = kvikio;
     out.cache            = cache;
     out.object_store     = object_store;
     out.apply_cache_mode();

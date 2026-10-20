@@ -285,33 +285,6 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, cucascade::io::kvikio_config& opt)
-{
-  yaml::reader r(node, "kvikio");
-  r.optional("nthreads", opt.nthreads);
-  r.optional("task_size", yaml::bytes(opt.task_size));
-  r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));
-  r.optional("bounce_buffer_size", yaml::bytes(opt.bounce_buffer_size));
-  r.optional("auto_direct_io_read", opt.auto_direct_io_read);
-  r.optional("auto_direct_io_read_overread", opt.auto_direct_io_read_overread);
-  r.optional("thread_pool_per_block_device", opt.thread_pool_per_block_device);
-  std::string compat;
-  r.optional("compat_mode", compat);
-  if (!compat.empty()) {
-    if (compat == "auto") {
-      opt.compat_mode = kvikio::CompatMode::AUTO;
-    } else if (compat == "on") {
-      opt.compat_mode = kvikio::CompatMode::ON;
-    } else if (compat == "off") {
-      opt.compat_mode = kvikio::CompatMode::OFF;
-    } else {
-      throw std::runtime_error("'kvikio.compat_mode': invalid enum value '" + compat +
-                               "' (expected auto, on or off)");
-    }
-  }
-  r.reject_unknown();
-}
-
 static void from_yaml(const YAML::Node& node, cucascade::io::cache::config& opt)
 {
   yaml::reader r(node, "cache");
@@ -398,14 +371,34 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   }
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("backend", opt.backend);
+  {
+    // Read as a string so the removed kvikIO backend can be reported: `kvikio`
+    // still loads (as `native`) so existing configs keep working.
+    std::optional<std::string> backend;
+    r.optional("backend", backend);
+    if (backend.has_value()) {
+      if (!scan_manager::string_to_enum(std::string_view{*backend}, opt.backend)) {
+        throw std::runtime_error("'backend': invalid enum value '" + *backend + "'");
+      }
+      if (*backend == "kvikio") {
+        SIRIUS_LOG_WARN(
+          "'scan_manager.backend: kvikio' is deprecated: the kvikIO backend was removed from "
+          "cuCascade; using the native backend");
+      }
+    }
+  }
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
-  if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
+  if (r.optional_node("kvikio")) {
+    // Deprecated: consumed (so reject_unknown() passes) and ignored.
+    SIRIUS_LOG_WARN(
+      "'scan_manager.kvikio' is deprecated and ignored: the kvikIO backend was removed from "
+      "cuCascade; remove the block from the config");
+  }
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
