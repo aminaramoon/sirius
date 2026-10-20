@@ -315,7 +315,7 @@ Thread pool (default `num_threads: 1`) plus:
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `kvikio/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
+**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the cuCascade IO layer that feeds the GPU scan operators.
 
@@ -323,9 +323,9 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 4 uring reactor threads), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `native`, `kvikio` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `native`. `sirius` is a deprecated alias of `native`, still accepted. Values are lowercase. |
+| `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: `io_uring` for local paths, and REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://` reads, listing and glob expansion. cuCascade's cuFile (GDS) backend is not selectable here. `sirius` is a deprecated alias of `native`, still accepted. `kvikio` names the removed kvikIO backend: it still loads, as `native`, with a deprecation WARN. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
-| `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own libcurl event loop and connection pool. |
+| `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pools. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
@@ -397,8 +397,8 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `stall_speed_limit_bytes` | int (bytes/s) | 65536 | Stall detector for data GETs: a transfer below this rate for `stall_time_s` consecutive seconds fails and is retried (0 disables). |
 | `stall_time_s` | int (seconds) | 30 | How long a data GET may stay below `stall_speed_limit_bytes` before it is cut loose (0 disables). |
 | `merge_max_gap` | bytes | 512Ki | Largest gap between two segments still fetched by a single GET. The bridged bytes are read and discarded, trading them for a saved round trip. 0 fuses only adjacent segments. |
-| `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
-| `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
+| `upkeep_interval_ms` | int (ms) | 15000 | Accepted and ignored (it drove HTTP/2 keepalive pings in the former libcurl transport). |
+| `conn_max_age_s` | int (seconds) | 4 | Idle cutoff of a pooled connection (one idle for longer is closed instead of reused), and the warm-up rate limit (0 = 4 s). |
 | `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
 | `retry_jitter_ms` | int (ms) | 50 | Random jitter added to retry backoff. |
 | `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
@@ -409,49 +409,26 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
 
 Two REST values are deliberately not YAML keys. **Connections per reactor** are
-fixed at 64 — the useful number is a property of one reactor thread, not of a
+fixed at 64 per endpoint — the useful number is a property of one reactor thread, not of a
 deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
-each with its own thread and connection pool. **Physical GET size** is reactor-owned:
-each reactor derives a target between 4 MiB and 16 MiB from the queued logical
-bytes and its currently free connections. Large contiguous requests are balanced
-under the 16 MiB ceiling. Fragmented cache fills are grouped only at whole
+each with its own thread and connection pools. **Physical GET size** is reactor-owned:
+each request's GETs are sized between 1 MiB and 32 MiB (`rest::config`
+`min_segment_bytes` / `max_segment_bytes`) from the endpoint's throughput estimate,
+and cut evenly. Fragmented cache fills are grouped only at whole
 cache-chunk boundaries so a chunk is never published before all of its bytes
 arrive.
 
 `merge_max_gap` remains a logical planner hint: nearby ranges can be represented
 as prepared slices without forcing a static physical layout. Device operations
 allocate as many pinned CuCascade blocks as their selected physical range needs;
-those blocks stay owned through curl retries, the asynchronous H2D copy, and its
+those blocks stay owned through REST retries, the asynchronous H2D copy, and its
 CUDA completion event. Staging is therefore proportional to active device work
 instead of being reserved as one fixed bounce slot per connection.
 
-### `scan_manager.kvikio` — kvikIO backend (`io/kvikio/config.hpp`)
+### `scan_manager.kvikio` — removed
 
-Used when `backend: kvikio` routes reads (local files and `s3://` objects)
-to kvikIO. **Every key is optional and unset means "leave kvikIO's own default
-alone"** — kvikIO seeds each setting from an environment variable at first use, so
-omitting a key preserves that value and setting one overrides it.
-
-**These are process-global.** Every key except `compat_mode` maps to a setter on
-kvikIO's `defaults` singleton, so the last context constructed wins and the
-setting is shared with every other kvikIO user in the process. Treat it as
-startup configuration. `compat_mode` is the exception: it rides the file-handle
-constructor, so it scopes to files this backend opens.
-
-This backend runs without the prefetching cache and therefore without the
-readahead, so `scan_manager.cache.*`, `max_readahead_scans` and
-`readahead_strategy` have no effect on it.
-
-| Key | Type | Env default | Description |
-|-----|------|-------------|-------------|
-| `nthreads` | int (**> 0**) | `KVIKIO_NTHREADS` (1) | Threads in kvikIO's task pool — the parallelism bound for a single read. |
-| `task_size` | bytes (**> 0**) | `KVIKIO_TASK_SIZE` (4Mi) | Chunk size a parallel read is split into. Keep it a page multiple when `auto_direct_io_read` is on. |
-| `gds_threshold` | bytes | `KVIKIO_GDS_THRESHOLD` (1Mi) | Minimum read size routed through GDS + the thread pool; smaller reads take a direct POSIX shortcut. 0 is legal. |
-| `bounce_buffer_size` | bytes (**> 0**) | `KVIKIO_BOUNCE_BUFFER_SIZE` (16Mi) | Host staging buffer for device reads that cannot go straight to GPU memory. |
-| `auto_direct_io_read` | bool | `KVIKIO_AUTO_DIRECT_IO_READ` | Use `O_DIRECT` for POSIX reads. POSIX path only — the cuFile/GDS path manages its own I/O mode. |
-| `auto_direct_io_read_overread` | bool | `KVIKIO_AUTO_DIRECT_IO_READ_OVERREAD` (false) | Align device-read offsets down and sizes up to pages so the whole transfer is pure Direct I/O, at the cost of extra bytes. Requires `auto_direct_io_read`. |
-| `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
-| `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
+The kvikIO backend was removed from cuCascade. A `scan_manager.kvikio` block is
+still accepted so existing configs load, but it is ignored and logs a deprecation WARN.
 
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 
