@@ -1626,7 +1626,8 @@ void sirius_scan_manager::prepare_for_query(
           .release_host_staging =
             _config.cache.use_fs_cache() &&
             _config.cache.eviction == cucascade::io::cache::eviction_policy::prefetch,
-          .pipeline_width = _config.pipeline_width});
+          .max_parked_splits = _config.device_prefetch_max_splits,
+          .pipeline_width    = _config.pipeline_width});
       state->readahead->prepare_for_query(query);
       state->readahead->start(plan.strategy);
     }

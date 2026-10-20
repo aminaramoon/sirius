@@ -818,6 +818,20 @@ TEST_CASE("device_prefetching_fraction defaults to 0 and parses from YAML",
   CHECK(set.device_prefetching_enabled());
 }
 
+TEST_CASE("device_prefetch_max_splits defaults to 0 and parses from YAML",
+          "[scan_manager][config][device_prefetch]")
+{
+  CHECK(scan_manager_config{}.device_prefetch_max_splits == 0);
+
+  auto const unset = load_scan_manager("sirius_device_prefetch_max_splits_unset.yaml",
+                                       scan_manager_yaml("      rest_n_reactors: 1\n"));
+  CHECK(unset.device_prefetch_max_splits == 0);
+
+  auto const set = load_scan_manager("sirius_device_prefetch_max_splits_set.yaml",
+                                     scan_manager_yaml("      device_prefetch_max_splits: 6\n"));
+  CHECK(set.device_prefetch_max_splits == 6);
+}
+
 TEST_CASE("device_prefetching_fraction rejects values outside [0,1]",
           "[scan_manager][config][device_prefetch]")
 {

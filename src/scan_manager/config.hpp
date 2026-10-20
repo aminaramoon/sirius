@@ -284,6 +284,10 @@ struct scan_manager_config {
     return device_prefetching_fraction > 0.0;
   }
 
+  /// Landed-but-unconsumed device prefetches the readahead may park per GPU; 0 (the default)
+  /// derives max(2, 2 x pipeline threads / GPUs).  Only read with the device tier on.
+  std::size_t device_prefetch_max_splits{0};
+
   /// Scans the executor can have running at once — the pipeline pool's width.
   /// The budget @c opportunistic schedules against, since one prefetch per
   /// non-scan deployment is only useful while the executor could still take

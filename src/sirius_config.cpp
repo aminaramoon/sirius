@@ -389,6 +389,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("readahead_strategy", opt.readahead_strategy);
   r.optional(
     "device_prefetching_fraction", opt.device_prefetching_fraction, yaml::fraction<double>{});
+  r.optional("device_prefetch_max_splits", opt.device_prefetch_max_splits);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (r.optional_node("kvikio")) {
