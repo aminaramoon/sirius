@@ -331,6 +331,8 @@ TEST_CASE("eviction_policy round-trips through its YAML spelling",
 
   REQUIRE(cucascade::io::cache::string_to_enum("idle", policy));
   CHECK(policy == eviction_policy::idle);
+  REQUIRE(cucascade::io::cache::string_to_enum("prefetch", policy));
+  CHECK(policy == eviction_policy::prefetch);
   REQUIRE(cucascade::io::cache::string_to_enum("lru", policy));
   CHECK(policy == eviction_policy::lru);
   CHECK_FALSE(cucascade::io::cache::string_to_enum("fifo", policy));
@@ -341,6 +343,8 @@ TEST_CASE("eviction_policy round-trips through its YAML spelling",
   CHECK(out == "idle");
   REQUIRE(cucascade::io::cache::enum_to_string(eviction_policy::lru, out));
   CHECK(out == "lru");
+  REQUIRE(cucascade::io::cache::enum_to_string(eviction_policy::prefetch, out));
+  CHECK(out == "prefetch");
 }
 
 TEST_CASE("scan_manager_config defaults to the none cache mode",
@@ -380,6 +384,13 @@ TEST_CASE("apply_cache_mode derives the knobs for every mode", "[scan_manager][c
   CHECK_FALSE(cfg.cache.dispose_on_idle);
 
   cfg.cache.eviction = eviction_policy::idle;
+  cfg.apply_cache_mode();
+  CHECK(cfg.uring.use_odirect);
+  CHECK(cfg.cache.use_fs_cache());
+  CHECK(cfg.cache.dispose_on_idle);
+
+  // prefetch retires chunks exactly as idle does.
+  cfg.cache.eviction = eviction_policy::prefetch;
   cfg.apply_cache_mode();
   CHECK(cfg.uring.use_odirect);
   CHECK(cfg.cache.use_fs_cache());
@@ -424,6 +435,15 @@ TEST_CASE("sirius_config derives scan_manager knobs from the cache block",
   CHECK(idle.uring.use_odirect);
   CHECK(idle.cache.use_fs_cache());
   CHECK(idle.cache.dispose_on_idle);
+
+  auto const prefetch = load_scan_manager("sirius_cache_mode_prefetch.yaml",
+                                          cache_yaml("        mode: cucs\n"
+                                                     "        eviction: prefetch\n"));
+  CHECK(prefetch.cache.mode == cache_mode::cucs);
+  CHECK(prefetch.cache.eviction == eviction_policy::prefetch);
+  CHECK(prefetch.uring.use_odirect);
+  CHECK(prefetch.cache.use_fs_cache());
+  CHECK(prefetch.cache.dispose_on_idle);
 }
 
 TEST_CASE("sirius_config accepts the deprecated sirius cache mode as cucs",
