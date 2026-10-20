@@ -1589,7 +1589,16 @@ void sirius_scan_manager::prepare_for_query(
     if (plan.budget > 0) {
       // Registers its mailbox for the query's lifetime; unregistered in reset().
       state->readahead = std::make_shared<readahead_scan_manager>(
-        *_query_event_publisher, plan.budget, _physical_counters);
+        *_query_event_publisher,
+        plan.budget,
+        _physical_counters,
+        device_prefetch_options{
+          .fraction = _config.device_prefetching_fraction,
+          .memory   = &_reservation_manager,
+          .release_host_staging =
+            _config.cache.use_fs_cache() &&
+            _config.cache.eviction == cucascade::io::cache::eviction_policy::prefetch,
+          .pipeline_width = _config.pipeline_width});
       state->readahead->prepare_for_query(query);
       state->readahead->start(plan.strategy);
     }
