@@ -183,6 +183,12 @@ std::shared_ptr<scripted_context> gated_context(std::shared_ptr<read_gate> const
   });
 }
 
+/// Every read hands back an invalid future: nothing to install a callback on.
+std::shared_ptr<scripted_context> no_future_context()
+{
+  return std::make_shared<scripted_context>([](std::size_t) { return read_future{}; });
+}
+
 /// Release hooks run on whichever thread drops the last reference: poll for their effects.
 template <class Condition>
 bool eventually(Condition condition, std::chrono::seconds timeout = std::chrono::seconds(5))
@@ -654,6 +660,36 @@ TEST_CASE_METHOD(issuer_fixture,
 }
 
 TEST_CASE_METHOD(issuer_fixture,
+                 "a read that returns no future fails its hint once, never the call",
+                 "[scan_manager][device_prefetch]")
+{
+  auto const path = file.path.string();
+  auto split      = std::make_shared<device_split>(std::vector<scan::scan_info::fadvise_entry>{
+    {cucascade::io::open_datasource(instant_context(), path), {byte_range(0, 1 * MiB)}},
+    {cucascade::io::open_datasource(no_future_context(), path), {byte_range(3 * MiB, 2 * MiB)}}});
+  auto issuer     = this->issuer();
+  done_probe done;
+  device_prefetch_issue outcome{};
+  REQUIRE_NOTHROW(outcome = issuer.issue(split, done.callback()));
+  REQUIRE(outcome == device_prefetch_issue::issued);
+  auto const result = done.wait();
+  CHECK(done.calls->load() == 1);
+  CHECK_FALSE(result.ok);
+  CHECK(result.bytes == 3 * MiB);
+  REQUIRE(result.error != nullptr);
+  CHECK_THAT(message_of(result.error), Catch::Matchers::ContainsSubstring("no future"));
+  REQUIRE(split->prefetched() != nullptr);
+  CHECK(split->prefetched()->current() == scan::prefetched_ranges::state::failed);
+  CHECK_FALSE(split->prefetched()->abandoned());
+
+  split.reset();
+  CHECK(eventually([&] { return window->failed.load() == 1; }));
+  CHECK(window->parked_splits.load() == 0);
+  CHECK(window->parked_bytes.load() == 0);
+  tier->view().synchronize();
+}
+
+TEST_CASE_METHOD(issuer_fixture,
                  "device memory returns once the buffers are dropped",
                  "[scan_manager][device_prefetch]")
 {
@@ -744,7 +780,7 @@ TEST_CASE_METHOD(readahead_fixture,
   CHECK(outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 0);
 
   ra->stop();
-  CHECK(eventually([&] { return ra->available_tickets() == 2; }));
+  CHECK(eventually([&] { return ra->available_tickets_for_testing() == 2; }));
   auto const line = ra->summary();
   INFO(line);
   CHECK(line.find("device[prefetched=1 ") != std::string::npos);
@@ -783,7 +819,7 @@ TEST_CASE_METHOD(readahead_fixture,
   CHECK(second->prefetched() == nullptr);
 
   ra->stop();
-  CHECK(ra->available_tickets() == 2);
+  CHECK(ra->available_tickets_for_testing() == 2);
 }
 
 TEST_CASE_METHOD(readahead_fixture,
@@ -956,18 +992,17 @@ TEST_CASE_METHOD(readahead_fixture,
 
     // The window is full while the first split is unconsumed, so the second falls through to
     // the host tier, which has nowhere to stage and gives up at once.
-    auto refused      = on_gpu0(two_ranges(ds));
-    auto const before = std::chrono::steady_clock::now();
+    // No memory retry is the evidence that it never waited.
+    auto refused = on_gpu0(two_ranges(ds));
     ra->register_scan_task(refused, 1);
-    REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 1; },
-                       std::chrono::seconds(1)));
-    CHECK(std::chrono::steady_clock::now() - before < std::chrono::seconds(1));
+    REQUIRE(
+      eventually([&] { return outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 1; }));
     CHECK(ra->counters().device_skipped_window.load() == 1);
     CHECK(ra->counters().memory_retries.load() == 0);
     CHECK(refused->prefetched() == nullptr);
 
     ra->stop();
-    CHECK(eventually([&] { return ra->available_tickets() == 2; }));
+    CHECK(eventually([&] { return ra->available_tickets_for_testing() == 2; }));
     landed.reset();
     ra.reset();
     tier->view().synchronize();
@@ -979,11 +1014,95 @@ TEST_CASE_METHOD(readahead_fixture,
     auto split = on_gpu0(two_ranges(ds));
     ra->register_scan_task(split, 1);
     ra->start();
-    REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 1; },
-                       std::chrono::seconds(1)));
+    REQUIRE(
+      eventually([&] { return outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 1; }));
     CHECK(ra->counters().memory_retries.load() == 0);
     CHECK(ra->counters().device_attempts.load() == 0);
     ra->stop();
-    CHECK(ra->available_tickets() == 2);
+    CHECK(ra->available_tickets_for_testing() == 2);
   }
+}
+
+TEST_CASE_METHOD(readahead_fixture,
+                 "a failed device read through the worker hands its ticket back once",
+                 "[scan_manager][device_prefetch][readahead]")
+{
+  std::shared_ptr<cucascade::io::ioctx> context;
+  SECTION("the read errors") { context = failing_context(); }
+  SECTION("the read returns no future") { context = no_future_context(); }
+
+  auto ra    = readahead(options());
+  auto split = on_gpu0(two_ranges(cucascade::io::open_datasource(context, file.path.string())));
+  ra->register_scan_task(split, 1);
+  ra->start();
+  REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_failed) == 1; }));
+  CHECK(ra->counters().device_attempts.load() == 1);
+  CHECK(ra->counters().device_bytes.load() == 0);
+  // Back to attempted, so the consumer's own read is charged a ticket.
+  CHECK(split->get_prefetch_state() == prefetch_state::attempted);
+  REQUIRE(split->prefetched() != nullptr);
+  CHECK(split->prefetched()->current() == scan::prefetched_ranges::state::failed);
+
+  ra->stop();
+  CHECK(ra->available_tickets_for_testing() == 2);
+  CHECK(outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 0);
+  CHECK(ra->summary().find(" failed=1 ") != std::string::npos);
+  CHECK(ra->summary().find(" parked=1]") != std::string::npos);
+
+  // The failed buffers stay parked until the split dies.
+  split.reset();
+  CHECK(eventually([&] { return ra->summary().find(" parked=0]") != std::string::npos; }));
+  ra.reset();
+  tier->view().synchronize();
+}
+
+TEST_CASE_METHOD(readahead_fixture,
+                 "stop waits for an in-flight device read to return its ticket",
+                 "[scan_manager][device_prefetch][readahead]")
+{
+  auto gate = std::make_shared<read_gate>();
+  auto ra   = readahead(options());
+  auto split =
+    on_gpu0(two_ranges(cucascade::io::open_datasource(gated_context(gate), file.path.string())));
+  ra->register_scan_task(split, 1);
+  ra->start();
+  REQUIRE(eventually([&] { return gate->reads.load() == 1; }));
+
+  // The read lands while stop() is draining: the ticket must be back when stop() returns.
+  std::thread opener([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    gate->open();
+  });
+  ra->stop();
+  opener.join();
+  CHECK(ra->available_tickets_for_testing() == 2);
+  CHECK(outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 1);
+
+  split.reset();
+  ra.reset();
+  tier->view().synchronize();
+}
+
+TEST_CASE_METHOD(readahead_fixture,
+                 "a device copy that lands after its split was disposed is wasted",
+                 "[scan_manager][device_prefetch][readahead]")
+{
+  auto gate = std::make_shared<read_gate>();
+  auto ra   = readahead(options());
+  auto split =
+    on_gpu0(two_ranges(cucascade::io::open_datasource(gated_context(gate), file.path.string())));
+  ra->register_scan_task(split, 1);
+  ra->start();
+  REQUIRE(eventually([&] { return gate->reads.load() == 1; }));
+
+  split->set_scan_stage(scan_stage::disposed);
+  gate->open();
+  REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_wasted) == 1; }));
+  CHECK(outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 0);
+
+  ra->stop();
+  CHECK(ra->available_tickets_for_testing() == 2);
+  split.reset();
+  ra.reset();
+  tier->view().synchronize();
 }

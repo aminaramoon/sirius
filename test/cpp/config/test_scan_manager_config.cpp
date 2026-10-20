@@ -832,6 +832,14 @@ TEST_CASE("device_prefetch_max_splits defaults to 0 and parses from YAML",
   CHECK(set.device_prefetch_max_splits == 6);
 }
 
+TEST_CASE("device_prefetch_max_splits rejects a negative count",
+          "[scan_manager][config][device_prefetch]")
+{
+  require_load_error("sirius_device_prefetch_max_splits_negative.yaml",
+                     scan_manager_yaml("      device_prefetch_max_splits: -1\n"),
+                     "'scan_manager.device_prefetch_max_splits': value out of range");
+}
+
 TEST_CASE("device_prefetching_fraction rejects values outside [0,1]",
           "[scan_manager][config][device_prefetch]")
 {

@@ -43,6 +43,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -55,6 +56,31 @@ using op::scan::scan_info;
 using read_result   = cucascade::exec::try_t<std::size_t>;
 using read_callback = cucascade::exec::invocable<void(read_result&&)>;
 using done_callback = sirius::exec::invocable<void(device_prefetch_result) noexcept>;
+// Installing a callback of the future's own stored type is a move and a compare-exchange; any
+// other type is wrapped in a heap-allocated adapter, whose allocation could fail after the read
+// was submitted.
+static_assert(
+  std::is_same_v<read_callback, cucascade::exec::semi_future<std::size_t>::callback_type>);
+
+/// An exception_ptr holding a std::runtime_error, or whatever constructing it threw.
+std::exception_ptr runtime_error_ptr(char const* what) noexcept
+{
+  try {
+    return std::make_exception_ptr(std::runtime_error(what));
+  } catch (...) {
+    return std::current_exception();
+  }
+}
+
+/// Blocks until @p f settles and returns its result; never throws.  @p f must be valid.
+read_result settle_inline(cucascade::exec::semi_future<std::size_t>&& f) noexcept
+{
+  try {
+    return std::move(f).get_try();
+  } catch (...) {
+    return read_result{std::current_exception()};
+  }
+}
 
 /// Fan-in over one attempt's per-hint reads.  Settles the prefetch and reports once every hint
 /// and the issuer's guard have arrived.  Shared by every read callback, so it outlives issue();
@@ -318,7 +344,7 @@ device_prefetch_issue device_prefetch_issuer::try_issue(std::shared_ptr<scan_inf
       SIRIUS_LOG_WARN(
         "[readahead] could not attach the device prefetch reservation on GPU {}; skipping",
         _space.get_device_id());
-      return device_prefetch_issue::memory;
+      return device_prefetch_issue::error;  // not a memory shortage: no back-off
     }
     absl::Cleanup detach = [allocator, s = stream.value()] {
       allocator->reset_stream_reservation(s);
@@ -419,6 +445,10 @@ device_prefetch_issue device_prefetch_issuer::try_issue(std::shared_ptr<scan_inf
 
   // 12. Submit one low-priority vectored device read per hint.  A submitted read is never
   //     arrived early: its buffers must outlive it.
+  //
+  //     Invariant: nothing below throws, every hint arrives exactly once, and the call ends in
+  //     `issued`.  Any other exit after a submission would release the readahead ticket twice
+  //     (the caller's and on_done's) or leave the fan-in short of an arrival and leak the buffers.
   for (std::size_t k = 0; k < hints.size(); ++k) {
     if (slices[k].empty()) {
       fan_in->arrive(k, read_result{std::size_t{0}});
@@ -442,16 +472,28 @@ device_prefetch_issue device_prefetch_issuer::try_issue(std::shared_ptr<scan_inf
       fan_in->arrive(k, read_result{std::current_exception()});
       continue;
     }
+    // A read that handed back no future has nothing to install on and nothing anyone could wait
+    // for: it is a failed hint, never an installed one.
+    if (!f.valid()) {
+      fan_in->arrive(k, read_result{runtime_error_ptr("device read returned no future")});
+      continue;
+    }
     try {
       std::move(f).install_callback(std::move(callbacks[k]));
     } catch (...) {
       // The IO is submitted.  install_callback resets the future's state only after the callback
-      // is stored, so a valid future means the callback is NOT installed: wait for the read here
-      // (the single blocking path, reachable only through an allocation failure) and arrive with
-      // its real result.  An invalid future means the callback IS installed: do nothing.
-      SIRIUS_LOG_ERROR("[readahead] install_callback failed for '{}'; waiting for the read inline",
-                       path_of(hints[k]));
-      if (f.valid()) { fan_in->arrive(k, std::move(f).get_try()); }
+      // is stored, so a still-valid future means the callback is NOT installed: wait for the read
+      // here (the single blocking path, reachable only through an allocation failure) and arrive
+      // with its real result.  A future that became invalid means the callback IS installed and
+      // arrives by itself.
+      try {
+        SIRIUS_LOG_ERROR(
+          "[readahead] install_callback failed for hint {} on GPU {}; waiting for the read inline",
+          k,
+          _space.get_device_id());
+      } catch (...) {
+      }
+      if (f.valid()) { fan_in->arrive(k, settle_inline(std::move(f))); }
     }
   }
 
