@@ -8,6 +8,7 @@
 #include "catch.hpp"
 #include "io/parquet_helpers.hpp"
 #include "op/scan/parquet_materialize.hpp"
+#include "utils/parquet_test_sources.hpp"
 #include "utils/utils.hpp"
 
 #include <cudf/ast/expressions.hpp>
@@ -44,64 +45,20 @@ namespace {
 
 namespace fs = std::filesystem;
 
-void require_ok(std::unique_ptr<duckdb::QueryResult> result)
-{
-  REQUIRE(result);
-  INFO((result->HasError() ? result->GetError() : ""));
-  REQUIRE_FALSE(result->HasError());
-}
-
-fs::path fresh_tmp_dir(std::string const& tag)
-{
-  auto dir = fs::temp_directory_path() / ("sirius_pr6_schema_" + tag);
-  std::error_code ec;
-  fs::remove_all(dir, ec);
-  fs::create_directories(dir);
-  return dir;
-}
+using sirius::test::bulk_context;
+using sirius::test::bulk_object;
+using sirius::test::filtered_options;
+using sirius::test::fresh_tmp_dir;
+using sirius::test::read_metadata;
+using sirius::test::read_parquet_footer;
+using sirius::test::require_ok;
+using sirius::test::stage_column_chunks;
+using sirius::test::write_parquet;
 
 fs::path parquet_fixture(std::string_view file_name)
 {
   return fs::path{SIRIUS_PROJECT_ROOT} / "test" / "cpp" / "integration" / "data" / "parquet" /
          file_name;
-}
-
-fs::path write_parquet(duckdb::Connection& con,
-                       fs::path const& dir,
-                       std::string const& table,
-                       std::string const& create_sql)
-{
-  require_ok(con.Query("DROP TABLE IF EXISTS " + table));
-  require_ok(con.Query(create_sql));
-
-  auto path = dir / (table + ".parquet");
-  require_ok(con.Query("COPY " + table + " TO '" + path.string() + "' (FORMAT PARQUET)"));
-  return path;
-}
-
-std::unique_ptr<cudf::io::datasource::buffer> read_parquet_footer(cudf::io::datasource& source)
-{
-  auto constexpr footer_tail_size = sizeof(cudf::io::parquet::file_ender_s);
-  auto const file_size            = source.size();
-  REQUIRE(file_size >= footer_tail_size);
-
-  auto tail = source.host_read(file_size - footer_tail_size, footer_tail_size);
-
-  std::uint32_t footer_size = 0;
-  std::memcpy(&footer_size, tail->data(), sizeof(footer_size));
-  REQUIRE(file_size >= footer_tail_size + footer_size);
-
-  return source.host_read(file_size - footer_tail_size - footer_size, footer_size);
-}
-
-cudf::io::parquet::FileMetaData read_metadata(fs::path const& path)
-{
-  auto source = cudf::io::datasource::create(path.string());
-  auto footer = read_parquet_footer(*source);
-  auto opts   = cudf::io::parquet_reader_options::builder().build();
-  cudf::io::parquet::experimental::hybrid_scan_reader reader{
-    cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), opts};
-  return reader.parquet_metadata();
 }
 
 std::vector<duckdb::LogicalType> expected_flat_types()
@@ -244,31 +201,6 @@ TEST_CASE("parquet_helpers extract_schema maps deep nested columns and resumes a
 
 namespace {
 
-/// One file's column chunks staged on the device, which is the shape the bulk
-/// materialize route hands the hybrid scan readers.
-struct staged_chunks {
-  std::vector<rmm::device_buffer> buffers;
-  std::vector<cudf::device_span<std::uint8_t const>> spans;
-};
-
-staged_chunks stage_column_chunks(cudf::io::datasource& source,
-                                  std::span<cudf::io::text::byte_range_info const> ranges,
-                                  ::cuda::stream_ref stream)
-{
-  staged_chunks staged;
-  staged.buffers.reserve(ranges.size());
-  for (auto const& range : ranges) {
-    auto const host = source.host_read(static_cast<std::size_t>(range.offset()),
-                                       static_cast<std::size_t>(range.size()));
-    staged.buffers.emplace_back(host->data(), host->size(), stream);
-  }
-  staged.spans.reserve(staged.buffers.size());
-  for (auto const& buffer : staged.buffers) {
-    staged.spans.emplace_back(static_cast<std::uint8_t const*>(buffer.data()), buffer.size());
-  }
-  return staged;
-}
-
 /// `l_orderkey < 100000` over lineitem.parquet: 100382 of 600572 rows, spread
 /// over all 5 row groups, so an equal count proves row-level filtering.
 struct orderkey_filter {
@@ -277,16 +209,6 @@ struct orderkey_filter {
   cudf::ast::column_name_reference column{"l_orderkey"};
   cudf::ast::operation expression{cudf::ast::ast_operator::LESS, column, value};
 };
-
-cudf::io::parquet_reader_options filtered_options(std::vector<std::string> const& paths,
-                                                  std::vector<std::string> columns,
-                                                  cudf::ast::operation const& filter)
-{
-  auto options =
-    cudf::io::parquet_reader_options::builder(cudf::io::source_info{paths}).filter(filter).build();
-  options.set_column_names(std::move(columns));
-  return options;
-}
 
 /// Rows the single-file bulk route produces for @p options.
 cudf::size_type bulk_row_count(fs::path const& path,
@@ -307,75 +229,6 @@ cudf::size_type bulk_row_count(fs::path const& path,
       row_groups, staged.spans, options, stream, cudf::get_current_device_resource_ref())
     .tbl->num_rows();
 }
-
-/// A backend that prefers bulk IO -- the one thing `prefers_bulk_materialize`
-/// asks a source's datasource.
-class bulk_object final : public cucascade::io::io_object {
- public:
-  explicit bulk_object(std::string path = "bulk", std::size_t size = 0)
-    : _path(std::move(path)), _size(size)
-  {
-  }
-
-  [[nodiscard]] std::string const& raw_file_cache_id() const noexcept override { return _path; }
-  [[nodiscard]] std::string const& object_path() const noexcept override { return _path; }
-  [[nodiscard]] std::size_t size() const noexcept override { return _size; }
-
- private:
-  std::string _path;
-  std::size_t _size;
-};
-
-/// Minimal ioctx: reports @c prefers_bulk_io() and never serves a read (the
-/// tests below only route and validate schemas; none reaches the backend).
-class bulk_context final : public cucascade::io::ioctx {
- public:
-  ~bulk_context() override { pre_destroy(); }
-
-  [[nodiscard]] cucascade::io::io_context_type type() const noexcept override
-  {
-    return cucascade::io::io_context_type::restful;
-  }
-  void shutdown() noexcept override {}
-  [[nodiscard]] bool supports(std::string_view) const noexcept override { return true; }
-  [[nodiscard]] bool supports_device_read() const noexcept override { return false; }
-  [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
-  [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
-  [[nodiscard]] bool supports_device_range_read() const noexcept override { return false; }
-  [[nodiscard]] bool prefers_bulk_io() const noexcept override { return true; }
-
-  [[nodiscard]] std::vector<cucascade::io::byte_range> align_and_coalesce(
-    std::span<cucascade::io::byte_range const> ranges,
-    std::optional<std::size_t>) const noexcept override
-  {
-    return {ranges.begin(), ranges.end()};
-  }
-
-  std::size_t host_read_io(cucascade::io::io_object const&,
-                           std::size_t,
-                           std::size_t size,
-                           std::uint8_t*) override
-  {
-    return size;
-  }
-
-  cucascade::exec::semi_future<std::size_t> mixed_readv_async_io(
-    cucascade::io::io_object const&,
-    std::vector<cucascade::io::prepared_io_slice>&& slices) noexcept override
-  {
-    std::size_t bytes = 0;
-    for (auto const& slice : slices) {
-      bytes += slice.size();
-    }
-    return cucascade::exec::make_semi_future<std::size_t>(bytes);
-  }
-
- protected:
-  std::shared_ptr<cucascade::io::io_object> create_io_object(std::string path) override
-  {
-    return std::make_shared<bulk_object>(std::move(path));
-  }
-};
 
 sirius::op::scan::parquet_source schema_source(fs::path const& path,
                                                std::shared_ptr<bulk_context> const& ioctx)
