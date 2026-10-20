@@ -3347,6 +3347,8 @@ TEST_CASE("consumer passes mismatched device inputs through without filtering or
   SECTION("the batch's memory space names another device")
   {
     // The program is prepared for the current device, so only the batch's memory space differs.
+    // No stream can belong to the fictitious device, so the batch records an unknown (null)
+    // writer, which cuCascade does not check against the space's device.
     auto const space = make_space_naming_device(other_device);
     // This synthetic space cannot own the current device's writer stream. Keep the real table
     // alive through a view with an unknown writer; the consumer must decline before GPU access.
