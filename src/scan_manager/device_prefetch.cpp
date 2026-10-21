@@ -493,7 +493,10 @@ device_prefetch_issue device_prefetch_issuer::try_issue(std::shared_ptr<scan_inf
           _space.get_device_id());
       } catch (...) {
       }
-      if (f.valid()) { fan_in->arrive(k, settle_inline(std::move(f))); }
+      // The && overload leaves the state in place when install fails, so f is still usable.
+      if (f.valid()) {  // NOLINT(bugprone-use-after-move)
+        fan_in->arrive(k, settle_inline(std::move(f)));
+      }
     }
   }
 

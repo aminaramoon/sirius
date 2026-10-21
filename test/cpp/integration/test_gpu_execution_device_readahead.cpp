@@ -29,7 +29,6 @@
 #include "utils/transparent_execution_test_utils.hpp"
 
 #include <duckdb.hpp>
-#include <unistd.h>
 
 #include <chrono>
 #include <cstdint>
@@ -38,33 +37,12 @@
 #include <memory>
 #include <regex>
 #include <string>
-#include <system_error>
 #include <thread>
 #include <vector>
 
 namespace {
 
 namespace fs = std::filesystem;
-
-/// A scratch directory, removed with everything in it.
-struct scratch_dir {
-  fs::path path =
-    fs::temp_directory_path() / ("sirius_device_readahead_" + std::to_string(::getpid()));
-
-  scratch_dir()
-  {
-    std::error_code ec;
-    fs::remove_all(path, ec);
-    fs::create_directories(path);
-  }
-  ~scratch_dir()
-  {
-    std::error_code ec;
-    fs::remove_all(path, ec);
-  }
-  scratch_dir(scratch_dir const&)            = delete;
-  scratch_dir& operator=(scratch_dir const&) = delete;
-};
 
 /// integration.yaml's memory and executor blocks, a scan batch small enough to cut the test file
 /// into several splits, and the readahead with the device tier at @p fraction.  The readahead
@@ -189,10 +167,10 @@ TEST_CASE("device-tier readahead lands parquet splits on the GPU and matches Duc
   SECTION("device tier on") { fraction = 0.6; }
   SECTION("device tier off") { fraction = 0.0; }
 
-  scratch_dir dir;
-  auto const config = dir.path / "sirius.yaml";
+  sirius::test::scratch_dir dir{"device_readahead"};
+  auto const config = dir.path() / "sirius.yaml";
   write_config(config, fraction);
-  auto const file = (dir.path / "device_readahead.parquet").string();
+  auto const file = (dir.path() / "device_readahead.parquet").string();
 
   device_readahead_db db(config);
   db.run_ok("SET gpu_execution = false;");
