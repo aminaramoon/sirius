@@ -122,7 +122,14 @@ struct promotion_result {
   cucascade::memory::memory_space_id observed{cucascade::memory::Tier::SIZE, -1};
   /// Bytes reserved for the copy (the exact need, with slack), when promoted.
   std::size_t bytes{0};
+  /// Which copy was made, when promoted. Set it explicitly: when it is left at @c none the store
+  /// infers it from the tiers, which cannot tell @c relocate_d2h from @c d2h.
   promotion_kind kind{promotion_kind::none};
+  /// When promoted: a value of @c g_conversion_seq taken while the batch was exclusively locked
+  /// for the copy, so every downgrade record of an earlier move sorts below it and every later
+  /// one above it. 0 when none was taken; the store then falls back to the candidate's sequence
+  /// at take time.
+  std::uint64_t conversion_seq{0};
 };
 
 /// One promotion handed to a lane. Built under the executor's lock; holds no strong reference.
@@ -720,7 +727,8 @@ struct assign_item {
   /// GPU target by index; empty for a staging-only item.
   std::optional<std::size_t> gpu;
   /// HOST target by index: the target of a staging-only item, or the fallback of a DISK-resident
-  /// GPU item when `stage_to_host` is set. Empty when staging is not possible.
+  /// GPU item. Empty when staging is not possible. The caller leaves it empty whenever
+  /// `stage_to_host` is false: @ref assign_head_of_line does not read the configuration.
   std::optional<std::size_t> host;
   /// Bytes the item needs on the GPU (with its OOM multiplier) and on the HOST.
   std::size_t gpu_bytes{0};

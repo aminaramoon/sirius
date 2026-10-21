@@ -29,6 +29,12 @@ using cucascade::memory::Tier;
 
 constexpr std::uint64_t no_epoch = ~std::uint64_t{0};
 
+/// Whether epoch @p a is later than epoch @p b, robust to wrap-around.
+[[nodiscard]] constexpr bool epoch_after(std::uint64_t a, std::uint64_t b) noexcept
+{
+  return static_cast<std::int64_t>(a - b) > 0;
+}
+
 [[nodiscard]] bool lower_tier(Tier tier) noexcept
 {
   return tier == Tier::HOST || tier == Tier::DISK;
@@ -231,14 +237,16 @@ bool candidate_store::add_query(query_id_t q,
   if (_queries.contains(q)) { return false; }
   query_state qs;
   qs.active_gpus = std::move(active_gpus);
-  std::stable_sort(repos.begin(), repos.end(), [](repo_info const& a, repo_info const& b) {
-    return a.dest_priority < b.dest_priority;
-  });
+  // Deduplicate in input order first, so the first entry of a token wins whatever its priority.
   qs.repos.reserve(repos.size());
   for (auto& r : repos) {
-    if (qs.repo_index.contains(r.token)) { continue; }
-    qs.repo_index.emplace(r.token, qs.repos.size());
-    qs.repos.push_back(std::move(r));
+    if (qs.repo_index.emplace(r.token, 0).second) { qs.repos.push_back(std::move(r)); }
+  }
+  std::stable_sort(qs.repos.begin(), qs.repos.end(), [](repo_info const& a, repo_info const& b) {
+    return a.dest_priority < b.dest_priority;
+  });
+  for (std::size_t i = 0; i < qs.repos.size(); ++i) {
+    qs.repo_index[qs.repos[i].token] = i;
   }
   _queries.emplace(q, std::move(qs));
   return true;
@@ -257,27 +265,32 @@ void candidate_store::mark_readiness_dirty(query_id_t q) noexcept
 
 void candidate_store::retire_query(query_id_t q) noexcept
 {
-  for (auto it = _by_id.begin(); it != _by_id.end();) {
-    if (it->second.query == q) {
-      auto const next = std::next(it);
-      erase_candidate(it);
-      it = next;
-    } else {
-      ++it;
-    }
-  }
-  for (auto it = _ledger.begin(); it != _ledger.end();) {
-    if (it->second.query == q) {
-      count(q, counter::wasted_unconsumed);
-      auto const next = std::next(it);
-      erase_ledger(it);
-      it = next;
-    } else {
-      ++it;
-    }
-  }
+  // Candidates and ledger entries exist only for known queries, and each is indexed in its
+  // query's state, so an unknown query has nothing to purge and a known one needs no full scan.
   auto const it = _queries.find(q);
   if (it == _queries.end()) { return; }
+  auto& qs = it->second;
+  // Erasing a candidate or a ledger entry also drops its index entry; an index entry that no longer
+  // resolves to one of q is dropped directly, so both loops always make progress.
+  while (!qs.by_seq.empty()) {
+    auto const first = qs.by_seq.begin();
+    auto const cit   = _by_id.find(first->second);
+    if (cit != _by_id.end() && cit->second.query == q) {
+      erase_candidate(cit);
+    } else {
+      qs.by_seq.erase(first);
+    }
+  }
+  while (!qs.ledger_ids.empty()) {
+    auto const first = qs.ledger_ids.begin();
+    auto const lit   = _ledger.find(*first);
+    if (lit != _ledger.end() && lit->second.query == q) {
+      count(q, counter::wasted_unconsumed);
+      erase_ledger(lit);
+    } else {
+      qs.ledger_ids.erase(first);
+    }
+  }
   try {
     _stats_by_query.insert_or_assign(q, it->second.stats);
   } catch (...) {
@@ -288,6 +301,9 @@ void candidate_store::retire_query(query_id_t q) noexcept
 
 std::optional<per_query_stats> candidate_store::forget_query(query_id_t q) noexcept
 {
+  // A query the store never knew (or already forgot) freed nothing preload could have been
+  // refused by: leave the epochs alone rather than ungating every space.
+  if (!_queries.contains(q) && !_stats_by_query.contains(q)) { return std::nullopt; }
   retire_query(q);
   advance_all_mem_epochs();
   auto const it = _stats_by_query.find(q);
@@ -311,9 +327,15 @@ intake_status candidate_store::intake(query_id_t q, event::downgraded_batch cons
   auto const id = rec.batch_id;
 
   // A batch still in the ledger was moved down again before its consumer took it: whatever
-  // happens to the record, the ledger no longer describes where the batch is.
+  // happens to the record, the ledger no longer describes where the batch is. A record of a move
+  // from before the promotion (delivered late, or out of order across reporters) says nothing
+  // about where the batch is now.
   bool bounced = false;
   if (auto const lit = _ledger.find(id); lit != _ledger.end()) {
+    if (rec.conversion_seq <= lit->second.seq) {
+      count(q, counter::dropped_stale_record);
+      return intake_status::dropped_stale_record;
+    }
     erase_ledger(lit);
     count(q, counter::bounce);
     bounced = true;
@@ -580,7 +602,14 @@ outcome_effect candidate_store::apply_outcome(promotion_job const& job,
   // Space-level effects hold whatever happened to the query.
   auto const o = result.outcome;
   if (o == promotion_outcome::no_memory || o == promotion_outcome::gated) {
-    if (auto const s = slot(job.t)) { _gate_epoch[*s] = job.mem_epoch_at_take; }
+    // Outcomes of concurrent jobs can be applied out of order: a gate only moves forward, so an
+    // older refusal never reopens a space a newer one closed.
+    if (auto const s = slot(job.t)) {
+      auto& gate = _gate_epoch[*s];
+      if (gate == no_epoch || epoch_after(job.mem_epoch_at_take, gate)) {
+        gate = job.mem_epoch_at_take;
+      }
+    }
     effect.purge = purge_scope::target;
   } else if (o == promotion_outcome::held_off) {
     effect.purge = purge_scope::held_off;
@@ -603,6 +632,18 @@ outcome_effect candidate_store::apply_outcome(promotion_job const& job,
   auto& c     = it->second;
   c.in_flight = false;
 
+  // A lost race on the batch: wait for the queue to move past the dispatch epoch, and give up
+  // after max_lock_attempts.
+  auto const lost_race = [&] {
+    ++c.lock_misses;
+    if (c.lock_misses >= static_cast<std::uint32_t>(std::max(_cfg.max_lock_attempts, 1))) {
+      count(job.query, counter::dropped_lock_attempts);
+      erase_candidate(it);
+    } else {
+      c.blocked_queue_epoch = job.queue_epoch_at_take;
+    }
+  };
+
   switch (o) {
     case promotion_outcome::promoted: {
       auto& promotions = qs.promotions[c.batch_id];
@@ -619,15 +660,31 @@ outcome_effect candidate_store::apply_outcome(promotion_job const& job,
         }
         break;
       }
-      add_ledger(c, job, result.bytes != 0 ? result.bytes : c.est_bytes);
-      erase_candidate(it);
+      auto const seq   = std::max(job.seq_at_take, result.conversion_seq);
+      auto const bytes = result.bytes != 0 ? result.bytes : c.est_bytes;
+      add_ledger(c, qs, job, bytes, seq);
+      if (job.t.tier != Tier::HOST || job.t.index >= _host_devices.size() || promotions >= cap) {
+        erase_candidate(it);
+        break;
+      }
+      // Staged on HOST: keep the candidate there, so a later pass can take it on to its GPU.
+      reindex_seq(c, qs, seq);
+      c.location = cucascade::memory::memory_space_id{Tier::HOST, _host_devices[job.t.index]};
       break;
     }
     case promotion_outcome::retired:
     case promotion_outcome::expired:
     case promotion_outcome::already_resident: erase_candidate(it); break;
     case promotion_outcome::stale:
-      if (result.observed.tier != Tier::SIZE) { c.location = result.observed; }
+      // A record merged during the attempt is newer than what the worker saw.
+      if (c.last_seq != job.seq_at_take) { break; }
+      if (result.observed.tier != Tier::SIZE && result.observed != job.expected_source) {
+        c.location = result.observed;
+        break;
+      }
+      // Nothing moved (a task claimed a class-B batch): a lost race like a lock refusal. Without
+      // this bound it would stay plannable and could be re-planned with no event in between.
+      lost_race();
       break;
     case promotion_outcome::unsupported: c.unsupported = true; break;
     case promotion_outcome::too_big:
@@ -639,15 +696,7 @@ outcome_effect candidate_store::apply_outcome(promotion_job const& job,
     case promotion_outcome::no_memory:
     case promotion_outcome::gated:
     case promotion_outcome::held_off: break;
-    case promotion_outcome::contended:
-      ++c.lock_misses;
-      if (c.lock_misses >= static_cast<std::uint32_t>(std::max(_cfg.max_lock_attempts, 1))) {
-        count(job.query, counter::dropped_lock_attempts);
-        erase_candidate(it);
-      } else {
-        c.blocked_queue_epoch = job.queue_epoch_at_take;
-      }
-      break;
+    case promotion_outcome::contended: lost_race(); break;
     case promotion_outcome::oom:
       if (c.oom_count < std::numeric_limits<std::uint32_t>::max()) { ++c.oom_count; }
       if (!c.gpu_banned &&
@@ -683,13 +732,24 @@ std::size_t candidate_store::outstanding_b_bytes(std::size_t gpu) const noexcept
   return gpu < _outstanding_b.size() ? _outstanding_b[gpu] : 0;
 }
 
-void candidate_store::add_ledger(candidate const& c, promotion_job const& job, std::size_t bytes)
+void candidate_store::add_ledger(candidate const& c,
+                                 query_state& qs,
+                                 promotion_job const& job,
+                                 std::size_t bytes,
+                                 std::uint64_t seq)
 {
   int const gpu = job.t.tier == Tier::GPU && job.t.index < _gpu_devices.size()
                     ? static_cast<int>(job.t.index)
                     : -1;
   if (auto const old = _ledger.find(c.batch_id); old != _ledger.end()) { erase_ledger(old); }
-  _ledger.emplace(c.batch_id, ledger_entry{c.batch, c.query, gpu, job.k, bytes});
+  // Index first: if the ledger insert throws, the index entry is rolled back.
+  qs.ledger_ids.insert(c.batch_id);
+  try {
+    _ledger.emplace(c.batch_id, ledger_entry{c.batch, c.query, gpu, job.k, bytes, seq});
+  } catch (...) {
+    qs.ledger_ids.erase(c.batch_id);
+    throw;
+  }
   if (gpu >= 0) {
     auto const g    = static_cast<std::size_t>(gpu);
     _outstanding[g] = sat_add(_outstanding[g], bytes);
@@ -697,10 +757,21 @@ void candidate_store::add_ledger(candidate const& c, promotion_job const& job, s
   }
 }
 
+void candidate_store::reindex_seq(candidate& c, query_state& qs, std::uint64_t seq)
+{
+  if (seq <= c.last_seq) { return; }
+  qs.by_seq.emplace(seq, c.batch_id);  // may throw; the candidate is unchanged then
+  qs.by_seq.erase({c.last_seq, c.batch_id});
+  c.last_seq = seq;
+}
+
 void candidate_store::erase_ledger(
   std::unordered_map<std::uint64_t, ledger_entry>::iterator it) noexcept
 {
   auto const& e = it->second;
+  if (auto const qit = _queries.find(e.query); qit != _queries.end()) {
+    qit->second.ledger_ids.erase(it->first);
+  }
   if (e.gpu >= 0) {
     auto const g    = static_cast<std::size_t>(e.gpu);
     _outstanding[g] = sat_sub(_outstanding[g], e.bytes);

@@ -45,6 +45,7 @@ namespace sirius::preload {
   X(dropped_overflow)              \
   X(dropped_lock_attempts)         \
   X(dropped_promotion_cap)         \
+  X(dropped_stale_record)          \
   X(passes)                        \
   X(passes_noop)                   \
   X(items_planned)                 \
