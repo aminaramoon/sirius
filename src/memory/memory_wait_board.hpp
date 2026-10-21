@@ -43,7 +43,11 @@ namespace sirius::memory {
  * The counts are read with @ref waiting and @ref oom_pending rather than learned from events,
  * because event delivery is asynchronous and lags the stall it reports. Every count update and
  * read is sequentially consistent: a reader that reserves memory and then sees no waiter, and an
- * executor that enters a wait and then fails to reserve, cannot both miss each other.
+ * executor that enters a wait and then fails to reserve, cannot both miss each other. This holds
+ * only from @ref enter_wait onward: the executor enters the wait after its first, non-blocking
+ * reservation attempt has failed, so a reservation that lands between that attempt and
+ * @ref enter_wait can still see no waiter. The counts are advisory; a reader that must not take
+ * memory a stalled task needs enforces that with its own reservation limit.
  *
  * Devices outside @c [0, max_device_id] are ignored: holds on them are inactive and their counts
  * read as zero.

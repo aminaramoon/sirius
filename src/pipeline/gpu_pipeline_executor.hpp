@@ -31,6 +31,7 @@
 
 #include <atomic>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 
 namespace sirius::op {
@@ -97,12 +98,21 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
     _query_event_publisher = publisher.shared_from_this();
   }
 
-  /// Report stalled reserve phases and OOM-rescheduled tasks on @p board, shared with every
-  /// other GPU executor and with the components that read it. Null (the default) disables the
-  /// reporting; each stall path then costs one null-pointer test. Must be called before start():
-  /// the manager and worker threads read the handle unsynchronized.
+  /**
+   * @brief Report stalled reserve phases and OOM-rescheduled tasks on @p board, shared with every
+   *        other GPU executor and with the components that read it.
+   *
+   * Null (the default) disables the reporting; each stall path then costs one null-pointer test.
+   *
+   * @pre The executor is not running: the manager and worker threads read the handle
+   *      unsynchronized.
+   * @throws std::logic_error if the executor is running.
+   */
   void set_memory_wait_board(std::shared_ptr<sirius::memory::memory_wait_board> board)
   {
+    if (_running.load(std::memory_order_acquire)) {
+      throw std::logic_error("gpu_pipeline_executor: memory wait board set while running");
+    }
     _memory_wait_board = std::move(board);
   }
 
