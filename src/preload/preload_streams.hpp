@@ -38,6 +38,9 @@ namespace sirius::preload {
  * their consumer rebinds them. The pools must therefore outlive every repository that may hold
  * such a batch, which is why they are owned separately from the executor. Every stream borrowed
  * from a pool must be returned (its @c borrowed_stream destroyed) before the pool is destroyed.
+ *
+ * A stream-creation failure while growing a pool terminates the process: cuCascade's
+ * @c acquire_stream is @c noexcept.
  */
 class preload_streams {
  public:
@@ -49,6 +52,8 @@ class preload_streams {
    */
   explicit preload_streams(std::span<int const> gpu_device_ids)
   {
+    // So that a created pool is always owned by _pools, and destroyed under its device.
+    _pools.reserve(gpu_device_ids.size());
     try {
       for (int const device : gpu_device_ids) {
         if (device < 0 || for_device(device) != nullptr) { continue; }
@@ -94,7 +99,7 @@ class preload_streams {
         rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{e.device}};
         e.pool.reset();
       } catch (...) {
-        // The device could not be made current; the streams are still destroyed below.
+        // Best effort: destroy the streams below on whatever device is current.
       }
       e.pool.reset();
     }

@@ -68,7 +68,13 @@ enum class repr_kind : std::uint8_t {
  */
 [[nodiscard]] std::size_t promotion_peak_bytes(cucascade::idata_representation const& data);
 
-/// A GPU target as a promotion sees it.
+/**
+ * @brief A GPU target as a promotion sees it.
+ *
+ * The ceiling is enforced strictly only when the space tracks reservations per thread (Sirius's
+ * default): per stream, HOST->GPU allocations on the space's shared stream pool are not charged
+ * to the promotion's reservation.
+ */
 struct promotion_gpu {
   cucascade::memory::memory_space* space{nullptr};
   /// A promotion whose exact need exceeds this is refused with @c too_big.
@@ -125,8 +131,10 @@ struct promotion_env {
  * A GPU copy runs on a stream of the GPU's preload pool with the reservation attached to the
  * calling thread's allocation tracker under a fail-on-overrun policy, so a misestimate throws
  * @c rmm::out_of_memory (@c oom) instead of exceeding the ceiling. A HOST copy draws from the
- * reservation. An encoded batch is staged with @c relocate_to, any other with @c convert_to.
- * Any other exception gives @c failed. On @c promoted, the result carries the exact need in bytes,
+ * reservation; an @c rmm::out_of_memory there gives @c no_memory (@c oom is for GPU targets
+ * only). An encoded
+ * batch is staged with @c relocate_to, any other with @c convert_to. Any other exception gives
+ * @c failed. On @c promoted, the result carries the exact need in bytes,
  * the copy's @ref promotion_kind and a conversion sequence taken under the batch lock.
  */
 [[nodiscard]] promotion_result promote_one(promotion_job const& job,

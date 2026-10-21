@@ -16,9 +16,10 @@
 
 #include "catch.hpp"
 #include "data/convertible_data.hpp"
-#include "data/convertible_data_batch.hpp"
 #include "data/data_batch_utils.hpp"
+#include "data/data_repository_manager_registry.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "downgrade/downgrade_executor.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "memory/memory_wait_board.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -43,7 +44,10 @@
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/data/common.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/encoded_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
@@ -53,6 +57,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -372,6 +377,22 @@ struct scoped_host_decoder {
   scoped_host_decoder& operator=(scoped_host_decoder const&) = delete;
 };
 
+/// A representation preload does not move: anything but host, disk or encoded data.
+class opaque_representation final : public cucascade::idata_representation {
+ public:
+  explicit opaque_representation(cucascade::memory::memory_space& space)
+    : idata_representation(space)
+  {
+  }
+
+  [[nodiscard]] std::size_t get_size_in_bytes() const override { return 4096; }
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override { return 4096; }
+  std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) override
+  {
+    return std::make_unique<opaque_representation>(get_memory_space());
+  }
+};
+
 std::vector<int64_t> iota_values(std::size_t n)
 {
   std::vector<int64_t> values(n);
@@ -415,11 +436,28 @@ TEST_CASE("HOST to GPU keeps the batch, records a writer event and releases its 
   CHECK(f.int32_values(*batch) == values);
   CHECK(f.gpu->get_total_reserved_memory() == baseline);
 
-  // Downgrade can demote a preloaded batch again: it needs the writer event the copy recorded.
-  sirius::convertible_data_batch convertible{batch};
-  std::vector<cucascade::memory::memory_space const*> const targets{f.host};
-  auto const moved = convertible.convert(targets, f.stream, *f.mgr, /*blocking=*/false);
-  REQUIRE(moved.has_value());
+  // The downgrade executor can demote the preloaded batch again.
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(f.query);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+  sirius::parallel::downgrade_executor downgrader(
+    f.lifecycle,
+    sirius::exec::downgrade_executor_config{
+      .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+      .monitor_period = std::chrono::milliseconds{0}},
+    repo_registry,
+    f.gpu->get_id(),
+    f.gpu,
+    *f.mgr);
+  downgrader.start();
+  std::atomic<int> evaluations{0};
+  // Satisfied after one dispatch.
+  auto const freed =
+    downgrader.request_downgrade([&evaluations] { return evaluations.fetch_add(1) >= 1; }).get();
+  downgrader.stop();
+  CHECK(freed > 0);
   CHECK(tier_of(*batch) == Tier::HOST);
   CHECK(batch->get_batch_id() == id);
 }
@@ -557,6 +595,99 @@ TEST_CASE("a target above its ceiling gives gated and releases the reservation",
   }
 }
 
+TEST_CASE("a ceiling crossed after the reservation gives gated and releases the reservation",
+          "[preload_promotion]")
+{
+  promotion_fixture f;
+  auto batch          = f.make_batch_in(*f.host);
+  auto job            = f.job_for(batch, gpu_target);
+  auto const occupied = promotion_fixture::occupy(*f.gpu);
+  auto const baseline = f.gpu->get_total_reserved_memory();
+  std::size_t need{0};
+  {
+    auto ro = batch->to_read_only();
+    need    = with_slack(promotion_peak_bytes(*ro.get_data()));
+  }
+  auto const consumed = consumed_bytes(f.gpu->get_max_memory(), f.gpu->get_available_memory());
+
+  SECTION("another reservation lands between the reservation and the copy")
+  {
+    job.est_reserve = need;  // no growth: only the late reservation crosses the ceiling
+    job.ceiling     = consumed + need + (16ull << 20);
+    std::unique_ptr<cucascade::memory::reservation> late;
+    auto const result = promote_one(job, f.env([&](promotion_job const&) {
+      late = f.gpu->make_reservation_or_null(64ull << 20);
+      CHECK(late != nullptr);
+    }));
+    CHECK(result.outcome == promotion_outcome::gated);
+    late.reset();
+  }
+
+  SECTION("growing the reservation to the exact need crosses the ceiling")
+  {
+    job.est_reserve = 1;
+    job.ceiling     = consumed + (64ull << 10);
+    REQUIRE(need > (64ull << 10));
+    CHECK(promote_one(job, f.env()).outcome == promotion_outcome::gated);
+  }
+
+  CHECK(f.gpu->get_total_reserved_memory() == baseline);
+  CHECK(tier_of(*batch) == Tier::HOST);
+}
+
+TEST_CASE("a reservation that cannot grow to the exact need gives no_memory", "[preload_promotion]")
+{
+  promotion_fixture f;
+  auto batch      = f.make_batch_in(*f.host);
+  auto job        = f.job_for(batch, gpu_target);
+  job.est_reserve = 1;
+  std::size_t need{0};
+  {
+    auto ro = batch->to_read_only();
+    need    = with_slack(promotion_peak_bytes(*ro.get_data()));
+  }
+  // Leave 512 KiB reservable: enough for the estimate, not for the need.
+  std::size_t const left = 512ull << 10;
+  REQUIRE(need > left);
+  auto const allocated = f.gpu->get_capacity() - f.gpu->get_available_memory();
+  REQUIRE(f.gpu->get_max_memory() > allocated + left);
+  auto blocker = f.gpu->make_reservation_or_null(f.gpu->get_max_memory() - allocated - left);
+  REQUIRE(blocker != nullptr);
+  REQUIRE_FALSE(f.gpu->should_downgrade_memory());
+  auto const baseline = f.gpu->get_total_reserved_memory();
+
+  CHECK(promote_one(job, f.env()).outcome == promotion_outcome::no_memory);
+  CHECK(f.gpu->get_total_reserved_memory() == baseline);
+  CHECK(tier_of(*batch) == Tier::HOST);
+}
+
+TEST_CASE("out of memory is local to the candidate on a GPU and space-wide on HOST",
+          "[preload_promotion]")
+{
+  promotion_fixture f;
+  auto const throw_oom = [](promotion_job const&) { throw rmm::out_of_memory("test: no blocks"); };
+
+  SECTION("GPU target")
+  {
+    auto batch          = f.make_batch_in(*f.host);
+    auto const baseline = f.gpu->get_total_reserved_memory();
+    CHECK(promote_one(f.job_for(batch, gpu_target), f.env(throw_oom)).outcome ==
+          promotion_outcome::oom);
+    CHECK(f.gpu->get_total_reserved_memory() == baseline);
+    CHECK(tier_of(*batch) == Tier::HOST);
+  }
+
+  SECTION("HOST target")
+  {
+    auto batch          = f.make_batch_in(*f.disk);
+    auto const baseline = f.host->get_total_reserved_memory();
+    CHECK(promote_one(f.job_for(batch, host_target), f.env(throw_oom)).outcome ==
+          promotion_outcome::no_memory);
+    CHECK(f.host->get_total_reserved_memory() == baseline);
+    CHECK(tier_of(*batch) == Tier::DISK);
+  }
+}
+
 TEST_CASE("a stalled or OOM-pending task on the GPU gives held_off", "[preload_promotion]")
 {
   promotion_fixture f;
@@ -596,6 +727,19 @@ TEST_CASE("a stalled or OOM-pending task on the GPU gives held_off", "[preload_p
     CHECK(promote_one(f.job_for(staged, host_target), f.env()).outcome ==
           promotion_outcome::held_off);
     CHECK(tier_of(*staged) == Tier::DISK);
+  }
+
+  SECTION("staging yields to a GPU that stalls between the reservation and the copy")
+  {
+    auto staged              = f.make_batch_in(*f.disk);
+    auto const host_baseline = f.host->get_total_reserved_memory();
+    std::optional<sirius::memory::memory_wait_board::waiter> waiter;
+    auto const result =
+      promote_one(f.job_for(staged, host_target),
+                  f.env([&](promotion_job const&) { waiter.emplace(f.board->enter_wait(0)); }));
+    CHECK(result.outcome == promotion_outcome::held_off);
+    CHECK(tier_of(*staged) == Tier::DISK);
+    CHECK(f.host->get_total_reserved_memory() == host_baseline);
   }
 
   CHECK(tier_of(*batch) == Tier::HOST);
@@ -787,6 +931,18 @@ TEST_CASE("retired queries, expired batches and moved or claimed batches are not
     auto on_host = f.make_batch_in(*f.host);
     auto job     = f.job_for(on_host, host_target);
     CHECK(promote_one(job, f.env()).outcome == promotion_outcome::already_resident);
+  }
+
+  SECTION("a representation preload does not know gives unsupported")
+  {
+    auto opaque = cucascade::data_batch::make(sirius::get_next_batch_id(),
+                                              std::make_unique<opaque_representation>(*f.disk));
+    CHECK(promote_one(f.job_for(opaque, host_target), f.env()).outcome ==
+          promotion_outcome::unsupported);
+    CHECK(promote_one(f.job_for(opaque, gpu_target), f.env()).outcome ==
+          promotion_outcome::unsupported);
+    CHECK(tier_of(*opaque) == Tier::DISK);
+    CHECK(repr_type_of(*opaque) == typeid(opaque_representation));
   }
 
   SECTION("representations are classified by their exact type")
