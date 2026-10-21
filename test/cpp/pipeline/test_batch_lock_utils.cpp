@@ -20,9 +20,12 @@
 // host/disk -> GPU upgrades keep in-place move semantics. Also covers the
 // pipelineable_operator_data invariant that prepare_for_processing rebinds the idle batch
 // vector to the (possibly cloned) batches underlying the read-only accessors, and the
-// target-space-aware bytes_to_materialize_input estimator.
+// target-space-aware bytes_to_materialize_input estimator, and the decode-in-place guard for
+// encoded data that already sits in the target GPU space.
 
 #include "catch.hpp"
+#include "compression/compressed_representation.hpp"
+#include "compression/device_compressed_blob.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -41,6 +44,8 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
@@ -48,16 +53,24 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/encoded_data_representation.hpp>
+#include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <future>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -732,4 +745,290 @@ TEST_CASE("single-consumer source is freed promptly after a cross-GPU prepare",
     auto ro = clone_sp->to_read_only();
     REQUIRE(ro.get_memory_space()->get_id() == f.gpu1->get_id());
   }
+}
+
+namespace {
+
+constexpr char kTestEncoding[] = "test-raw-int64";
+
+/// Encoded batch in `space` (GPU or HOST) whose payload is the raw bytes of `values`.
+std::shared_ptr<cucascade::data_batch> make_encoded_batch(const std::vector<int64_t>& values,
+                                                          cucascade::memory::memory_space& space,
+                                                          ::cuda::stream_ref stream)
+{
+  const std::size_t bytes = values.size() * sizeof(int64_t);
+  cucascade::encoded_data_metadata metadata{
+    .encoding = kTestEncoding, .version = 1, .uncompressed_size = bytes, .metadata = {}};
+  std::unique_ptr<cucascade::encoded_data_representation> repr;
+  if (space.get_tier() == cucascade::memory::Tier::GPU) {
+    rmm::device_buffer staging(
+      values.data(), bytes, rmm::cuda_stream_view{stream.get()}, space.get_default_allocator());
+    repr = cucascade::encoded_data_representation::from_device(
+      staging.data(), bytes, std::move(metadata), space, stream);
+    stream.sync();  // staging is freed on `stream` at scope exit
+  } else {
+    repr = cucascade::encoded_data_representation::from_host(
+      std::as_bytes(std::span<const int64_t>(values)), std::move(metadata), space);
+  }
+  return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(repr));
+}
+
+/**
+ * Registers a test decoder (encoded raw INT64 payload -> single-column gpu_table) on the global
+ * converter registry for the guard's lifetime, counting its invocations. Construct it after the
+ * fixture's setup(), which resets the registry.
+ */
+struct scoped_test_decoder {
+  std::shared_ptr<std::atomic<int>> calls = std::make_shared<std::atomic<int>>(0);
+
+  scoped_test_decoder()
+  {
+    sirius::converter_registry::get()
+      .register_converter<cucascade::encoded_data_representation,
+                          cucascade::gpu_table_representation>(
+        [calls = calls](
+          cucascade::idata_representation& source,
+          const cucascade::memory::memory_space* target,
+          ::cuda::stream_ref stream,
+          cucascade::memory::reservation*) -> std::unique_ptr<cucascade::idata_representation> {
+          // May run on a worker thread: report violations by throwing, not with Catch macros.
+          calls->fetch_add(1);
+          auto& encoded = source.cast<cucascade::encoded_data_representation>();
+          if (encoded.get_metadata().encoding != kTestEncoding ||
+              target->get_tier() != cucascade::memory::Tier::GPU ||
+              encoded.get_memory_space().get_id() != target->get_id()) {
+            throw std::logic_error("test decoder: unexpected source or target");
+          }
+          const auto rows = encoded.get_payload_size() / sizeof(int64_t);
+          auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                               static_cast<cudf::size_type>(rows),
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               target->get_default_allocator());
+          if (cudaMemcpyAsync(col->mutable_view().data<int64_t>(),
+                              encoded.get_device_buffer().data(),
+                              rows * sizeof(int64_t),
+                              cudaMemcpyDeviceToDevice,
+                              stream.get()) != cudaSuccess) {
+            throw std::runtime_error("test decoder: device copy failed");
+          }
+          std::vector<std::unique_ptr<cudf::column>> cols;
+          cols.push_back(std::move(col));
+          return std::make_unique<cucascade::gpu_table_representation>(
+            std::make_unique<cudf::table>(std::move(cols)),
+            const_cast<cucascade::memory::memory_space&>(*target),
+            stream);
+        });
+  }
+
+  ~scoped_test_decoder()
+  {
+    if (sirius::converter_registry::is_initialized()) {
+      sirius::converter_registry::get()
+        .unregister_converter<cucascade::encoded_data_representation,
+                              cucascade::gpu_table_representation>();
+    }
+  }
+
+  scoped_test_decoder(const scoped_test_decoder&)            = delete;
+  scoped_test_decoder& operator=(const scoped_test_decoder&) = delete;
+};
+
+std::vector<int64_t> iota_values(std::size_t n)
+{
+  std::vector<int64_t> values(n);
+  std::iota(values.begin(), values.end(), int64_t{1000});
+  return values;
+}
+
+/// Asserts `prepared` is a shared lock on `batch` itself (no clone), decoded into a gpu_table in
+/// `space`, holding `expected`.
+void require_decoded_in_place(
+  const std::optional<sirius::pipeline::lock_and_prepare_batch_result>& prepared,
+  const std::shared_ptr<cucascade::data_batch>& batch,
+  const cucascade::memory::memory_space& space,
+  const std::vector<int64_t>& expected,
+  ::cuda::stream_ref stream)
+{
+  REQUIRE(prepared.has_value());
+  REQUIRE(std::holds_alternative<sirius::pipeline::lock_to_existing_batch>(*prepared));
+  const auto& lock = std::get<sirius::pipeline::lock_to_existing_batch>(*prepared);
+  REQUIRE(lock.ro_lock.get_batch_id() == batch->get_batch_id());
+  REQUIRE(lock.ro_lock.get_memory_space()->get_id() == space.get_id());
+  REQUIRE(typeid(*lock.ro_lock.get_data()) == typeid(cucascade::gpu_table_representation));
+  REQUIRE(column_values_to_host<int64_t>(sirius::get_cudf_table_view(lock.ro_lock).column(0),
+                                         stream) == expected);
+}
+
+}  // namespace
+
+TEST_CASE("encoded data on the target GPU is decoded in place without a clone",
+          "[batch_lock_utils][encoded_guard]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+  scoped_test_decoder decoder;
+
+  rmm::cuda_stream stream;
+  const auto values = iota_values(kNumRows);
+  auto batch        = make_encoded_batch(values, *f.gpu0, stream);
+  const auto id     = batch->get_batch_id();
+
+  // Both the explicit target and the "current space" default reach the guard.
+  const bool explicit_target = GENERATE(true, false);
+  CAPTURE(explicit_target);
+  const auto* requested = explicit_target ? f.gpu0 : nullptr;
+
+  {
+    auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, requested, stream);
+    require_decoded_in_place(prepared, batch, *f.gpu0, values, stream);
+    REQUIRE(batch->get_state() == cucascade::batch_state::read_only);
+  }
+  REQUIRE(decoder.calls->load() == 1);
+  REQUIRE(batch->get_batch_id() == id);
+  REQUIRE(batch->get_state() == cucascade::batch_state::idle);
+
+  // The decoded batch now takes the ordinary same-space fast path: no second decode.
+  {
+    auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, requested, stream);
+    require_decoded_in_place(prepared, batch, *f.gpu0, values, stream);
+  }
+  REQUIRE(decoder.calls->load() == 1);
+}
+
+TEST_CASE("encoded data on the target GPU without a decoder throws and leaves the batch intact",
+          "[batch_lock_utils][encoded_guard]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+
+  rmm::cuda_stream stream;
+  auto batch    = make_encoded_batch(iota_values(64), *f.gpu0, stream);
+  const auto id = batch->get_batch_id();
+
+  REQUIRE_THROWS_WITH(
+    sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, stream),
+    Catch::Matchers::ContainsSubstring("no encoded_data_representation -> gpu_table_representation "
+                                       "decoder is registered") &&
+      Catch::Matchers::ContainsSubstring(kTestEncoding));
+
+  // Every lock was released on the throw and the encoded bytes are still installed.
+  REQUIRE(batch->get_state() == cucascade::batch_state::idle);
+  auto ro = batch->to_read_only();
+  REQUIRE(ro.get_batch_id() == id);
+  REQUIRE(ro.get_memory_space()->get_id() == f.gpu0->get_id());
+  REQUIRE(typeid(*ro.get_data()) == typeid(cucascade::encoded_data_representation));
+}
+
+TEST_CASE("concurrent prepares of a shared encoded GPU batch decode it once",
+          "[batch_lock_utils][encoded_guard]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+  scoped_test_decoder decoder;
+
+  rmm::cuda_stream stream1;
+  rmm::cuda_stream stream2;
+  const auto values = iota_values(kNumRows);
+  auto batch        = make_encoded_batch(values, *f.gpu0, stream1);
+
+  auto worker = [&](::cuda::stream_ref sv) {
+    return sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, sv);
+  };
+  ::cuda::stream_ref const stream1_ref = stream1;
+  ::cuda::stream_ref const stream2_ref = stream2;
+  auto fut1                            = std::async(std::launch::async, worker, stream1_ref);
+  auto fut2                            = std::async(std::launch::async, worker, stream2_ref);
+
+  using result_future = std::future<std::optional<sirius::pipeline::lock_and_prepare_batch_result>>;
+  // Release the first finisher's shared lock before waiting on the other, which may be blocked
+  // acquiring the exclusive lock (see the spilled-batch race test above).
+  const auto deadline   = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+  result_future* first  = nullptr;
+  result_future* second = nullptr;
+  while (first == nullptr && std::chrono::steady_clock::now() < deadline) {
+    if (fut1.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready) {
+      first  = &fut1;
+      second = &fut2;
+    } else if (fut2.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready) {
+      first  = &fut2;
+      second = &fut1;
+    }
+  }
+  REQUIRE(first != nullptr);
+  require_decoded_in_place(first->get(), batch, *f.gpu0, values, stream1);
+  REQUIRE(second->wait_for(std::chrono::seconds(120)) == std::future_status::ready);
+  require_decoded_in_place(second->get(), batch, *f.gpu0, values, stream1);
+
+  REQUIRE(decoder.calls->load() == 1);
+  REQUIRE(batch->get_state() == cucascade::batch_state::idle);
+}
+
+TEST_CASE("same-space fast paths other than encoded-on-GPU are unchanged",
+          "[batch_lock_utils][encoded_guard]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+  scoped_test_decoder decoder;
+
+  rmm::cuda_stream stream;
+
+  SECTION("gpu_table on the target GPU is returned as is")
+  {
+    auto batch                                    = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+    const cucascade::idata_representation* before = nullptr;
+    {
+      auto ro = batch->to_read_only();
+      before  = ro.get_data();
+    }
+    auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, stream);
+    REQUIRE(prepared.has_value());
+    REQUIRE(std::holds_alternative<sirius::pipeline::lock_to_existing_batch>(*prepared));
+    const auto& lock = std::get<sirius::pipeline::lock_to_existing_batch>(*prepared);
+    REQUIRE(lock.ro_lock.get_batch_id() == batch->get_batch_id());
+    REQUIRE(lock.ro_lock.get_data() == before);
+  }
+
+  SECTION("compressed_device_representation on the target GPU passes through undecoded")
+  {
+    auto batch =
+      cucascade::data_batch::make(sirius::get_next_batch_id(),
+                                  std::make_unique<sirius::compressed_device_representation>(
+                                    *f.gpu0,
+                                    std::make_shared<sirius::compressed_device_blob>(),
+                                    std::vector<std::string>{"k"},
+                                    /*compressed_bytes=*/64,
+                                    /*uncompressed_bytes=*/256,
+                                    /*num_rows=*/int64_t{32}));
+    const cucascade::idata_representation* before = nullptr;
+    {
+      auto ro = batch->to_read_only();
+      before  = ro.get_data();
+    }
+    auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, stream);
+    REQUIRE(prepared.has_value());
+    REQUIRE(std::holds_alternative<sirius::pipeline::lock_to_existing_batch>(*prepared));
+    const auto& lock = std::get<sirius::pipeline::lock_to_existing_batch>(*prepared);
+    REQUIRE(lock.ro_lock.get_batch_id() == batch->get_batch_id());
+    REQUIRE(lock.ro_lock.get_data() == before);
+    REQUIRE(typeid(*lock.ro_lock.get_data()) == typeid(sirius::compressed_device_representation));
+  }
+
+  SECTION("encoded data in a HOST target space is returned as is")
+  {
+    auto batch = make_encoded_batch(iota_values(64), *f.host0, stream);
+    const cucascade::idata_representation* before = nullptr;
+    {
+      auto ro = batch->to_read_only();
+      before  = ro.get_data();
+    }
+    auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.host0, stream);
+    REQUIRE(prepared.has_value());
+    REQUIRE(std::holds_alternative<sirius::pipeline::lock_to_existing_batch>(*prepared));
+    const auto& lock = std::get<sirius::pipeline::lock_to_existing_batch>(*prepared);
+    REQUIRE(lock.ro_lock.get_batch_id() == batch->get_batch_id());
+    REQUIRE(lock.ro_lock.get_data() == before);
+  }
+
+  REQUIRE(decoder.calls->load() == 0);
 }

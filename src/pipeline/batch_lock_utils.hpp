@@ -23,13 +23,18 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/encoded_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <format>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <tuple>
+#include <typeinfo>
+#include <variant>
 
 namespace sirius {
 namespace pipeline {
@@ -47,6 +52,102 @@ struct lock_to_new_batch {
 };
 
 using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_to_new_batch>;
+
+namespace detail {
+
+/**
+ * @brief Whether @p data is exactly a cucascade::encoded_data_representation.
+ *
+ * Exact type match on purpose: other device-resident encodings, such as
+ * compressed_device_representation (decompressed in place by the scan operators), keep the
+ * same-space pass-through of lock_and_prepare_batch.
+ */
+[[nodiscard]] inline bool is_encoded_representation(
+  const cucascade::idata_representation* data) noexcept
+{
+  return data != nullptr && typeid(*data) == typeid(cucascade::encoded_data_representation);
+}
+
+/**
+ * @brief Decode the encoded representation held under @p mut in place into a
+ *        gpu_table_representation in @p target_space; the batch keeps its id.
+ *
+ * @throws std::runtime_error if no encoded_data_representation -> gpu_table_representation
+ *         converter is registered. The batch is left unchanged.
+ */
+inline void decode_encoded_in_place(cucascade::mutable_data_batch& mut,
+                                    cucascade::representation_converter_registry& registry,
+                                    const cucascade::memory::memory_space& target_space,
+                                    ::cuda::stream_ref stream)
+{
+  const auto& encoded = static_cast<const cucascade::encoded_data_representation&>(*mut.get_data());
+  if (!registry.has_converter_for<cucascade::gpu_table_representation>(encoded)) {
+    throw std::runtime_error(
+      std::format("lock_and_prepare_batch: batch {} holds encoded data (encoding '{}', version {}) "
+                  "on GPU {} but no encoded_data_representation -> "
+                  "gpu_table_representation decoder is registered",
+                  mut.get_batch_id(),
+                  encoded.get_metadata().encoding,
+                  encoded.get_metadata().version,
+                  target_space.get_device_id()));
+  }
+  mut.convert_to<cucascade::gpu_table_representation>(registry, &target_space, stream);
+}
+
+/**
+ * @brief GPU-target preparation under an exclusive lock, for a batch whose caller has already
+ *        released its shared lock.
+ *
+ * The upgrade to the exclusive lock is not atomic (shared released, then exclusive acquired): a
+ * concurrent consumer may have converted the batch in the gap, so this dispatches on the state
+ * observed under the exclusive lock:
+ * - already in the target space: encoded bytes are decoded in place, anything else is used as is;
+ * - on a different GPU: cloned (a GPU-resident batch is never moved cross-device);
+ * - on HOST or DISK: converted in place (move), freeing the spilled copy.
+ */
+[[nodiscard]] inline lock_and_prepare_batch_result prepare_for_gpu_under_exclusive_lock(
+  const std::shared_ptr<cucascade::data_batch>& batch,
+  const cucascade::memory::memory_space& target_space,
+  cucascade::representation_converter_registry& registry,
+  ::cuda::stream_ref stream)
+{
+  {
+    cucascade::mutable_data_batch mut_accessor = batch->to_mutable();
+
+    const auto* current_space = mut_accessor.get_memory_space();
+    if (current_space != nullptr && current_space->get_id() == target_space.get_id()) {
+      // Already in the target space. Encoded bytes must still be decoded before an operator reads
+      // them; checked before the GPU-tier clone test below, which would otherwise copy them into
+      // a new batch. Anything else skips the wasteful same-space deep copy.
+      if (is_encoded_representation(mut_accessor.get_data())) {
+        decode_encoded_in_place(mut_accessor, registry, target_space, stream);
+      }
+    } else if (mut_accessor.get_current_tier() == cucascade::memory::Tier::GPU) {
+      // Upgraded to a DIFFERENT GPU in the gap: never move a GPU-resident batch cross-device
+      // (that would steal it from the device that just materialized it) — clone instead. The
+      // clone happens under the exclusive lock we already hold; pinning the state here avoids
+      // yet another non-atomic lock transition.
+      // TODO(dhruv9vats): attach a DataBatch probe so compute IDs resolve to a traced clone.
+      auto clone = mut_accessor.clone_to<cucascade::gpu_table_representation>(
+        registry, sirius::get_next_batch_id(), &target_space, stream);
+      return lock_to_new_batch{
+        .new_batch = clone,
+        .ro_lock   = clone->to_read_only(),
+      };
+      // mut_accessor to the original batch dropped.
+    } else {
+      // HOST/DISK -> GPU upgrade/readback: convert in place (move), freeing the spilled copy.
+      mut_accessor.convert_to<cucascade::gpu_table_representation>(registry, &target_space, stream);
+    }
+    // exclusive mutable access dropped.
+  }
+
+  return lock_to_existing_batch{
+    .ro_lock = batch->to_read_only(),
+  };
+}
+
+}  // namespace detail
 
 /**
  * @brief Lock or prepare a single data batch for processing in the requested memory space.
@@ -70,6 +171,12 @@ using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_
  *   the exclusive lock is re-dispatched: same space -> no-op; a different GPU -> clone (a
  *   GPU-resident batch is never moved cross-device); still host/disk -> move as planned.
  *
+ * - Same space, GPU target, and the data is exactly a cucascade::encoded_data_representation:
+ *   the batch is upgraded to an exclusive lock and decoded in place through the registered
+ *   encoded -> gpu_table converter, so operators never see undecoded bytes. The returned
+ *   accessor references the same batch. Other same-space representations (including
+ *   compressed_device_representation) are returned as is under the shared lock.
+ *
  * @param batch                   The batch to lock/prepare.
  * @param requested_memory_space  Target memory space; may be nullptr to use the batch's current
  *                                space.
@@ -77,6 +184,7 @@ using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_
  * @return A read_only_data_batch holding the shared lock (on the clone for cross-GPU inputs),
  *         or std::nullopt on failure.
  * @throws rmm::out_of_memory  If a GPU memory allocation fails during the conversion or clone.
+ * @throws std::runtime_error  If encoded data in the target GPU space has no registered decoder.
  */
 inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
@@ -113,10 +221,19 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
     requested_memory_space != nullptr ? requested_memory_space : read_accessor.get_memory_space();
   if (target_space == nullptr) { return std::nullopt; }
 
-  // Memory space matches — return the read-only accessor directly
+  // Memory space matches — return the read-only accessor directly, unless it holds encoded bytes
+  // on the target GPU, which must be decoded first. Those are re-checked and decoded under the
+  // exclusive lock; the batch keeps its id.
   if (read_accessor.get_memory_space() != nullptr &&
       read_accessor.get_memory_space()->get_id() == target_space->get_id()) {
-    return lock_to_existing_batch{.ro_lock = std::move(read_accessor)};
+    if (target_space->get_tier() != cucascade::memory::Tier::GPU ||
+        !detail::is_encoded_representation(read_accessor.get_data())) {
+      return lock_to_existing_batch{.ro_lock = std::move(read_accessor)};
+    }
+    std::ignore =
+      cucascade::data_batch::to_idle(std::move(read_accessor));  // release the read lock
+    return detail::prepare_for_gpu_under_exclusive_lock(
+      batch, *target_space, sirius::converter_registry::get(), stream);
   }
 
   // Memory space mismatch — clone or move depending on where the data lives.
@@ -143,48 +260,10 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
         // read_accessor to the original batch dropped.
       }
 
-      // HOST/DISK -> GPU upgrade/readback: convert in place (move), freeing the spilled copy
-      {
-        std::ignore =
-          cucascade::data_batch::to_idle(std::move(read_accessor));  // release the read lock
-        cucascade::mutable_data_batch mut_accessor = batch->to_mutable();
-
-        // this upgrade to mutable is not atomic (shared released, then exclusive acquire): a
-        // concurrent consumer of a shared spilled batch may have converted it in the gap.
-        // Re-dispatch on the state observed under the exclusive lock:
-        const auto* current_space = mut_accessor.get_memory_space();
-        if (current_space != nullptr && current_space->get_id() == target_space->get_id()) {
-          // Already in the target space — skip the wasteful same-space deep copy.
-          std::ignore = cucascade::data_batch::to_idle(
-            std::move(mut_accessor));  // release the exclusive write lock
-          return lock_to_existing_batch{
-            .ro_lock = batch->to_read_only(),
-          };
-        }
-
-        if (mut_accessor.get_current_tier() == cucascade::memory::Tier::GPU) {
-          // Upgraded to a DIFFERENT GPU in the gap: never move a GPU-resident batch cross-device
-          // (that would steal it from the device that just materialized it) — clone instead. The
-          // clone happens under the exclusive lock we already hold; pinning the state here avoids
-          // yet another non-atomic lock transition.
-          // TODO(dhruv9vats): attach a DataBatch probe so compute IDs resolve to a traced clone.
-          auto clone = mut_accessor.clone_to<cucascade::gpu_table_representation>(
-            registry, sirius::get_next_batch_id(), target_space, stream);
-          return lock_to_new_batch{
-            .new_batch = clone,
-            .ro_lock   = clone->to_read_only(),
-          };
-          // mut_accessor to the original batch dropped.
-        }
-        mut_accessor.convert_to<cucascade::gpu_table_representation>(
-          registry, target_space, stream);
-
-        // exclusive mutable access dropped.
-      }
-
-      return lock_to_existing_batch{
-        .ro_lock = batch->to_read_only(),
-      };
+      // HOST/DISK -> GPU upgrade/readback, re-dispatched under the exclusive lock.
+      std::ignore =
+        cucascade::data_batch::to_idle(std::move(read_accessor));  // release the read lock
+      return detail::prepare_for_gpu_under_exclusive_lock(batch, *target_space, registry, stream);
     }
     case cucascade::memory::Tier::HOST: {
       {
