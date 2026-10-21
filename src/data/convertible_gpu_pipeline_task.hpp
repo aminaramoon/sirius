@@ -237,6 +237,30 @@ class convertible_gpu_pipeline_task : public convertible_data {
     return dynamic_cast<sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
   }
 
+  /**
+   * @brief Read-only counterpart of get_pipelineable_data(itask&).
+   *
+   * Follows the same dynamic_cast chain through const accessors only, so it can be used where
+   * only a `const itask&` is available (e.g. a visitor running under a task queue's lock).
+   *
+   * @param task The task to inspect.
+   * @return Pointer to pipelineable_operator_data, or nullptr if unreachable.
+   */
+  static const sirius::op::pipelineable_operator_data* get_pipelineable_data(
+    const sirius::parallel::itask& task)
+  {
+    auto const* gpt = dynamic_cast<const sirius::pipeline::gpu_pipeline_task*>(&task);
+    if (!gpt) { return nullptr; }
+
+    auto const* ls = gpt->local_state();
+    if (!ls) { return nullptr; }
+
+    auto const* gpt_ls = dynamic_cast<const sirius::pipeline::gpu_pipeline_task_local_state*>(ls);
+    if (!gpt_ls) { return nullptr; }
+
+    return dynamic_cast<const sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
+  }
+
  private:
   /**
    * @brief Attribute a conversion record to the owned task.

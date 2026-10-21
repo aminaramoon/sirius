@@ -131,6 +131,7 @@ class itask {
   }
 
   itask_local_state* local_state() noexcept { return _local_state.get(); }
+  [[nodiscard]] const itask_local_state* local_state() const noexcept { return _local_state.get(); }
   [[nodiscard]] itask_global_state* global_state() noexcept { return _global_state.get(); }
   [[nodiscard]] uint64_t get_task_id() const noexcept { return _task_id; }
 
