@@ -160,17 +160,22 @@ class convertible_data_batch : public convertible_data {
       }
 
       if (recording()) {
-        event::downgraded_batch rec;
-        rec.batch          = _batch;
-        rec.batch_id       = mut.get_batch_id();
-        rec.conversion_seq = g_conversion_seq.fetch_add(1, std::memory_order_relaxed);
-        if (cur_space != nullptr) { rec.from = cur_space->get_id(); }
-        rec.to         = space->get_id();
-        rec.bytes      = data_size;
-        rec.source     = event::downgrade_source::repository;
-        rec.repository = _repo_token;
-        rec.partition  = _partition;
-        note_converted(std::move(rec));
+        // The batch has already moved and cannot be moved back, so a failure while building the
+        // record drops the record rather than failing the conversion.
+        try {
+          event::downgraded_batch rec;
+          rec.batch          = _batch;
+          rec.batch_id       = mut.get_batch_id();
+          rec.conversion_seq = g_conversion_seq.fetch_add(1, std::memory_order_relaxed);
+          if (cur_space != nullptr) { rec.from = cur_space->get_id(); }
+          rec.to         = space->get_id();
+          rec.bytes      = data_size;
+          rec.source     = event::downgrade_source::repository;
+          rec.repository = _repo_token;
+          rec.partition  = _partition;
+          note_converted(std::move(rec));
+        } catch (...) {
+        }
       }
 
       // RAII: mutable_data_batch destructor releases the mutable lock and transitions back to idle

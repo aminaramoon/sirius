@@ -92,8 +92,12 @@ class convertible_data {
   /**
    * @brief Records of the batch conversions completed while recording was on.
    *
-   * One entry per batch moved, in the order the moves completed. Read only after convert() has
-   * returned; the next convert() may invalidate the span.
+   * One entry per batch moved, in the order the moves completed. Records accumulate across
+   * convert() calls on this object and are never cleared, so a caller that converts an object more
+   * than once must not report the same records twice; the downgrade executor converts each object
+   * once. If convert() throws, the records of batches it moved before the throw are kept and remain
+   * readable. Read only after convert() has returned or thrown; the next convert() may invalidate
+   * the span.
    */
   [[nodiscard]] std::span<const event::downgraded_batch> converted_batches() const noexcept
   {

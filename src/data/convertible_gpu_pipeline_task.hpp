@@ -170,9 +170,14 @@ class convertible_gpu_pipeline_task : public convertible_data {
         for (std::size_t i = 0; i < result->size(); ++i) {
           totals[i] += (*result)[i];
         }
-        for (auto rec : batch_converter.converted_batches()) {
-          tag_with_task(rec);
-          note_converted(std::move(rec));
+        // Store each batch's record as soon as it moves, so batches moved before a later batch's
+        // convert() throws stay reported. Recording never fails a conversion.
+        try {
+          for (auto rec : batch_converter.converted_batches()) {
+            tag_with_task(rec);
+            note_converted(std::move(rec));
+          }
+        } catch (...) {
         }
       }
     }
@@ -233,7 +238,13 @@ class convertible_gpu_pipeline_task : public convertible_data {
   }
 
  private:
-  /// @brief Attribute a conversion record to the owned task.
+  /**
+   * @brief Attribute a conversion record to the owned task.
+   *
+   * The query id is read through a checked cast of the global state rather than
+   * gpu_pipeline_task::get_pipeline(), which assumes the global state is a
+   * gpu_pipeline_task_global_state and would dereference a foreign one.
+   */
   void tag_with_task(event::downgraded_batch& rec) const
   {
     rec.source = event::downgrade_source::task_queue;

@@ -347,7 +347,9 @@ TEST_CASE("convertible_data_batch records one entry per successful conversion",
   auto const& rec = down.converted_batches().front();
   REQUIRE(rec.batch.lock() == batch);
   REQUIRE(rec.batch_id == batch->get_batch_id());
-  REQUIRE(rec.conversion_seq >= seq_before);
+  // The record takes exactly one value from the process-wide counter.
+  REQUIRE(rec.conversion_seq == seq_before);
+  REQUIRE(sirius::g_conversion_seq.load() == seq_before + 1);
   REQUIRE(rec.from == e.gpu_space->get_id());
   REQUIRE(rec.to == e.host_space->get_id());
   REQUIRE(rec.bytes == gpu_size);
@@ -389,6 +391,14 @@ TEST_CASE("convertible_data_batch records one entry per successful conversion",
     {
       auto discard = std::move(exclusive_lock);
     }
+
+    // No target space to convert into.
+    sirius::convertible_data_batch no_target(batch);
+    no_target.record_conversions(true);
+    auto const seq_now = sirius::g_conversion_seq.load();
+    REQUIRE_FALSE(no_target.convert({}, e.stream(), *e.mgr, true).has_value());
+    REQUIRE(no_target.converted_batches().empty());
+    REQUIRE(sirius::g_conversion_seq.load() == seq_now);
   }
 }
 
