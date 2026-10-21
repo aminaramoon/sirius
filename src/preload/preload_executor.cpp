@@ -926,7 +926,8 @@ void preload_executor::planner_loop(std::stop_token const& st) noexcept
     }
     _quiescent_cv.notify_all();
     if (summary) {
-      // Formatted outside the lock: event hooks wait on it.
+      // Formatted outside the lock: event hooks wait on it. `_gpus` and `_hosts` are fixed at
+      // construction, so reading their device ids here needs no lock.
       lk.unlock();
       log::log_noexcept([&] {
         std::string budgets;

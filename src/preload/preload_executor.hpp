@@ -483,6 +483,7 @@ class preload_executor final : public event::query_event_subscriber {
   hw_caps_override _caps;
   std::size_t _head_margin{0};
 
+  /// Built by the constructor and never changed after: threads read them without `_mu`.
   std::vector<gpu_state> _gpus;
   std::vector<host_state> _hosts;
   std::vector<cucascade::memory::memory_space*> _disks;
