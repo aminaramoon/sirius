@@ -17,6 +17,7 @@
 #include "catch.hpp"
 
 // sirius
+#include "data/convertible_data.hpp"
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "event/downgraded_batch.hpp"
@@ -46,13 +47,18 @@
 // cudf
 #include <cudf/utilities/default_stream.hpp>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -103,6 +109,57 @@ class downgrade_recorder final : public sirius::event::query_event_subscriber {
   std::vector<entry> _entries;
 };
 
+/// A per-process directory under the temp directory, removed on scope exit even when a REQUIRE
+/// aborts the test case.
+class scoped_temp_dir {
+ public:
+  explicit scoped_temp_dir(std::string const& name)
+    : _path(std::filesystem::temp_directory_path() / (name + "_" + std::to_string(::getpid())))
+  {
+  }
+  ~scoped_temp_dir()
+  {
+    std::error_code ec;
+    std::filesystem::remove_all(_path, ec);
+  }
+  scoped_temp_dir(scoped_temp_dir const&)            = delete;
+  scoped_temp_dir& operator=(scoped_temp_dir const&) = delete;
+
+  [[nodiscard]] std::filesystem::path const& path() const noexcept { return _path; }
+
+ private:
+  std::filesystem::path _path;
+};
+
+/// A convertible_data whose convert() records the given moves (when recording is on) and then
+/// throws, like a multi-batch conversion that fails part-way.
+class partially_failing_convertible final : public sirius::convertible_data {
+ public:
+  explicit partially_failing_convertible(std::vector<sirius::event::downgraded_batch> moves)
+    : _moves(std::move(moves))
+  {
+  }
+
+  std::optional<std::vector<std::size_t>> convert(
+    const std::vector<const cucascade::memory::memory_space*>&,
+    ::cuda::stream_ref,
+    sirius::memory::sirius_memory_reservation_manager&,
+    bool) override
+  {
+    if (recording()) {
+      for (auto const& move : _moves) {
+        note_converted(move);
+      }
+    }
+    throw std::runtime_error("conversion failed after moving some batches");
+  }
+
+  std::size_t bytes_in_space(cucascade::memory::memory_space*) const override { return 0; }
+
+ private:
+  std::vector<sirius::event::downgraded_batch> _moves;
+};
+
 /// Memory manager with one GPU, one HOST space and, when @p disk_dir is non-empty, a DISK space.
 std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_manager(
   std::filesystem::path const& disk_dir = {})
@@ -130,10 +187,10 @@ std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_manager(
 std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_space& gpu_space,
                                                       std::size_t num_rows = 1000)
 {
-  auto stream = cudf::get_default_stream();
+  auto stream                                            = cudf::get_default_stream();
   std::vector<cudf::data_type> col_types                 = {cudf::data_type{cudf::type_id::INT32}};
   std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 100000)};
-  auto table                                             = sirius::create_cudf_table_with_random_data(
+  auto table = sirius::create_cudf_table_with_random_data(
     num_rows, col_types, ranges, stream, gpu_space.get_default_allocator());
   return sirius::make_data_batch(
     std::move(table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
@@ -248,6 +305,54 @@ TEST_CASE("downgrade_record_query_id prefers the pipeline's id, then the priorit
 
   rec.task_priority.reset();
   REQUIRE(downgrade_record_query_id(rec) == wide);
+}
+
+TEST_CASE("publish_downgraded_batches reports the moves of a conversion that threw",
+          "[downgrade_events]")
+{
+  auto const owner_query = sirius::make_query_id(3);
+  auto const task_query  = sirius::make_query_id(4);
+  sirius::event::downgraded_batch attributed;
+  attributed.batch_id      = 11;
+  attributed.task_query_id = task_query;
+  sirius::event::downgraded_batch unattributed;
+  unattributed.batch_id = 12;
+
+  auto mgr              = make_manager();
+  auto convert_and_fail = [&mgr](sirius::convertible_data& candidate) {
+    REQUIRE_THROWS_AS(candidate.convert({}, cudf::get_default_stream(), *mgr, true),
+                      std::runtime_error);
+  };
+
+  auto publisher = std::make_shared<sirius::event::query_event_publisher>();
+  downgrade_recorder recorder(*publisher);
+
+  partially_failing_convertible recorded({attributed, unattributed});
+  recorded.record_conversions(true);
+  convert_and_fail(recorded);
+  REQUIRE(recorded.converted_batches().size() == 2);
+
+  // Without a publisher nothing is reported, whatever was recorded.
+  CHECK(publish_downgraded_batches(nullptr, recorded, owner_query) == 0);
+  // A caller-supplied owner attributes every record.
+  CHECK(publish_downgraded_batches(publisher.get(), recorded, owner_query) == 2);
+  // Otherwise each record is attributed on its own, and one that cannot be is skipped.
+  CHECK(publish_downgraded_batches(publisher.get(), recorded, std::nullopt) == 1);
+
+  // With recording off, a failed conversion leaves nothing to publish.
+  partially_failing_convertible unrecorded({attributed});
+  convert_and_fail(unrecorded);
+  CHECK(unrecorded.converted_batches().empty());
+  CHECK(publish_downgraded_batches(publisher.get(), unrecorded, owner_query) == 0);
+
+  auto const entries = recorder.collect();
+  REQUIRE(entries.size() == 3);
+  CHECK(entries[0].query == owner_query);
+  CHECK(entries[0].batch.batch_id == 11);
+  CHECK(entries[1].query == owner_query);
+  CHECK(entries[1].batch.batch_id == 12);
+  CHECK(entries[2].query == task_query);
+  CHECK(entries[2].batch.batch_id == 11);
 }
 
 TEST_CASE("repository downgrades publish one event per batch under the owning query",
@@ -388,11 +493,11 @@ TEST_CASE("task-queue downgrades publish under the task's query", "[downgrade_ev
 
 TEST_CASE("a HOST to DISK downgrade publishes a second, later record", "[downgrade_events]")
 {
-  auto const disk_dir = std::filesystem::temp_directory_path() / "sirius_test_downgrade_events";
-  auto mgr            = make_manager(disk_dir);
-  auto* gpu_space     = mgr->get_memory_space(Tier::GPU, 0);
-  auto* host          = mgr->get_memory_space(Tier::HOST, 0);
-  auto disk_spaces    = mgr->get_memory_spaces_for_tier(Tier::DISK);
+  scoped_temp_dir const disk_dir("sirius_test_downgrade_events");
+  auto mgr         = make_manager(disk_dir.path());
+  auto* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
+  auto* host       = mgr->get_memory_space(Tier::HOST, 0);
+  auto disk_spaces = mgr->get_memory_spaces_for_tier(Tier::DISK);
   REQUIRE(gpu_space != nullptr);
   REQUIRE(host != nullptr);
   REQUIRE(disk_spaces.size() == 1);
@@ -436,9 +541,6 @@ TEST_CASE("a HOST to DISK downgrade publishes a second, later record", "[downgra
     CHECK(e->batch.repository == token);
     CHECK(e->batch.source == sirius::event::downgrade_source::repository);
   }
-
-  std::error_code ec;
-  std::filesystem::remove_all(disk_dir, ec);
 }
 
 TEST_CASE("downgrades publish nothing while no one subscribes", "[downgrade_events]")

@@ -17,8 +17,6 @@
 #pragma once
 
 #include "data/data_repository_manager_registry.hpp"
-#include "event/downgraded_batch.hpp"
-#include "event/query_event_publisher.hpp"
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
@@ -36,6 +34,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <functional>
 #include <future>
 #include <memory>
@@ -43,6 +42,14 @@
 #include <optional>
 #include <thread>
 #include <vector>
+
+namespace sirius {
+class convertible_data;
+namespace event {
+struct downgraded_batch;
+class query_event_publisher;
+}  // namespace event
+}  // namespace sirius
 
 namespace sirius {
 namespace parallel {
@@ -56,6 +63,21 @@ namespace parallel {
  */
 [[nodiscard]] std::optional<query_id_t> downgrade_record_query_id(
   event::downgraded_batch const& record) noexcept;
+
+/**
+ * @brief Publish one @c batch_downgraded event per batch @p candidate recorded as moved.
+ *
+ * Call once convert() has returned or thrown, so no batch lock is held; records written before a
+ * throw describe real moves and are published too. Each record is reported under @p owner when
+ * the caller knows the query (repository candidates), otherwise under
+ * downgrade_record_query_id(); a record that cannot be attributed is skipped.
+ *
+ * @param publisher Receives the events; null publishes nothing.
+ * @return The number of records handed to @p publisher.
+ */
+std::size_t publish_downgraded_batches(event::query_event_publisher* publisher,
+                                       convertible_data const& candidate,
+                                       std::optional<query_id_t> owner) noexcept;
 
 /**
  * @brief A request to free GPU memory by downgrading data batches.
@@ -166,16 +188,14 @@ class downgrade_executor {
    * @brief Attach the query-event publisher that receives one @c batch_downgraded event per
    *        batch this executor moves.
    *
-   * Shares ownership, so the handle is neither null nor dangling. Must be called before start().
-   * Until then the executor reports into its own subscriber-less publisher. Whether anything is
-   * recorded and published is decided once per downgrade request from
+   * Shares ownership, so the handle cannot dangle. Precondition: the executor is not running
+   * (call before start() or after stop()); the processing thread reads the handle unsynchronized.
+   * Without a publisher nothing is recorded or published. Whether anything is recorded and
+   * published is decided once per downgrade request from
    * @c has_subscribers(event_type::batch_downgraded), so with no subscriber a request costs one
    * atomic load.
    */
-  void set_query_event_publisher(sirius::event::query_event_publisher& publisher)
-  {
-    _query_event_publisher = publisher.shared_from_this();
-  }
+  void set_query_event_publisher(sirius::event::query_event_publisher& publisher);
 
   /**
    * @brief Asynchronously request a predicate-driven downgrade.
@@ -248,9 +268,8 @@ class downgrade_executor {
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
   /// Non-owning; the runtime or test fixture must outlive this executor.
   sirius::exec::query_lifecycle_registry& _query_lifecycle;
-  /// Receives batch_downgraded events. Never null; see set_query_event_publisher().
-  std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
-    std::make_shared<sirius::event::query_event_publisher>()};
+  /// Receives batch_downgraded events; null until set_query_event_publisher() is called.
+  std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher;
 };
 
 }  // namespace parallel

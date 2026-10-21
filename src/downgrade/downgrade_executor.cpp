@@ -20,6 +20,8 @@
 #include "data/convertible_data_batch.hpp"
 #include "data/convertible_gpu_pipeline_task.hpp"
 #include "downgrade/spill_policy.hpp"
+#include "event/downgraded_batch.hpp"
+#include "event/query_event_publisher.hpp"
 #include "log/logging.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -27,6 +29,7 @@
 #include <absl/cleanup/cleanup.h>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <optional>
 #include <ranges>
@@ -56,19 +59,12 @@ std::optional<query_id_t> downgrade_record_query_id(event::downgraded_batch cons
   return std::nullopt;
 }
 
-namespace {
-
-/**
- * @brief Publish one @c batch_downgraded event per batch @p candidate moved.
- *
- * Called once convert() has returned or thrown, so no batch lock is held. Records are reported
- * under @p owner when the caller knows the query (repository candidates), and otherwise under
- * downgrade_record_query_id(); a record that cannot be attributed is skipped.
- */
-void publish_downgraded_batches(event::query_event_publisher& publisher,
-                                convertible_data const& candidate,
-                                std::optional<query_id_t> owner) noexcept
+std::size_t publish_downgraded_batches(event::query_event_publisher* publisher,
+                                       convertible_data const& candidate,
+                                       std::optional<query_id_t> owner) noexcept
 {
+  if (publisher == nullptr) { return 0; }
+  std::size_t published    = 0;
   std::size_t unattributed = 0;
   for (auto const& record : candidate.converted_batches()) {
     auto const query = owner ? owner : downgrade_record_query_id(record);
@@ -76,7 +72,8 @@ void publish_downgraded_batches(event::query_event_publisher& publisher,
       ++unattributed;
       continue;
     }
-    publisher.publish_batch_downgraded(*query, record);
+    publisher->publish_batch_downgraded(*query, record);
+    ++published;
   }
   if (unattributed > 0) {
     try {
@@ -85,9 +82,8 @@ void publish_downgraded_batches(event::query_event_publisher& publisher,
     } catch (...) {
     }
   }
+  return published;
 }
-
-}  // namespace
 
 downgrade_executor::downgrade_executor(
   sirius::exec::query_lifecycle_registry& lifecycle,
@@ -296,6 +292,7 @@ void downgrade_executor::processing_loop()
     // Record and report moved batches only while someone listens; the answer is fixed for the
     // whole request so a worker never copies the publisher handle when nobody does.
     bool const report_downgrades =
+      _query_event_publisher != nullptr &&
       _query_event_publisher->has_subscribers(event::event_type::batch_downgraded);
     auto const downgrade_publisher =
       report_downgrades ? _query_event_publisher : std::shared_ptr<event::query_event_publisher>{};
@@ -423,7 +420,7 @@ void downgrade_executor::processing_loop()
               } catch (...) {
                 SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository");
               }
-              if (publisher) { publish_downgraded_batches(*publisher, *cand, owner); }
+              publish_downgraded_batches(publisher.get(), *cand, owner);
             });
         }
         if (pool_interrupted) break;
@@ -511,7 +508,7 @@ void downgrade_executor::processing_loop()
             }
             // Runs before `rollback`, while the wrapper still owns the extracted task, and also
             // after a throw: batches moved before it stay recorded and are reported.
-            if (publisher) { publish_downgraded_batches(*publisher, *cand, std::nullopt); }
+            publish_downgraded_batches(publisher.get(), *cand, std::nullopt);
           });
       }
     }
@@ -710,6 +707,12 @@ void downgrade_executor::set_pipeline_task_queue(
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
 {
   _pipeline_task_queue = pipeline_task_queue;
+}
+
+void downgrade_executor::set_query_event_publisher(sirius::event::query_event_publisher& publisher)
+{
+  assert(!_running.load() && "set_query_event_publisher must not race the processing thread");
+  _query_event_publisher = publisher.shared_from_this();
 }
 
 // --- Public request API ---
