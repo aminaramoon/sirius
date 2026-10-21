@@ -74,8 +74,8 @@ using cucascade::memory::Tier;
   return total;
 }
 
-/// Consumed bytes of @p space, counting every live reservation, are at or below @p ceiling and the
-/// space is below its downgrade trigger.
+/// Consumed bytes of @p space (@ref consumed_bytes), counting every live reservation, are at or
+/// below @p ceiling and the space is below its downgrade trigger.
 [[nodiscard]] bool admissible(cucascade::memory::memory_space& space, std::size_t ceiling)
 {
   auto const consumed = consumed_bytes(space.get_max_memory(), space.get_available_memory());
@@ -129,6 +129,15 @@ void run_test_hook(promotion_env const& env, promotion_job const& job)
   if (env.test_hook) { env.test_hook(job); }
 }
 
+/**
+ * @brief Promote a HOST or DISK batch to the GPU target `env.gpus[job.t.index]`.
+ *
+ * Call only with the query's work lease held and no executor lock: the batch strong reference
+ * must be released before the lease. The batch is locked only with @c try_to_mutable.
+ *
+ * @throws rmm::out_of_memory when the copy overruns the attached reservation. The source
+ *         representation is left in place on any throw.
+ */
 promotion_result promote_to_gpu(promotion_job const& job, promotion_env const& env)
 {
   if (job.t.index >= env.gpus.size()) { return outcome(promotion_outcome::failed); }
@@ -205,6 +214,14 @@ promotion_result promote_to_gpu(promotion_job const& job, promotion_env const& e
     from_disk ? promotion_kind::d2g : promotion_kind::h2g, need, next_conversion_seq());
 }
 
+/**
+ * @brief Stage a DISK batch into the HOST target `env.hosts[job.t.index]`.
+ *
+ * Same preconditions as @ref promote_to_gpu.
+ *
+ * @throws rmm::out_of_memory when the host pool cannot supply the blocks. The source
+ *         representation is left in place on any throw.
+ */
 promotion_result stage_to_host(promotion_job const& job, promotion_env const& env)
 {
   if (job.t.index >= env.hosts.size()) { return outcome(promotion_outcome::failed); }
@@ -238,8 +255,9 @@ promotion_result stage_to_host(promotion_job const& job, promotion_env const& en
   if (kind != repr_kind::encoded && kind != repr_kind::disk_data) {
     return outcome(promotion_outcome::unsupported);
   }
-  // Relocation validates that the reservation covers the block-rounded payload; a table read
-  // draws its host blocks from the reservation.
+  // Relocation validates that the reservation covers the block-rounded payload. A table read
+  // draws its host blocks from the reservation; the 4 KiB-aligned DISK size is an upper bound
+  // on them, so the ceiling check may slightly over-count.
   auto const need =
     kind == repr_kind::encoded
       ? cucascade::encoded_data_representation::relocation_reservation_bytes(
@@ -313,7 +331,9 @@ promotion_result promote_one(promotion_job const& job, promotion_env const& env)
            : job.t.tier == Tier::HOST ? stage_to_host(job, env)
                                       : outcome(promotion_outcome::failed);
   } catch (rmm::out_of_memory const&) {
-    return outcome(promotion_outcome::oom);
+    // On a GPU this is a low estimate, local to the candidate. A HOST pool that is out of
+    // blocks has no estimate to grow: refuse the space, as a failed reservation does.
+    return outcome(job.t.tier == Tier::GPU ? promotion_outcome::oom : promotion_outcome::no_memory);
   } catch (std::exception const& e) {
     // The executor warns once per query; the cause of every failure is logged here.
     log::log_noexcept([&] {
