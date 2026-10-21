@@ -1105,9 +1105,6 @@ void sirius_config::warn_preload_config()
   auto& cfg = _preload_executor_config;
   if (!cfg.enabled) { return; }
 
-  // Rounding tolerance for comparisons between products of fractions.
-  constexpr double epsilon = 1e-9;
-
   if (cfg.gpu_speculative_headroom_fraction < cfg.gpu_committed_headroom_fraction) {
     SIRIUS_LOG_WARN(
       "sirius_config: executor.preload.gpu_speculative_headroom_fraction ({:.3f}) is below "
@@ -1138,15 +1135,16 @@ void sirius_config::warn_preload_config()
     cfg.max_batch_fraction = cfg.max_inflight_fraction;
   }
 
-  // Device readahead keeps consumed bytes up to f x reservation_limit and parks at most half of
-  // that; preload's GPU ceilings are capped there so a full readahead window always fits above
-  // them. Both sides are compared as fractions of capacity.
+  // The ceilings come from the same helpers the executor uses, so a class reported disabled here
+  // is disabled at run time too.
   auto const readahead_fraction = _scan_manager_config.device_prefetching_fraction;
   for (auto const& space : _memory_space_configs) {
     if (auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
-      auto const committed   = gpu->downgrade_stop_fraction - cfg.gpu_committed_headroom_fraction;
-      auto const speculative = gpu->downgrade_stop_fraction - cfg.gpu_speculative_headroom_fraction;
-      if (committed <= epsilon) {
+      auto const committed   = preload::ceiling_fraction(gpu->downgrade_stop_fraction,
+                                                       cfg.gpu_committed_headroom_fraction);
+      auto const speculative = preload::ceiling_fraction(gpu->downgrade_stop_fraction,
+                                                         cfg.gpu_speculative_headroom_fraction);
+      if (committed <= 0.0) {
         SIRIUS_LOG_WARN(
           "sirius_config: GPU {}'s downgrade_stop_fraction ({:.3f}) minus "
           "executor.preload.gpu_committed_headroom_fraction ({:.3f}) leaves no room; all preload "
@@ -1154,9 +1152,10 @@ void sirius_config::warn_preload_config()
           gpu->device_id,
           gpu->downgrade_stop_fraction,
           cfg.gpu_committed_headroom_fraction);
+        // The speculative headroom is at least the committed one, so that class is closed too.
         continue;
       }
-      if (speculative <= epsilon) {
+      if (speculative <= 0.0) {
         SIRIUS_LOG_WARN(
           "sirius_config: GPU {}'s downgrade_stop_fraction ({:.3f}) minus "
           "executor.preload.gpu_speculative_headroom_fraction ({:.3f}) leaves no room; "
@@ -1165,25 +1164,29 @@ void sirius_config::warn_preload_config()
           gpu->downgrade_stop_fraction,
           cfg.gpu_speculative_headroom_fraction);
       }
-      if (readahead_fraction > 0.0) {
-        auto const readahead_cap = readahead_fraction * gpu->reservation_limit_fraction / 2.0;
-        if (readahead_cap + epsilon < committed) {
-          SIRIUS_LOG_WARN(
-            "sirius_config: on GPU {}, preload's ceilings ({:.3f} committed, {:.3f} speculative, "
-            "of capacity) are capped at {:.3f}, half of the device readahead window "
-            "(scan_manager.device_prefetching_fraction {:.3f} x reservation_limit_fraction "
-            "{:.3f}); preload yields to readahead",
-            gpu->device_id,
-            committed,
-            std::max(speculative, 0.0),
-            readahead_cap,
-            readahead_fraction,
-            gpu->reservation_limit_fraction);
-        }
+      auto const capped = preload::gpu_ceilings(
+        cfg, gpu->downgrade_stop_fraction, gpu->reservation_limit_fraction, readahead_fraction);
+      if (capped.committed + preload::ceiling_epsilon < committed) {
+        SIRIUS_LOG_WARN(
+          "sirius_config: on GPU {}, device readahead lowers preload's ceilings (committed "
+          "{:.3f} -> {:.3f}, speculative {:.3f} -> {:.3f}, of capacity) to at most {:.3f}, half "
+          "of its window (scan_manager.device_prefetching_fraction {:.3f} x "
+          "reservation_limit_fraction {:.3f}); preload yields to readahead",
+          gpu->device_id,
+          committed,
+          capped.committed,
+          speculative,
+          capped.speculative,
+          preload::readahead_cap_fraction(readahead_fraction, gpu->reservation_limit_fraction),
+          readahead_fraction,
+          gpu->reservation_limit_fraction);
       }
     } else if (auto const* host =
                  std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
-      if (host->downgrade_stop_fraction - cfg.host_headroom_fraction <= epsilon) {
+      // Without stage_to_host preload never targets HOST, so its ceiling is irrelevant.
+      if (!cfg.stage_to_host) { continue; }
+      if (preload::ceiling_fraction(host->downgrade_stop_fraction, cfg.host_headroom_fraction) <=
+          0.0) {
         SIRIUS_LOG_WARN(
           "sirius_config: HOST {}'s downgrade_stop_fraction ({:.3f}) minus "
           "executor.preload.host_headroom_fraction ({:.3f}) leaves no room; preload staging "

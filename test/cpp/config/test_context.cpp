@@ -2840,6 +2840,15 @@ TEST_CASE("Sirius configuration warns when a preload ceiling leaves no room",
     CHECK(count_records(logs, "preload staging into this HOST space is disabled") ==
           static_cast<std::size_t>(host_spaces));
   }
+  SECTION("HOST headroom is not checked when staging to HOST is off")
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    (void)resolve_preload_yaml(
+      preload_yaml("      enabled: true\n"
+                   "      stage_to_host: false\n"
+                   "      host_headroom_fraction: 0.8\n"));
+    CHECK(count_records(logs, "preload staging into this HOST space is disabled") == 0);
+  }
   SECTION("the warnings follow the per-space downgrade_stop_fraction")
   {
     sirius::test::scoped_recording_log_sink logs{"warn"};
@@ -2863,14 +2872,17 @@ TEST_CASE("Sirius configuration warns when device readahead caps the preload cei
           "[sirius][config][preload_config]")
 {
   constexpr std::string_view needle = "preload yields to readahead";
-  auto const yaml                   = [](std::string const& fraction, std::string const& headroom) {
-    return preload_yaml(
+
+  auto const yaml = [](std::string const& fraction, std::string const& headroom) {
+    auto const preload_keys =
       "      enabled: true\n"
-                        "      gpu_committed_headroom_fraction: " +
-        headroom + "\n",
+      "      gpu_committed_headroom_fraction: " +
+      headroom + "\n";
+    auto const scan_manager_keys =
       "    scan_manager:\n"
-                        "      device_prefetching_fraction: " +
-        fraction + "\n");
+      "      device_prefetching_fraction: " +
+      fraction + "\n";
+    return preload_yaml(preload_keys, scan_manager_keys);
   };
   {
     // Readahead off: no cap.
@@ -2879,15 +2891,67 @@ TEST_CASE("Sirius configuration warns when device readahead caps the preload cei
     CHECK(count_records(logs, needle) == 0);
   }
   {
-    // Half of 0.6 x 1.0 is 0.3, below the committed ceiling 0.6.
+    // Half of 0.6 x 1.0 is 0.3, below both ceilings (0.6 committed, 0.5 speculative).
     sirius::test::scoped_recording_log_sink logs{"warn"};
     (void)resolve_preload_yaml(yaml("0.6", "0.0"));
     CHECK(count_records(logs, needle) == 1);
+    CHECK(count_records(logs, "committed 0.600 -> 0.300, speculative 0.500 -> 0.300") == 1);
+  }
+  {
+    // Half of 1.0 x 1.0 is 0.5, between the speculative (0.6 - 0.15 = 0.45) and committed (0.6)
+    // ceilings: only the committed one is lowered.
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    (void)resolve_preload_yaml(
+      preload_yaml("      enabled: true\n"
+                   "      gpu_speculative_headroom_fraction: 0.15\n",
+                   "    scan_manager:\n"
+                   "      device_prefetching_fraction: 1.0\n"));
+    CHECK(count_records(logs, needle) == 1);
+    CHECK(count_records(logs, "committed 0.600 -> 0.500, speculative 0.450 -> 0.450") == 1);
   }
   {
     // Half of 1.0 x 1.0 is 0.5, above the committed ceiling 0.6 - 0.2 = 0.4.
     sirius::test::scoped_recording_log_sink logs{"warn"};
     (void)resolve_preload_yaml(yaml("1.0", "0.2"));
     CHECK(count_records(logs, needle) == 0);
+  }
+}
+
+TEST_CASE("Preload ceiling helpers", "[sirius][config][preload_config]")
+{
+  using sirius::preload::ceiling_fraction;
+  using sirius::preload::gpu_ceilings;
+  using sirius::preload::readahead_cap_fraction;
+
+  SECTION("a ceiling within rounding of zero is zero")
+  {
+    CHECK(ceiling_fraction(0.6, 0.1) == Catch::Approx(0.5));
+    CHECK(ceiling_fraction(0.6, 0.6) == 0.0);
+    CHECK(ceiling_fraction(0.6, 0.6 - 1e-12) == 0.0);
+    CHECK(ceiling_fraction(0.6, 0.7) == 0.0);
+    CHECK(ceiling_fraction(0.6, 0.6 - 1e-6) > 0.0);
+  }
+  SECTION("readahead caps only when on")
+  {
+    CHECK(readahead_cap_fraction(0.0, 0.9) == 1.0);
+    CHECK(readahead_cap_fraction(0.6, 0.9) == Catch::Approx(0.27));
+  }
+  SECTION("gpu ceilings apply the readahead cap per class")
+  {
+    sirius::preload::preload_executor_config cfg{};
+    cfg.gpu_committed_headroom_fraction   = 0.0;
+    cfg.gpu_speculative_headroom_fraction = 0.15;
+
+    auto const off = gpu_ceilings(cfg, 0.6, 1.0, 0.0);
+    CHECK(off.committed == Catch::Approx(0.6));
+    CHECK(off.speculative == Catch::Approx(0.45));
+    auto const between = gpu_ceilings(cfg, 0.6, 1.0, 1.0);
+    CHECK(between.committed == Catch::Approx(0.5));
+    CHECK(between.speculative == Catch::Approx(0.45));
+    auto const tiny = gpu_ceilings(cfg, 0.6, 1.0, 1e-12);
+    CHECK(tiny.committed == 0.0);
+    CHECK(tiny.speculative == 0.0);
+    cfg.gpu_committed_headroom_fraction = 0.6;
+    CHECK(gpu_ceilings(cfg, 0.6, 1.0, 0.0).committed == 0.0);
   }
 }
