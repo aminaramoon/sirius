@@ -46,6 +46,49 @@ static std::string tier_to_string(cucascade::memory::Tier tier)
   }
 }
 
+std::optional<query_id_t> downgrade_record_query_id(event::downgraded_batch const& record) noexcept
+{
+  if (record.task_query_id) { return record.task_query_id; }
+  if (record.task_priority) {
+    return make_query_id(
+      static_cast<std::uint32_t>(static_cast<std::uint64_t>(*record.task_priority) >> 32));
+  }
+  return std::nullopt;
+}
+
+namespace {
+
+/**
+ * @brief Publish one @c batch_downgraded event per batch @p candidate moved.
+ *
+ * Called once convert() has returned or thrown, so no batch lock is held. Records are reported
+ * under @p owner when the caller knows the query (repository candidates), and otherwise under
+ * downgrade_record_query_id(); a record that cannot be attributed is skipped.
+ */
+void publish_downgraded_batches(event::query_event_publisher& publisher,
+                                convertible_data const& candidate,
+                                std::optional<query_id_t> owner) noexcept
+{
+  std::size_t unattributed = 0;
+  for (auto const& record : candidate.converted_batches()) {
+    auto const query = owner ? owner : downgrade_record_query_id(record);
+    if (!query) {
+      ++unattributed;
+      continue;
+    }
+    publisher.publish_batch_downgraded(*query, record);
+  }
+  if (unattributed > 0) {
+    try {
+      SIRIUS_LOG_DEBUG("[downgrade] {} downgraded batch(es) not reported: owning query unknown",
+                       unattributed);
+    } catch (...) {
+    }
+  }
+}
+
+}  // namespace
+
 downgrade_executor::downgrade_executor(
   sirius::exec::query_lifecycle_registry& lifecycle,
   exec::downgrade_executor_config config,
@@ -250,6 +293,13 @@ void downgrade_executor::processing_loop()
         return predicate_satisfied(req.get()) || target_completed();
       };
 
+    // Record and report moved batches only while someone listens; the answer is fixed for the
+    // whole request so a worker never copies the publisher handle when nobody does.
+    bool const report_downgrades =
+      _query_event_publisher->has_subscribers(event::event_type::batch_downgraded);
+    auto const downgrade_publisher =
+      report_downgrades ? _query_event_publisher : std::shared_ptr<event::query_event_publisher>{};
+
     // === TIER 1: Data repositories ===
     // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
     // query: outer loop DESCENDING by query id (newest query first), inner loop in
@@ -311,6 +361,7 @@ void downgrade_executor::processing_loop()
           auto work = _query_lifecycle.try_acquire_work(victim_id);
           if (!work) { break; }
           candidate->retain_work(std::move(work));
+          candidate->record_conversions(report_downgrades);
 
           auto slot = _pool->reserve();
           if (!slot) {
@@ -339,7 +390,9 @@ void downgrade_executor::processing_loop()
              &repo_stats,
              &host_target_stats,
              &disk_target_stats,
-             predicate_satisfied]() mutable {
+             predicate_satisfied,
+             publisher = downgrade_publisher,
+             owner     = victim_id]() mutable {
               absl::Cleanup rollback = [&planned_bytes, candidate_bytes]() {
                 planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
               };
@@ -370,6 +423,7 @@ void downgrade_executor::processing_loop()
               } catch (...) {
                 SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository");
               }
+              if (publisher) { publish_downgraded_batches(*publisher, *cand, owner); }
             });
         }
         if (pool_interrupted) break;
@@ -393,6 +447,7 @@ void downgrade_executor::processing_loop()
           pipeline_provider.get_next_convertible(source_space, /*front_to_back=*/false);
         if (!candidate) break;
         tasks_converted++;
+        candidate->record_conversions(report_downgrades);
 
         auto candidate_bytes = candidate->bytes_in_space(source_space);
 
@@ -420,7 +475,8 @@ void downgrade_executor::processing_loop()
            &pipeline_queue_stats,
            &host_target_stats,
            &disk_target_stats,
-           predicate_satisfied]() mutable {
+           predicate_satisfied,
+           publisher = downgrade_publisher]() mutable {
             absl::Cleanup rollback = [&]() {
               planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
               std::lock_guard lock(failed_pipeline_candidates_mutex);
@@ -453,6 +509,9 @@ void downgrade_executor::processing_loop()
             } catch (...) {
               SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue");
             }
+            // Runs before `rollback`, while the wrapper still owns the extracted task, and also
+            // after a throw: batches moved before it stay recorded and are reported.
+            if (publisher) { publish_downgraded_batches(*publisher, *cand, std::nullopt); }
           });
       }
     }

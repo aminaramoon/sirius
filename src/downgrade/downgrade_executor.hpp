@@ -17,6 +17,8 @@
 #pragma once
 
 #include "data/data_repository_manager_registry.hpp"
+#include "event/downgraded_batch.hpp"
+#include "event/query_event_publisher.hpp"
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
@@ -24,6 +26,7 @@
 #include "exec/query_lifecycle_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
+#include "query_id.hpp"
 
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
@@ -43,6 +46,16 @@
 
 namespace sirius {
 namespace parallel {
+
+/**
+ * @brief The query a task-queue downgrade record is reported under.
+ *
+ * The id of the task's pipeline when the record carries one, otherwise the query packed into the
+ * high bits of the task's scheduling priority (see query_priority_bits(), which masks it to 31
+ * bits), otherwise nullopt: such a record cannot be attributed and is not published.
+ */
+[[nodiscard]] std::optional<query_id_t> downgrade_record_query_id(
+  event::downgraded_batch const& record) noexcept;
 
 /**
  * @brief A request to free GPU memory by downgrading data batches.
@@ -150,6 +163,21 @@ class downgrade_executor {
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
+   * @brief Attach the query-event publisher that receives one @c batch_downgraded event per
+   *        batch this executor moves.
+   *
+   * Shares ownership, so the handle is neither null nor dangling. Must be called before start().
+   * Until then the executor reports into its own subscriber-less publisher. Whether anything is
+   * recorded and published is decided once per downgrade request from
+   * @c has_subscribers(event_type::batch_downgraded), so with no subscriber a request costs one
+   * atomic load.
+   */
+  void set_query_event_publisher(sirius::event::query_event_publisher& publisher)
+  {
+    _query_event_publisher = publisher.shared_from_this();
+  }
+
+  /**
    * @brief Asynchronously request a predicate-driven downgrade.
    *
    * Dispatches batch downgrades until the predicate returns true or candidates
@@ -220,6 +248,9 @@ class downgrade_executor {
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
   /// Non-owning; the runtime or test fixture must outlive this executor.
   sirius::exec::query_lifecycle_registry& _query_lifecycle;
+  /// Receives batch_downgraded events. Never null; see set_query_event_publisher().
+  std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
+    std::make_shared<sirius::event::query_event_publisher>()};
 };
 
 }  // namespace parallel
