@@ -515,7 +515,9 @@ TEST_CASE("preload events deliver their payloads unchanged", "[event][query_even
   payload_subscriber subscriber{*publisher};
 
   // The payload only names the batch, so a test needs a control block, not a
-  // batch: an aliasing pointer onto an unrelated owner stands in for one.
+  // batch: an aliasing pointer onto an unrelated owner stands in for one. Its
+  // stored pointer is null even while alive, so liveness is read from the
+  // owner count and identity from the owner, never from the pointer itself.
   auto kept_owner = std::make_shared<int>(0);
   std::shared_ptr<cucascade::data_batch> const kept{kept_owner, nullptr};
   auto dropped_owner = std::make_shared<int>(0);
