@@ -158,8 +158,8 @@ scan_manager_config make_s3_scan_config(std::string endpoint,
   cfg.rest.honor_retry_after       = false;
   cfg.rest.max_connections         = 1;
   cfg.thread_pool.num_threads      = 1;
-  cfg.uring_n_reactors             = 1;
-  cfg.rest_n_reactors              = 1;
+  cfg.uring_reactors_per_gpu       = 1;
+  cfg.rest_reactors_per_gpu        = 1;
   cfg.cache.mode                   = cucascade::io::cache::cache_mode::none;
   return cfg;
 }
@@ -655,8 +655,8 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   // One connection per reactor over two reactors: small enough for the serial
   // test server to serve the burst, but still per-reactor rather than global
   // (each reactor owns its own, thread-confined connection pool).
-  cfg.rest.max_connections = 1;
-  cfg.rest_n_reactors      = 2;
+  cfg.rest.max_connections  = 1;
+  cfg.rest_reactors_per_gpu = 2;
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
@@ -676,7 +676,7 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   };
 
   int const baseline          = server.request_count();
-  constexpr int expected_warm = 2;  // rest_n_reactors * max_connections
+  constexpr int expected_warm = 2;  // rest_reactors_per_gpu * max_connections
 
   // A bucket URL, with no object in it: warm-up traffic never names a data file.
   io_ctx->warmup("s3://warm-bucket");
@@ -945,7 +945,7 @@ TEST_CASE("backend=native without an object store declines s3 paths and says why
   scan_manager_config cfg{};
   cfg.backend                 = sirius::scan_manager::io_backend::native;
   cfg.thread_pool.num_threads = 1;
-  cfg.uring_n_reactors        = 1;
+  cfg.uring_reactors_per_gpu  = 1;
   cfg.cache.mode              = cucascade::io::cache::cache_mode::none;
   REQUIRE(cfg.object_store.endpoint.empty());
   REQUIRE(cfg.object_store.access_key.empty());

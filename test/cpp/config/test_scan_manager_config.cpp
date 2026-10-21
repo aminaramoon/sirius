@@ -462,7 +462,7 @@ TEST_CASE("sirius_config defaults the cache mode to none when YAML omits it",
           "[scan_manager][config][cache_mode]")
 {
   auto const cfg = load_scan_manager("sirius_cache_mode_default.yaml",
-                                     scan_manager_yaml("      uring_n_reactors: 2\n"));
+                                     scan_manager_yaml("      uring_reactors_per_gpu: 2\n"));
 
   CHECK(cfg.cache.mode == cache_mode::none);
   CHECK(cfg.cache.eviction == eviction_policy::lru);
@@ -657,7 +657,7 @@ TEST_CASE("uring scan budget stays 0 unless set", "[scan_manager][config][readah
 TEST_CASE("sirius_config reads max_readahead_scans", "[scan_manager][config][readahead]")
 {
   auto const unset = load_scan_manager("sirius_readahead_unset.yaml",
-                                       scan_manager_yaml("      rest_n_reactors: 1\n"));
+                                       scan_manager_yaml("      rest_reactors_per_gpu: 1\n"));
   CHECK_FALSE(unset.max_readahead_scans.has_value());
 
   auto const off = load_scan_manager("sirius_readahead_off.yaml",
@@ -674,7 +674,7 @@ TEST_CASE("sirius_config reads max_readahead_scans", "[scan_manager][config][rea
 TEST_CASE("sirius_config reads readahead_strategy", "[scan_manager][config][readahead]")
 {
   auto const unset = load_scan_manager("sirius_readahead_strategy_unset.yaml",
-                                       scan_manager_yaml("      rest_n_reactors: 1\n"));
+                                       scan_manager_yaml("      rest_reactors_per_gpu: 1\n"));
   CHECK_FALSE(unset.readahead_strategy.has_value());
 
   auto const pinned =
@@ -740,17 +740,17 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
           "[scan_manager][config][backend]")
 {
   scan_manager_config cfg{};
-  cfg.uring_n_reactors      = 3;
-  cfg.rest_n_reactors       = 5;
-  cfg.cache.mode            = cache_mode::os;
-  cfg.cache.eviction        = eviction_policy::idle;
-  cfg.object_store.endpoint = "http://object-store.test:9000";
-  cfg.rest.max_connections  = 17;
+  cfg.uring_reactors_per_gpu = 3;
+  cfg.rest_reactors_per_gpu  = 5;
+  cfg.cache.mode             = cache_mode::os;
+  cfg.cache.eviction         = eviction_policy::idle;
+  cfg.object_store.endpoint  = "http://object-store.test:9000";
+  cfg.rest.max_connections   = 17;
 
   auto const io = cfg.to_io_config();
   CHECK(io.backend == cucascade::io::io_backend::native);
-  CHECK(io.uring_n_reactors == 3);
-  CHECK(io.rest_n_reactors == 5);
+  CHECK(io.uring_reactors_per_gpu == 3);
+  CHECK(io.rest_reactors_per_gpu == 5);
   // A non-default value in each copied sub-config survives the copy.
   CHECK(io.object_store.endpoint == "http://object-store.test:9000");
   CHECK(io.rest.max_connections == 17);
@@ -772,7 +772,7 @@ TEST_CASE("sirius_config reads the backend from YAML", "[scan_manager][config][b
   CHECK(native.backend == io_backend::native);
 
   auto const omitted = load_scan_manager("sirius_backend_default.yaml",
-                                         scan_manager_yaml("      uring_n_reactors: 2\n"));
+                                         scan_manager_yaml("      uring_reactors_per_gpu: 2\n"));
   CHECK(omitted.backend == io_backend::native);
 }
 
@@ -808,7 +808,7 @@ TEST_CASE("device_prefetching_fraction defaults to 0 and parses from YAML",
   CHECK_FALSE(scan_manager_config{}.device_prefetching_enabled());
 
   auto const unset = load_scan_manager("sirius_device_prefetch_unset.yaml",
-                                       scan_manager_yaml("      rest_n_reactors: 1\n"));
+                                       scan_manager_yaml("      rest_reactors_per_gpu: 1\n"));
   CHECK(unset.device_prefetching_fraction == 0.0);
   CHECK_FALSE(unset.device_prefetching_enabled());
 
@@ -824,7 +824,7 @@ TEST_CASE("device_prefetch_max_splits defaults to 0 and parses from YAML",
   CHECK(scan_manager_config{}.device_prefetch_max_splits == 0);
 
   auto const unset = load_scan_manager("sirius_device_prefetch_max_splits_unset.yaml",
-                                       scan_manager_yaml("      rest_n_reactors: 1\n"));
+                                       scan_manager_yaml("      rest_reactors_per_gpu: 1\n"));
   CHECK(unset.device_prefetch_max_splits == 0);
 
   auto const set = load_scan_manager("sirius_device_prefetch_max_splits_set.yaml",
@@ -994,8 +994,8 @@ TEST_CASE("kvikio backend on multi-GPU loads as native",
 TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")
 {
   auto const check_defaults = [&](scan_manager_config const& cfg) {
-    CHECK(cfg.uring_n_reactors == 4);
-    CHECK(cfg.rest_n_reactors == 2);
+    CHECK(cfg.uring_reactors_per_gpu == 1);
+    CHECK(cfg.rest_reactors_per_gpu == 1);
     CHECK(cfg.uring.n_max_concurrent_scans == 0);
     CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
     CHECK(cfg.uring.slices_per_pass == 4);
@@ -1070,7 +1070,7 @@ TEST_CASE("uring prefetch_reactors is accepted as a deprecated no-op",
   CHECK(io.slices_per_pass == baseline_io.slices_per_pass);
   CHECK(io.range_batch_slices == baseline_io.range_batch_slices);
   CHECK(io.use_odirect == baseline_io.use_odirect);
-  CHECK(cfg.uring_n_reactors == baseline.uring_n_reactors);
+  CHECK(cfg.uring_reactors_per_gpu == baseline.uring_reactors_per_gpu);
 
   std::size_t warnings = 0;
   for (auto const& record : logs.records()) {

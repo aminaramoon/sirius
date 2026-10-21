@@ -1376,7 +1376,9 @@ sirius_scan_manager::sirius_scan_manager(
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
-    _ioctx_registry(_config.to_io_config(), reservation_manager)
+    // The registry places each backend's reactors per GPU of the topology index:
+    // staging from, and workers pinned to, the GPU's NUMA node.
+    _ioctx_registry(_config.to_io_config(), reservation_manager, _topology_index)
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
@@ -1400,9 +1402,10 @@ sirius_scan_manager::sirius_scan_manager(
   };
   _io_ctx = make_default_ioctx(cucascade::io::io_context_type::uring);
   SIRIUS_LOG_DEBUG(
-    "[sirius_scan_manager] default io context: uring n_reactors={} slices_per_pass={} "
-    "range_batch_slices={}",
-    _config.uring_n_reactors,
+    "[sirius_scan_manager] default io context: uring reactors_per_gpu={} gpus={} "
+    "slices_per_pass={} range_batch_slices={}",
+    _config.uring_reactors_per_gpu,
+    _topology_index->gpu_ids().size(),
     _config.uring.slices_per_pass,
     _config.uring.range_batch_slices);
 

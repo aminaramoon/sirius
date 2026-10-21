@@ -86,7 +86,7 @@ struct bench_options {
   /// Max concurrent in-flight easy handles per REST runner (rest.max_connections).
   std::size_t max_nconnection{128};
 
-  /// Number of REST runner threads (rest_n_reactors).
+  /// Number of REST runner threads (rest_reactors_per_gpu).
   std::size_t n_reactors{1};
 
   /// Share of each GPU's memory the pool may use.  Only matters for benchmarks
@@ -286,8 +286,8 @@ class engine {
     if (!opts.secret_key.empty()) { cfg.object_store.secret_key = opts.secret_key; }
     if (!opts.session_token.empty()) { cfg.object_store.session_token = opts.session_token; }
 
-    cfg.rest.max_connections = opts.max_nconnection;
-    cfg.rest_n_reactors      = opts.n_reactors;
+    cfg.rest.max_connections  = opts.max_nconnection;
+    cfg.rest_reactors_per_gpu = opts.n_reactors;
 
     cfg.cache.mode = cucascade::io::cache::cache_mode::none;
     cfg.apply_cache_mode();

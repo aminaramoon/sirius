@@ -376,8 +376,10 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
         "cuCascade; using the native backend");
     }
   }
-  r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
-  r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
+  r.optional(
+    "uring_reactors_per_gpu", opt.uring_reactors_per_gpu, yaml::greater_than<std::size_t>{0});
+  r.optional(
+    "rest_reactors_per_gpu", opt.rest_reactors_per_gpu, yaml::greater_than<std::size_t>{0});
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
   r.optional(
