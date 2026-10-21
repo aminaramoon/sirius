@@ -48,8 +48,8 @@ namespace fs = std::filesystem;
 
 /// A scratch directory, removed with everything in it.
 struct scratch_dir {
-  fs::path path = fs::temp_directory_path() /
-                  ("sirius_device_readahead_" + std::to_string(::getpid()));
+  fs::path path =
+    fs::temp_directory_path() / ("sirius_device_readahead_" + std::to_string(::getpid()));
 
   scratch_dir()
   {
@@ -223,7 +223,7 @@ TEST_CASE("device-tier readahead lands parquet splits on the GPU and matches Duc
     auto const cpu = db.rows(sql);
     CHECK(gpu == cpu);
   }
-  auto const after = sirius::test::get_transparent_execution_stats(*db.con);
+  auto const after       = sirius::test::get_transparent_execution_stats(*db.con);
   auto const gpu_queries = after.executions - before.executions;
   CHECK(gpu_queries == queries.size());
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
