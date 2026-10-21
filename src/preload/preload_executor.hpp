@@ -375,6 +375,11 @@ class preload_executor final : public event::query_event_subscriber {
     std::size_t class_b_items{0};
     std::size_t planned{0};
     std::size_t assigned{0};
+    /// Each GPU's consumed bytes and its budget at the start of the assignment (kept only for
+    /// the DEBUG log).
+    std::vector<std::pair<std::size_t, gpu_budget_state>> gpus;
+    /// Each HOST's consumed bytes and its budget at the start of the assignment (likewise).
+    std::vector<std::pair<std::size_t, host_budget_state>> hosts;
   };
 
   /// Live state of one GPU or HOST space, read without the executor's mutex.
@@ -393,6 +398,8 @@ class preload_executor final : public event::query_event_subscriber {
     std::vector<space_reading> hosts;
     /// Per DISK lane: the type of the space's io context, when one is set.
     std::vector<std::optional<cucascade::io::io_context_type>> disk_contexts;
+    /// The per-pass DEBUG line is enabled: the pass keeps each space's budget for it.
+    bool log_budgets{false};
   };
 
   /// One planned item before assignment.
@@ -447,6 +454,8 @@ class preload_executor final : public event::query_event_subscriber {
   void clear_ready_lists() noexcept;
   void notify_lanes_with_work() noexcept;
   void mark_dirty(std::uint32_t reasons) noexcept;
+  /// An idle event: asks for a pass unless one was already asked for since the last other event.
+  void mark_idle() noexcept;
   [[nodiscard]] bool quiescent() const noexcept;
   [[nodiscard]] std::optional<std::size_t> lane_of(cucascade::memory::memory_space_id source,
                                                    target t) const noexcept;
@@ -506,6 +515,9 @@ class preload_executor final : public event::query_event_subscriber {
   bool _room_refused{true};
   /// Class-B bytes being copied into each GPU.
   std::vector<std::size_t> _inflight_b;
+  /// An idle event already asked for a pass, and nothing else has since. Idle events change no
+  /// state, so repeating one (the scheduler re-publishes them while a device waits) adds nothing.
+  bool _idle_wake_pending{false};
   std::uint64_t _events_handled{0};
   std::chrono::steady_clock::time_point _dirty_since{};
   bool _log_promotions{false};
