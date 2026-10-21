@@ -302,7 +302,7 @@ hardware-derived exception described below:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | per pool (below) | Worker threads in the pool. |
-| `cpu_affinity` | list of int | — | Cores to pin task-creator and downgrade threads. GPU pipeline affinity is derived from the selected GPU's CPU topology. |
+| `cpu_affinity` | list of int | — | Cores to pin task-creator and downgrade threads. GPU pipeline affinity is derived from the selected GPU's CPU topology. The preload executor has its own `cpu_affinity` key ([below](#siriusexecutorpreload)). |
 
 ### `sirius.executor.task_creator`
 
@@ -328,6 +328,9 @@ Thread pool (default `num_threads: 1`) plus:
 ### `sirius.executor.preload`
 
 **File:** `src/preload/config.hpp`
+
+> **Not yet active.** This release parses and validates the block, including the WARNs below,
+> but does not create the preload executor yet: `enabled: true` has no effect on execution.
 
 The preload executor undoes downgrade moves ahead of the consumer: batches the downgrade executor
 spilled to HOST or DISK are copied back to the GPU (HOST→GPU, DISK→GPU) or staged on HOST
@@ -356,7 +359,7 @@ lanes and per-DISK-space lanes, whose thread counts come from the two concurrenc
 | `lookahead_tasks` | int (**≥ 0**) | 8 | Queued tasks per queue, past the head margin, whose inputs are considered. |
 | `repository_window` | int (**≥ 0**) | 2 | Front positions considered per repository partition. |
 | `repository_partition_lookahead` | int (**≥ 0**) | 1 | For consumers that drain partitions in order: partitions past the next one that may be promoted speculatively. |
-| `stage_to_host` | bool | `true` | Stage a DISK batch on HOST when its GPU target is unknown, out of room, or banned. |
+| `stage_to_host` | bool | `true` | Stage a DISK batch on HOST when its GPU target is unknown, out of room, or banned. When `false`, preload never stages on HOST. |
 | `max_promotions_per_batch` | int (**≥ 0**) | 2 | Maximum promotions of one batch per query. |
 | `max_lock_attempts` | int (**≥ 1**) | 3 | Attempts to take a batch's lock without blocking before the batch is dropped. |
 | `max_oom_retries` | int (**≥ 0**) | 1 | GPU out-of-memory retries per batch, each with a doubled estimate, before the batch is never targeted at a GPU again. |
@@ -367,10 +370,15 @@ config also checks the block against each memory space and logs one WARN per fin
 
 - a GPU whose `downgrade_stop_fraction − gpu_committed_headroom_fraction` is ≤ 0 gets no preload
   at all; one whose speculative ceiling is ≤ 0 gets no speculative preload;
-- a HOST space whose `downgrade_stop_fraction − host_headroom_fraction` is ≤ 0 gets no staging;
+- with `stage_to_host: true`, a HOST space whose `downgrade_stop_fraction − host_headroom_fraction`
+  is ≤ 0 gets no staging;
 - with device readahead on (`scan_manager.device_prefetching_fraction` = `f` > 0), both GPU
   ceilings are capped at `f × reservation_limit_fraction / 2` of capacity, so a full readahead
-  window always fits above them; the WARN reports when that cap is below the committed ceiling.
+  window always fits above them; the WARN reports when that cap is below the committed ceiling,
+  with each ceiling before and after the cap.
+
+A ceiling within 1e-9 of zero counts as zero, so rounding in the subtraction never leaves a
+class enabled with no room.
 
 Every ceiling stays at or below `downgrade_stop_fraction`, so preload on its own never starts a
 downgrade. At run time the executor re-checks each ceiling after reserving memory for a copy.

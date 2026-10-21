@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <vector>
 
@@ -92,7 +93,8 @@ struct preload_executor_config {
   /// promoted speculatively.
   int repository_partition_lookahead{1};
 
-  /// Stage DISK->HOST when the GPU target is unknown, out of room, or banned.
+  /// Stage DISK->HOST when the GPU target is unknown, out of room, or banned. When false, preload
+  /// never targets a HOST space.
   bool stage_to_host{true};
 
   /// Maximum promotions of one batch per query.
@@ -109,5 +111,72 @@ struct preload_executor_config {
   /// candidate is evicted first. Must be positive.
   std::size_t max_candidates{65536};
 };
+
+/// A ceiling, as a fraction of capacity, at or below this counts as zero: it absorbs rounding in
+/// differences and products of configured fractions.
+inline constexpr double ceiling_epsilon = 1e-9;
+
+/**
+ * @brief A preload ceiling as a fraction of a memory space's capacity.
+ *
+ * @param downgrade_stop_fraction The space's downgrade stop threshold, as a fraction of capacity.
+ * @param headroom_fraction The headroom preload keeps below it.
+ * @return `downgrade_stop_fraction - headroom_fraction`, or 0 when that is at or below
+ *         @ref ceiling_epsilon. A ceiling of 0 disables that class of promotion on the space.
+ */
+[[nodiscard]] constexpr double ceiling_fraction(double downgrade_stop_fraction,
+                                                double headroom_fraction) noexcept
+{
+  auto const ceiling = downgrade_stop_fraction - headroom_fraction;
+  return ceiling > ceiling_epsilon ? ceiling : 0.0;
+}
+
+/**
+ * @brief The cap device readahead puts on preload's GPU ceilings, as a fraction of capacity.
+ *
+ * Device readahead keeps consumed bytes up to `device_prefetching_fraction x
+ * reservation_limit_fraction` of capacity and parks at most half of that; capping preload at the
+ * half keeps a full readahead window above it.
+ *
+ * @return 1 (no cap) when readahead is off (`device_prefetching_fraction <= 0`).
+ */
+[[nodiscard]] constexpr double readahead_cap_fraction(double device_prefetching_fraction,
+                                                      double reservation_limit_fraction) noexcept
+{
+  if (device_prefetching_fraction <= 0.0) { return 1.0; }
+  return device_prefetching_fraction * reservation_limit_fraction / 2.0;
+}
+
+/// The two GPU ceilings of one GPU, as fractions of its capacity. 0 disables that class.
+struct gpu_ceiling_fractions {
+  double committed;
+  double speculative;
+};
+
+/**
+ * @brief Both GPU ceilings of one GPU, with the device readahead cap applied.
+ *
+ * Config validation and the executor both derive the ceilings here, so a class that the config
+ * reports as disabled is also disabled at run time.
+ *
+ * @param cfg The preload config, after `sirius_config` has clamped it.
+ * @param downgrade_stop_fraction The GPU's downgrade stop threshold, as a fraction of capacity.
+ * @param reservation_limit_fraction The GPU's reservation limit, as a fraction of capacity.
+ * @param device_prefetching_fraction `scan_manager.device_prefetching_fraction`; <= 0 means off.
+ */
+[[nodiscard]] constexpr gpu_ceiling_fractions gpu_ceilings(
+  preload_executor_config const& cfg,
+  double downgrade_stop_fraction,
+  double reservation_limit_fraction,
+  double device_prefetching_fraction) noexcept
+{
+  auto const cap = readahead_cap_fraction(device_prefetching_fraction, reservation_limit_fraction);
+  auto const capped = [&](double headroom_fraction) {
+    auto const ceiling = ceiling_fraction(downgrade_stop_fraction, headroom_fraction);
+    return ceiling_fraction(std::min(ceiling, cap), 0.0);
+  };
+  return {capped(cfg.gpu_committed_headroom_fraction),
+          capped(cfg.gpu_speculative_headroom_fraction)};
+}
 
 }  // namespace sirius::preload
