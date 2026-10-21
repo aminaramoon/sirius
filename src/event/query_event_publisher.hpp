@@ -186,8 +186,8 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   /// the routing table.  Called by the subscriber base in its constructor.
   ///
   /// Publishing walks one subscriber list per event, so a subscriber that
-  /// names two events is skipped outright by the other six rather than being
-  /// handed a payload it will drop.  With a handful of subscribers that is a
+  /// names two events is skipped outright by every other event rather than
+  /// being handed a payload it will drop.  With a handful of subscribers that is a
   /// rounding error; it is worth having because the cost grows with
   /// subscribers x events while the useful work does not.
   ///
