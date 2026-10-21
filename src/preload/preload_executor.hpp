@@ -159,6 +159,9 @@ struct promotion_record {
  *
  * Lifetime: construct, @ref start, then @ref stop (also run by the destructor). The executor must
  * be destroyed before anything it borrows.
+ *
+ * Limits: no-preference inputs go to a GPU only on a single-GPU system (else HOST staging), and
+ * a misplaced preload is counted only for tasks inside a bucket's margin and window.
  */
 class preload_executor final : public event::query_event_subscriber {
  public:
@@ -179,6 +182,7 @@ class preload_executor final : public event::query_event_subscriber {
   preload_executor& operator=(preload_executor&&)      = delete;
 
   /// Start the lanes and the planner, then deliver events. Idempotent; a no-op after @ref stop.
+  /// A GPUDirect Storage probe that throws is logged and counts as no GDS.
   void start();
 
   /// Stop delivering events, join the planner and the lanes (a running promotion finishes its
@@ -201,6 +205,7 @@ class preload_executor final : public event::query_event_subscriber {
   /// memory was freed. Idempotent.
   void forget_query(query_id_t q) noexcept;
 
+  /// Counters read one by one: not consistent across counters while the executor runs.
   [[nodiscard]] preload_stats stats() const;
 
   [[nodiscard]] std::string_view name() const noexcept override { return "preload"; }
@@ -222,6 +227,8 @@ class preload_executor final : public event::query_event_subscriber {
   void set_promotion_hook_for_testing(std::function<void(promotion_job const&)> hook);
   /// Preloaded, unconsumed bytes on GPU index @p gpu.
   [[nodiscard]] std::size_t outstanding_bytes_for_testing(std::size_t gpu) const;
+  /// The class-B part of @ref outstanding_bytes_for_testing.
+  [[nodiscard]] std::size_t outstanding_speculative_bytes_for_testing(std::size_t gpu) const;
   /// Worker threads of each lane: GPUs' HOST->GPU lanes by index, then DISK lanes by index.
   [[nodiscard]] std::vector<int> lane_threads_for_testing() const;
 
@@ -300,8 +307,15 @@ class preload_executor final : public event::query_event_subscriber {
     cucascade::memory::Tier source{cucascade::memory::Tier::SIZE};
     /// Bytes the job will reserve: what it counts against the in-flight cap.
     std::size_t est{0};
-    /// Already counted as refused by the in-flight cap.
-    mutable bool counted_inflight{false};
+    /// Already counted as refused by the in-flight cap (carried over when the plan is rebuilt).
+    bool counted_inflight{false};
+  };
+
+  /// Why a lane cannot take an item now.
+  enum class take_check : std::uint8_t {
+    ok,       ///< takeable
+    blocked,  ///< gone, in flight, gated, held off or out of tokens
+    inflight  ///< the target GPU's in-flight bytes would exceed their cap
   };
 
   /// A pull-based lane. Counters and the ready list are guarded by the executor's mutex.
@@ -355,6 +369,14 @@ class preload_executor final : public event::query_event_subscriber {
     std::optional<int> placement_device;
   };
 
+  /// What a planner pass did, for its log line (written after the mutex is released).
+  struct pass_summary {
+    std::size_t class_a_tasks{0};
+    std::size_t class_b_items{0};
+    std::size_t planned{0};
+    std::size_t assigned{0};
+  };
+
   /// Live state of one GPU or HOST space, read without the executor's mutex.
   struct space_reading {
     std::size_t consumed{0};
@@ -388,24 +410,38 @@ class preload_executor final : public event::query_event_subscriber {
   void planner_loop(std::stop_token const& st) noexcept;
   void lane_loop(lane& l, std::stop_token const& st) noexcept;
 
-  // Planner phases 1 and 2 (no executor mutex).
+  // Planner phases 1 and 2. Called without the executor mutex, which is a leaf: they take the
+  // queue's lock, and hold each query's work lease while they touch its batches or repositories.
   [[nodiscard]] std::vector<visited_task> visit_queues() const;
-  void scan_repositories(pass_snapshot const& snap, plan_input& in) const;
+  /// At most @c max_repository_scans repositories per pass, resuming after the last one scanned.
+  /// Planner thread only: it moves @c _scan_cursor.
+  void scan_repositories(pass_snapshot const& snap, plan_input& in);
   void read_spaces(plan_input& in) const;
 
-  // Planner phase 3 and lane bookkeeping (executor mutex held).
-  void install_plan(plan_input const& in);
-  void add_entry(std::vector<plan_entry>& entries,
+  // Planner phase 3 and lane bookkeeping. Every member below requires the executor mutex.
+  pass_summary install_plan(plan_input const& in);
+  /// @return Whether an entry was appended (false when @p c has no usable target).
+  bool add_entry(std::vector<plan_entry>& entries,
                  candidate const& c,
                  target_request const& request,
                  plan_key key);
   void rebuild_ready_lists(std::vector<plan_entry> const& entries, assignment_result const& result);
   void refine_disk_lanes(plan_input const& in) noexcept;
-  [[nodiscard]] bool takeable(lane const& l, lane_item const& item) const noexcept;
+  /// Pure, so safe in a wait predicate. Board loads are an early filter; the worker checks again.
+  [[nodiscard]] take_check check_take(lane const& l, lane_item const& item) const noexcept;
   [[nodiscard]] bool has_takeable(lane const& l) const noexcept;
+  /// Also drops items whose candidate is gone, and counts each item it finds over the in-flight
+  /// cap once.
   [[nodiscard]] std::optional<taken_job> take_first_takeable(lane& l);
   [[nodiscard]] bool needs_token(lane const& l, lane_item const& item) const noexcept;
-  void apply_result(lane const& l, taken_job const& taken, promotion_result const& result) noexcept;
+  /// @pre The job's lane slot is released.
+  /// @return Whether this is the first failed promotion of its query (worth one warning).
+  bool apply_result(taken_job const& taken, promotion_result const& result) noexcept;
+  /// Whether a finished job can change what a new pass assigns: its outcome changed a candidate
+  /// or a gate, an event came while it ran, or the last pass refused an item for room that the
+  /// job's bytes were holding.
+  [[nodiscard]] bool replan_after(promotion_job const& job,
+                                  promotion_outcome outcome) const noexcept;
   void purge_ready_items(target t, purge_scope scope) noexcept;
   void purge_query_items(query_id_t q) noexcept;
   void clear_ready_lists() noexcept;
@@ -414,6 +450,8 @@ class preload_executor final : public event::query_event_subscriber {
   [[nodiscard]] bool quiescent() const noexcept;
   [[nodiscard]] std::optional<std::size_t> lane_of(cucascade::memory::memory_space_id source,
                                                    target t) const noexcept;
+  /// With no NUMA information at all, HOST 0; with NUMA known but no HOST space on that node,
+  /// none, since cross-NUMA staging is a non-goal.
   [[nodiscard]] std::optional<std::size_t> staging_host(int gpu_device,
                                                         candidate const& c) const noexcept;
   [[nodiscard]] int numa_of(int gpu_device) const noexcept;
@@ -449,12 +487,14 @@ class preload_executor final : public event::query_event_subscriber {
   std::shared_ptr<std::function<void(promotion_job const&)>> _hook;
   promotion_env _env;
 
-  /// Guards start() and stop().
+  /// Guards start() and stop(), including starting and stopping event delivery.
   std::mutex _lifecycle_mu;
   enum class run_state : std::uint8_t { idle, running, stopped };
   run_state _state{run_state::idle};
-  std::atomic<std::thread::id> _hook_thread{};
   std::atomic<bool> _unexpected_logged{false};
+
+  /// Planner thread only: the last repository scanned, where the next pass resumes.
+  std::optional<std::pair<query_id_t, std::uintptr_t>> _scan_cursor;
 
   /// The executor's leaf lock: guards everything below.
   mutable std::mutex _mu;
@@ -462,6 +502,10 @@ class preload_executor final : public event::query_event_subscriber {
   std::vector<std::unique_ptr<lane>> _lanes;
   std::uint32_t _dirty{0};
   bool _planner_busy{false};
+  /// The last pass refused an item for room (ceiling or window), which in-flight bytes count in.
+  bool _room_refused{true};
+  /// Class-B bytes being copied into each GPU.
+  std::vector<std::size_t> _inflight_b;
   std::uint64_t _events_handled{0};
   std::chrono::steady_clock::time_point _dirty_since{};
   bool _log_promotions{false};
