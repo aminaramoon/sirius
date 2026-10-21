@@ -39,12 +39,14 @@
 #include "preload/preload_policy.hpp"
 #include "preload/preload_streams.hpp"
 #include "query_id.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
 #include "utils/utils.hpp"
 
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
@@ -75,6 +77,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -97,6 +100,8 @@ struct fixture_options {
   double reservation_fraction{1.0};
   double trigger{0.9};
   double stop{0.8};
+  /// Track GPU reservations per stream instead of per thread.
+  bool per_stream{false};
 };
 
 /// A pipeline whose FULL barrier the test opens by hand.
@@ -201,7 +206,7 @@ struct executor_fixture {
       .set_gpu_usage_limit(opts.gpu_capacity)
       .set_reservation_fraction_per_gpu(opts.reservation_fraction)
       .set_downgrade_fractions_per_gpu(opts.trigger, opts.stop)
-      .track_reservation_per_stream(false)
+      .track_reservation_per_stream(opts.per_stream)
       .set_per_numa_region_capacity(4 * gib)
       .use_gpu_id_as_host_id()
       .set_reservation_fraction_per_numa_region(0.75)
@@ -374,8 +379,15 @@ struct executor_fixture {
   /// Wait until every published event has been handled, without waiting for quiescence.
   bool handled(std::chrono::milliseconds limit = 20s)
   {
+    return eventually([&] { return exec->events_handled_for_testing() >= expected_events; }, limit);
+  }
+
+  /// Poll @p done until it holds or @p limit passes.
+  template <typename Pred>
+  static bool eventually(Pred done, std::chrono::milliseconds limit = 20s)
+  {
     auto const deadline = std::chrono::steady_clock::now() + limit;
-    while (exec->events_handled_for_testing() < expected_events) {
+    while (!done()) {
       if (std::chrono::steady_clock::now() > deadline) { return false; }
       std::this_thread::sleep_for(1ms);
     }
@@ -489,6 +501,9 @@ TEST_CASE_METHOD(executor_fixture,
   CHECK(stat(*exec, counter::promoted_h2g) == 1);
   CHECK(promoted_ids(*exec) == std::vector<std::uint64_t>{batch->get_batch_id()});
   CHECK(exec->outstanding_bytes_for_testing(0) > 0);
+  // One job, however many passes saw the item.
+  CHECK(stat(*exec, counter::items_planned) == 1);
+  CHECK(stat(*exec, counter::class_a_items) == 1);
 }
 
 TEST_CASE_METHOD(executor_fixture,
@@ -542,9 +557,11 @@ TEST_CASE_METHOD(executor_fixture,
     CHECK(tier_of(*batch) == Tier::HOST);
     CHECK(stat(*exec, counter::refused_held_off) >= 1);
 
+    auto const passes = stat(*exec, counter::passes);
     waiter.reset();
     std::this_thread::sleep_for(100ms);
     CHECK(tier_of(*batch) == Tier::HOST);  // the release alone is not an event
+    CHECK(stat(*exec, counter::passes) == passes);
 
     wait_ended(q);
     settle();
@@ -743,12 +760,17 @@ TEST_CASE_METHOD(executor_fixture,
   settle();
   CHECK(tier_of(*plain_disk) == Tier::HOST);
   CHECK(tier_of(*plain_host) == Tier::HOST);
+  // At most a window of staged batches per repository, in partition order.
   CHECK(tier_of(*parts[0]) == Tier::HOST);
   CHECK(tier_of(*parts[1]) == Tier::HOST);
-  CHECK(tier_of(*parts[2]) == Tier::HOST);
-  CHECK(stat(*exec, counter::promoted_d2h) == 4);
+  CHECK(tier_of(*parts[2]) == Tier::DISK);
+  CHECK(stat(*exec, counter::promoted_d2h) == 3);
   CHECK(stat(*exec, counter::promoted_h2g) == 0);
   CHECK(stat(*exec, counter::promoted_d2g) == 0);
+  // More events change nothing while the staged batches wait for their consumer.
+  completed(q);
+  settle();
+  CHECK(tier_of(*parts[2]) == Tier::DISK);
 
   // Barriers clear: the unpartitioned consumer is the creator's next pop and is left alone; the
   // partitioned one gets the partition after its next one.
@@ -760,7 +782,7 @@ TEST_CASE_METHOD(executor_fixture,
   CHECK(tier_of(*plain_host) == Tier::HOST);
   CHECK(tier_of(*parts[0]) == Tier::HOST);
   CHECK(tier_of(*parts[1]) == Tier::GPU);
-  CHECK(tier_of(*parts[2]) == Tier::HOST);
+  CHECK(tier_of(*parts[2]) == Tier::DISK);
   CHECK(stat(*exec, counter::promoted_h2g) == 1);
 }
 
@@ -1020,6 +1042,8 @@ TEST_CASE_METHOD(executor_fixture,
     }
     CHECK(disk_started);
   } else {
+    // Once the DISK item is planned, only the missing token keeps a worker from taking it.
+    REQUIRE(eventually([&] { return stat(*exec, counter::passes) >= 2; }));
     std::this_thread::sleep_for(200ms);
     CHECK_FALSE(disk_started);  // the HOST->GPU copy holds the only token
   }
@@ -1096,7 +1120,7 @@ TEST_CASE_METHOD(executor_fixture,
   downgraded(q, record(batch, sirius::event::downgrade_source::task_queue, 0, 0, 1));
   settle();
   REQUIRE(event_handled);
-  std::this_thread::sleep_for(200ms);
+  // Quiescent and without a timer: nothing more can happen until the next event.
   CHECK(attempts == (event_during_attempt ? 2 : 1));
   CHECK(stat(*exec, counter::gated) == static_cast<std::uint64_t>(attempts.load()));
   CHECK(tier_of(*batch) == Tier::HOST);
@@ -1134,7 +1158,8 @@ TEST_CASE_METHOD(executor_fixture,
   auto const first = attempts.load();
   CHECK(first >= 1);
   CHECK(first <= 2);
-  std::this_thread::sleep_for(200ms);
+  // Quiescent: no lane may try the GPU again before the next memory event.
+  REQUIRE(exec->wait_until_quiescent_for_testing(30s, expected_events));
   CHECK(attempts == first);
 
   completed(q);
@@ -1169,8 +1194,6 @@ TEST_CASE_METHOD(executor_fixture,
   settle();
   CHECK(tier_of(*batch) == Tier::DISK);
   CHECK(stat(*exec, counter::refused_held_off) >= 1);
-  std::this_thread::sleep_for(100ms);
-  CHECK(tier_of(*batch) == Tier::DISK);
 
   // The downgrade frees GPU memory and reports the batch it moved.
   filler.reset();
@@ -1222,6 +1245,301 @@ TEST_CASE(
     CHECK(tier_of(*batch) == Tier::HOST);
     CHECK(attempts == 0);
     CHECK(stat(*f.exec, counter::refused_ceiling) >= 1);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 7: bans
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: repeated OOMs ban the GPU and the batch is staged instead",
+                 "[preload_executor]")
+{
+  build();
+  auto const q     = open_query(1);
+  auto const batch = spilled(*disk);
+  push_task(pipeline_state(priority(q, 1)), {batch});
+  std::atomic<int> gpu_attempts{0};
+  exec->set_promotion_hook_for_testing([&](promotion_job const& job) {
+    if (job.t.tier != Tier::GPU) { return; }
+    ++gpu_attempts;
+    throw rmm::out_of_memory("preload test: copy overran its reservation");
+  });
+
+  downgraded(q, record(batch));
+  settle();
+  // One retry with a doubled estimate (max_oom_retries = 1), then HOST staging only.
+  CHECK(gpu_attempts == 2);
+  CHECK(stat(*exec, counter::oom) == 2);
+  CHECK(stat(*exec, counter::gpu_banned) == 1);
+  CHECK(tier_of(*batch) == Tier::HOST);
+  CHECK(stat(*exec, counter::promoted_d2h) == 1);
+
+  completed(q);
+  settle();
+  CHECK(gpu_attempts == 2);
+  CHECK(tier_of(*batch) == Tier::HOST);
+}
+
+TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: a batch too big for the GPU is staged instead",
+                 "[preload_executor]")
+{
+  auto cfg               = config();
+  cfg.max_batch_fraction = 0.002;  // about 2 MiB of a 1 GiB GPU
+  build(cfg);
+  auto const q     = open_query(1);
+  auto const batch = spilled(*disk, 1 << 20);  // 4 MiB
+  push_task(pipeline_state(priority(q, 1)), {batch});
+
+  // The record understates the batch, so only the worker finds it too big.
+  downgraded(q, record(batch, sirius::event::downgrade_source::task_queue, 0, 0, 1));
+  settle();
+  CHECK(stat(*exec, counter::too_big) == 1);
+  CHECK(stat(*exec, counter::gpu_banned) == 1);
+  CHECK(tier_of(*batch) == Tier::HOST);
+  CHECK(stat(*exec, counter::promoted_d2h) == 1);
+  CHECK(stat(*exec, counter::promoted_d2g) == 0);
+
+  completed(q);
+  settle();
+  CHECK(stat(*exec, counter::too_big) == 1);
+  CHECK(tier_of(*batch) == Tier::HOST);
+}
+
+TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: a speculative batch that bounced is not promoted again",
+                 "[preload_executor]")
+{
+  build();
+  cucascade::data_repository repo;
+  partition_consumer consumer;
+  consumer.set_placement(std::make_shared<sirius::op::partition_placement const>(
+    sirius::op::partition_placement::round_robin(2, {0})));
+  auto const qid   = sirius::make_query_id(1);
+  auto const q     = open_query(1, {repo_of(repo, priority(qid, 2), &consumer)});
+  auto const token = reinterpret_cast<std::uintptr_t>(&repo);
+  std::vector<std::shared_ptr<cucascade::data_batch>> parts;
+  for (std::size_t p = 0; p < 2; ++p) {
+    parts.push_back(spilled(*host));
+    repo.add_data_batch(parts.back(), p);
+  }
+  for (std::size_t p = 0; p < parts.size(); ++p) {
+    downgraded(q, record(parts[p], sirius::event::downgrade_source::repository, token, p));
+  }
+  settle();
+  REQUIRE(tier_of(*parts[1]) == Tier::GPU);
+  CHECK(exec->outstanding_speculative_bytes_for_testing(0) > 0);
+
+  move_to(parts[1], *host);
+  downgraded(q, record(parts[1], sirius::event::downgrade_source::repository, token, 1));
+  settle();
+  CHECK(stat(*exec, counter::bounce) == 1);
+  CHECK(exec->outstanding_speculative_bytes_for_testing(0) == 0);
+
+  completed(q);
+  settle();
+  CHECK(tier_of(*parts[1]) == Tier::HOST);
+  CHECK(stat(*exec, counter::promoted_h2g) == 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Windows, scan budget, staging switch and ledger verdicts
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: bytes in flight count against the lookahead window",
+                 "[preload_executor]")
+{
+  auto cfg                    = config();
+  cfg.host_to_gpu_concurrency = 2;
+  // About 1.5 MiB: one batch's reservation fits, two do not.
+  cfg.gpu_lookahead_fraction = 1.5 / 1024.0;
+  build(cfg);
+  auto const q     = open_query(1);
+  auto const state = pipeline_state(priority(q, 1));
+  auto const first = spilled(*host);
+  auto const other = spilled(*host);
+  push_task(state, {first});
+  push_task(state, {other});
+  promotion_gate gate;
+  exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
+
+  downgraded(q, record(first));
+  REQUIRE(gate.wait_entered(1));
+  // A pass while the first copy is parked: its bytes already fill the window.
+  downgraded(q, record(other));
+  REQUIRE(eventually([&] { return stat(*exec, counter::refused_window) >= 1; }));
+  CHECK(gate.count() == 1);
+
+  gate.release();
+  settle();
+  CHECK(tier_of(*first) == Tier::GPU);
+  CHECK(tier_of(*other) == Tier::HOST);
+  CHECK(stat(*exec, counter::promoted_h2g) == 1);
+}
+
+TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: the repository scan budget reaches every repository",
+                 "[preload_executor]")
+{
+  auto cfg              = config();
+  cfg.repository_window = 1;
+  build(cfg);
+  constexpr std::size_t n_repos = 70;  // more than one pass scans
+  auto const source             = std::make_shared<barrier_pipeline>();
+  auto const qid                = sirius::make_query_id(1);
+  std::vector<std::unique_ptr<cucascade::data_repository>> repos;
+  std::vector<repo_info> infos;
+  for (std::size_t i = 0; i < n_repos; ++i) {
+    repos.push_back(std::make_unique<cucascade::data_repository>());
+    infos.push_back(repo_of(*repos.back(), priority(qid, 2), nullptr, {source}));
+  }
+  auto const q = open_query(1, infos);
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (auto const& repo : repos) {
+    batches.push_back(spilled(*disk));
+    repo->add_data_batch(batches.back(), 0);
+  }
+  for (std::size_t i = 0; i < n_repos; ++i) {
+    downgraded(q,
+               record(batches[i],
+                      sirius::event::downgrade_source::repository,
+                      reinterpret_cast<std::uintptr_t>(repos[i].get())));
+  }
+  settle();
+  for (auto const& b : batches) {
+    CHECK(tier_of(*b) == Tier::HOST);
+  }
+  CHECK(stat(*exec, counter::promoted_d2h) == n_repos);
+}
+
+TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: stage_to_host off disables DISK->HOST staging",
+                 "[preload_executor]")
+{
+  auto cfg          = config();
+  cfg.stage_to_host = false;
+  build(cfg);
+  auto const source = std::make_shared<barrier_pipeline>();
+  cucascade::data_repository repo;
+  auto const qid   = sirius::make_query_id(1);
+  auto const q     = open_query(1, {repo_of(repo, priority(qid, 2), nullptr, {source})});
+  auto const batch = spilled(*disk);
+  repo.add_data_batch(batch, 0);
+  downgraded(
+    q,
+    record(
+      batch, sirius::event::downgrade_source::repository, reinterpret_cast<std::uintptr_t>(&repo)));
+  settle();
+  CHECK(stat(*exec, counter::passes) >= 1);
+  CHECK(tier_of(*batch) == Tier::DISK);
+  CHECK(stat(*exec, counter::promoted_d2h) == 0);
+}
+
+TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: a consumed batch is a hit, a claimed speculative one turns A",
+                 "[preload_executor]")
+{
+  SECTION("class A: its task ran")
+  {
+    build();
+    auto const q     = open_query(1);
+    auto const batch = spilled(*host);
+    push_task(pipeline_state(priority(q, 1)), {batch});
+    downgraded(q, record(batch));
+    settle();
+    REQUIRE(tier_of(*batch) == Tier::GPU);
+    REQUIRE(exec->outstanding_bytes_for_testing(0) > 0);
+    CHECK(stat(*exec, counter::hit) == 0);
+
+    while (queue.try_pop()) {}  // the task ran: its inputs are unsubscribed
+    completed(q);
+    settle();
+    CHECK(stat(*exec, counter::hit) == 1);
+    CHECK(exec->outstanding_bytes_for_testing(0) == 0);
+  }
+
+  SECTION("class B: a task claimed it")
+  {
+    build();
+    cucascade::data_repository repo;
+    partition_consumer consumer;
+    consumer.set_placement(std::make_shared<sirius::op::partition_placement const>(
+      sirius::op::partition_placement::round_robin(2, {0})));
+    auto const qid   = sirius::make_query_id(1);
+    auto const q     = open_query(1, {repo_of(repo, priority(qid, 2), &consumer)});
+    auto const token = reinterpret_cast<std::uintptr_t>(&repo);
+    std::vector<std::shared_ptr<cucascade::data_batch>> parts;
+    for (std::size_t p = 0; p < 2; ++p) {
+      parts.push_back(spilled(*host));
+      repo.add_data_batch(parts.back(), p);
+      downgraded(q, record(parts.back(), sirius::event::downgrade_source::repository, token, p));
+    }
+    settle();
+    REQUIRE(tier_of(*parts[1]) == Tier::GPU);
+    auto const outstanding = exec->outstanding_bytes_for_testing(0);
+    REQUIRE(exec->outstanding_speculative_bytes_for_testing(0) == outstanding);
+
+    push_task(pipeline_state(priority(q, 2)), {parts[1]});  // subscribes it
+    task_created(q);
+    settle();
+    CHECK(exec->outstanding_bytes_for_testing(0) == outstanding);
+    CHECK(exec->outstanding_speculative_bytes_for_testing(0) == 0);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Start-up checks
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+bool logged(sirius::test::scoped_recording_log_sink const& sink, std::string_view text)
+{
+  auto const records = sink.records();
+  return std::any_of(records.begin(), records.end(), [&](auto const& r) {
+    return r.level == sirius::log::level::warn && r.message.find(text) != std::string::npos;
+  });
+}
+
+}  // namespace
+
+TEST_CASE("preload executor: start-up warnings", "[preload_executor]")
+{
+  sirius::test::scoped_recording_log_sink sink{"warn"};
+
+  SECTION("negative core ids are skipped")
+  {
+    executor_fixture f;
+    auto cfg              = executor_fixture::config();
+    cfg.cpu_affinity_list = {-1, 0};
+    f.build(cfg);
+    CHECK(logged(sink, "ignoring negative core ids"));
+    auto const q     = f.open_query(1);
+    auto const batch = f.spilled(*f.host);
+    f.push_task(f.pipeline_state(executor_fixture::priority(q, 1)), {batch});
+    f.downgraded(q, f.record(batch));
+    f.settle();
+    CHECK(tier_of(*batch) == Tier::GPU);
+  }
+  SECTION("zero ceilings")
+  {
+    executor_fixture f;
+    auto cfg                              = executor_fixture::config();
+    cfg.gpu_committed_headroom_fraction   = 1.0;
+    cfg.gpu_speculative_headroom_fraction = 1.0;
+    cfg.host_headroom_fraction            = 1.0;
+    f.build(cfg);
+    CHECK(logged(sink, "committed ceiling is 0"));
+    CHECK(logged(sink, "staging ceiling is 0"));
+  }
+  SECTION("per-stream reservation tracking")
+  {
+    executor_fixture f{fixture_options{.per_stream = true}};
+    f.build();
+    CHECK(logged(sink, "tracks reservations per stream"));
   }
 }
 

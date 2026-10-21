@@ -75,6 +75,27 @@ constexpr std::size_t max_repository_scans = 64;
 /// Expired candidates checked per pass.
 constexpr std::size_t prune_budget = 256;
 
+/// The executor whose event hook is running on this thread, if any.
+thread_local void const* t_hook_owner = nullptr;
+
+/// Marks the current thread as running an event hook of @p owner for the guard's lifetime.
+class hook_scope {
+ public:
+  explicit hook_scope(void const* owner) noexcept : _previous(t_hook_owner)
+  {
+    t_hook_owner = owner;
+  }
+  ~hook_scope() { t_hook_owner = _previous; }
+
+  hook_scope(hook_scope const&)            = delete;
+  hook_scope& operator=(hook_scope const&) = delete;
+  hook_scope(hook_scope&&)                 = delete;
+  hook_scope& operator=(hook_scope&&)      = delete;
+
+ private:
+  void const* _previous;
+};
+
 template <typename T>
 std::shared_ptr<T> required(std::shared_ptr<T> p, char const* what)
 {
@@ -239,17 +260,25 @@ std::vector<repo_info> collect_repositories(
 
 /**
  * Holds a lane's concurrency slot, the target GPU's HOST->GPU token when the job needs one, and
- * the job's bytes in the target's in-flight count. Construct and release with the executor's
- * mutex held; release is idempotent and runs before any bookkeeping that can throw.
+ * the job's bytes in the target's in-flight count (and the GPU's class-B count for class B).
+ * Construct and release with the executor's mutex held; release is idempotent and runs before
+ * any bookkeeping that can throw.
  */
 class preload_executor::lane_slot {
  public:
   lane_slot(preload_executor& ex, lane& l, taken_job const& taken) noexcept
-    : _ex(ex), _lane(l), _t(taken.job.t), _bytes(taken.job.est_reserve), _token(taken.token)
+    : _ex(ex),
+      _lane(l),
+      _t(taken.job.t),
+      _bytes(taken.job.est_reserve),
+      _token(taken.token),
+      _speculative(taken.job.k == klass::B && _t.tier == Tier::GPU &&
+                   _t.index < ex._inflight_b.size())
   {
     ++_lane.active;
     if (_token) { _ex._store.acquire_h2g_token(_t.index); }
     _ex._store.add_inflight(_t, _bytes);
+    if (_speculative) { _ex._inflight_b[_t.index] = sat_add(_ex._inflight_b[_t.index], _bytes); }
     _ex._counters.raise_lane_concurrency(_lane.idx, static_cast<std::uint64_t>(_lane.active));
     if (_t.tier == Tier::GPU) {
       _ex._counters.raise_gpu_inflight_bytes(_t.index, _ex._store.inflight_bytes(_t));
@@ -270,6 +299,7 @@ class preload_executor::lane_slot {
     --_lane.active;
     if (_token) { _ex._store.release_h2g_token(_t.index); }
     _ex._store.remove_inflight(_t, _bytes);
+    if (_speculative) { _ex._inflight_b[_t.index] = sat_sub(_ex._inflight_b[_t.index], _bytes); }
   }
 
  private:
@@ -278,6 +308,7 @@ class preload_executor::lane_slot {
   target _t;
   std::size_t _bytes;
   bool _token;
+  bool _speculative;
   bool _held{true};
 };
 
@@ -319,6 +350,7 @@ preload_executor::preload_executor(event::query_event_publisher& publisher,
 {
   build_spaces();
   build_lanes();
+  _inflight_b.assign(_gpus.size(), 0);
   _env.gpus      = _promotion_gpus;
   _env.hosts     = _promotion_hosts;
   _env.test_hook = [this](promotion_job const& job) {
@@ -424,8 +456,21 @@ void preload_executor::start()
     // spaces that exist.
     std::vector<bool> gds(_lanes.size(), false);
     for (auto const& l : _lanes) {
-      if (l->kind == lane_kind::disk) {
-        gds[l->idx] = _caps.gds ? *_caps.gds : disk_uses_gds(*l->space);
+      if (l->kind != lane_kind::disk) { continue; }
+      if (_caps.gds) {
+        gds[l->idx] = *_caps.gds;
+        continue;
+      }
+      try {
+        gds[l->idx] = disk_uses_gds(*l->space);
+      } catch (std::exception const& e) {
+        // The probe is advisory: without it, the lane runs as if there were no GDS.
+        SIRIUS_LOG_WARN("[preload] DISK:{} GPUDirect Storage probe failed ({}); assuming no GDS",
+                        l->space->get_device_id(),
+                        e.what());
+      } catch (...) {
+        SIRIUS_LOG_WARN("[preload] DISK:{} GPUDirect Storage probe failed; assuming no GDS",
+                        l->space->get_device_id());
       }
     }
     {
@@ -478,9 +523,11 @@ void preload_executor::start()
       throw;
     }
     _state = run_state::running;
+    // Under the lifecycle lock, so a concurrent stop() cannot run between the threads starting
+    // and event delivery starting. Events delivered from here on find the planner and the lanes
+    // running.
+    event::query_event_subscriber::start();
   }
-  // Events delivered from here on find the planner and the lanes running.
-  event::query_event_subscriber::start();
 }
 
 void preload_executor::join_threads() noexcept
@@ -503,9 +550,10 @@ void preload_executor::stop() noexcept
 {
   // Joining the planner and the lanes is fine from anywhere but an event hook, which would
   // otherwise stop its own worker without joining it.
-  assert(_hook_thread.load(std::memory_order_relaxed) != std::this_thread::get_id());
-  event::query_event_subscriber::stop();
+  assert(t_hook_owner != this);
   std::lock_guard const lifecycle{_lifecycle_mu};
+  // Hooks never take the lifecycle lock, so stopping delivery under it cannot deadlock.
+  event::query_event_subscriber::stop();
   if (_state == run_state::stopped) { return; }
   _state = run_state::stopped;
   join_threads();
@@ -565,6 +613,16 @@ void preload_executor::log_start() const noexcept
       if (_cfg.stage_to_host && h.ceiling == 0) {
         SIRIUS_LOG_WARN("[preload] HOST:{} staging ceiling is 0: no DISK->HOST staging there",
                         h.device);
+      }
+    }
+    if (_topology && _hosts.size() > 1) {
+      for (auto const& g : _gpus) {
+        if (g.numa < 0) {
+          SIRIUS_LOG_WARN(
+            "[preload] GPU:{} has no known NUMA node: staging for it uses the batch's origin, or "
+            "the first HOST space when that is unknown too",
+            g.device);
+        }
       }
     }
   });
@@ -659,7 +717,7 @@ void preload_executor::on_batch_downgraded(event::event_id_t,
                                            query_id_t query_id,
                                            event::downgraded_batch const& batch) noexcept
 {
-  _hook_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+  hook_scope const in_hook{this};
   std::lock_guard const lk{_mu};
   try {
     auto const status = _store.intake(query_id, batch);
@@ -685,7 +743,7 @@ void preload_executor::on_task_completed(event::event_id_t,
                                          int gpu_id,
                                          event::task_outcome outcome) noexcept
 {
-  _hook_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+  hook_scope const in_hook{this};
   std::lock_guard const lk{_mu};
   _store.advance_queue_epoch();
   if (outcome == event::task_outcome::succeeded) {
@@ -707,7 +765,7 @@ void preload_executor::on_task_completed(event::event_id_t,
 void preload_executor::on_memory_wait_ended_for_task(
   event::event_id_t, event::timestamp_t, query_id_t, std::size_t, int gpu_id, std::size_t) noexcept
 {
-  _hook_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+  hook_scope const in_hook{this};
   std::lock_guard const lk{_mu};
   if (auto const g = _store.gpu_index_of(gpu_id)) { _store.advance_mem_epoch({Tier::GPU, *g}); }
   if (_store.has_candidates()) { mark_dirty(dirty::memory); }
@@ -722,7 +780,7 @@ void preload_executor::on_task_created(event::event_id_t,
                                        op::SiriusPhysicalOperatorType,
                                        exec::queue_priority) noexcept
 {
-  _hook_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+  hook_scope const in_hook{this};
   std::lock_guard const lk{_mu};
   _store.advance_queue_epoch();
   if (_store.has_candidates()) { mark_dirty(dirty::queue); }
@@ -737,7 +795,7 @@ void preload_executor::on_task_deployed(event::event_id_t,
                                         op::SiriusPhysicalOperatorType,
                                         int) noexcept
 {
-  _hook_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+  hook_scope const in_hook{this};
   std::lock_guard const lk{_mu};
   _store.advance_queue_epoch();
   if (_store.has_candidates()) { mark_dirty(dirty::queue); }
@@ -748,7 +806,7 @@ void preload_executor::on_task_deployed(event::event_id_t,
 void preload_executor::on_pipeline_closed(
   event::event_id_t, event::timestamp_t, query_id_t query_id, std::size_t, std::size_t) noexcept
 {
-  _hook_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+  hook_scope const in_hook{this};
   std::lock_guard const lk{_mu};
   // A FULL barrier may have cleared, and a finalized operator freed its memory.
   _store.mark_readiness_dirty(query_id);
@@ -760,7 +818,7 @@ void preload_executor::on_pipeline_closed(
 
 void preload_executor::on_task_queue_empty(event::event_id_t, event::timestamp_t) noexcept
 {
-  _hook_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+  hook_scope const in_hook{this};
   std::lock_guard const lk{_mu};
   if (_store.has_candidates()) { mark_dirty(dirty::idle); }
   ++_events_handled;
@@ -771,7 +829,7 @@ void preload_executor::on_executor_awaiting_task(event::event_id_t,
                                                  event::timestamp_t,
                                                  int) noexcept
 {
-  _hook_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+  hook_scope const in_hook{this};
   std::lock_guard const lk{_mu};
   if (_store.has_candidates()) { mark_dirty(dirty::idle); }
   ++_events_handled;
@@ -815,7 +873,8 @@ void preload_executor::planner_loop(std::stop_token const& st) noexcept
     plan_input in;
     try {
       sirius::nvtx_scoped_range const range{"sirius::preload::plan"};
-      if (snap->has_candidates) {
+      // While preloaded batches wait for their consumer, the visit also counts misplaced ones.
+      if (snap->has_candidates || !snap->ledger.empty()) {
         sirius::nvtx_scoped_range const visit{"sirius::preload::visit_queue"};
         in.class_a = visit_queues();
       }
@@ -831,8 +890,9 @@ void preload_executor::planner_loop(std::stop_token const& st) noexcept
     // Phase 3, under the lock: install the plan.
     lk.lock();
     _planner_busy = false;
+    std::optional<pass_summary> summary;
     try {
-      install_plan(in);
+      summary = install_plan(in);
       bool const dispatched =
         std::any_of(_lanes.begin(), _lanes.end(), [](auto const& l) { return !l->ready.empty(); });
       if (dispatched) {
@@ -843,9 +903,23 @@ void preload_executor::planner_loop(std::stop_token const& st) noexcept
       }
     } catch (...) {
       clear_ready_lists();
+      _room_refused = true;  // unknown: let the next finished job re-plan
       log_unexpected("install");
     }
     _quiescent_cv.notify_all();
+    if (summary) {
+      // Formatted outside the lock: event hooks wait on it.
+      lk.unlock();
+      log::log_noexcept([&] {
+        SIRIUS_LOG_DEBUG(
+          "[preload] pass: {} class A task(s), {} class B item(s), {} planned, {} assigned",
+          summary->class_a_tasks,
+          summary->class_b_items,
+          summary->planned,
+          summary->assigned);
+      });
+      lk.lock();
+    }
   }
 }
 
@@ -905,27 +979,19 @@ std::vector<preload_executor::visited_task> preload_executor::visit_queues() con
   return out;
 }
 
-void preload_executor::scan_repositories(pass_snapshot const& snap, plan_input& in) const
+void preload_executor::scan_repositories(pass_snapshot const& snap, plan_input& in)
 {
-  std::map<query_id_t, std::vector<ledger_probe const*>> probes;
-  for (auto const& probe : snap.ledger) {
-    probes[probe.query].push_back(&probe);
-  }
-  auto const window    = static_cast<std::size_t>(std::max(_cfg.repository_window, 0));
-  auto const lookahead = static_cast<std::size_t>(std::max(_cfg.repository_partition_lookahead, 0));
-  std::size_t scans    = 0;
-
-  for (auto const& qv : snap.queries) {
-    auto const pit       = probes.find(qv.query);
-    bool const has_probe = pit != probes.end();
-    bool const has_repos = snap.has_candidates && !qv.repos.empty() && window > 0;
-    if (!has_probe && !has_repos) { continue; }
-    // Strong references and repository pointers are used only while this lease is held.
-    auto const lease = _lifecycle.try_acquire_work(qv.query);
-    if (!lease) { continue; }
-
-    if (has_probe) {
-      for (auto const* probe : pit->second) {
+  // Live ledger entries: lock() creates a strong reference, so each query is probed under its
+  // own lease.
+  {
+    std::map<query_id_t, std::vector<ledger_probe const*>> probes;
+    for (auto const& probe : snap.ledger) {
+      probes[probe.query].push_back(&probe);
+    }
+    for (auto const& [q, list] : probes) {
+      auto const lease = _lifecycle.try_acquire_work(q);
+      if (!lease) { continue; }
+      for (auto const* probe : list) {
         auto const batch = probe->batch.lock();
         if (!batch) { continue; }  // swept without a lease in phase 3
         auto const subscribers = batch->get_subscriber_count();
@@ -937,54 +1003,92 @@ void preload_executor::scan_repositories(pass_snapshot const& snap, plan_input& 
         }
       }
     }
-    if (!has_repos) { continue; }
+  }
 
+  auto const window    = static_cast<std::size_t>(std::max(_cfg.repository_window, 0));
+  auto const lookahead = static_cast<std::size_t>(std::max(_cfg.repository_partition_lookahead, 0));
+  if (!snap.has_candidates || window == 0) { return; }
+
+  // Repositories with candidates, oldest query first. The scan budget bounds a pass, and a pass
+  // resumes after the repository the previous one scanned last, so none is starved.
+  std::vector<std::pair<query_view const*, repo_view const*>> order;
+  for (auto const& qv : snap.queries) {
     for (auto const& rv : qv.repos) {
-      if (scans >= max_repository_scans) { break; }
-      auto const& info = rv.info;
-      if (info.repo == nullptr || rv.candidate_ids.empty()) { continue; }
-      bool const ready =
-        std::all_of(info.full_sources.begin(), info.full_sources.end(), [](auto const& w) {
-          auto const source = w.lock();
-          return source && source->is_pipeline_finished();
-        });
-      bool const partitioned = info.partition_consumer != nullptr;
-      // A ready consumer that is not partition-draining is the creator's next pop: left alone.
-      if (ready && !partitioned) { continue; }
-      ++scans;
-      try {
-        auto const parts  = info.repo->num_partitions();
-        std::size_t rank  = 0;
-        std::size_t found = 0;
-        for (std::size_t p = 0; p < parts && found < rv.candidate_ids.size(); ++p) {
-          if (ready && rank > lookahead) { break; }
-          auto const ids = info.repo->get_batch_ids(p);
-          if (ids.empty()) { continue; }
-          std::optional<int> device;
-          if (ready && rank > 0) { device = placement_device(*info.partition_consumer, p); }
-          for (std::size_t i = 0; i < std::min(window, ids.size()); ++i) {
-            if (!std::binary_search(rv.candidate_ids.begin(), rv.candidate_ids.end(), ids[i])) {
-              continue;
-            }
-            ++found;
-            repo_item item;
-            item.query              = qv.query;
-            item.batch_id           = ids[i];
-            item.repo               = info.token;
-            item.priority           = info.dest_priority;
-            item.partition          = static_cast<std::uint32_t>(p);
-            item.position           = static_cast<std::uint32_t>(i);
-            item.ready              = ready;
-            item.partition_consumer = partitioned;
-            item.rank               = rank;
-            item.placement_device   = device;
-            in.class_b.push_back(item);
+      if (rv.info.repo != nullptr && !rv.candidate_ids.empty()) { order.emplace_back(&qv, &rv); }
+    }
+  }
+  if (order.empty()) { return; }
+  std::size_t first = 0;
+  if (_scan_cursor) {
+    auto const last = std::find_if(order.begin(), order.end(), [&](auto const& e) {
+      return std::pair{e.first->query, e.second->info.token} == *_scan_cursor;
+    });
+    if (last != order.end()) {
+      first = static_cast<std::size_t>(std::distance(order.begin(), last)) + 1;
+    } else {
+      // That repository has no candidates left: resume at its query, or the next younger one.
+      auto const next = std::find_if(order.begin(), order.end(), [&](auto const& e) {
+        return e.first->query >= _scan_cursor->first;
+      });
+      first           = static_cast<std::size_t>(std::distance(order.begin(), next));
+    }
+    first %= order.size();
+  }
+
+  std::size_t scans = 0;
+  std::optional<query_id_t> leased;
+  exec::query_lifecycle_registry::work_lease lease;
+  for (std::size_t n = 0; n < order.size() && scans < max_repository_scans; ++n) {
+    auto const& [qv, rv] = order[(first + n) % order.size()];
+    if (leased != qv->query) {
+      // Strong references and repository pointers are used only while this lease is held.
+      leased = qv->query;
+      lease  = _lifecycle.try_acquire_work(qv->query);
+    }
+    if (!lease) { continue; }
+    auto const& info = rv->info;
+    bool const ready =
+      std::all_of(info.full_sources.begin(), info.full_sources.end(), [](auto const& w) {
+        auto const source = w.lock();
+        return source && source->is_pipeline_finished();
+      });
+    bool const partitioned = info.partition_consumer != nullptr;
+    // A ready consumer that is not partition-draining is the creator's next pop: left alone.
+    if (ready && !partitioned) { continue; }
+    ++scans;
+    _scan_cursor = std::pair{qv->query, info.token};
+    try {
+      auto const parts  = info.repo->num_partitions();
+      std::size_t rank  = 0;
+      std::size_t found = 0;
+      for (std::size_t p = 0; p < parts && found < rv->candidate_ids.size(); ++p) {
+        if (ready && rank > lookahead) { break; }
+        auto const ids = info.repo->get_batch_ids(p);
+        if (ids.empty()) { continue; }
+        std::optional<int> device;
+        if (ready && rank > 0) { device = placement_device(*info.partition_consumer, p); }
+        for (std::size_t i = 0; i < std::min(window, ids.size()); ++i) {
+          if (!std::binary_search(rv->candidate_ids.begin(), rv->candidate_ids.end(), ids[i])) {
+            continue;
           }
-          ++rank;
+          ++found;
+          repo_item item;
+          item.query              = qv->query;
+          item.batch_id           = ids[i];
+          item.repo               = info.token;
+          item.priority           = info.dest_priority;
+          item.partition          = static_cast<std::uint32_t>(p);
+          item.position           = static_cast<std::uint32_t>(i);
+          item.ready              = ready;
+          item.partition_consumer = partitioned;
+          item.rank               = rank;
+          item.placement_device   = device;
+          in.class_b.push_back(item);
         }
-      } catch (std::exception const&) {
-        // The repository changed shape under the scan; the next pass sees it settled.
+        ++rank;
       }
+    } catch (std::exception const&) {
+      // The repository changed shape under the scan; the next pass sees it settled.
     }
   }
 }
@@ -1027,7 +1131,7 @@ void preload_executor::refine_disk_lanes(plan_input const& in) noexcept
   }
 }
 
-void preload_executor::install_plan(plan_input const& in)
+preload_executor::pass_summary preload_executor::install_plan(plan_input const& in)
 {
   _counters.add(counter::passes);
   _store.sweep_expired_ledger();
@@ -1035,8 +1139,9 @@ void preload_executor::install_plan(plan_input const& in)
   _store.prune_expired_candidates(prune_budget);
   if (!in.scanned || in.gpus.size() != _gpus.size() || in.hosts.size() != _hosts.size()) {
     clear_ready_lists();
+    _room_refused = true;  // nothing was judged: let the next finished job re-plan
     _counters.add(counter::passes_noop);
-    return;
+    return {};
   }
   refine_disk_lanes(in);
 
@@ -1078,18 +1183,28 @@ void preload_executor::install_plan(plan_input const& in)
   for (auto const& g : _gpus) {
     all_gpus.push_back(g.device);
   }
+  // Behind a barrier only DISK batches move (to HOST), and a repository holds at most a window of
+  // staged batches its consumer has not taken yet: those staged or being staged count first.
   std::map<std::pair<query_id_t, std::uintptr_t>, int> staged_per_repo;
+  for (auto const& b : in.class_b) {
+    if (b.ready) { continue; }
+    auto const* c = _store.find(b.batch_id);
+    if (c == nullptr || c->query != b.query) { continue; }
+    auto const* e      = _store.find_ledger(b.batch_id);
+    bool const staged  = c->location.tier == Tier::HOST && e != nullptr && e->gpu < 0;
+    bool const staging = c->in_flight && c->location.tier == Tier::DISK;
+    if (staged || staging) { ++staged_per_repo[{b.query, b.repo}]; }
+  }
   for (auto const& b : in.class_b) {
     auto const* c = _store.find(b.batch_id);
     if (c == nullptr || !_store.plannable(*c) || c->query != b.query) { continue; }
     auto const* qs = _store.find_query(b.query);
     if (qs == nullptr) { continue; }
+    int* staged = nullptr;
     if (!b.ready) {
-      // Behind a barrier only DISK batches move (to HOST), at most a window per repository.
       if (c->location.tier != Tier::DISK) { continue; }
-      auto& staged = staged_per_repo[{b.query, b.repo}];
-      if (staged >= window) { continue; }
-      ++staged;
+      staged = &staged_per_repo[{b.query, b.repo}];
+      if (*staged >= window) { continue; }
     }
     target_request r;
     r.k                  = klass::B;
@@ -1102,10 +1217,13 @@ void preload_executor::install_plan(plan_input const& in)
     r.placement_device   = b.placement_device;
     r.active_gpus        = qs->active_gpus.empty() ? std::span<int const>{all_gpus}
                                                    : std::span<int const>{qs->active_gpus};
-    add_entry(entries,
-              *c,
-              r,
-              plan_key{band_gpu, b.priority, klass::B, b.partition, b.position, b.batch_id});
+    if (add_entry(entries,
+                  *c,
+                  r,
+                  plan_key{band_gpu, b.priority, klass::B, b.partition, b.position, b.batch_id}) &&
+        staged != nullptr) {
+      ++*staged;
+    }
   }
 
   std::stable_sort(entries.begin(), entries.end(), [](plan_entry const& a, plan_entry const& b) {
@@ -1130,17 +1248,18 @@ void preload_executor::install_plan(plan_input const& in)
     auto const& g = _gpus[i];
     target const t{Tier::GPU, i};
     gpu_budget_inputs gin;
-    gin.device            = g.device;
-    gin.consumed          = in.gpus[i].consumed;
-    gin.above_trigger     = in.gpus[i].above_trigger;
-    gin.mem_epoch         = _store.mem_epoch(t);
-    gin.gate_epoch        = _store.gate_epoch(t);
-    gin.inflight_bytes    = _store.inflight_bytes(t);
-    gin.ceilings          = g.ceilings;
-    gin.lookahead_bytes   = g.lookahead_bytes;
-    gin.outstanding       = _store.outstanding_bytes(i);
+    gin.device          = g.device;
+    gin.consumed        = in.gpus[i].consumed;
+    gin.above_trigger   = in.gpus[i].above_trigger;
+    gin.mem_epoch       = _store.mem_epoch(t);
+    gin.gate_epoch      = _store.gate_epoch(t);
+    gin.inflight_bytes  = _store.inflight_bytes(t);
+    gin.ceilings        = g.ceilings;
+    gin.lookahead_bytes = g.lookahead_bytes;
+    // Bytes being copied in will be outstanding once they land: the windows count them now.
+    gin.outstanding       = sat_add(_store.outstanding_bytes(i), _store.inflight_bytes(t));
     gin.speculative_bytes = g.speculative_bytes;
-    gin.outstanding_b     = _store.outstanding_b_bytes(i);
+    gin.outstanding_b     = sat_add(_store.outstanding_b_bytes(i), _inflight_b[i]);
     gin.max_batch_bytes   = g.max_batch_bytes;
     gpu_budgets.push_back(make_gpu_budget_state(gin, *_board));
     pressures.push_back({g.device, in.gpus[i].above_trigger});
@@ -1171,19 +1290,15 @@ void preload_executor::install_plan(plan_input const& in)
     if (reason == refusal::none || result.refusals[r] == 0) { continue; }
     _counters.add(refusal_counter(reason), result.refusals[r]);
   }
+  // Room and windows count in-flight bytes: a job finishing may let a refused item fit.
+  auto const refused = [&](refusal r) { return result.refusals[static_cast<std::size_t>(r)] > 0; };
+  _room_refused =
+    refused(refusal::ceiling) || refused(refusal::window) || refused(refusal::speculative_window);
   rebuild_ready_lists(entries, result);
-
-  log::log_noexcept([&] {
-    SIRIUS_LOG_DEBUG(
-      "[preload] pass: {} class A task(s), {} class B item(s), {} planned, {} assigned",
-      in.class_a.size(),
-      in.class_b.size(),
-      entries.size(),
-      result.assigned.size());
-  });
+  return {in.class_a.size(), in.class_b.size(), entries.size(), result.assigned.size()};
 }
 
-void preload_executor::add_entry(std::vector<plan_entry>& entries,
+bool preload_executor::add_entry(std::vector<plan_entry>& entries,
                                  candidate const& c,
                                  target_request const& request,
                                  plan_key key)
@@ -1193,7 +1308,7 @@ void preload_executor::add_entry(std::vector<plan_entry>& entries,
     if (choice.reason == skip_reason::creator_next) {
       _counters.add(counter::skipped_creator_next);
     }
-    return;
+    return false;
   }
   plan_entry e;
   e.batch_id     = c.batch_id;
@@ -1210,24 +1325,33 @@ void preload_executor::add_entry(std::vector<plan_entry>& entries,
   if (c.location.tier == Tier::DISK && _cfg.stage_to_host) {
     e.a.host = staging_host(choice.device, c);
   }
-  if (!e.a.gpu && !e.a.host) { return; }
+  if (!e.a.gpu && !e.a.host) { return false; }
   key.band = e.a.gpu ? band_gpu : band_host_staging;
   e.key    = key;
   entries.push_back(e);
+  return true;
 }
 
 void preload_executor::rebuild_ready_lists(std::vector<plan_entry> const& entries,
                                            assignment_result const& result)
 {
+  // An item stays counted as refused by the in-flight cap across plans, so each counts once.
+  std::unordered_set<std::uint64_t> counted;
+  for (auto const& l : _lanes) {
+    for (auto const& item : l->ready) {
+      if (item.counted_inflight) { counted.insert(item.r.batch_id); }
+    }
+  }
   clear_ready_lists();
   for (auto const& a : result.assigned) {
     auto const& e    = entries[a.item];
     auto const index = lane_of(e.source, a.t);
     if (!index) { continue; }
     lane_item item;
-    item.query  = e.query;
-    item.source = e.source.tier;
-    item.r      = {e.batch_id, a.t, e.k, 0};
+    item.query            = e.query;
+    item.source           = e.source.tier;
+    item.r                = {e.batch_id, a.t, e.k, 0};
+    item.counted_inflight = counted.contains(e.batch_id);
     if (a.t.tier == Tier::GPU) {
       auto const& g  = _gpus[a.t.index];
       item.r.ceiling = e.k == klass::A ? g.ceilings.committed : g.ceilings.speculative;
@@ -1235,10 +1359,7 @@ void preload_executor::rebuild_ready_lists(std::vector<plan_entry> const& entrie
     } else {
       item.r.ceiling = _hosts[a.t.index].ceiling;
       item.est       = e.a.host_bytes;
-      _counters.add(counter::staging_items);
     }
-    _counters.add(counter::items_planned);
-    _counters.add(e.k == klass::A ? counter::class_a_items : counter::class_b_items);
     _lanes[*index]->ready.push_back(item);
   }
   if (result.assigned.empty()) { _counters.add(counter::passes_noop); }
@@ -1269,12 +1390,13 @@ std::optional<std::size_t> preload_executor::staging_host(int gpu_device,
   }
   auto const numa_target = gpu_device >= 0 ? numa_of(gpu_device) : -1;
   auto const numa_origin = c.origin_gpu ? numa_of(*c.origin_gpu) : -1;
-  auto const device      = choose_staging_host(numa_target, c.origin_host, numa_origin);
-  if (device >= 0) {
-    if (auto const h = _store.host_index_of(device)) { return h; }
-  }
-  // No NUMA information: any HOST beats leaving the batch on DISK.
-  if (!_hosts.empty()) { return 0; }
+  auto const device      = choose_staging_host(numa_target, c.origin_host, numa_origin, [&](int d) {
+    return _store.host_index_of(d).has_value();
+  });
+  if (device >= 0) { return _store.host_index_of(device); }
+  bool const numa_known = numa_target >= 0 || numa_origin >= 0 || c.origin_host.value_or(-1) >= 0;
+  // Nothing known at all: any HOST beats leaving the batch on DISK.
+  if (!numa_known && !_hosts.empty()) { return 0; }
   return std::nullopt;
 }
 
@@ -1296,39 +1418,38 @@ bool preload_executor::needs_token(lane const& l, lane_item const& item) const n
   return takes_h2g_token(item.source, item.r.t.tier, l.kind == lane_kind::disk && l.gds);
 }
 
-bool preload_executor::takeable(lane const& l, lane_item const& item) const noexcept
+preload_executor::take_check preload_executor::check_take(lane const& l,
+                                                          lane_item const& item) const noexcept
 {
   auto const* c = _store.find(item.r.batch_id);
-  if (c == nullptr || !_store.plannable(*c)) { return false; }
-  if (_store.gated(item.r.t)) { return false; }
+  if (c == nullptr || !_store.plannable(*c)) { return take_check::blocked; }
+  if (_store.gated(item.r.t)) { return take_check::blocked; }
   if (item.r.t.tier == Tier::GPU) {
-    if (item.r.t.index >= _gpus.size()) { return false; }
+    if (item.r.t.index >= _gpus.size()) { return take_check::blocked; }
     auto const& g = _gpus[item.r.t.index];
-    // Board loads are an early filter only; the worker checks again.
-    if (held_off(*_board, g.device)) { return false; }
+    if (held_off(*_board, g.device)) { return take_check::blocked; }
     if (sat_add(_store.inflight_bytes(item.r.t), item.est) > g.max_inflight_bytes) {
-      if (!item.counted_inflight) {
-        item.counted_inflight = true;
-        _counters.add(counter::refused_inflight);
-      }
-      return false;
+      return take_check::inflight;
     }
     if (needs_token(l, item) &&
         _store.h2g_tokens(item.r.t.index) >= static_cast<std::uint32_t>(g.h2g_cap)) {
-      return false;
+      return take_check::blocked;
     }
-    return true;
+    return take_check::ok;
   }
-  if (item.r.t.index >= _hosts.size()) { return false; }
-  return std::none_of(_hosts[item.r.t.index].local_gpus.begin(),
-                      _hosts[item.r.t.index].local_gpus.end(),
-                      [&](std::size_t gi) { return held_off(*_board, _gpus[gi].device); });
+  if (item.r.t.index >= _hosts.size()) { return take_check::blocked; }
+  auto const& local  = _hosts[item.r.t.index].local_gpus;
+  bool const pressed = std::any_of(local.begin(), local.end(), [&](std::size_t gi) {
+    return held_off(*_board, _gpus[gi].device);
+  });
+  return pressed ? take_check::blocked : take_check::ok;
 }
 
 bool preload_executor::has_takeable(lane const& l) const noexcept
 {
-  return std::any_of(
-    l.ready.begin(), l.ready.end(), [&](lane_item const& item) { return takeable(l, item); });
+  return std::any_of(l.ready.begin(), l.ready.end(), [&](lane_item const& item) {
+    return check_take(l, item) == take_check::ok;
+  });
 }
 
 std::optional<preload_executor::taken_job> preload_executor::take_first_takeable(lane& l)
@@ -1338,7 +1459,12 @@ std::optional<preload_executor::taken_job> preload_executor::take_first_takeable
       it = l.ready.erase(it);
       continue;
     }
-    if (!takeable(l, *it)) {
+    auto const check = check_take(l, *it);
+    if (check != take_check::ok) {
+      if (check == take_check::inflight && !it->counted_inflight) {
+        it->counted_inflight = true;
+        _counters.add(counter::refused_inflight);
+      }
       ++it;
       continue;
     }
@@ -1346,6 +1472,10 @@ std::optional<preload_executor::taken_job> preload_executor::take_first_takeable
     auto const item = *it;
     it              = l.ready.erase(it);
     if (!job) { continue; }
+    // Counted per job handed to a worker, not per plan: passes re-plan the same items.
+    _counters.add(counter::items_planned);
+    _counters.add(job->k == klass::A ? counter::class_a_items : counter::class_b_items);
+    if (job->t.tier == Tier::HOST) { _counters.add(counter::staging_items); }
     return taken_job{std::move(*job), item, needs_token(l, item)};
   }
   return std::nullopt;
@@ -1364,19 +1494,34 @@ void preload_executor::lane_loop(lane& l, std::stop_token const& st) noexcept
     }
   }
   std::unique_lock lk{_mu};
-  for (;;) {
-    l.cv.wait(lk, st, [&] { return l.active < l.effective_cap && has_takeable(l); });
-    if (st.stop_requested()) { return; }
+  while (!st.stop_requested()) {
+    // Looking for work also counts the items it finds over the in-flight cap, once each; the
+    // wait predicate itself has no side effects.
     std::optional<taken_job> taken;
-    try {
-      taken = take_first_takeable(l);
-    } catch (...) {
-      l.ready.clear();
-      log_unexpected("take");
-      _quiescent_cv.notify_all();
+    if (l.active < l.effective_cap) {
+      try {
+        taken = take_first_takeable(l);
+      } catch (...) {
+        l.ready.clear();
+        log_unexpected("take");
+        _quiescent_cv.notify_all();
+      }
+    }
+    if (!taken) {
+      // Also wake for an item newly over the in-flight cap, so that the next look counts it.
+      l.cv.wait(lk, st, [&] {
+        return l.active < l.effective_cap &&
+               std::any_of(
+                 l.ready.begin(),
+                 l.ready.end(),
+                 [&](lane_item const& item) {
+                   auto const check = check_take(l, item);
+                   return check == take_check::ok ||
+                          (check == take_check::inflight && !item.counted_inflight);
+                 });
+      });
       continue;
     }
-    if (!taken) { continue; }
 
     lane_slot slot{*this, l, *taken};
     lk.unlock();
@@ -1385,15 +1530,7 @@ void preload_executor::lane_loop(lane& l, std::stop_token const& st) noexcept
     auto const us      = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - started)
                       .count();
-    lk.lock();
-    slot.release();
-
-    apply_result(l, *taken, result);
-    if (result.outcome == promotion_outcome::promoted) {
-      auto const [sum, max] = timing_counters(result.kind);
-      _counters.add(sum, static_cast<std::uint64_t>(us));
-      _counters.raise(max, static_cast<std::uint64_t>(us));
-    }
+    // Logged before taking the lock again: event hooks wait on it.
     log::log_noexcept([&] {
       SIRIUS_LOG_TRACE("[preload][{}:{}] batch={} q={} klass={} {}->{} bytes={} us={} outcome={}",
                        tier_name(taken->job.t.tier),
@@ -1407,29 +1544,70 @@ void preload_executor::lane_loop(lane& l, std::stop_token const& st) noexcept
                        us,
                        outcome_name(result.outcome));
     });
-    mark_dirty(dirty::lane_done);
+    lk.lock();
+    slot.release();
+
+    bool const first_failure = apply_result(*taken, result);
+    if (result.outcome == promotion_outcome::promoted) {
+      auto const [sum, max] = timing_counters(result.kind);
+      _counters.add(sum, static_cast<std::uint64_t>(us));
+      _counters.raise(max, static_cast<std::uint64_t>(us));
+    }
+    if (replan_after(taken->job, result.outcome)) { mark_dirty(dirty::lane_done); }
     // A freed slot, token or in-flight budget may let any lane take more.
     notify_lanes_with_work();
     _quiescent_cv.notify_all();
-  }
-}
-
-void preload_executor::apply_result(lane const&,
-                                    taken_job const& taken,
-                                    promotion_result const& result) noexcept
-{
-  try {
-    auto const effect = _store.apply_outcome(taken.job, result);
-    purge_ready_items(taken.job.t, effect.purge);
-    if (effect.first_failure_in_query) {
+    if (first_failure) {
+      lk.unlock();
       log::log_noexcept([&] {
         SIRIUS_LOG_WARN(
           "[preload] query {}: promotion of batch {} failed; further failures of this query are "
           "logged at DEBUG",
-          taken.job.query,
-          taken.job.batch_id);
+          taken->job.query,
+          taken->job.batch_id);
       });
+      lk.lock();
     }
+  }
+}
+
+bool preload_executor::replan_after(promotion_job const& job,
+                                    promotion_outcome outcome) const noexcept
+{
+  switch (outcome) {
+    // A lock refusal waits for the next queue event, unless one came during the attempt: the
+    // pass it ran could not plan an in-flight candidate.
+    case promotion_outcome::contended:
+      return _room_refused || _store.queue_epoch() != job.queue_epoch_at_take;
+    // These only dropped the candidate (or, unsupported, parked it for good). Nothing a pass
+    // reads changed but the job's released in-flight bytes, which matter only if the last pass
+    // refused an item for room.
+    case promotion_outcome::unsupported:
+    case promotion_outcome::retired:
+    case promotion_outcome::expired:
+    case promotion_outcome::already_resident:
+    case promotion_outcome::failed: return _room_refused;
+    // A staged batch can go on to its GPU; a new location, a ban or a doubled estimate changes
+    // the candidate's target; a gate may send DISK items to HOST instead; and the event that
+    // ends a hold-off may have come during the attempt, while the candidate could not be planned.
+    case promotion_outcome::held_off:
+    case promotion_outcome::promoted:
+    case promotion_outcome::stale:
+    case promotion_outcome::too_big:
+    case promotion_outcome::oom:
+    case promotion_outcome::no_memory:
+    case promotion_outcome::gated: break;
+  }
+  return true;
+}
+
+bool preload_executor::apply_result(taken_job const& taken, promotion_result const& result) noexcept
+{
+  bool first_failure = false;
+  try {
+    auto const effect = _store.apply_outcome(taken.job, result);
+    purge_ready_items(taken.job.t, effect.purge);
+    first_failure = effect.first_failure_in_query;
   } catch (...) {
     _store.drop_candidate_noexcept(taken.job.batch_id);
     log_unexpected("outcome");
@@ -1448,6 +1626,7 @@ void preload_executor::apply_result(lane const&,
       // The test log is best effort.
     }
   }
+  return first_failure;
 }
 
 void preload_executor::purge_ready_items(target t, purge_scope scope) noexcept
@@ -1548,6 +1727,12 @@ std::size_t preload_executor::outstanding_bytes_for_testing(std::size_t gpu) con
 {
   std::lock_guard const lk{_mu};
   return _store.outstanding_bytes(gpu);
+}
+
+std::size_t preload_executor::outstanding_speculative_bytes_for_testing(std::size_t gpu) const
+{
+  std::lock_guard const lk{_mu};
+  return _store.outstanding_b_bytes(gpu);
 }
 
 std::vector<int> preload_executor::lane_threads_for_testing() const
