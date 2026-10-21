@@ -213,11 +213,15 @@ void readahead_scan_manager::stop() noexcept
   // below describes a settled query (the stopped gatekeeper gives up every wait at once,
   // so it cannot drain for us).  Bounded: an IO that never completes must not hold up
   // teardown.
-  constexpr auto k_device_drain = std::chrono::milliseconds{200};
-  auto const deadline           = std::chrono::steady_clock::now() + k_device_drain;
-  while (_device_inflight.load(std::memory_order_acquire) > 0 &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  // Skipped once the summary is out or when only the destructor is stopping us: completions can
+  // no longer lock the manager then, so the count would never fall.
+  if (!_summary_logged.load(std::memory_order_acquire) && !weak_from_this().expired()) {
+    constexpr auto k_device_drain = std::chrono::milliseconds{200};
+    auto const deadline           = std::chrono::steady_clock::now() + k_device_drain;
+    while (_device_inflight.load(std::memory_order_acquire) > 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
   }
   // One line per query, on the way down: the manager is per-query, so this is
   // the last moment its counters describe a whole query and nothing else.  Once:
@@ -518,10 +522,10 @@ bool readahead_scan_manager::try_issue_device(prefetch_candidate const& candidat
         // resurrect it.
         if (auto self = weak.lock()) { self->on_device_prefetch_complete(op_id, split, result); }
       });
-  } catch (std::exception const& e) {
+  } catch (...) {
     // Building the callback may allocate; issue() itself reports failures as outcomes.
     _device_inflight.fetch_sub(1, std::memory_order_release);
-    SIRIUS_LOG_WARN("[readahead] device prefetch attempt abandoned: {}", e.what());
+    SIRIUS_LOG_WARN("[readahead] device prefetch attempt abandoned: callback setup failed");
     return false;
   }
 
