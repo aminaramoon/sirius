@@ -28,6 +28,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <cstdint>
 #include <format>
 #include <memory>
 #include <optional>
@@ -69,28 +70,55 @@ namespace detail {
 }
 
 /**
+ * @brief Throw a descriptive error when @p data is encoded and no decoder can turn it into a
+ *        gpu_table_representation; a no-op for every other representation.
+ *
+ * Run before any conversion or clone of the batch, so a missing decoder surfaces with the
+ * encoding name instead of the converter registry's type-name error, and the batch is untouched.
+ *
+ * @throws std::runtime_error if @p data is an encoded_data_representation and no
+ *         encoded_data_representation -> gpu_table_representation converter is registered.
+ */
+inline void require_decoder_if_encoded(const cucascade::idata_representation& data,
+                                       const cucascade::representation_converter_registry& registry,
+                                       const cucascade::memory::memory_space& target_space,
+                                       uint64_t batch_id)
+{
+  if (!is_encoded_representation(&data) ||
+      registry.has_converter_for<cucascade::gpu_table_representation>(data)) {
+    return;
+  }
+  const auto& encoded = data.cast<cucascade::encoded_data_representation>();
+  throw std::runtime_error(
+    std::format("lock_and_prepare_batch: batch {} holds encoded data (encoding '{}', version {}) "
+                "on GPU {} but no encoded_data_representation -> gpu_table_representation "
+                "decoder is registered to prepare it for GPU {}",
+                batch_id,
+                encoded.get_metadata().encoding,
+                encoded.get_metadata().version,
+                encoded.get_memory_space().get_device_id(),
+                target_space.get_device_id()));
+}
+
+/**
  * @brief Decode the encoded representation held under @p mut in place into a
  *        gpu_table_representation in @p target_space; the batch keeps its id.
  *
+ * @pre is_encoded_representation(mut.get_data()); checked, a violation throws std::bad_cast
+ *      before the batch is touched.
  * @throws std::runtime_error if no encoded_data_representation -> gpu_table_representation
  *         converter is registered. The batch is left unchanged.
+ * @throws rmm::out_of_memory (or whatever the decoder throws) if decoding fails. The encoded
+ *         representation stays installed.
  */
 inline void decode_encoded_in_place(cucascade::mutable_data_batch& mut,
                                     cucascade::representation_converter_registry& registry,
                                     const cucascade::memory::memory_space& target_space,
                                     ::cuda::stream_ref stream)
 {
-  const auto& encoded = static_cast<const cucascade::encoded_data_representation&>(*mut.get_data());
-  if (!registry.has_converter_for<cucascade::gpu_table_representation>(encoded)) {
-    throw std::runtime_error(
-      std::format("lock_and_prepare_batch: batch {} holds encoded data (encoding '{}', version {}) "
-                  "on GPU {} but no encoded_data_representation -> "
-                  "gpu_table_representation decoder is registered",
-                  mut.get_batch_id(),
-                  encoded.get_metadata().encoding,
-                  encoded.get_metadata().version,
-                  target_space.get_device_id()));
-  }
+  const auto& data = *mut.get_data();
+  static_cast<void>(data.cast<cucascade::encoded_data_representation>());  // checks the @pre
+  require_decoder_if_encoded(data, registry, target_space, mut.get_batch_id());
   mut.convert_to<cucascade::gpu_table_representation>(registry, &target_space, stream);
 }
 
@@ -104,6 +132,12 @@ inline void decode_encoded_in_place(cucascade::mutable_data_batch& mut,
  * - already in the target space: encoded bytes are decoded in place, anything else is used as is;
  * - on a different GPU: cloned (a GPU-resident batch is never moved cross-device);
  * - on HOST or DISK: converted in place (move), freeing the spilled copy.
+ *
+ * Encoded data on a different GPU is cloned through the same decoder, so a missing decoder is
+ * reported by require_decoder_if_encoded before the clone. The returned shared lock is acquired
+ * after the exclusive lock is released (again not atomic): a concurrent downgrade may move the
+ * batch out of @p target_space in between, so the caller can end up holding a shared lock on a
+ * batch outside @p target_space.
  */
 [[nodiscard]] inline lock_and_prepare_batch_result prepare_for_gpu_under_exclusive_lock(
   const std::shared_ptr<cucascade::data_batch>& batch,
@@ -127,6 +161,8 @@ inline void decode_encoded_in_place(cucascade::mutable_data_batch& mut,
       // (that would steal it from the device that just materialized it) — clone instead. The
       // clone happens under the exclusive lock we already hold; pinning the state here avoids
       // yet another non-atomic lock transition.
+      require_decoder_if_encoded(
+        *mut_accessor.get_data(), registry, target_space, mut_accessor.get_batch_id());
       // TODO(dhruv9vats): attach a DataBatch probe so compute IDs resolve to a traced clone.
       auto clone = mut_accessor.clone_to<cucascade::gpu_table_representation>(
         registry, sirius::get_next_batch_id(), &target_space, stream);
@@ -184,7 +220,7 @@ inline void decode_encoded_in_place(cucascade::mutable_data_batch& mut,
  * @return A read_only_data_batch holding the shared lock (on the clone for cross-GPU inputs),
  *         or std::nullopt on failure.
  * @throws rmm::out_of_memory  If a GPU memory allocation fails during the conversion or clone.
- * @throws std::runtime_error  If encoded data in the target GPU space has no registered decoder.
+ * @throws std::runtime_error  If encoded data bound for a GPU target has no registered decoder.
  */
 inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
@@ -250,6 +286,8 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
         // INT64 offsets promotion of host->GPU reconstruction, and a GPU->GPU copy preserves the
         // source's column types (a GPU-resident source is already normalized — the same-space
         // fast path above depends on that invariant).
+        detail::require_decoder_if_encoded(
+          *read_accessor.get_data(), registry, *target_space, read_accessor.get_batch_id());
         // TODO(dhruv9vats): attach a DataBatch probe so compute IDs resolve to a traced clone.
         auto clone = read_accessor.clone_to<cucascade::gpu_table_representation>(
           registry, get_next_batch_id(), target_space, stream);
