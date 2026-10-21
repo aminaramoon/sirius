@@ -3123,6 +3123,56 @@ class lifetime_probe_representation final : public cucascade::idata_representati
   std::function<void()> _on_destroy;
 };
 
+/**
+ * Registers query @p q with one repository of two GPU partitions that @p consumer drains one per
+ * task, all on the first GPU, and tracks it in preload with every promotion held at @p gate. The
+ * context's own downgrade executor then spills both partitions and reports them; preload brings
+ * back the partition after the one the creator drains next and is held inside that copy.
+ * @p stream, @p consumer and @p gate must outlive the context.
+ * @return The two partitions.
+ */
+std::vector<std::weak_ptr<cucascade::data_batch>> hold_preload_promotion(
+  duckdb::SiriusContext& ctx,
+  sirius::query_id_t q,
+  rmm::cuda_stream const& stream,
+  preload_partition_consumer& consumer,
+  preload_promotion_gate& gate)
+{
+  using namespace std::chrono_literals;
+  auto* preload = ctx.get_preload_executor();
+  REQUIRE(preload != nullptr);
+  auto& gpu = first_gpu(ctx);
+
+  ctx.get_query_lifecycle_registry().open_query(q);
+  auto manager = ctx.get_data_repository_registry().create_for_query(q);
+  auto owned   = std::make_unique<cucascade::shared_data_repository>();
+  auto* repo   = owned.get();
+  std::vector<std::weak_ptr<cucascade::data_batch>> parts;
+  for (std::size_t p = 0; p < 2; ++p) {
+    auto batch = make_gpu_batch(gpu, ::cuda::stream_ref{stream.value()});
+    parts.push_back(batch);
+    repo->add_data_batch(std::move(batch), p);
+  }
+  manager->add_new_repository(1, "out", std::move(owned));
+  manager.reset();  // the registry owns the repositories
+  consumer.set_placement(std::make_shared<sirius::op::partition_placement const>(
+    sirius::op::partition_placement::round_robin(2, {gpu.get_device_id()})));
+  sirius::preload::repo_info info;
+  info.token              = reinterpret_cast<std::uintptr_t>(repo);
+  info.repo               = repo;
+  info.dest_priority      = sirius::query_priority_bits(q) | 1;
+  info.partition_consumer = &consumer;
+  preload->prepare_for_query(q, {info}, {gpu.get_device_id()});
+  preload->set_promotion_hook_for_testing(
+    [&gate](sirius::preload::promotion_job const&) { gate.enter(); });
+
+  auto const freed =
+    ctx.get_downgrade_executor(gpu.get_id()).request_downgrade([] { return false; }).get();
+  REQUIRE(freed > 0);
+  REQUIRE(gate.wait_entered(1, 30s));
+  return parts;
+}
+
 }  // namespace
 
 TEST_CASE("SiriusContext creates the preload executor, its streams and its board only when enabled",
@@ -3141,8 +3191,6 @@ TEST_CASE("SiriusContext creates the preload executor, its streams and its board
       CHECK(
         streams.lock()->size() ==
         ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size());
-      // The context, the preload executor and the GPU executor share it.
-      CHECK(board.use_count() >= 3);
       CHECK(preload_threads() > 0);
     } else {
       CHECK(ctx->get_preload_executor() == nullptr);
@@ -3186,41 +3234,8 @@ TEST_CASE("SiriusContext terminate joins a preload promotion in flight",
   preload_promotion_gate gate;
   auto ctx = initialized_context(true, dir.path());
   finally open_gate{[&] { gate.release(); }};
-  auto* preload = ctx->get_preload_executor();
-  REQUIRE(preload != nullptr);
-  auto& gpu = first_gpu(*ctx);
-
-  // A query whose consumer drains one partition per task, all pinned to this GPU.
-  auto const q = sirius::make_query_id(424242);
-  ctx->get_query_lifecycle_registry().open_query(q);
-  auto manager = ctx->get_data_repository_registry().create_for_query(q);
-  auto owned   = std::make_unique<cucascade::shared_data_repository>();
-  auto* repo   = owned.get();
-  std::vector<std::weak_ptr<cucascade::data_batch>> parts;
-  for (std::size_t p = 0; p < 2; ++p) {
-    auto batch = make_gpu_batch(gpu, ::cuda::stream_ref{stream.value()});
-    parts.push_back(batch);
-    repo->add_data_batch(std::move(batch), p);
-  }
-  manager->add_new_repository(1, "out", std::move(owned));
-  manager.reset();  // the registry owns the repositories
-  consumer.set_placement(std::make_shared<sirius::op::partition_placement const>(
-    sirius::op::partition_placement::round_robin(2, {gpu.get_device_id()})));
-  sirius::preload::repo_info info;
-  info.token              = reinterpret_cast<std::uintptr_t>(repo);
-  info.repo               = repo;
-  info.dest_priority      = sirius::query_priority_bits(q) | 1;
-  info.partition_consumer = &consumer;
-  preload->prepare_for_query(q, {info}, {gpu.get_device_id()});
-  preload->set_promotion_hook_for_testing(
-    [&gate](sirius::preload::promotion_job const&) { gate.enter(); });
-
-  // The context's own downgrade executor spills both partitions and reports them; preload brings
-  // back the partition after the one the creator drains next, and is held inside that copy.
-  auto const freed =
-    ctx->get_downgrade_executor(gpu.get_id()).request_downgrade([] { return false; }).get();
-  REQUIRE(freed > 0);
-  REQUIRE(gate.wait_entered(1, 30s));
+  auto const parts =
+    hold_preload_promotion(*ctx, sirius::make_query_id(424242), stream, consumer, gate);
 
   auto terminating = std::async(std::launch::async, [&] { ctx->terminate(); });
   CHECK(terminating.wait_for(200ms) == std::future_status::timeout);  // joins the running copy
@@ -3233,9 +3248,63 @@ TEST_CASE("SiriusContext terminate joins a preload promotion in flight",
   CHECK(parts[1].expired());
 }
 
-TEST_CASE("SiriusContext keeps the preload streams past the repositories when terminate throws",
+TEST_CASE("SiriusContext query cleanup waits for a preload promotion in flight, then forgets",
           "[sirius][context][isolated_context][preload_context]")
 {
+  using namespace std::chrono_literals;
+  sirius::test::scratch_dir dir{"preload_context"};
+  // Outlive the context: the batches' buffers, the preload hook and its repository's consumer.
+  rmm::cuda_stream stream;
+  preload_partition_consumer consumer;
+  preload_promotion_gate gate;
+  sirius::test::scoped_recording_log_sink log("info");
+  auto ctx = initialized_context(true, dir.path());
+  finally open_gate{[&] { gate.release(); }};
+  auto* preload        = ctx->get_preload_executor();
+  auto const q         = sirius::make_query_id(424244);
+  auto const parts     = hold_preload_promotion(*ctx, q, stream, consumer, gate);
+  auto const summaries = [&] {
+    return std::ranges::count_if(log.sink().records(), [](auto const& r) {
+      return r.message.starts_with("[preload] query ") &&
+             r.message.find(": promoted h2g=") != std::string::npos;
+    });
+  };
+
+  // The cancellation path every execution window ends with: preload retires the query, then the
+  // work barrier waits for the copy, which holds the query's work lease.
+  auto cleanup = std::async(std::launch::async, [&] { ctx->run_mandatory_cleanup_for_testing(q); });
+  CHECK(cleanup.wait_for(200ms) == std::future_status::timeout);
+  CHECK_FALSE(parts[0].expired());
+  CHECK_FALSE(parts[1].expired());
+  CHECK(summaries() == 0);
+  gate.release();
+  REQUIRE(cleanup.wait_for(60s) == std::future_status::ready);
+  REQUIRE_NOTHROW(cleanup.get());
+
+  // The repositories were erased with the batches, and preload logged the query's summary once.
+  CHECK(parts[0].expired());
+  CHECK(parts[1].expired());
+  CHECK_FALSE(ctx->get_query_lifecycle_registry().state(q).has_value());
+  CHECK(summaries() == 1);
+
+  // The promotion's outcome landed after the query was retired: it updated no state of the query,
+  // so forgetting it again finds nothing to report, and nothing it promoted is tracked.
+  REQUIRE(preload->wait_until_quiescent_for_testing(30s));
+  preload->forget_query(q);
+  CHECK(summaries() == 1);
+  CHECK(preload->outstanding_bytes_for_testing(0) == 0);
+
+  // No lease was left behind: terminate()'s lifecycle clear() succeeds.
+  REQUIRE_NOTHROW(ctx->terminate());
+}
+
+TEST_CASE(
+  "SiriusContext unwinds after terminate throws, keeping the preload streams past the repositories",
+  "[sirius][context][isolated_context][preload_context]")
+{
+  bool enabled = false;
+  SECTION("preload enabled") { enabled = true; }
+  SECTION("preload disabled") { enabled = false; }
   sirius::test::scratch_dir dir{"preload_context"};
   // Declared before the context, whose destruction drops the probe and outlives the registry
   // this lease belongs to (its control block survives the registry).
@@ -3243,9 +3312,9 @@ TEST_CASE("SiriusContext keeps the preload streams past the repositories when te
   std::weak_ptr<sirius::preload::preload_streams const> streams;
   int probes_destroyed  = 0;
   bool streams_at_probe = false;
-  auto ctx              = initialized_context(true, dir.path());
+  auto ctx              = initialized_context(enabled, dir.path());
   streams               = ctx->preload_streams_for_testing();
-  REQUIRE_FALSE(streams.expired());
+  REQUIRE(streams.expired() == !enabled);
 
   auto const q    = sirius::make_query_id(424243);
   auto& lifecycle = ctx->get_query_lifecycle_registry();
@@ -3274,26 +3343,32 @@ TEST_CASE("SiriusContext keeps the preload streams past the repositories when te
   REQUIRE(leaked);
   REQUIRE_THROWS(ctx->terminate());
   // Preload was stopped before clear(); the repositories and the stream pools are untouched.
+  CHECK(ctx->is_initialized());
   CHECK(preload_threads() == 0);
   CHECK(probes_destroyed == 0);
-  CHECK_FALSE(streams.expired());
+  CHECK(streams.expired() == !enabled);
 
-  // The destructor's terminate() throws again; the members unwind in declaration order.
+  // The destructor runs terminate() a second time, which throws again at the same clear(); the
+  // members then unwind in declaration order.
   ctx.reset();
   CHECK(probes_destroyed == 1);
-  CHECK(streams_at_probe);
+  CHECK(streams_at_probe == enabled);
   CHECK(streams.expired());
 }
 
-TEST_CASE("SiriusContext initialize failure after preload start joins the preload threads",
+TEST_CASE("SiriusContext initialize failure after preload start stops and drops preload",
           "[sirius][context][isolated_context][preload_context]")
 {
   sirius::test::scratch_dir dir{"preload_context"};
-  auto const prev_threshold                  = cudf::get_allocate_host_as_pinned_threshold();
-  std::size_t threads_at_failure             = 0;
+  auto const prev_threshold      = cudf::get_allocate_host_as_pinned_threshold();
+  std::size_t threads_at_failure = 0;
+  std::weak_ptr<sirius::preload::preload_streams const> streams;
+  std::weak_ptr<sirius::memory::memory_wait_board const> board;
   auto ctx                                   = std::make_unique<duckdb::SiriusContext>();
   ctx->after_executor_start_hook_for_testing = [&] {
     threads_at_failure = preload_threads();
+    streams            = ctx->preload_streams_for_testing();
+    board              = ctx->memory_wait_board_for_testing();
     throw std::runtime_error("injected initialize failure");
   };
   REQUIRE_THROWS_WITH(ctx->initialize(preload_context_config(true, dir.path())),
@@ -3302,11 +3377,16 @@ TEST_CASE("SiriusContext initialize failure after preload start joins the preloa
   CHECK(threads_at_failure > 0);
   CHECK(cudf::get_allocate_host_as_pinned_threshold() == prev_threshold);
 
-  // Nothing stops them but the context's destruction, which joins them before the scheduler,
-  // the lifecycle and the publisher they borrow are destroyed.
-  CHECK(preload_threads() == threads_at_failure);
-  ctx.reset();
+  // The failure path stopped and dropped preload while the scheduler, the lifecycle and the
+  // publisher it borrows were still alive.
   CHECK(preload_threads() == 0);
+  CHECK(streams.expired());
+  CHECK(ctx->memory_wait_board_for_testing().expired());
+  // The scheduler's GPU executors, which the failure path leaves to the context's destruction,
+  // still hold the board.
+  CHECK_FALSE(board.expired());
+  ctx.reset();
+  CHECK(board.expired());
 }
 
 TEST_CASE("SiriusContext tracks and releases each query in the preload executor",
@@ -3363,7 +3443,8 @@ TEST_CASE("SiriusContext tracks and releases each query in the preload executor"
   auto const gpu_queries = static_cast<std::ptrdiff_t>(after.executions - before.executions);
   REQUIRE(gpu_queries == 2);
 
-  // Every query's cleanup forgets it in preload, which logs its summary then.
+  // Every query's cleanup forgets it in preload, which logs its summary then; preload logs one
+  // only for a query it tracked.
   if (enabled) {
     auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (count_lines("[preload] query ") < gpu_queries &&
@@ -3372,6 +3453,9 @@ TEST_CASE("SiriusContext tracks and releases each query in the preload executor"
     }
     CHECK(count_lines("[preload] query ") == gpu_queries);
   }
+  CHECK(std::ranges::count_if(log.sink().records(), [](auto const& r) {
+          return r.message.find("not tracked") != std::string::npos;
+        }) == 0);
 
   // With nothing left behind, terminate()'s lifecycle clear() succeeds.
   con.reset();

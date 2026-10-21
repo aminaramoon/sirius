@@ -75,6 +75,7 @@ class preload_streams;
 }  // namespace sirius::preload
 
 namespace sirius::memory {
+class memory_wait_board;
 class numa_small_pinned_mr;
 using cucascade::memory::topology_index;
 }  // namespace sirius::memory
@@ -463,6 +464,10 @@ class SiriusContext : public ClientContextState {
                                             RebindQueryInfo current_rebind) final;
 
   /// \brief Initialize the Sirius context with the given configuration.
+  ///
+  /// On a throw, the preload executor is stopped and dropped, but other components it already
+  /// built or started stay until the context is destroyed: destroy a context whose initialize()
+  /// failed rather than initializing it again.
   void initialize(const sirius::parsed_sirius_config& config);
 
   /**
@@ -531,13 +536,20 @@ class SiriusContext : public ClientContextState {
   void before_cpu_replay_for_testing(ClientContext& context);
   /// Runs inside initialize() once the downgrade and preload executors are running, before the
   /// task creator, scan manager and scheduler start. A throw takes initialize()'s failure path
-  /// with those executors' threads live. Set before initialize(); test-only.
+  /// with those executors' threads live; that path stops and drops preload. Set before
+  /// initialize(); test-only.
   std::function<void()> after_executor_start_hook_for_testing;
-  /// The preload stream pools and the memory wait board; both empty when preload is disabled.
+  /// @brief The preload stream pools; empty when preload is disabled or the context is not
+  ///        initialized. Test-only.
   [[nodiscard]] std::weak_ptr<sirius::preload::preload_streams const> preload_streams_for_testing()
     const noexcept;
+  /// @brief The memory wait board shared with the GPU executors; the context's reference is
+  ///        empty when preload is disabled or the context is not initialized. Test-only.
   [[nodiscard]] std::weak_ptr<sirius::memory::memory_wait_board const>
   memory_wait_board_for_testing() const noexcept;
+  /// @brief Run @p query_id's mandatory cleanup (retire its work, then release its state) outside
+  ///        an execution window, as a window's end does. May throw. Test-only.
+  std::size_t run_mandatory_cleanup_for_testing(sirius::query_id_t query_id);
 
   /// \brief Whether the given connection is inside an internal-query bracket.
   [[nodiscard]] static bool is_internal_query_active(ClientContext& context) noexcept;
@@ -749,6 +761,7 @@ class SiriusContext : public ClientContextState {
   get_downgrade_executors() const;
 
   /// \brief The preload executor, or nullptr when @c executor.preload.enabled is false.
+  /// \throws std::runtime_error if the context is not initialized.
   [[nodiscard]] sirius::preload::preload_executor* get_preload_executor() const;
 
   /// @brief Check whether cudaDeviceEnablePeerAccess succeeded for the given
@@ -1014,8 +1027,9 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   // Null unless preload is enabled. Borrows the scheduler's task queue, the lifecycle registry,
-  // the memory manager and the publisher, so it is declared after them: if initialize() throws
-  // once it has started, its destructor joins its threads before any of those is destroyed.
+  // the memory manager and the publisher, so it is declared after them: even when it outlives a
+  // throwing initialize() or terminate(), its destructor joins its threads before any of those is
+  // destroyed.
   std::unique_ptr<sirius::preload::preload_executor> preload_executor_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;

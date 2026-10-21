@@ -649,6 +649,7 @@ std::size_t SiriusContext::release_query_state(sirius::query_id_t query_id, bool
     }
   }
   // Its repositories are gone: preload forgets the query and re-plans for the memory freed.
+  // A throw above skips this; drop_query_runtime_state_best_effort() then forgets the query.
   if (preload_executor_) { preload_executor_->forget_query(query_id); }
 
   // Drop scan-manager providers for this query. Repositories are already
@@ -709,6 +710,10 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   } catch (...) {
     // Health was latched by the caller. Resources remain owned until terminate().
   }
+  // Preload keeps only weak references and raw pointers it never uses once the query is
+  // forgotten, so it can drop the query (and its retired statistics) even though the
+  // repositories stay registered until terminate().
+  if (preload_executor_) { preload_executor_->forget_query(query_id); }
 }
 
 SiriusContext::SlotGuard::SlotGuard(SiriusContext& ctx, ClientContext& context) : ctx_(ctx)
@@ -898,6 +903,19 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
       if (!dismissed) { self->restore_cudf_pinned_memory_resource(); }
     }
   } pinned_rollback{this};
+  // Destroyed first on a throw: stop the preload threads (joined by the executor's destructor)
+  // while cuDF's pinned resource is still installed, and leave no preload state behind.
+  struct preload_rollback_guard {
+    SiriusContext* self;
+    bool dismissed = false;
+    ~preload_rollback_guard()
+    {
+      if (dismissed) { return; }
+      self->preload_executor_.reset();
+      self->preload_streams_.reset();
+      self->memory_wait_board_.reset();
+    }
+  } preload_rollback{this};
 
   auto quent_context = sirius::telemetry::make_quent_context(config.get_telemetry_config());
   cucascade::memory::topology_discovery discovery;
@@ -1216,12 +1234,16 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   scan_manager_->start();
   task_scheduler_->start();
 
-  is_initialized_           = true;
-  pinned_rollback.dismissed = true;
+  is_initialized_            = true;
+  preload_rollback.dismissed = true;
+  pinned_rollback.dismissed  = true;
 }
 
 void SiriusContext::terminate()
 {
+  // A terminate() that throws leaves the context initialized, and ~SiriusContext runs it again:
+  // every step before the throw must therefore be safe to repeat (stops, resets and the cuDF
+  // pinned-resource restore are idempotent). The lifecycle clear() test relies on this.
   throw_if_not_initialized();
   query_lifecycle_.quiesce_all();
 
@@ -1383,6 +1405,12 @@ SiriusContext::memory_wait_board_for_testing() const noexcept
   return memory_wait_board_;
 }
 
+std::size_t SiriusContext::run_mandatory_cleanup_for_testing(sirius::query_id_t query_id)
+{
+  throw_if_not_initialized();
+  return run_mandatory_cleanup(query_id, "test");
+}
+
 sirius::creator::task_creator& SiriusContext::get_task_creator()
 {
   throw_if_not_initialized();
@@ -1467,6 +1495,8 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
         query_id, *query, task_creator_->get_active_gpu_ids(query_id));
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN("[preload] query {}: not tracked: {}", query_id, e.what());
+    } catch (...) {
+      SIRIUS_LOG_WARN("[preload] query {}: not tracked: unknown error", query_id);
     }
   }
   return query;
