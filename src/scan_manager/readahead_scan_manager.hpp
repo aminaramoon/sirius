@@ -436,6 +436,8 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// when it did not issue or when the completion has released the ticket.  @ref stop waits on
   /// it, because the gatekeeper's own drain is cut short once the gate is stopped.
   std::atomic<int> _device_inflight{0};
+  /// Set by the first @ref stop, which logs the query's summary line.
+  std::atomic<bool> _summary_logged{false};
 
   /// This query's readahead outcomes; see @ref readahead_counters.
   readahead_counters _counters;

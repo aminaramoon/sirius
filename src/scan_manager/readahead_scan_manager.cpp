@@ -220,8 +220,9 @@ void readahead_scan_manager::stop() noexcept
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
   // One line per query, on the way down: the manager is per-query, so this is
-  // the last moment its counters describe a whole query and nothing else.
-  SIRIUS_LOG_INFO("[readahead] {}", summary());
+  // the last moment its counters describe a whole query and nothing else.  Once:
+  // the query's drain stops the manager and its destructor stops it again.
+  if (!_summary_logged.exchange(true)) { SIRIUS_LOG_INFO("[readahead] {}", summary()); }
 }
 
 std::string readahead_scan_manager::summary() const
