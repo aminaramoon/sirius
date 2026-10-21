@@ -894,20 +894,26 @@ TEST_CASE("Sirius configuration accepts intentional compression retention fracti
   require_fraction("valid_compression_fraction_above_one.yaml", 1.5);
 }
 
-TEST_CASE("Sirius configuration keeps task creation policy internal", "[sirius][config]")
+TEST_CASE("Sirius configuration reads task creator strategy and priority_order", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
   auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
 
-  SECTION("explicit strategy is rejected with removal guidance")
+  SECTION("explicit strategy: lookahead is accepted")
+  {
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_task_creator_strategy_lookahead.yaml"));
+    CHECK(config.get_task_creator_config().strategy == sirius::creator::request_type::lookahead);
+    CHECK(config.get_task_creator_config().priority == sirius::creator::priority_order::source);
+  }
+
+  SECTION("unknown strategy value is rejected")
   {
     sirius::sirius_config config;
     REQUIRE_THROWS_WITH(
-      config.load_from_file(data_dir / "invalid_task_creator_strategy.yaml"),
-      Catch::Matchers::ContainsSubstring("sirius.executor.task_creator.strategy") &&
-        Catch::Matchers::ContainsSubstring("removed") &&
-        Catch::Matchers::ContainsSubstring("remove this key"));
-    CHECK(config.get_task_creator_config().strategy == sirius::creator::request_type::active);
+      config.load_from_file(data_dir / "invalid_task_creator_strategy_value.yaml"),
+      Catch::Matchers::ContainsSubstring("strategy") &&
+        Catch::Matchers::ContainsSubstring("invalid enum value 'eager'"));
   }
 
   SECTION("omitted strategy retains the active demand-driven default")
@@ -918,15 +924,13 @@ TEST_CASE("Sirius configuration keeps task creation policy internal", "[sirius][
     CHECK(config.get_task_creator_config().priority == sirius::creator::priority_order::source);
   }
 
-  SECTION("explicit priority order is rejected with removal guidance")
+  SECTION("explicit priority_order: sink is accepted")
   {
     sirius::sirius_config config;
-    REQUIRE_THROWS_WITH(
-      config.load_from_file(data_dir / "invalid_task_creator_priority_order.yaml"),
-      Catch::Matchers::ContainsSubstring("sirius.executor.task_creator.priority_order") &&
-        Catch::Matchers::ContainsSubstring("removed") &&
-        Catch::Matchers::ContainsSubstring("remove this key"));
-    CHECK(config.get_task_creator_config().priority == sirius::creator::priority_order::source);
+    REQUIRE_NOTHROW(
+      config.load_from_file(data_dir / "valid_task_creator_priority_order_sink.yaml"));
+    CHECK(config.get_task_creator_config().priority == sirius::creator::priority_order::sink);
+    CHECK(config.get_task_creator_config().strategy == sirius::creator::request_type::active);
   }
 }
 

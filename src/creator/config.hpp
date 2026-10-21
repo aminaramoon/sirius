@@ -96,13 +96,14 @@ struct task_creator_config {
   exec::thread_pool_config thread_pool{.num_threads        = default_task_creator_num_threads,
                                        .thread_name_prefix = "task_creator"};
 
-  /// Internal policy for servicing scheduling requests. The current default is active
-  /// (demand-driven only); lookahead remains available to engine-controlled policy.
+  /// Most speculative request type the task creator may use
+  /// (`sirius.executor.task_creator.strategy`). `active` is demand-driven only; `lookahead`
+  /// additionally warms up not-yet-activated scans one task at a time.
   request_type strategy{request_type::active};
 
-  /// Internal within-branch scheduling priority, consumed by compute_pipeline_priorities.
-  /// The current engine policy keeps plan order (head/scan first); sink remains available to a
-  /// future engine-controlled policy.
+  /// Within-branch scheduling priority, consumed by compute_pipeline_priorities
+  /// (`sirius.executor.task_creator.priority_order`). `source` keeps plan order (head/scan
+  /// first); `sink` dispatches the pipelines farthest from the scan first.
   priority_order priority{priority_order::source};
 };
 

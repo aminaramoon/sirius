@@ -304,12 +304,12 @@ hardware-derived exception described below:
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 1`). Task creation
-policy and within-branch priority are internal: Sirius currently creates tasks
-on demand and prioritizes source-side pipelines first. The former
-`sirius.executor.task_creator.strategy` and
-`sirius.executor.task_creator.priority_order` keys have been removed;
-configurations that still contain either key must delete it.
+Thread pool (default `num_threads: 1`) plus:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `strategy` | enum: `active`, `lookahead` | `active` | Most speculative request type the task creator may use. `active` is demand-driven only; `lookahead` additionally warms up not-yet-activated scans one task at a time when the task queue runs empty (see [task-creator.md](task-creator.md)). Values are lowercase. |
+| `priority_order` | enum: `source`, `sink` | `source` | Order in which the task creator prioritizes pipelines within a branch. `source`: pipelines closer to the scan run first (plan order); `sink`: pipelines closer to the sink run first. Values are lowercase. |
 
 ### `sirius.executor.pipeline`
 
