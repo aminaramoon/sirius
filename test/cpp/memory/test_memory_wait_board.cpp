@@ -56,7 +56,8 @@ TEST_CASE("memory_wait_board counts waiters and OOM tokens per device", "[memory
     CHECK(board->oom_pending(2) == 0);
 
     // The two counts are independent.
-    { auto t0 = board->hold_oom(0);
+    {
+      auto t0 = board->hold_oom(0);
       CHECK(board->oom_pending(0) == 1);
       CHECK(board->waiting(0) == 2);
     }
@@ -81,7 +82,9 @@ TEST_CASE("memory_wait_board holds move without double counting or double releas
     CHECK(a.device() == -1);  // NOLINT(bugprone-use-after-move)
     CHECK(b.active());
     CHECK(board->waiting(1) == 1);
-    { auto c = std::move(b); }
+    {
+      auto c = std::move(b);
+    }
     CHECK(board->waiting(1) == 0);
   }
 
@@ -155,10 +158,10 @@ TEST_CASE("memory_wait_board ignores devices outside its range", "[memory_wait_b
 
 TEST_CASE("memory_wait_board holds outlive the board's other owners", "[memory_wait_board]")
 {
-  auto board = std::make_shared<memory_wait_board>(0);
+  auto board                                = std::make_shared<memory_wait_board>(0);
   std::weak_ptr<memory_wait_board> observer = board;
-  auto token  = board->hold_oom(0);
-  auto waiter = board->enter_wait(0);
+  auto token                                = board->hold_oom(0);
+  auto waiter                               = board->enter_wait(0);
   board.reset();
   REQUIRE_FALSE(observer.expired());
   CHECK(observer.lock()->oom_pending(0) == 1);
@@ -188,8 +191,8 @@ TEST_CASE("memory_wait_board counts stay balanced under concurrent holds", "[mem
   for (int t = 0; t < threads; ++t) {
     workers.emplace_back([&board, t] {
       for (int i = 0; i < rounds; ++i) {
-        auto w   = board->enter_wait(t % 2);
-        auto tok = board->hold_oom((t + 1) % 2);
+        auto w     = board->enter_wait(t % 2);
+        auto tok   = board->hold_oom((t + 1) % 2);
         auto moved = std::move(w);
       }
     });

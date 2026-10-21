@@ -20,6 +20,7 @@
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "memory/memory_wait_board.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/executor_event_recorder.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
@@ -39,6 +40,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -715,4 +717,72 @@ TEST_CASE("Discarding a query's tasks releases their OOM tokens",
   CHECK(global_state->completed_count.load() == 0);
   f.executor->stop();
   CHECK(global_state->board->oom_pending(0) == 0);
+}
+
+TEST_CASE("A task that exhausts its OOM retries holds one token and releases it on failure",
+          "[gpu_pipeline_executor][oom][memory_wait_board]")
+{
+  oom_test_fixture f;
+  if (!f.setup(1, "oom-exhaust")) {
+    WARN("Skipping OOM token exhaustion test — no GPU available.");
+    return;
+  }
+  auto injections                       = std::make_shared<sirius::op::scan::test_injections>();
+  injections->gpu_task_retry_limit      = 3;
+  injections->gpu_task_retry_backoff_ms = 1;
+  f.completion->injections              = injections;
+
+  auto global_state = std::make_shared<oom_test_global_state>();
+  global_state->set_completion_handler(f.completion);
+  global_state->board = std::make_shared<sirius::memory::memory_wait_board>(0);
+  f.executor->set_memory_wait_board(global_state->board);
+
+  f.executor->start();
+  f.executor->schedule(std::make_unique<scripted_retry_task>(
+    0, make_empty_local_state(), global_state, /*always_oom=*/true));
+
+  // The failing attempt's task is destroyed, and its token released, after the error is reported.
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!f.completion->has_error() || global_state->board->oom_pending(0) != 0) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  CHECK(global_state->board->waiting(0) == 0);
+
+  sirius::test::retire_scheduler_query(
+    f.lifecycle, *f.executor, sirius::make_query_id(0), false, f.creator.get());
+  f.executor->stop();
+  CHECK(global_state->board->oom_pending(0) == 0);
+  CHECK(global_state->completed_count.load() == 0);
+
+  std::lock_guard<std::mutex> lock(global_state->attempts_mutex);
+  auto const& attempts = global_state->attempts;
+  // The first run plus one run per allowed retry.
+  REQUIRE(attempts.size() == 4);
+  CHECK_FALSE(attempts[0].holds_token);
+  CHECK(attempts[0].oom_pending == 0);
+  // Each further OOM carries the chain's one token over instead of adding another.
+  for (std::size_t i = 1; i < attempts.size(); ++i) {
+    INFO("attempt " << i);
+    CHECK(attempts[i].retry_count == i);
+    CHECK(attempts[i].holds_token);
+    CHECK(attempts[i].token_device == 0);
+    CHECK(attempts[i].oom_pending == 1);
+  }
+}
+
+TEST_CASE("The memory wait board cannot be replaced while the scheduler runs",
+          "[gpu_pipeline_executor][oom][memory_wait_board]")
+{
+  oom_test_fixture f;
+  if (!f.setup(1, "oom-board-set")) {
+    WARN("Skipping memory wait board setter test — no GPU available.");
+    return;
+  }
+  auto board = std::make_shared<sirius::memory::memory_wait_board>(0);
+  CHECK_NOTHROW(f.executor->set_memory_wait_board(board));
+  f.executor->start();
+  CHECK_THROWS_AS(f.executor->set_memory_wait_board(nullptr), std::logic_error);
+  f.executor->stop();
+  CHECK_NOTHROW(f.executor->set_memory_wait_board(nullptr));
 }

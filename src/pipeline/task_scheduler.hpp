@@ -36,6 +36,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace sirius::parallel {
@@ -139,10 +140,20 @@ class task_scheduler {
     }
   }
 
-  /// Install the board on which every GPU executor reports its stalled reserve phases and its
-  /// OOM-rescheduled tasks. Must be called before start(); null removes it.
+  /**
+   * @brief Install the board on which every GPU executor reports its stalled reserve phases and
+   *        its OOM-rescheduled tasks; null removes it.
+   *
+   * The executors are all created by the constructor, so every one of them receives the board.
+   *
+   * @pre The scheduler is not running.
+   * @throws std::logic_error if the scheduler is running.
+   */
   void set_memory_wait_board(std::shared_ptr<sirius::memory::memory_wait_board> board)
   {
+    if (_running.load(std::memory_order_acquire)) {
+      throw std::logic_error("task_scheduler: memory wait board set while running");
+    }
     for (auto& [_, executor] : _gpu_executors) {
       if (executor) { executor->set_memory_wait_board(board); }
     }
