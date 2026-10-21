@@ -594,27 +594,37 @@ TEST_CASE("multi_index visit_in_pop_order runs alongside concurrent pushes and p
   std::thread consumer([&] {
     int popped = 0;
     while (popped < kTasks) {
-      if (q.try_pop_from(gpu_index{popped % 2 == 0 ? 0 : 1})) { ++popped; }
-      if (q.try_pop_from(gpu_index{popped % 2 == 0 ? 1 : 0})) { ++popped; }
+      bool progressed = false;
+      if (q.try_pop_from(gpu_index{popped % 2 == 0 ? 0 : 1})) {
+        ++popped;
+        progressed = true;
+      }
+      if (q.try_pop_from(gpu_index{popped % 2 == 0 ? 1 : 0})) {
+        ++popped;
+        progressed = true;
+      }
+      if (!progressed) { std::this_thread::yield(); }
     }
     done.store(true);
   });
 
   // Every walk sees each bucket in non-decreasing priority order, whatever the interleaving.
+  // Assertions wait until both threads are joined: a throwing REQUIRE while they are still
+  // joinable would call std::terminate instead of reporting a test failure.
+  bool all_ordered = true;
   while (!done.load()) {
     for (device_key dev : {0, 1}) {
       queue_priority last = std::numeric_limits<queue_priority>::min();
-      bool ordered        = true;
       q.visit_in_pop_order(gpu_index{dev}, [&](const payload& p) {
-        ordered = ordered && p.keys.device_id == dev && p.keys.priority >= last;
-        last    = p.keys.priority;
+        all_ordered = all_ordered && p.keys.device_id == dev && p.keys.priority >= last;
+        last        = p.keys.priority;
         return true;
       });
-      REQUIRE(ordered);
     }
   }
   producer.join();
   consumer.join();
+  REQUIRE(all_ordered);
   REQUIRE(q.empty());
 }
 
