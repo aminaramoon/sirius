@@ -25,7 +25,7 @@ sirius:
     scan_manager:
       # One reactor keeps uring pinned staging at 64 MiB so it fits this
       # deliberately small host pool; the production default is 4.
-      uring_n_reactors: 1
+      uring_reactors_per_gpu: 1
   operator_params:
     enable_dense_count_join: true
   telemetry:

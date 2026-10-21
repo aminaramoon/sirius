@@ -35,10 +35,9 @@
 
 namespace sirius::scan_manager {
 
-/// Default uring reactor count (matches cuCascade's @c io_config::uring_n_reactors;
-/// one worker thread each);
-/// counted in the scan-manager sizing budget below.
-inline constexpr std::size_t default_uring_n_reactors = 4;
+/// Default uring reactors per GPU (matches cuCascade's @c io_config::uring_reactors_per_gpu;
+/// one worker thread each); counted once in the scan-manager sizing budget below.
+inline constexpr std::size_t default_uring_reactors_per_gpu = 1;
 
 /// Readahead budget the device tier falls back to when the serving backend
 /// publishes none and the pipeline width is not stamped (see
@@ -68,7 +67,7 @@ inline constexpr std::size_t default_device_readahead_budget = 4;
 {
   constexpr int reserved =
     exec::default_downgrade_num_threads + creator::default_task_creator_num_threads +
-    exec::default_gpu_pipeline_num_threads + static_cast<int>(default_uring_n_reactors);
+    exec::default_gpu_pipeline_num_threads + static_cast<int>(default_uring_reactors_per_gpu);
   return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
 }
 
@@ -235,13 +234,14 @@ struct scan_manager_config {
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::native};
 
-  /// Number of uring reactors for the local-disk IO path (each one worker thread
-  /// and one ring; each allocates its pinned staging at @c ioctx::start()).
-  std::size_t uring_n_reactors{default_uring_n_reactors};
+  /// uring reactors per GPU for the local-disk IO path (each one worker thread
+  /// and one ring, pinned to its GPU's local CPUs; each allocates its pinned
+  /// staging from its GPU's NUMA node at @c ioctx::start()).
+  std::size_t uring_reactors_per_gpu{default_uring_reactors_per_gpu};
 
-  /// Number of REST reactors for the S3/object-store IO path (each its own
-  /// io_uring ring + HTTP/1.1 connection pools).
-  std::size_t rest_n_reactors{2};
+  /// REST reactors per GPU for the S3/object-store IO path (each its own
+  /// io_uring ring + HTTP/1.1 connection pools, placed like the uring ones).
+  std::size_t rest_reactors_per_gpu{1};
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
@@ -330,13 +330,13 @@ struct scan_manager_config {
   [[nodiscard]] cucascade::io::io_config to_io_config() const
   {
     cucascade::io::io_config out{};
-    out.backend          = cucascade::io::io_backend::native;
-    out.uring_n_reactors = uring_n_reactors;
-    out.rest_n_reactors  = rest_n_reactors;
-    out.uring            = uring;
-    out.rest             = rest;
-    out.cache            = cache;
-    out.object_store     = object_store;
+    out.backend                = cucascade::io::io_backend::native;
+    out.uring_reactors_per_gpu = uring_reactors_per_gpu;
+    out.rest_reactors_per_gpu  = rest_reactors_per_gpu;
+    out.uring                  = uring;
+    out.rest                   = rest;
+    out.cache                  = cache;
+    out.object_store           = object_store;
     out.apply_cache_mode();
     return out;
   }

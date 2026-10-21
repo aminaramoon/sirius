@@ -116,8 +116,8 @@ void metadata_overwrite(cucascade::io::cache::cache_mode mode)
   cfg.cache.eviction                        = cucascade::io::cache::eviction_policy::lru;
   cfg.cache.min_prefetching_budget_fraction = 0.5;
   cfg.cache.eviction_threshold_fraction     = 1.0;
-  cfg.uring_n_reactors                      = 1;
-  cfg.rest_n_reactors                       = 1;
+  cfg.uring_reactors_per_gpu                = 1;
+  cfg.rest_reactors_per_gpu                 = 1;
   cfg.apply_cache_mode();
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius::scan_manager::sirius_scan_manager manager{

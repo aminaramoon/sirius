@@ -31,7 +31,7 @@ sirius:
     scan_manager:
       # Four reactors reserve 4 x 64 MiB = 256 MiB of pinned staging, which
       # overruns the 160 MB host pool above and makes reactor startup throw.
-      uring_n_reactors: 4
+      uring_reactors_per_gpu: 4
   telemetry:
     enable_quent: false
     output_directory: "/tmp/sirius_telemetry_config_test"

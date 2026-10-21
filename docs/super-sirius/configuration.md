@@ -93,7 +93,7 @@ sirius:
     scan_manager:
       num_threads: 4
       backend: native
-      uring_n_reactors: 4
+      uring_reactors_per_gpu: 4
       cache: { mode: none, eviction: lru }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
@@ -381,8 +381,8 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 4 uring reactor threads), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: `io_uring` for local paths, and REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://` reads, listing and glob expansion. cuCascade's cuFile (GDS) backend is not selectable here. `sirius` is a deprecated alias of `native`, still accepted. `kvikio` names the removed kvikIO backend: it still loads, as `native`, with a deprecation WARN. Values are lowercase. |
-| `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
-| `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pools. |
+| `uring_reactors_per_gpu` | int (**> 0**) | 1 | uring reactors per GPU for local-disk reads (4 GPUs and `1` give 4 reactors). Each reactor is one worker thread with its own io_uring ring and request queue, pinned to its GPU's local CPUs, and allocates its own pinned staging from the host memory space of its GPU's NUMA node when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). A device read goes to the reactors on its GPU's NUMA node unless they are much busier than the rest (cuCascade's `io_config::reactor_spill`). |
+| `rest_reactors_per_gpu` | int (**> 0**) | 1 | REST reactors per GPU for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pools, placed per GPU like the uring reactors. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones (or `eager` whatever the backend when `device_prefetching_fraction > 0`). Values are lowercase. |
 | `device_prefetching_fraction` | double [0,1] | 0 | Device tier of the readahead. `0` turns it off: the readahead only stages bytes in the pinned host cache. A positive value lets the readahead read a split's byte ranges straight into GPU buffers on the split's assigned GPU, ahead of its scan task, as long as that GPU space's consumed memory after admitting the split (limit − available: reservations plus allocations, by anyone, the same measure cuCascade's downgrade check uses) stays at or below this fraction of the space's reservation limit (`memory_space::get_max_memory()`); a split whose reservation is refused, that would take the space past this ceiling, or whose buffers cannot be allocated falls back to the host tier, and only these memory refusals make the device tier back off on that GPU until one of its splits is disposed (or 100 ms pass); a split too large for the GPU's parked window, or one that arrives while the window is full (see `device_prefetch_max_splits`), also falls back to the host tier but does not back off. Prefetched device bytes are invisible to the downgrade executor until their scan consumes them, so keep this fraction times the GPU's `reservation_limit_fraction` at or below its `downgrade_stop_fraction` (0.6 by default; a higher value is accepted with a warning). Setting it also enables the readahead on a local backend that publishes no budget (`uring.n_max_concurrent_scans: 0`): the budget then defaults to the pipeline width, an unset `readahead_strategy` to `eager`, and `cache.mode: none` no longer disables the readahead (reads go through the reactor's own staging). On such a local backend the host tier (pinned-cache staging) therefore also runs, eagerly, for every split the device tier refuses, although uring publishes no host readahead budget. `max_readahead_scans` / `readahead_strategy` still win when set. Works without a host cache — under `cache.mode: none`/`os`, or a `cucs` cache that failed to build, the host tier records `nothing_to_issue` for the splits the device tier refuses. Pair with `cache.eviction: prefetch` under `cache.mode: cucs`. See [Device-tier readahead](#device-tier-readahead). |
@@ -521,7 +521,7 @@ and transport use one trust policy; there are no separate REST YAML controls.
 
 Two REST values are deliberately not YAML keys. **Connections per reactor** are
 fixed at 64 per reactor per endpoint — the useful number is a property of one reactor thread, not of a
-deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
+deployment, and more concurrency comes from adding reactors (`rest_reactors_per_gpu`),
 each with its own thread and connection pools. **Physical GET size** is reactor-owned:
 each request's GETs are sized between 1 MiB and 32 MiB (`rest::config`
 `min_segment_bytes` / `max_segment_bytes`) from the endpoint's throughput estimate,
@@ -806,7 +806,7 @@ per-pool extras.
 | `task_creator` | `executor.task_creator` | 1 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
-| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO reactor threads are separate: `uring_n_reactors`, `rest_n_reactors`) |
+| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO reactor threads are separate: `uring_reactors_per_gpu`, `rest_reactors_per_gpu`) |
 | `preload_executor` | `executor.preload` | off; when enabled, 1 planner plus per-GPU and per-DISK lanes | `preload-*` | Moving downgraded batches back toward the GPU before their consumer runs |
 
 The task-creator, downgrade, and scan-manager pools and the preload executor support optional CPU

@@ -69,7 +69,7 @@ scan_manager_config make_s3_rest_config()
   cfg.object_store.tls_verify = false;
   cfg.rest.request_timeout_s  = 30;
   cfg.rest.max_connections    = 8;
-  cfg.rest_n_reactors         = 1;
+  cfg.rest_reactors_per_gpu   = 1;
   cfg.cache.mode              = cucascade::io::cache::cache_mode::none;
   return cfg;
 }

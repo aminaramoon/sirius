@@ -3000,7 +3000,7 @@ std::string preload_context_yaml(bool enabled, fs::path const& disk_dir)
       num_threads: 1
       monitor_period: 10ms
     scan_manager:
-      uring_n_reactors: 1
+      uring_reactors_per_gpu: 1
     preload:
       enabled: )" +
          (enabled ? "true" : "false") + R"(
