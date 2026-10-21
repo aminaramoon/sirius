@@ -258,7 +258,7 @@ struct promotion_fixture {
 /// Runs @p job on its own thread, as a preload lane does; the caller may hold batch locks.
 promotion_result promote_on_thread(promotion_job const& job, promotion_env const& env)
 {
-  return std::async(std::launch::async, [&] { return promote_one(job, env); }).get();
+  return std::async(std::launch::async, [&] { return promote_one(job, env, nullptr); }).get();
 }
 
 Tier tier_of(cucascade::data_batch& batch)
@@ -419,7 +419,7 @@ TEST_CASE("HOST to GPU keeps the batch, records a writer event and releases its 
   auto const baseline = f.gpu->get_total_reserved_memory();
   auto const seq_low  = sirius::g_conversion_seq.load();
 
-  auto const result = promote_one(f.job_for(batch, gpu_target), f.env());
+  auto const result = promote_one(f.job_for(batch, gpu_target), f.env(), nullptr);
 
   REQUIRE(result.outcome == promotion_outcome::promoted);
   CHECK(result.kind == promotion_kind::h2g);
@@ -471,7 +471,7 @@ TEST_CASE("DISK to GPU and DISK to HOST promote the batch in place", "[preload_p
     std::vector<int32_t> values;
     auto batch          = f.make_batch_in(*f.disk, &values);
     auto const baseline = f.gpu->get_total_reserved_memory();
-    auto const result   = promote_one(f.job_for(batch, gpu_target), f.env());
+    auto const result   = promote_one(f.job_for(batch, gpu_target), f.env(), nullptr);
     REQUIRE(result.outcome == promotion_outcome::promoted);
     CHECK(result.kind == promotion_kind::d2g);
     REQUIRE(tier_of(*batch) == Tier::GPU);
@@ -484,14 +484,14 @@ TEST_CASE("DISK to GPU and DISK to HOST promote the batch in place", "[preload_p
     std::vector<int32_t> values;
     auto batch               = f.make_batch_in(*f.disk, &values);
     auto const host_baseline = f.host->get_total_reserved_memory();
-    auto const staged        = promote_one(f.job_for(batch, host_target), f.env());
+    auto const staged        = promote_one(f.job_for(batch, host_target), f.env(), nullptr);
     REQUIRE(staged.outcome == promotion_outcome::promoted);
     CHECK(staged.kind == promotion_kind::d2h);
     REQUIRE(tier_of(*batch) == Tier::HOST);
     CHECK(repr_type_of(*batch) == typeid(cucascade::host_data_representation));
     CHECK(f.host->get_total_reserved_memory() == host_baseline);
 
-    auto const promoted = promote_one(f.job_for(batch, gpu_target), f.env());
+    auto const promoted = promote_one(f.job_for(batch, gpu_target), f.env(), nullptr);
     REQUIRE(promoted.outcome == promotion_outcome::promoted);
     CHECK(promoted.kind == promotion_kind::h2g);
     CHECK(promoted.conversion_seq > staged.conversion_seq);
@@ -514,7 +514,7 @@ TEST_CASE("an estimate below the true need succeeds by growing the reservation",
   REQUIRE(need > job.est_reserve);
   auto const baseline = f.gpu->get_total_reserved_memory();
 
-  auto const result = promote_one(job, f.env());
+  auto const result = promote_one(job, f.env(), nullptr);
 
   REQUIRE(result.outcome == promotion_outcome::promoted);
   CHECK(result.bytes == need);
@@ -540,7 +540,7 @@ TEST_CASE("the GPU estimate covers widening INT32 string offsets", "[preload_pro
     }
     auto job          = f.job_for(batch, gpu_target);
     job.est_reserve   = 1;
-    auto const result = promote_one(job, f.env());
+    auto const result = promote_one(job, f.env(), nullptr);
     REQUIRE(result.outcome == promotion_outcome::promoted);
     CHECK(result.bytes >= widened);
     CHECK(tier_of(*batch) == Tier::GPU);
@@ -577,7 +577,7 @@ TEST_CASE("a target above its ceiling gives gated and releases the reservation",
     auto const occupied = promotion_fixture::occupy(*f.gpu);
     auto const baseline = f.gpu->get_total_reserved_memory();
     job.ceiling         = consumed_bytes(f.gpu->get_max_memory(), f.gpu->get_available_memory());
-    CHECK(promote_one(job, f.env()).outcome == promotion_outcome::gated);
+    CHECK(promote_one(job, f.env(), nullptr).outcome == promotion_outcome::gated);
     CHECK(f.gpu->get_total_reserved_memory() == baseline);
     CHECK(tier_of(*batch) == Tier::HOST);
   }
@@ -589,7 +589,7 @@ TEST_CASE("a target above its ceiling gives gated and releases the reservation",
     auto const occupied = promotion_fixture::occupy(*f.host);
     auto const baseline = f.host->get_total_reserved_memory();
     job.ceiling         = consumed_bytes(f.host->get_max_memory(), f.host->get_available_memory());
-    CHECK(promote_one(job, f.env()).outcome == promotion_outcome::gated);
+    CHECK(promote_one(job, f.env(), nullptr).outcome == promotion_outcome::gated);
     CHECK(f.host->get_total_reserved_memory() == baseline);
     CHECK(tier_of(*batch) == Tier::DISK);
   }
@@ -615,10 +615,12 @@ TEST_CASE("a ceiling crossed after the reservation gives gated and releases the 
     job.est_reserve = need;  // no growth: only the late reservation crosses the ceiling
     job.ceiling     = consumed + need + (16ull << 20);
     std::unique_ptr<cucascade::memory::reservation> late;
-    auto const result = promote_one(job, f.env([&](promotion_job const&) {
-      late = f.gpu->make_reservation_or_null(64ull << 20);
-      CHECK(late != nullptr);
-    }));
+    auto const result = promote_one(job,
+                                    f.env([&](promotion_job const&) {
+                                      late = f.gpu->make_reservation_or_null(64ull << 20);
+                                      CHECK(late != nullptr);
+                                    }),
+                                    nullptr);
     CHECK(result.outcome == promotion_outcome::gated);
     late.reset();
   }
@@ -628,7 +630,7 @@ TEST_CASE("a ceiling crossed after the reservation gives gated and releases the 
     job.est_reserve = 1;
     job.ceiling     = consumed + (64ull << 10);
     REQUIRE(need > (64ull << 10));
-    CHECK(promote_one(job, f.env()).outcome == promotion_outcome::gated);
+    CHECK(promote_one(job, f.env(), nullptr).outcome == promotion_outcome::gated);
   }
 
   CHECK(f.gpu->get_total_reserved_memory() == baseline);
@@ -656,7 +658,7 @@ TEST_CASE("a reservation that cannot grow to the exact need gives no_memory", "[
   REQUIRE_FALSE(f.gpu->should_downgrade_memory());
   auto const baseline = f.gpu->get_total_reserved_memory();
 
-  CHECK(promote_one(job, f.env()).outcome == promotion_outcome::no_memory);
+  CHECK(promote_one(job, f.env(), nullptr).outcome == promotion_outcome::no_memory);
   CHECK(f.gpu->get_total_reserved_memory() == baseline);
   CHECK(tier_of(*batch) == Tier::HOST);
 }
@@ -671,7 +673,7 @@ TEST_CASE("out of memory is local to the candidate on a GPU and space-wide on HO
   {
     auto batch          = f.make_batch_in(*f.host);
     auto const baseline = f.gpu->get_total_reserved_memory();
-    CHECK(promote_one(f.job_for(batch, gpu_target), f.env(throw_oom)).outcome ==
+    CHECK(promote_one(f.job_for(batch, gpu_target), f.env(throw_oom), nullptr).outcome ==
           promotion_outcome::oom);
     CHECK(f.gpu->get_total_reserved_memory() == baseline);
     CHECK(tier_of(*batch) == Tier::HOST);
@@ -681,7 +683,7 @@ TEST_CASE("out of memory is local to the candidate on a GPU and space-wide on HO
   {
     auto batch          = f.make_batch_in(*f.disk);
     auto const baseline = f.host->get_total_reserved_memory();
-    CHECK(promote_one(f.job_for(batch, host_target), f.env(throw_oom)).outcome ==
+    CHECK(promote_one(f.job_for(batch, host_target), f.env(throw_oom), nullptr).outcome ==
           promotion_outcome::no_memory);
     CHECK(f.host->get_total_reserved_memory() == baseline);
     CHECK(tier_of(*batch) == Tier::DISK);
@@ -698,24 +700,26 @@ TEST_CASE("a stalled or OOM-pending task on the GPU gives held_off", "[preload_p
   SECTION("a waiter before the reservation")
   {
     auto waiter = f.board->enter_wait(0);
-    CHECK(promote_one(job, f.env()).outcome == promotion_outcome::held_off);
+    CHECK(promote_one(job, f.env(), nullptr).outcome == promotion_outcome::held_off);
   }
 
   SECTION("an OOM token before the reservation")
   {
     auto token = f.board->hold_oom(0);
-    CHECK(promote_one(job, f.env()).outcome == promotion_outcome::held_off);
+    CHECK(promote_one(job, f.env(), nullptr).outcome == promotion_outcome::held_off);
   }
 
   SECTION("a waiter that appears between the reservation and the copy")
   {
     std::optional<sirius::memory::memory_wait_board::waiter> waiter;
     int hook_calls    = 0;
-    auto const result = promote_one(job, f.env([&](promotion_job const& j) {
-      ++hook_calls;
-      CHECK(j.batch_id == job.batch_id);
-      waiter.emplace(f.board->enter_wait(0));
-    }));
+    auto const result = promote_one(job,
+                                    f.env([&](promotion_job const& j) {
+                                      ++hook_calls;
+                                      CHECK(j.batch_id == job.batch_id);
+                                      waiter.emplace(f.board->enter_wait(0));
+                                    }),
+                                    nullptr);
     CHECK(hook_calls == 1);
     CHECK(result.outcome == promotion_outcome::held_off);
   }
@@ -724,7 +728,7 @@ TEST_CASE("a stalled or OOM-pending task on the GPU gives held_off", "[preload_p
   {
     auto staged = f.make_batch_in(*f.disk);
     auto waiter = f.board->enter_wait(0);
-    CHECK(promote_one(f.job_for(staged, host_target), f.env()).outcome ==
+    CHECK(promote_one(f.job_for(staged, host_target), f.env(), nullptr).outcome ==
           promotion_outcome::held_off);
     CHECK(tier_of(*staged) == Tier::DISK);
   }
@@ -736,7 +740,8 @@ TEST_CASE("a stalled or OOM-pending task on the GPU gives held_off", "[preload_p
     std::optional<sirius::memory::memory_wait_board::waiter> waiter;
     auto const result =
       promote_one(f.job_for(staged, host_target),
-                  f.env([&](promotion_job const&) { waiter.emplace(f.board->enter_wait(0)); }));
+                  f.env([&](promotion_job const&) { waiter.emplace(f.board->enter_wait(0)); }),
+                  nullptr);
     CHECK(result.outcome == promotion_outcome::held_off);
     CHECK(tier_of(*staged) == Tier::DISK);
     CHECK(f.host->get_total_reserved_memory() == host_baseline);
@@ -756,7 +761,8 @@ TEST_CASE("a batch above the per-batch limit gives too_big", "[preload_promotion
   f.gpus.front().max_batch_bytes = 1;
   auto batch                     = f.make_batch_in(*f.host);
   auto const baseline            = f.gpu->get_total_reserved_memory();
-  CHECK(promote_one(f.job_for(batch, gpu_target), f.env()).outcome == promotion_outcome::too_big);
+  CHECK(promote_one(f.job_for(batch, gpu_target), f.env(), nullptr).outcome ==
+        promotion_outcome::too_big);
   CHECK(tier_of(*batch) == Tier::HOST);
   CHECK(f.gpu->get_total_reserved_memory() == baseline);
 }
@@ -799,7 +805,7 @@ TEST_CASE("a copy that overruns its reservation gives oom and keeps the source",
   for (std::uint32_t multiplier : {1u, 2u}) {
     auto job           = f.job_for(batch, gpu_target);
     job.oom_multiplier = multiplier;
-    CHECK(promote_one(job, f.env()).outcome == promotion_outcome::oom);
+    CHECK(promote_one(job, f.env(), nullptr).outcome == promotion_outcome::oom);
   }
   CHECK(decoder.calls->load() == 2);
   CHECK(batch->get_batch_id() == id);
@@ -825,7 +831,7 @@ TEST_CASE("encoded batches are staged by relocation and reach a GPU only through
     REQUIRE(tier_of(*batch) == Tier::DISK);
     auto const available_before = f.host->get_available_memory();
 
-    auto const result = promote_one(f.job_for(batch, host_target), f.env());
+    auto const result = promote_one(f.job_for(batch, host_target), f.env(), nullptr);
 
     REQUIRE(result.outcome == promotion_outcome::promoted);
     CHECK(result.kind == promotion_kind::relocate_d2h);
@@ -840,7 +846,7 @@ TEST_CASE("encoded batches are staged by relocation and reach a GPU only through
   SECTION("without a decoder an encoded batch never targets a GPU")
   {
     auto batch = make_encoded_host_batch(values, *f.host);
-    CHECK(promote_one(f.job_for(batch, gpu_target), f.env()).outcome ==
+    CHECK(promote_one(f.job_for(batch, gpu_target), f.env(), nullptr).outcome ==
           promotion_outcome::unsupported);
     CHECK(tier_of(*batch) == Tier::HOST);
     CHECK(repr_type_of(*batch) == typeid(cucascade::encoded_data_representation));
@@ -850,7 +856,7 @@ TEST_CASE("encoded batches are staged by relocation and reach a GPU only through
   {
     scoped_host_decoder decoder;
     auto batch        = make_encoded_host_batch(values, *f.host);
-    auto const result = promote_one(f.job_for(batch, gpu_target), f.env());
+    auto const result = promote_one(f.job_for(batch, gpu_target), f.env(), nullptr);
     REQUIRE(result.outcome == promotion_outcome::promoted);
     CHECK(result.kind == promotion_kind::h2g);
     REQUIRE(tier_of(*batch) == Tier::GPU);
@@ -885,9 +891,9 @@ TEST_CASE("retired queries, expired batches and moved or claimed batches are not
     auto batch = f.make_batch_in(*f.host);
     auto job   = f.job_for(batch, gpu_target);
     f.lifecycle.quiesce(f.query);
-    CHECK(promote_one(job, f.env()).outcome == promotion_outcome::retired);
+    CHECK(promote_one(job, f.env(), nullptr).outcome == promotion_outcome::retired);
     job.query = sirius::make_query_id(99);  // never opened
-    CHECK(promote_one(job, f.env()).outcome == promotion_outcome::retired);
+    CHECK(promote_one(job, f.env(), nullptr).outcome == promotion_outcome::retired);
     CHECK(tier_of(*batch) == Tier::HOST);
   }
 
@@ -896,18 +902,18 @@ TEST_CASE("retired queries, expired batches and moved or claimed batches are not
     auto batch     = f.make_batch_in(*f.host);
     auto const job = f.job_for(batch, gpu_target);
     batch.reset();
-    CHECK(promote_one(job, f.env()).outcome == promotion_outcome::expired);
+    CHECK(promote_one(job, f.env(), nullptr).outcome == promotion_outcome::expired);
   }
 
   SECTION("a batch claimed by a task gives stale for class B only")
   {
     auto batch = f.make_batch_in(*f.host);
     batch->subscribe();
-    auto const result = promote_one(f.job_for(batch, gpu_target, klass::B), f.env());
+    auto const result = promote_one(f.job_for(batch, gpu_target, klass::B), f.env(), nullptr);
     CHECK(result.outcome == promotion_outcome::stale);
     CHECK(result.observed == f.host->get_id());
     CHECK(tier_of(*batch) == Tier::HOST);
-    CHECK(promote_one(f.job_for(batch, gpu_target, klass::A), f.env()).outcome ==
+    CHECK(promote_one(f.job_for(batch, gpu_target, klass::A), f.env(), nullptr).outcome ==
           promotion_outcome::promoted);
     batch->unsubscribe();
   }
@@ -918,7 +924,7 @@ TEST_CASE("retired queries, expired batches and moved or claimed batches are not
     auto job   = f.job_for(batch, gpu_target);
     f.move_to(batch, *f.host);  // a consumer upload and re-downgrade, say
     job.expected_source = f.disk->get_id();
-    auto const result   = promote_one(job, f.env());
+    auto const result   = promote_one(job, f.env(), nullptr);
     CHECK(result.outcome == promotion_outcome::stale);
     CHECK(result.observed == f.host->get_id());
   }
@@ -926,20 +932,20 @@ TEST_CASE("retired queries, expired batches and moved or claimed batches are not
   SECTION("a batch already on a GPU, or off DISK for staging, gives already_resident")
   {
     auto on_gpu = f.make_gpu_batch(128);
-    CHECK(promote_one(f.job_for(on_gpu, gpu_target), f.env()).outcome ==
+    CHECK(promote_one(f.job_for(on_gpu, gpu_target), f.env(), nullptr).outcome ==
           promotion_outcome::already_resident);
     auto on_host = f.make_batch_in(*f.host);
     auto job     = f.job_for(on_host, host_target);
-    CHECK(promote_one(job, f.env()).outcome == promotion_outcome::already_resident);
+    CHECK(promote_one(job, f.env(), nullptr).outcome == promotion_outcome::already_resident);
   }
 
   SECTION("a representation preload does not know gives unsupported")
   {
     auto opaque = cucascade::data_batch::make(sirius::get_next_batch_id(),
                                               std::make_unique<opaque_representation>(*f.disk));
-    CHECK(promote_one(f.job_for(opaque, host_target), f.env()).outcome ==
+    CHECK(promote_one(f.job_for(opaque, host_target), f.env(), nullptr).outcome ==
           promotion_outcome::unsupported);
-    CHECK(promote_one(f.job_for(opaque, gpu_target), f.env()).outcome ==
+    CHECK(promote_one(f.job_for(opaque, gpu_target), f.env(), nullptr).outcome ==
           promotion_outcome::unsupported);
     CHECK(tier_of(*opaque) == Tier::DISK);
     CHECK(repr_type_of(*opaque) == typeid(opaque_representation));
@@ -959,6 +965,95 @@ TEST_CASE("retired queries, expired batches and moved or claimed batches are not
     CHECK(kind_of(*on_host) == repr_kind::host_data);
     CHECK(kind_of(*on_disk) == repr_kind::disk_data);
     CHECK(kind_of(*encoded) == repr_kind::encoded);
+  }
+}
+
+TEST_CASE(
+  "a promotion gives back its unreserved bytes exactly once, by the time its reservation "
+  "is admitted",
+  "[preload_promotion]")
+{
+  promotion_fixture f;
+  std::size_t const others = 1000;  // estimates of other running jobs into the same space
+  auto const consumed_of   = [](cucascade::memory::memory_space& space) {
+    return consumed_bytes(space.get_max_memory(), space.get_available_memory());
+  };
+
+  // In the hook the job has left the count and its reservation is in the consumed bytes.
+  auto const check_moved = [&](std::shared_ptr<cucascade::data_batch> const& batch,
+                               target t,
+                               cucascade::memory::memory_space& space) {
+    auto const occupied = promotion_fixture::occupy(space);
+    auto const job      = f.job_for(batch, t);
+    std::atomic<std::size_t> unreserved{others + job.est_reserve};
+    auto const before = consumed_of(space);
+    std::size_t seen_unreserved{0};
+    std::size_t seen_consumed{0};
+    auto const result = promote_one(job,
+                                    f.env([&](promotion_job const&) {
+                                      seen_unreserved = unreserved.load();
+                                      seen_consumed   = consumed_of(space);
+                                    }),
+                                    &unreserved);
+    CHECK(result.outcome == promotion_outcome::promoted);
+    CHECK(seen_unreserved == others);
+    CHECK(seen_consumed >= before + job.est_reserve);
+    CHECK(unreserved.load() == others);
+  };
+
+  SECTION("GPU target") { check_moved(f.make_batch_in(*f.host), gpu_target, *f.gpu); }
+
+  SECTION("HOST target") { check_moved(f.make_batch_in(*f.disk), host_target, *f.host); }
+
+  auto batch = f.make_batch_in(*f.host);
+  auto job   = f.job_for(batch, gpu_target);
+
+  SECTION("refused before the reservation")
+  {
+    std::atomic<std::size_t> unreserved{others + job.est_reserve};
+    auto waiter = f.board->enter_wait(0);
+    CHECK(promote_one(job, f.env(), &unreserved).outcome == promotion_outcome::held_off);
+    CHECK(unreserved.load() == others);
+  }
+
+  SECTION("a retired query")
+  {
+    std::atomic<std::size_t> unreserved{others + job.est_reserve};
+    f.lifecycle.quiesce(f.query);
+    CHECK(promote_one(job, f.env(), &unreserved).outcome == promotion_outcome::retired);
+    CHECK(unreserved.load() == others);
+  }
+
+  SECTION("no reservation possible")
+  {
+    auto const allocated = f.gpu->get_capacity() - f.gpu->get_available_memory();
+    REQUIRE(f.gpu->get_max_memory() > allocated);
+    auto blocker = f.gpu->make_reservation_or_null(f.gpu->get_max_memory() - allocated);
+    REQUIRE(blocker != nullptr);
+    std::atomic<std::size_t> unreserved{others + job.est_reserve};
+    CHECK(promote_one(job, f.env(), &unreserved).outcome == promotion_outcome::no_memory);
+    CHECK(unreserved.load() == others);
+  }
+
+  SECTION("gated after the reservation")
+  {
+    auto const occupied = promotion_fixture::occupy(*f.gpu);
+    job.est_reserve     = 1;
+    job.ceiling         = consumed_of(*f.gpu) + (64ull << 10);
+    std::atomic<std::size_t> unreserved{others + job.est_reserve};
+    CHECK(promote_one(job, f.env(), &unreserved).outcome == promotion_outcome::gated);
+    CHECK(unreserved.load() == others);
+  }
+
+  SECTION("a throw after the reservation")
+  {
+    std::atomic<std::size_t> unreserved{others + job.est_reserve};
+    auto const result =
+      promote_one(job,
+                  f.env([](promotion_job const&) { throw rmm::out_of_memory("test: no blocks"); }),
+                  &unreserved);
+    CHECK(result.outcome == promotion_outcome::oom);
+    CHECK(unreserved.load() == others);
   }
 }
 
