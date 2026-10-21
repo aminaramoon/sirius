@@ -61,6 +61,9 @@ struct hw_caps_override {
  * @brief Whether DISK space @p disk moves data with GPUDirect Storage.
  *
  * Reads the space's io context without installing one. False for a space that is not DISK.
+ * Unless the context is explicitly a non-cuFile one, this probes the cuFile driver, which opens
+ * it on first use (and may create `cufile.log` in the working directory): call it once, at
+ * start-up, and only when preload runs and a DISK space exists.
  */
 [[nodiscard]] bool disk_uses_gds(cucascade::memory::memory_space const& disk) noexcept;
 

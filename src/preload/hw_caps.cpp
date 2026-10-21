@@ -50,13 +50,14 @@ bool gpu_has_c2c(memory::topology_index const& topology, int device) noexcept
 bool disk_uses_gds(cucascade::memory::memory_space const& disk) noexcept
 {
   if (disk.get_tier() != cucascade::memory::Tier::DISK) { return false; }
-  // Probe the platform first: without real GDS the context does not matter.
-  if (!real_gds_available()) { return false; }
   try {
     auto const context = disk.get_io_context();
-    return gds_in_use(
-      true,
-      context ? std::optional{context->type()} : std::optional<cucascade::io::io_context_type>{});
+    auto const type =
+      context ? std::optional{context->type()} : std::optional<cucascade::io::io_context_type>{};
+    // An explicit non-cuFile context never uses GDS: answer without opening the cuFile driver,
+    // whose first use may write cufile.log to the working directory.
+    if (type && *type != cucascade::io::io_context_type::cufile) { return false; }
+    return gds_in_use(real_gds_available(), type);
   } catch (...) {
     return false;
   }

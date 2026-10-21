@@ -703,3 +703,275 @@ TEST_CASE("candidate_store keeps in-flight accounting per space", "[preload]")
   CHECK(f.store.mem_epoch(gpu_t1) == 1);
   CHECK(f.store.mem_epoch(host_t0) == 2);
 }
+
+// ---- ordering and staging ----------------------------------------------------------------------
+
+TEST_CASE("candidate_store: refusal gates only move forward", "[preload]")
+{
+  store_fixture f;
+  fake_batch b;
+  REQUIRE(f.store.intake(f.q1, record(b, 7, 1, gpu0, host0, 100)) == intake_status::inserted);
+  REQUIRE(f.store.intake(f.q1, record(b, 8, 2, gpu0, host0, 100)) == intake_status::inserted);
+  auto const older = f.take(7, gpu_t0);
+  f.store.advance_mem_epoch(gpu_t0);
+  auto const newer = f.take(8, gpu_t0);
+  REQUIRE(older.mem_epoch_at_take + 1 == newer.mem_epoch_at_take);
+
+  SECTION("the newer refusal applied first is not undone by the older one")
+  {
+    f.store.apply_outcome(newer, outcome(promotion_outcome::no_memory));
+    CHECK(f.store.gated(gpu_t0));
+    f.store.apply_outcome(older, outcome(promotion_outcome::gated));
+    CHECK(f.store.gate_epoch(gpu_t0) == newer.mem_epoch_at_take);
+    CHECK(f.store.gated(gpu_t0));
+  }
+
+  SECTION("in order, the newer refusal gates the space")
+  {
+    f.store.apply_outcome(older, outcome(promotion_outcome::no_memory));
+    CHECK_FALSE(f.store.gated(gpu_t0));  // a memory event arrived during that attempt
+    f.store.apply_outcome(newer, outcome(promotion_outcome::no_memory));
+    CHECK(f.store.gated(gpu_t0));
+  }
+
+  f.store.advance_mem_epoch(gpu_t0);
+  CHECK_FALSE(f.store.gated(gpu_t0));
+}
+
+TEST_CASE("candidate_store ignores a record older than the promotion in the ledger", "[preload]")
+{
+  store_fixture f;
+  fake_batch b;
+  REQUIRE(f.store.intake(f.q1, record(b, 7, 1, gpu0, host0, 100)) == intake_status::inserted);
+
+  SECTION("ordered by the sequence the worker took under the batch lock")
+  {
+    auto const job   = f.take(7, gpu_t0);
+    auto r           = outcome(promotion_outcome::promoted, 100);
+    r.kind           = promotion_kind::h2g;
+    r.conversion_seq = 10;
+    f.store.apply_outcome(job, r);
+    REQUIRE(f.store.find_ledger(7) != nullptr);
+    CHECK(f.store.find_ledger(7)->seq == 10);
+
+    // A HOST->DISK move from before the promotion, delivered late.
+    CHECK(f.store.intake(f.q1, record(b, 7, 6, host0, disk0, 100)) ==
+          intake_status::dropped_stale_record);
+    CHECK(f.store.find_ledger(7) != nullptr);
+    CHECK(f.store.outstanding_bytes(0) == 100);
+    CHECK(f.store.find(7) == nullptr);
+    CHECK(f.counters.get(counter::bounce) == 0);
+    CHECK(f.counters.get(counter::dropped_stale_record) == 1);
+
+    CHECK(f.store.intake(f.q1, record(b, 7, 11, gpu0, host0, 100)) == intake_status::bounced);
+    CHECK(f.store.find_ledger(7) == nullptr);
+    CHECK(f.counters.get(counter::bounce) == 1);
+  }
+
+  SECTION("without a worker sequence, the sequence at take time")
+  {
+    f.promote(7, gpu_t0, klass::A, 100);
+    REQUIRE(f.store.find_ledger(7) != nullptr);
+    CHECK(f.store.find_ledger(7)->seq == 1);
+    CHECK(f.store.intake(f.q1, record(b, 7, 1, gpu0, host0, 100)) ==
+          intake_status::dropped_stale_record);
+    CHECK(f.store.intake(f.q1, record(b, 7, 2, gpu0, host0, 100)) == intake_status::bounced);
+  }
+}
+
+TEST_CASE("candidate_store: a stale outcome never overrides a newer record", "[preload]")
+{
+  store_fixture f;
+  fake_batch b;
+  REQUIRE(f.store.intake(f.q1, record(b, 7, 1, gpu0, host0, 100)) == intake_status::inserted);
+
+  SECTION("a record merged during the attempt keeps its location")
+  {
+    auto const job = f.take(7, gpu_t0);
+    REQUIRE(f.store.intake(f.q1, record(b, 7, 5, host0, disk0, 100)) == intake_status::merged);
+    auto r     = outcome(promotion_outcome::stale);
+    r.observed = gpu0;
+    f.store.apply_outcome(job, r);
+    CHECK(f.store.find(7)->location == disk0);
+    CHECK(f.store.plannable(*f.store.find(7)));
+  }
+
+  SECTION("a stale outcome where nothing moved waits for the queue, then gives up")
+  {
+    for (int i = 0; i < f.cfg.max_lock_attempts; ++i) {
+      REQUIRE(f.store.find(7) != nullptr);
+      auto const job = f.take(7, gpu_t0, klass::B);
+      auto r         = outcome(promotion_outcome::stale);
+      r.observed     = host0;  // where the job expected it: a task claimed it
+      f.store.apply_outcome(job, r);
+      if (f.store.find(7) == nullptr) { break; }
+      CHECK(f.store.find(7)->location == host0);
+      CHECK_FALSE(f.store.plannable(*f.store.find(7)));
+      f.store.advance_queue_epoch();
+      CHECK(f.store.plannable(*f.store.find(7)));
+    }
+    CHECK(f.store.find(7) == nullptr);
+    CHECK(f.counters.get(counter::dropped_lock_attempts) == 1);
+  }
+}
+
+TEST_CASE("candidate_store: add_query keeps the first entry of a repeated token", "[preload]")
+{
+  store_fixture f;
+  auto const q3 = make_query_id(3);
+  REQUIRE(f.store.add_query(q3, {0}, {repo(repo_a, 30), repo(repo_b, 20), repo(repo_a, 10)}));
+  auto const* qs = f.store.find_query(q3);
+  REQUIRE(qs != nullptr);
+  REQUIRE(qs->repos.size() == 2);
+  CHECK(qs->repos[0].token == repo_b);
+  CHECK(qs->repos[1].token == repo_a);
+  CHECK(qs->repos[1].dest_priority == 30);
+  CHECK(qs->repo_index.at(repo_b) == 0);
+  CHECK(qs->repo_index.at(repo_a) == 1);
+  CHECK_FALSE(f.store.add_query(q3, {}, {}));
+}
+
+TEST_CASE("candidate_store: forget_query of an unknown query leaves the epochs alone", "[preload]")
+{
+  store_fixture f;
+  auto const before = f.store.snapshot_phase0().mem_epoch;
+  CHECK_FALSE(f.store.forget_query(make_query_id(9)).has_value());
+  CHECK(f.store.snapshot_phase0().mem_epoch == before);
+
+  REQUIRE(f.store.forget_query(f.q2).has_value());  // known: its memory was freed
+  auto const after = f.store.snapshot_phase0().mem_epoch;
+  CHECK(after != before);
+  CHECK_FALSE(f.store.forget_query(f.q2).has_value());  // already forgotten
+  CHECK(f.store.snapshot_phase0().mem_epoch == after);
+}
+
+TEST_CASE("candidate_store keeps a staged candidate for its HOST->GPU hop", "[preload]")
+{
+  store_fixture f;  // max_promotions_per_batch = 2
+  fake_batch b;
+  REQUIRE(f.store.intake(f.q1, record(b, 7, 1, host0, disk0, 100)) == intake_status::inserted);
+  auto staging     = f.take(7, host_t0);
+  auto r           = outcome(promotion_outcome::promoted, 100);
+  r.kind           = promotion_kind::d2h;
+  r.conversion_seq = 4;
+  f.store.apply_outcome(staging, r);
+
+  auto const* c = f.store.find(7);
+  REQUIRE(c != nullptr);
+  CHECK(c->location == host0);
+  CHECK(c->last_seq == 4);
+  CHECK(f.store.plannable(*c));
+  auto const* e = f.store.find_ledger(7);
+  REQUIRE(e != nullptr);
+  CHECK(e->gpu == -1);
+  CHECK(f.store.outstanding_bytes(0) == 0);
+  CHECK(f.counters.get(counter::promoted_d2h) == 1);
+  CHECK(f.store.find_query(f.q1)->promotions.at(7) == 1);
+
+  SECTION("the GPU hop moves the ledger entry to the GPU")
+  {
+    auto const hop = f.take(7, gpu_t0);
+    CHECK(hop.expected_source == host0);
+    CHECK(hop.seq_at_take == 4);
+    f.store.apply_outcome(hop, outcome(promotion_outcome::promoted, 100));
+    CHECK(f.store.find(7) == nullptr);
+    REQUIRE(f.store.find_ledger(7) != nullptr);
+    CHECK(f.store.find_ledger(7)->gpu == 0);
+    CHECK(f.store.outstanding_bytes(0) == 100);
+    CHECK(f.counters.get(counter::promoted_h2g) == 1);
+    // Both moves count toward the cap: a bounce now drops the batch.
+    CHECK(f.store.intake(f.q1, record(b, 7, 9, gpu0, host0, 100)) ==
+          intake_status::dropped_promotion_cap);
+    CHECK(f.store.outstanding_bytes(0) == 0);
+  }
+
+  SECTION("a move back to DISK is a bounce of the staged batch")
+  {
+    CHECK(f.store.intake(f.q1, record(b, 7, 3, host0, disk0, 100)) ==
+          intake_status::dropped_stale_record);
+    CHECK(f.store.find(7)->location == host0);
+    CHECK(f.store.intake(f.q1, record(b, 7, 5, host0, disk0, 100)) == intake_status::merged);
+    CHECK(f.store.find_ledger(7) == nullptr);
+    CHECK(f.store.find(7)->location == disk0);
+    CHECK(f.store.find(7)->speculative_banned);
+    CHECK(f.counters.get(counter::bounce) == 1);
+  }
+
+  SECTION("retire purges the staged candidate and its HOST ledger entry, nothing else")
+  {
+    fake_batch other;
+    REQUIRE(f.store.intake(f.q2, record(other, 8, 6, gpu0, host0, 50)) == intake_status::inserted);
+    f.promote(8, gpu_t0, klass::A, 50);
+    f.store.retire_query(f.q1);
+    CHECK(f.store.find(7) == nullptr);
+    CHECK(f.store.find_ledger(7) == nullptr);
+    CHECK(f.counters.get(counter::wasted_unconsumed) == 1);
+    REQUIRE(f.store.find_ledger(8) != nullptr);
+    CHECK(f.store.outstanding_bytes(0) == 50);
+    CHECK(f.store.find_query(f.q2)->ledger_ids.contains(8));
+  }
+}
+
+TEST_CASE("candidate_store drops a staged candidate that reached the promotion cap", "[preload]")
+{
+  store_fixture f;
+  f.cfg.max_promotions_per_batch = 1;
+  candidate_store store{f.cfg, {0}, {0}, f.counters};
+  REQUIRE(store.add_query(f.q1, {0}, {}));
+  fake_batch b;
+  REQUIRE(store.intake(f.q1, record(b, 7, 1, host0, disk0, 100)) == intake_status::inserted);
+  auto const job = store.take({7, host_t0, klass::A, 0});
+  REQUIRE(job.has_value());
+  store.apply_outcome(*job, outcome(promotion_outcome::promoted, 100));
+  CHECK(store.find(7) == nullptr);
+  REQUIRE(store.find_ledger(7) != nullptr);
+  CHECK(store.find_ledger(7)->gpu == -1);
+}
+
+TEST_CASE("candidate_store overflow skips a newest query that is entirely in flight", "[preload]")
+{
+  store_fixture f;
+  f.cfg.max_candidates = 3;
+  candidate_store store{f.cfg, {0}, {0}, f.counters};
+  REQUIRE(store.add_query(f.q1, {0}, {}));
+  REQUIRE(store.add_query(f.q2, {0}, {}));
+  fake_batch b;
+  REQUIRE(store.intake(f.q2, record(b, 20, 5, gpu0, host0, 1)) == intake_status::inserted);
+  REQUIRE(store.intake(f.q2, record(b, 21, 6, gpu0, host0, 1)) == intake_status::inserted);
+  REQUIRE(store.intake(f.q1, record(b, 10, 7, gpu0, host0, 1)) == intake_status::inserted);
+  REQUIRE(store.take({20, gpu_t0, klass::A, 0}).has_value());
+  REQUIRE(store.take({21, gpu_t0, klass::A, 0}).has_value());
+
+  // The older query's own newest candidate goes: here, the record itself.
+  CHECK(store.intake(f.q1, record(b, 11, 8, gpu0, host0, 1)) == intake_status::dropped_overflow);
+  CHECK(store.find(11) == nullptr);
+  // A late record with an older sequence evicts the older query's newest candidate instead.
+  CHECK(store.intake(f.q1, record(b, 12, 3, gpu0, host0, 1)) == intake_status::inserted);
+  CHECK(store.find(10) == nullptr);
+  CHECK(store.find(12) != nullptr);
+  CHECK(store.find(20) != nullptr);
+  CHECK(store.find(21) != nullptr);
+  CHECK(store.size() == 3);
+}
+
+TEST_CASE("candidate_store pruning resumes after its cursor and wraps around", "[preload]")
+{
+  store_fixture f;
+  std::vector<fake_batch> batches(5);
+  for (std::uint64_t i = 0; i < 4; ++i) {
+    REQUIRE(f.store.intake(f.q1, record(batches[i], i, i + 1, gpu0, host0, 1)) ==
+            intake_status::inserted);
+  }
+  REQUIRE(f.store.intake(f.q2, record(batches[4], 4, 5, gpu0, host0, 1)) ==
+          intake_status::inserted);
+
+  CHECK(f.store.prune_expired_candidates(3) == 0);  // visits q1's seq 1..3
+  batches[0].destroy();                             // behind the cursor
+  batches[4].destroy();                             // ahead of it, in the next query
+  CHECK(f.store.prune_expired_candidates(3) == 2);  // seq 4, q2's seq 5, then wraps to seq 1
+  CHECK(f.store.find(0) == nullptr);
+  CHECK(f.store.find(4) == nullptr);
+  CHECK(f.store.size() == 3);
+  // A budget above the store size visits each candidate once.
+  CHECK(f.store.prune_expired_candidates(100) == 0);
+}

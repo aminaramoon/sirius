@@ -113,8 +113,10 @@ struct query_state {
   std::unordered_map<std::uintptr_t, std::unordered_set<std::uint64_t>> candidates_by_repo;
   /// Promotions of each batch in this query.
   std::unordered_map<std::uint64_t, std::uint32_t> promotions;
-  /// (last_seq, batch_id) of this query's candidates, for overflow eviction and pruning.
+  /// (last_seq, batch_id) of every candidate of this query, for eviction, pruning and retire.
   std::set<std::pair<std::uint64_t, std::uint64_t>> by_seq;
+  /// Batch ids of this query's ledger entries, so retiring it needs no scan of the ledger.
+  std::unordered_set<std::uint64_t> ledger_ids;
   per_query_stats stats;
   /// A FULL barrier of this query may have cleared since the last pass.
   bool readiness_dirty{true};
@@ -130,6 +132,9 @@ struct ledger_entry {
   int gpu{-1};
   klass k{klass::A};
   std::size_t bytes{0};
+  /// Conversion sequence of the promotion (see @c promotion_result::conversion_seq). A record at
+  /// or below it describes a move from before the promotion and is ignored.
+  std::uint64_t seq{0};
 };
 
 /// What @ref candidate_store::intake did with a record.
@@ -141,7 +146,8 @@ enum class intake_status : std::uint8_t {
   dropped_expired,        ///< the batch is gone
   dropped_unsupported,    ///< the batch did not move to HOST or DISK
   dropped_promotion_cap,  ///< the batch was promoted the maximum number of times
-  dropped_overflow        ///< the store is full and this record lost the eviction
+  dropped_overflow,       ///< the store is full and this record lost the eviction
+  dropped_stale_record    ///< the record predates the promotion in the ledger
 };
 
 /// A planned item handed to a lane: which candidate goes where.
@@ -281,7 +287,7 @@ class candidate_store {
    * @brief Create the state of query @p q. The only way per-query state comes into being.
    *
    * @param repos The query's repositories, in any order; sorted here by destination priority.
-   *        A repeated token keeps its first entry.
+   *        A repeated token keeps its first entry in @p repos.
    * @return false (and nothing changes) if @p q is already known.
    */
   bool add_query(query_id_t q, std::vector<int> active_gpus, std::vector<repo_info> repos);
@@ -302,7 +308,8 @@ class candidate_store {
    * @brief Purge @p q again, advance every memory epoch (its repositories' memory was freed),
    *        and hand back its statistics.
    *
-   * Idempotent: a second call finds nothing and returns empty.
+   * Idempotent: a second call, or a call for a query the store never knew, finds nothing,
+   * leaves the epochs alone and returns empty.
    */
   std::optional<per_query_stats> forget_query(query_id_t q) noexcept;
 
@@ -313,8 +320,9 @@ class candidate_store {
    *
    * New batches become candidates; known ones merge: the record with the larger conversion
    * sequence decides the location and repository, and every record can fill the estimate,
-   * origins and task hints. A batch still in the ledger bounced: its entry is erased and the new
-   * candidate is banned from speculative promotion. At @c max_candidates the newest query's most
+   * origins and task hints. A batch still in the ledger bounced when the record is newer than the
+   * promotion: its entry is erased and the candidate is banned from speculative promotion. A
+   * record older than the promotion is ignored. At @c max_candidates the newest query's most
    * recently downgraded candidate that is not in flight is evicted.
    */
   intake_status intake(query_id_t q, event::downgraded_batch const& rec);
@@ -354,9 +362,14 @@ class candidate_store {
   /**
    * @brief Apply the result of a job taken with @ref take.
    *
-   * A memory refusal gates the target with the job's epoch, and a promotion off HOST advances
-   * that HOST's epoch, whether or not the query is still known: both describe a space. Everything
-   * else changes candidate and ledger state only when the query and the candidate still exist.
+   * A memory refusal gates the target with the job's epoch (never moving an existing gate back),
+   * and a promotion off HOST advances that HOST's epoch, whether or not the query is still known:
+   * both describe a space. Everything else changes candidate and ledger state only when the query
+   * and the candidate still exist.
+   *
+   * A promotion to a GPU moves the candidate into the ledger. A DISK->HOST staging adds a ledger
+   * entry too but keeps the candidate, now located on that HOST, so a later pass can take it on
+   * to its GPU; it is dropped instead once the batch reached @c max_promotions_per_batch.
    */
   outcome_effect apply_outcome(promotion_job const& job, promotion_result const& result);
 
@@ -391,7 +404,12 @@ class candidate_store {
   void merge(candidate& c, query_state& qs, event::downgraded_batch const& rec);
   void erase_candidate(candidate_map::iterator it) noexcept;
   void erase_ledger(std::unordered_map<std::uint64_t, ledger_entry>::iterator it) noexcept;
-  void add_ledger(candidate const& c, promotion_job const& job, std::size_t bytes);
+  void add_ledger(candidate const& c,
+                  query_state& qs,
+                  promotion_job const& job,
+                  std::size_t bytes,
+                  std::uint64_t seq);
+  void reindex_seq(candidate& c, query_state& qs, std::uint64_t seq);
   [[nodiscard]] std::optional<std::uint64_t> evict_one() noexcept;
 
   preload_executor_config _cfg;
