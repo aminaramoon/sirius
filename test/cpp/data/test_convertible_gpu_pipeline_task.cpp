@@ -16,7 +16,9 @@
 
 #include "catch.hpp"
 #include "operator/operator_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
 #include <cucascade/data/data_batch.hpp>
@@ -35,6 +37,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -344,6 +347,55 @@ TEST_CASE("convert GPU task to HOST", "[convertible_gpu_pipeline_task]")
   REQUIRE(result.has_value());
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
+}
+
+TEST_CASE("convert moves only the batches in the space the task was picked for",
+          "[convertible_gpu_pipeline_task][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  auto mgr   = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto* gpu0 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* gpu1 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 1);
+  auto* host = mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  REQUIRE(gpu0 != nullptr);
+  REQUIRE(gpu1 != nullptr);
+  REQUIRE(host != nullptr);
+
+  auto local = sirius::test::operator_utils::make_numeric_batch(
+    *gpu0, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  std::shared_ptr<cucascade::data_batch> remote;
+  {
+    rmm::cuda_set_device_raii const device{rmm::cuda_device_id{1}};
+    remote = sirius::test::operator_utils::make_numeric_batch(
+      *gpu1, std::vector<int32_t>{4, 5, 6}, cudf::type_id::INT32);
+  }
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  REQUIRE(queue.push(make_test_gpu_task(1, {local, remote})));
+
+  // GPU 0's downgrade executor: a GPU 0 stream, which cannot serve GPU 1's memory.
+  rmm::cuda_stream stream0;
+  {
+    sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
+    auto cd = provider.get_next_convertible(gpu0, false);
+    REQUIRE(cd != nullptr);
+    std::optional<std::vector<std::size_t>> result;
+    REQUIRE_NOTHROW(result = cd->convert({host}, stream0, *mgr, true));
+    REQUIRE(result.has_value());
+    CHECK(result->at(0) > 0);
+  }
+  stream0.synchronize();
+
+  CHECK(get_batch_tier(*local) == cucascade::memory::Tier::HOST);
+  {
+    auto ro = remote->to_read_only();
+    CHECK(ro.get_memory_space() == gpu1);
+  }
+  CHECK(queue.size() == 1);
+  while (queue.try_pop()) {}
 }
 
 TEST_CASE("bytes_in_space returns correct size", "[convertible_gpu_pipeline_task]")
