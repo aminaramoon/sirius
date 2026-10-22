@@ -66,12 +66,19 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @brief Construct from a task extracted from the queue.
    * @param task The task to wrap (exclusive ownership taken).
    * @param queue The originating task queue (task is returned here on destruction).
+   * @param source_space When set, convert() moves only the batches in this space: the space the
+   *        task was picked to relieve. A task's other inputs may live on another GPU, whose
+   *        memory the caller's stream cannot serve.
    */
   convertible_gpu_pipeline_task(
     std::unique_ptr<sirius::parallel::itask> task,
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue,
-    sirius::exec::query_lifecycle_registry& query_lifecycle)
-    : _task(std::move(task)), _queue(queue), _query_lifecycle(query_lifecycle)
+    sirius::exec::query_lifecycle_registry& query_lifecycle,
+    cucascade::memory::memory_space const* source_space = nullptr)
+    : _task(std::move(task)),
+      _queue(queue),
+      _query_lifecycle(query_lifecycle),
+      _source_space(source_space)
   {
   }
 
@@ -115,9 +122,9 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @brief Convert this task's data batches to reside in one of the target memory spaces.
    *
    * Iterates the data_batches from the task's pipelineable_operator_data input.
-   * For each batch not already at a target space, delegates to convertible_data_batch
-   * which acquires a mutable_data_batch (blocking or non-blocking), attempts the conversion,
-   * and releases automatically via RAII.
+   * For each batch not already at a target space (and, with a source space, in it), delegates
+   * to convertible_data_batch which acquires a mutable_data_batch (blocking or non-blocking),
+   * attempts the conversion, and releases automatically via RAII.
    *
    * While recording is on, each batch moved yields one record tagged with this task's priority,
    * preferred device and query.
@@ -147,11 +154,13 @@ class convertible_gpu_pipeline_task : public convertible_data {
     for (const auto& batch : batches) {
       if (!batch) { continue; }
 
-      // Quick check: skip batches already at a target space (avoid unnecessary locking)
+      // Quick check: skip batches already at a target space, or outside the source space
+      // (avoid unnecessary locking)
       {
         auto ro           = batch->to_read_only();
         auto* batch_space = ro.get_memory_space();
-        bool at_target    = false;
+        if (_source_space != nullptr && batch_space != _source_space) { continue; }
+        bool at_target = false;
         for (const auto* ts : target_spaces) {
           if (batch_space == ts) {
             at_target = true;
@@ -289,6 +298,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& _queue;
   /// Non-owning; the runtime or test fixture must outlive this wrapper.
   sirius::exec::query_lifecycle_registry& _query_lifecycle;
+  /// Non-owning; null converts batches in any space.
+  cucascade::memory::memory_space const* _source_space;
 };
 
 /**
@@ -318,7 +329,8 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    *
    * Extracts the first matching task from the queue using mutable_pop_if().
    * The extracted task is wrapped in a convertible_gpu_pipeline_task which
-   * returns the task to the queue via RAII on destruction.
+   * returns the task to the queue via RAII on destruction, and converts only
+   * its batches in @p space.
    *
    * Only tasks with at least one idle data_batch in the given memory space
    * are returned. Iteration direction is respected (front_to_back).
@@ -335,7 +347,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
       front_to_back);
     if (!task) { return nullptr; }
     return std::make_unique<convertible_gpu_pipeline_task>(
-      std::move(*task), _queue, _query_lifecycle);
+      std::move(*task), _queue, _query_lifecycle, space);
   }
 
   /**
@@ -365,7 +377,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
         front_to_back);
       if (!task) { break; }
       results.push_back(std::make_unique<convertible_gpu_pipeline_task>(
-        std::move(*task), _queue, _query_lifecycle));
+        std::move(*task), _queue, _query_lifecycle, space));
     }
     return results;
   }
