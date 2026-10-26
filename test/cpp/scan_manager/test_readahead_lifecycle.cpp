@@ -1087,11 +1087,19 @@ TEST_CASE("phase 1 runs once per candidate, not once per host retry", "[scan_man
   m->prepare_for_query(query.get());
   m->register_scan_task(split, 1);
   m->start();
-  REQUIRE(eventually([&] { return m->counters().memory_retries.load() >= 3; }));
+  // The host retry is bounded: an eviction retry inside the first attempt, then one delayed
+  // attempt (which evicts again) before the candidate is given up as memory pressure.  Phase 1
+  // runs on the first attempt only, never on the delayed one.
+  REQUIRE(eventually(
+    [&] { return m->counters().outcome(prefetch_outcome_kind::skipped_memory_pressure) == 1; }));
+  CHECK(m->counters().memory_retries.load() == 2);
+  CHECK(m->counters().candidates_taken.load() == 1);
   CHECK(m->counters().device_attempts.load() == 1);
   CHECK(m->counters().device_skipped_too_large.load() == 1);
 
   m->stop();
   CHECK(m->counters().outcome(prefetch_outcome_kind::skipped_memory_pressure) == 1);
+  CHECK(m->counters().memory_retries.load() == 2);
   CHECK(m->counters().device_attempts.load() == 1);
+  CHECK(m->available_tickets_for_testing() == 2);
 }
