@@ -840,17 +840,18 @@ TEST_CASE("describe_parquet probes the S3 footer on a cold bind and reuses the m
   CHECK(server.get_count() == 1);
   CHECK(server.suffix_get_count() == 1);
 
-  // Warm bind: the path is known to the metadata store, so the open takes open_hint::generic (a
-  // HEAD for the size). With a strong tag the stored footer is found under the same identity and
-  // no footer bytes are downloaded; without one the open has a fresh identity and reads the
-  // footer again — one GET, since cuDF's speculative tail read (64 KiB by default) covers this
-  // small file's footer in a single range.
+  // Warm bind. With a strong tag the path is a reusable candidate in the metadata store
+  // (has_path), so the open takes open_hint::generic (a HEAD for the size) and finds the stored
+  // footer under the same identity: no footer bytes are downloaded. A tagless open's footer is
+  // scoped to that open (an opened-handle identity), which cannot justify skipping the probe for
+  // the next open (#2132): the warm bind probes again, one more suffix GET and no HEAD.
   auto const second = manager.describe_parquet(uri);
   CHECK(second.object_size == first.object_size);
   CHECK(second.total_num_rows == first.total_num_rows);
   CHECK(second.names == first.names);
-  CHECK(server.head_count() == 1);
+  CHECK(server.head_count() == (strong_tag ? 1 : 0));
   CHECK(server.get_count() == (strong_tag ? 1 : 2));
+  CHECK(server.suffix_get_count() == (strong_tag ? 1 : 2));
 }
 
 TEST_CASE("routed S3 cache fill at the object tail is clipped to EOF", "[s3][routing]")
