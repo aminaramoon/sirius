@@ -63,8 +63,7 @@ using sirius::scan_manager::device_prefetch_issuer;
 using sirius::scan_manager::device_prefetch_result;
 using sirius::scan_manager::device_window;
 using sirius::test::temp_data_file;
-using byte_range     = cudf::io::text::byte_range_info;
-using prefetch_state = scan::scan_info::prefetch_state;
+using byte_range = cudf::io::text::byte_range_info;
 
 constexpr std::size_t MiB        = std::size_t{1} << 20;
 constexpr std::size_t kFileBytes = 8 * MiB;
@@ -172,6 +171,12 @@ struct read_gate {
 
   /// Completes the read with the bytes it asked for.
   void open() { promise.set_value(requested.load()); }
+  /// Fails the read, as an IO error would.
+  void fail()
+  {
+    promise.set_exception(
+      std::make_exception_ptr(std::runtime_error("injected device read failure")));
+  }
 };
 
 std::shared_ptr<scripted_context> gated_context(std::shared_ptr<read_gate> const& gate)
@@ -299,7 +304,6 @@ TEST_CASE_METHOD(issuer_fixture,
   auto issuer = this->issuer();
   done_probe done;
   REQUIRE(issuer.issue(split, done.callback()) == device_prefetch_issue::issued);
-  CHECK(split->get_prefetch_state() == prefetch_state::prefetched);
 
   auto const result = done.wait();
   CHECK(result.ok);
@@ -344,7 +348,6 @@ TEST_CASE_METHOD(issuer_fixture,
   done_probe done;
   CHECK(issuer.issue(split, done.callback()) == device_prefetch_issue::unsupported);
   CHECK(split->prefetched() == nullptr);
-  CHECK(split->get_prefetch_state() == prefetch_state::idle);
   CHECK(done.calls->load() == 0);
 
   SECTION("a split with nothing to read is not issued either")
@@ -371,7 +374,6 @@ TEST_CASE_METHOD(issuer_fixture,
   done_probe done;
   CHECK(issuer.issue(split, done.callback()) == device_prefetch_issue::too_large);
   CHECK(split->prefetched() == nullptr);
-  CHECK(split->get_prefetch_state() == prefetch_state::idle);
   CHECK(window->parked_splits.load() == 0);
   CHECK(done.calls->load() == 0);
 }
@@ -390,7 +392,6 @@ TEST_CASE_METHOD(issuer_fixture,
   done_probe done;
   CHECK(issuer.issue(split, done.callback()) == device_prefetch_issue::memory);
   CHECK(split->prefetched() == nullptr);
-  CHECK(split->get_prefetch_state() == prefetch_state::idle);
   CHECK(window->parked_splits.load() == 0);
   CHECK(done.calls->load() == 0);
 
@@ -418,7 +419,6 @@ TEST_CASE_METHOD(issuer_fixture,
   done_probe done;
   CHECK(issuer.issue(split, done.callback()) == device_prefetch_issue::memory);
   CHECK(split->prefetched() == nullptr);
-  CHECK(split->get_prefetch_state() == prefetch_state::idle);
   CHECK(window->parked_splits.load() == 0);
   CHECK(window->parked_bytes.load() == 0);
   CHECK(done.calls->load() == 0);
@@ -464,7 +464,6 @@ TEST_CASE_METHOD(issuer_fixture,
   done_probe done;
   CHECK(issuer.issue(split, done.callback()) == device_prefetch_issue::error);
   CHECK(split->prefetched() == occupant);
-  CHECK(split->get_prefetch_state() == prefetch_state::idle);
   CHECK(done.calls->load() == 0);
   CHECK(window->parked_splits.load() == 0);
   CHECK(window->parked_bytes.load() == 0);
@@ -485,7 +484,6 @@ TEST_CASE_METHOD(issuer_fixture,
   done_probe done;
   CHECK(issuer.issue(split, done.callback()) == device_prefetch_issue::fell_behind);
   CHECK(split->prefetched() == nullptr);
-  CHECK(split->get_prefetch_state() == prefetch_state::idle);
   CHECK(window->parked_splits.load() == 0);
 }
 
@@ -542,7 +540,6 @@ TEST_CASE_METHOD(issuer_fixture,
   REQUIRE(seen.has_value());
   CHECK(*seen == scan::prefetched_ranges::state::failed);
   CHECK(abandoned);
-  CHECK(split->get_prefetch_state() == prefetch_state::attempted);
   CHECK(split->prefetched() == nullptr);
   CHECK(window->parked_splits.load() == 0);
   CHECK(window->parked_bytes.load() == 0);
@@ -758,6 +755,15 @@ std::uint64_t outcomes(readahead_scan_manager const& m, prefetch_outcome_kind ki
   return m.counters().outcome(kind);
 }
 
+/// Once its only operator is closed and drained, the worker takes no further slot: its last idle
+/// poll returns the one it took and the worker exits.  From then on the tickets out are exactly the
+/// ones the splits' attempts and reads hold, so the test can count them.
+bool worker_settled(readahead_scan_manager const& m, int available)
+{
+  return m.counters().operators_drained.load() == 1 && m.counters().idle_polls.load() >= 1 &&
+         m.available_tickets_for_testing() == available;
+}
+
 }  // namespace
 
 TEST_CASE_METHOD(readahead_fixture,
@@ -767,6 +773,7 @@ TEST_CASE_METHOD(readahead_fixture,
   auto ra    = readahead(options());
   auto split = on_gpu0(two_ranges(local_datasource()));
   ra->register_scan_task(split, 1);
+  ra->mark_operator_closed(1);
   ra->start();
   REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 1; }));
 
@@ -774,10 +781,21 @@ TEST_CASE_METHOD(readahead_fixture,
   REQUIRE(ranges != nullptr);
   CHECK(ranges->current() == scan::prefetched_ranges::state::ready);
   CHECK(ranges->device_id() == 0);
-  CHECK(split->get_prefetch_state() == prefetch_state::prefetched);
   CHECK(ra->counters().device_attempts.load() == 1);
   CHECK(ra->counters().device_bytes.load() == 3 * MiB);
   CHECK(outcomes(*ra, prefetch_outcome_kind::nothing_to_issue) == 0);
+
+  // A landed copy holds no capacity: its ticket came back when the copy settled, and the
+  // consumer's reading report joins the covered split instead of charging a cold read.
+  REQUIRE(eventually([&] { return worker_settled(*ra, 2); }));
+  split->set_scan_stage(scan_stage::reading);
+  ra->update_scan_state(1, split.get(), scan_stage::reading);
+  CHECK(ra->counters().cold_read_tickets.load() == 0);
+  CHECK(ra->counters().borrowed.load() == 0);
+  CHECK(ra->available_tickets_for_testing() == 2);
+  split->set_scan_stage(scan_stage::disposed);
+  ra->update_scan_state(1, split.get(), scan_stage::disposed);
+  CHECK(ra->available_tickets_for_testing() == 2);
 
   ra->stop();
   CHECK(eventually([&] { return ra->available_tickets_for_testing() == 2; }));
@@ -988,7 +1006,8 @@ TEST_CASE_METHOD(readahead_fixture,
       eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_prefetched) == 1; }));
     REQUIRE(landed->prefetched() != nullptr);
     CHECK(landed->prefetched()->current() == scan::prefetched_ranges::state::ready);
-    CHECK(landed->get_prefetch_state() == prefetch_state::prefetched);
+    // The landed copy returned its ticket at completion.
+    CHECK(eventually([&] { return ra->available_tickets_for_testing() == 2; }));
 
     // The window is full while the first split is unconsumed, so the second falls through to
     // the host tier, which has nowhere to stage and gives up at once.
@@ -1034,14 +1053,24 @@ TEST_CASE_METHOD(readahead_fixture,
   auto ra    = readahead(options());
   auto split = on_gpu0(two_ranges(cucascade::io::open_datasource(context, file.path.string())));
   ra->register_scan_task(split, 1);
+  ra->mark_operator_closed(1);
   ra->start();
   REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_failed) == 1; }));
   CHECK(ra->counters().device_attempts.load() == 1);
   CHECK(ra->counters().device_bytes.load() == 0);
-  // Back to attempted, so the consumer's own read is charged a ticket.
-  CHECK(split->get_prefetch_state() == prefetch_state::attempted);
   REQUIRE(split->prefetched() != nullptr);
   CHECK(split->prefetched()->current() == scan::prefetched_ranges::state::failed);
+
+  // No consumer had started, so the failed attempt released its ticket at completion...
+  REQUIRE(eventually([&] { return worker_settled(*ra, 2); }));
+  // ...and the consumer's own read is charged one when it starts, until disposal.
+  split->set_scan_stage(scan_stage::reading);
+  ra->update_scan_state(1, split.get(), scan_stage::reading);
+  CHECK(ra->counters().cold_read_tickets.load() == 1);
+  CHECK(ra->available_tickets_for_testing() == 1);
+  split->set_scan_stage(scan_stage::disposed);
+  ra->update_scan_state(1, split.get(), scan_stage::disposed);
+  CHECK(ra->available_tickets_for_testing() == 2);
 
   ra->stop();
   CHECK(ra->available_tickets_for_testing() == 2);
@@ -1052,6 +1081,49 @@ TEST_CASE_METHOD(readahead_fixture,
   // The failed buffers stay parked until the split dies.
   split.reset();
   CHECK(eventually([&] { return ra->summary().find(" parked=0]") != std::string::npos; }));
+  ra.reset();
+  tier->view().synchronize();
+}
+
+TEST_CASE_METHOD(readahead_fixture,
+                 "a failed device read hands its ticket to a consumer already reading",
+                 "[scan_manager][device_prefetch][readahead]")
+{
+  auto gate = std::make_shared<read_gate>();
+  auto ra   = readahead(options());
+  auto split =
+    on_gpu0(two_ranges(cucascade::io::open_datasource(gated_context(gate), file.path.string())));
+  ra->register_scan_task(split, 1);
+  ra->mark_operator_closed(1);
+  ra->start();
+  REQUIRE(eventually([&] { return gate->reads.load() == 1; }));
+  REQUIRE(eventually([&] { return worker_settled(*ra, 1); }));
+
+  // The consumer starts while the device read is in flight: it joins the attempt's ticket.
+  split->set_scan_stage(scan_stage::reading);
+  ra->update_scan_state(1, split.get(), scan_stage::reading);
+  CHECK(ra->counters().cold_read_tickets.load() == 0);
+  CHECK(ra->counters().borrowed.load() == 0);
+  CHECK(ra->available_tickets_for_testing() == 1);
+
+  // The copy did not land, so the consumer reads for itself, charged to the ticket the attempt
+  // held: it stays out past the completion, without a second charge, until the split is disposed.
+  gate->fail();
+  REQUIRE(eventually([&] { return outcomes(*ra, prefetch_outcome_kind::device_failed) == 1; }));
+  CHECK(ra->available_tickets_for_testing() == 1);
+  ra->update_scan_state(1, split.get(), scan_stage::reading);
+  CHECK(ra->counters().cold_read_tickets.load() == 0);
+  CHECK(ra->available_tickets_for_testing() == 1);
+  split->set_scan_stage(scan_stage::disposed);
+  ra->update_scan_state(1, split.get(), scan_stage::disposed);
+  CHECK(ra->available_tickets_for_testing() == 2);
+  // A second disposal report releases nothing more.
+  ra->update_scan_state(1, split.get(), scan_stage::disposed);
+  CHECK(ra->available_tickets_for_testing() == 2);
+
+  ra->stop();
+  CHECK(ra->available_tickets_for_testing() == 2);
+  split.reset();
   ra.reset();
   tier->view().synchronize();
 }
