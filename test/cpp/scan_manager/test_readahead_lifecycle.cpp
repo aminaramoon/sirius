@@ -32,6 +32,7 @@
 #include "scan_manager/gatekeeper.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/readahead_test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -48,11 +49,15 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <memory>
 #include <optional>
 #include <regex>
+#include <source_location>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -959,6 +964,122 @@ TEST_CASE("scan inputs populate the cache without a readahead manager",
   CHECK(global_counter(cache->summary(), "hits") > 0);
 
   second_input.reset();
+  manager.reset(query_id);
+}
+
+namespace {
+
+/// Pull a counter from either section of a cache report; a missing counter is an error, not 0.
+std::uint64_t report_counter(std::string const& summary,
+                             std::string const& name,
+                             std::string const& section = "global")
+{
+  std::smatch m;
+  auto const re = std::regex(section + "\\[[^\\]]*\\b" + name + "=(\\d+)");
+  if (!std::regex_search(summary, m, re)) {
+    throw std::runtime_error("Missing cache counter: " + summary);
+  }
+  return std::stoull(m[1].str());
+}
+
+// Insert real cache activity while the scan manager emits its INFO report. This
+// exercises the old gap between that report and the baseline update, without
+// adding synchronization hooks or counter setters to the production cache.
+class read_during_summary_log final : public sirius::log::sink {
+ public:
+  read_during_summary_log(std::shared_ptr<sirius::log::sink> delegate, std::function<void()> read)
+    : delegate_(std::move(delegate)), read_(std::move(read))
+  {
+  }
+  void set_level(sirius::log::level level) override { delegate_->set_level(level); }
+  bool should_log(sirius::log::level level) const override { return delegate_->should_log(level); }
+  bool flush() override { return delegate_->flush(); }
+  void log(sirius::log::level level,
+           std::source_location const& location,
+           std::string_view message) override
+  {
+    delegate_->log(level, location, message);
+    if (message.starts_with("[sirius_scan_manager] cache summary:") && !read_done_.exchange(true))
+      read_();
+  }
+
+ private:
+  std::shared_ptr<sirius::log::sink> delegate_;
+  std::function<void()> read_;
+  std::atomic<bool> read_done_{false};
+};
+
+}  // namespace
+
+// The cache-level halves of upstream's "cache refresh reports each increment once across
+// overlapping refreshes" (#2003) live in cuCascade; this is its scan-manager section.
+TEST_CASE("scan manager logs the cache sample it closes and preserves activity during logging",
+          "[scan_manager][readahead][cache_summary]")
+{
+  temp_data_file file(8ull << 20);
+  auto memory             = initialize_memory_manager(1);
+  auto cfg                = sirius::test::dispose_on_idle_config();
+  cfg.cache.eviction      = eviction_policy::lru;
+  cfg.max_readahead_scans = 0;
+  cfg.apply_cache_mode();
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius::scan_manager::sirius_scan_manager manager{
+    scan_lifecycle, cfg, *memory, sirius::test::single_gpu_index_for_prefetch()};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache);
+  REQUIRE(cache->is_armed());
+  auto ds = manager.create_datasource(file.path.string());
+  std::array ranges{cudf::io::text::byte_range_info{0, 4096}};
+  ds->fadvise(ranges, 0);
+  REQUIRE(ds->prepare_prefetch(false) == cucascade::io::prepare_result::prepared);
+  std::vector<std::uint8_t> bytes(4096);
+  auto read = [&] {
+    if (ds->host_read(0, bytes.size(), bytes.data()) != bytes.size())
+      throw std::runtime_error("Incomplete cache read");
+  };
+  read();  // Populate the chunk; subsequent reads count as hits.
+  auto const before = cache->prepare_for_query();
+  std::vector<std::string> reports;
+  constexpr std::array names{"reads", "hits", "h2d", "miss", "evictions"};
+
+  read();
+  auto tctx           = sirius::test::make_test_telemetry_context();
+  auto const query_id = sirius::make_query_id(7);
+  sirius::telemetry::query_telemetry_info tinfo{quent::now_v7(), tctx->worker_id().raw(), query_id};
+  sirius::planner::query empty{std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+                               tctx->context(),
+                               query_id,
+                               tinfo};
+  std::string info_report;
+  {
+    sirius::test::scoped_recording_log_sink logs;
+    sirius::log::set_sink(std::make_shared<read_during_summary_log>(logs.sink_ptr(), read));
+    manager.prepare_for_query(empty, true, {});
+    // cuCascade's own trace record of the same report is compiled out, so only the scan
+    // manager's INFO record is checked.
+    for (auto const& record : logs.records()) {
+      auto const pos = record.message.find("fs_cache: global[");
+      if (pos == std::string::npos) continue;
+      if (record.level == sirius::log::level::info) info_report = record.message.substr(pos);
+    }
+  }
+  REQUIRE_FALSE(info_report.empty());
+  // The logged report is the very sample the refresh closed: one hit since `before`.
+  CHECK(report_counter(info_report, "hits", "last_cycle") == 1);
+  reports.push_back(info_report);
+  // The read injected by the INFO sink belongs to the next interval.
+  CHECK(report_counter(cache->summary(), "hits", "last_cycle") == 1);
+
+  reports.push_back(cache->prepare_for_query());
+  auto const after = cache->summary();
+  CHECK(report_counter(after, "hits") > report_counter(before, "hits"));
+  for (auto const* name : names) {
+    INFO(name);
+    std::uint64_t reported = 0;
+    for (auto const& report : reports)
+      reported += report_counter(report, name, "last_cycle");
+    CHECK(reported == report_counter(after, name) - report_counter(before, name));
+  }
   manager.reset(query_id);
 }
 
