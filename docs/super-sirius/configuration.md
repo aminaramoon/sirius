@@ -388,7 +388,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer threads. Preparation and coalescing run on each query owner thread, so they cannot occupy producer capacity. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 4 uring reactor threads), with a floor of 4. |
+| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer threads. Preparation and coalescing run on each query owner thread, so they cannot occupy producer capacity. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor thread, the `uring_reactors_per_gpu` default), with a floor of 4. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: `io_uring` for local paths, and REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://` reads, listing and glob expansion. cuCascade's cuFile (GDS) backend is not selectable here. `sirius` is a deprecated alias of `native`, still accepted. `kvikio` names the removed kvikIO backend: it still loads, as `native`, with a deprecation WARN. Values are lowercase. |
 | `uring_reactors_per_gpu` | int (**> 0**) | 1 | uring reactors per GPU for local-disk reads (4 GPUs and `1` give 4 reactors). Each reactor is one worker thread with its own io_uring ring and request queue, pinned to its GPU's local CPUs, and allocates its own pinned staging from the host memory space of its GPU's NUMA node when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). A device read goes to the reactors on its GPU's NUMA node unless they are much busier than the rest (cuCascade's `io_config::reactor_spill`). |
@@ -430,7 +430,9 @@ backend's `n_max_concurrent_scans`, and for a local backend that publishes none,
 reads cannot go through a host cache (`ioctx::can_use_fs_cache()` false, such as cuFile) is left out of that
 accounting: device-tier reads on it are bounded only by the query's own readahead budget. Demand reads
 borrow immediately; their debt pauses speculative prefetch. Events are routed by query ID. A failed cache
-allocation gets one eviction retry before speculation yields.
+allocation is retried with synchronous eviction, then once more after a 10 ms back-off (holding no
+capacity), before speculation yields with one `skipped_memory_pressure`; the device tier's phase 1 is not
+repeated by that retry.
 
 #### Device-tier readahead
 
