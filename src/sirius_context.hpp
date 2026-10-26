@@ -427,6 +427,12 @@ class SiriusContext : public ClientContextState {
     uint64_t parquet_type_refusals          = 0;
     uint64_t device_route_decodes           = 0;  ///< parquet splits decoded from a device prefetch
     uint64_t device_route_fallbacks         = 0;  ///< device-route decodes retried generally
+    uint64_t metadata_cache_entries = 0, metadata_cache_hits = 0, metadata_cache_misses = 0;
+    uint64_t metadata_cache_replacements = 0, metadata_cache_bypasses = 0;
+    uint64_t metadata_cache_joined = 0, metadata_cache_builds = 0;
+    uint64_t metadata_cache_failures = 0, metadata_cache_cancelled_waiters = 0;
+    uint64_t metadata_cache_stale           = 0;
+    uint64_t metadata_provenance_mismatches = 0;
     std::unordered_map<uint64_t, uint64_t> scan_lowerings;
   };
 

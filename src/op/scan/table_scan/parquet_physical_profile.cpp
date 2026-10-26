@@ -165,7 +165,7 @@ parquet_encryption_evidence inspect_parquet_encryption(std::span<uint8_t const> 
   }
 }
 parquet_metadata_resolution resolve_parquet_metadata_with_identity(
-  io::sirius_datasource& source,
+  cucascade::io::datasource& source,
   scan_contract_id contract,
   std::string const& identity,
   cudf::io::parquet_reader_options const& options,
@@ -225,7 +225,7 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
       append(id);
   }
   if (cache_hit) *cache_hit = false;
-  auto build = [&]() -> std::shared_ptr<io::io_object_metadata> {
+  auto build = [&]() -> std::shared_ptr<cucascade::io::io_object_metadata> {
     auto footer = fetch_plaintext_parquet_footer(source, contract, identity);
     crypto_reader probe({footer->data(), footer->size()});
     auto encryption = probe.read();

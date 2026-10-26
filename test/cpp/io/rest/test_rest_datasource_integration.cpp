@@ -139,7 +139,9 @@ TEST_CASE("rest datasource reads the SeaweedFS hello fixture through scan_manage
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_s3_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_s3_rest_config(), *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://" + bucket + "/hello.txt");
   require_rest_ioctx(datasource);
@@ -159,7 +161,9 @@ TEST_CASE("rest datasource reads exact host ranges and clips EOF on SeaweedFS fi
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const small  = read_binary_file(local_fixture_path("small.bin"));
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_s3_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_s3_rest_config(), *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/small.bin");
   require_rest_ioctx(datasource);
 
@@ -198,7 +202,8 @@ TEST_CASE("rest datasource fans out host_read_ranges_async against the SeaweedFS
   auto cfg                 = make_s3_rest_config();
   cfg.rest.max_connections = 4;
   cfg.rest.merge_max_gap   = 0;  // one GET per range: no bridging across the gaps
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/medium.bin");
   require_rest_ioctx(datasource);
 
@@ -246,7 +251,8 @@ TEST_CASE("rest datasource stages device reads through host memory for SeaweedFS
   scan_manager_fixture fixture;
   auto cfg                 = make_s3_rest_config();
   cfg.rest.max_connections = 4;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   SECTION("single chunk")
   {
@@ -308,7 +314,9 @@ TEST_CASE("rest datasource reads through the TLS SeaweedFS endpoint with the har
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_tls_s3_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_tls_s3_rest_config(), *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/hello.txt");
   require_rest_ioctx(datasource);
 

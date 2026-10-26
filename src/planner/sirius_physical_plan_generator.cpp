@@ -88,6 +88,8 @@
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
 
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/uri_parser.hpp>
 #include <cudf/cudf_utils.hpp>
 
 #include <duckdb/common/serializer/binary_serializer.hpp>
@@ -539,7 +541,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     bool remote = false;
     std::string scheme;
     try {
-      auto const parsed = sirius::io::parse(dv.file_path);
+      auto const parsed = cucascade::io::parse(dv.file_path);
       scheme            = parsed.scheme;
       remote            = parsed.scheme != "file";
     } catch (std::invalid_argument const&) {
@@ -550,8 +552,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     if (!remote) return;
     auto const backend           = scan_manager.planning_io_backend(dv.file_path);
     auto const backend_available = scheme == "s3" && backend.has_value() &&
-                                   (*backend == sirius::io::io_context_type::restful ||
-                                    *backend == sirius::io::io_context_type::kvikio);
+                                   *backend == cucascade::io::io_context_type::restful;
     remote_puffins.push_back({contract, dv.file_path, std::move(scheme), backend_available});
   };
   std::vector<scan_dv_count> counts;

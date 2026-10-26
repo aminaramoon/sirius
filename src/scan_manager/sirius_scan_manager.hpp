@@ -19,6 +19,7 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb_table_identity.hpp"
 #include "event/query_event_publisher.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/scoped_object_store_configs.hpp"
@@ -46,6 +47,7 @@
 #include <compression/compressed_representation.hpp>
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/io/cache/metadata_store.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -54,6 +56,7 @@
 #include <duckdb/common/vector.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/storage_lock.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 
 namespace cucascade::memory {
 class fixed_size_host_memory_resource;
@@ -871,6 +874,9 @@ class sirius_scan_manager {
     return _io_ctx;
   }
 
+  /// Aggregate metadata-cache diagnostics across the default and routed ioctxs.
+  [[nodiscard]] cucascade::io::cache::metadata_store::counters metadata_cache_statistics() const;
+
   /// Where the readahead subscribes for execution events.  Set once at startup;
   /// the readahead itself is per-query, so it registers and unregisters around
   /// its own lifetime rather than this one.
@@ -903,7 +909,7 @@ class sirius_scan_manager {
   /// Resolve only the registered backend type for @p path. This is a planning
   /// query: it does not construct or start an ioctx, open an object, issue a
   /// HEAD, warm a backend, or probe credentials/network.
-  [[nodiscard]] std::optional<sirius::io::io_context_type> planning_io_backend(
+  [[nodiscard]] std::optional<cucascade::io::io_context_type> planning_io_backend(
     std::string_view path) const;
 
  private:
@@ -1107,6 +1113,8 @@ class sirius_scan_manager {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
   exec::static_thread_pool _thread_pool;
+  std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
+    std::make_shared<shared_scan_budget>();
   std::shared_ptr<cucascade::io::ioctx> _io_ctx;
   /// `[uring_gauges]` DEBUG sampler of `_io_ctx` when it is a uring ioctx (null
   /// otherwise).  Stopped in @ref stop, before any ioctx is released.

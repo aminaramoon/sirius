@@ -186,17 +186,10 @@ class slot_guard {
  private:
   void release() noexcept
   {
-    // Back to attempted BEFORE the abandon wakes a consumer, so the consumer's own read is
-    // charged a ticket.  A compare-exchange, so only the prefetched this attempt published is
-    // undone.  Nothing was submitted, so nothing can have published ready yet; a ready prefetch
-    // would keep its state all the same.  Residual window:
-    // readahead_scan_manager::update_scan_state reads get_prefetch_state() when the consumer
-    // reports `reading` and acts on what it read; a report that read `prefetched` just before
-    // this correction skips its cold-read ticket (under-charged by one ticket, benign).
-    if (_ranges.current() != prefetched_ranges::state::ready) {
-      std::ignore = _split.compare_exchange_prefetch_state(scan_info::prefetch_state::prefetched,
-                                                           scan_info::prefetch_state::attempted);
-    }
+    // No ticket bookkeeping here: the readahead published the split's scan_ticket before this
+    // attempt and settles it when the attempt does not issue (a consumer that already reported
+    // `reading` has joined that ticket, which then transfers to its read), so nothing has to be
+    // undone for the consumer's sake.
     std::ignore = _ranges.abandon();
     _split.discard_prefetched_ranges();
   }
@@ -429,14 +422,14 @@ device_prefetch_issue device_prefetch_issuer::try_issue(std::shared_ptr<scan_inf
     return device_prefetch_issue::error;
   }
 
-  // 10. Install, then publish prefetched so the consumer's `reading` report takes no cold-read
-  //     ticket.  From here every non-issued exit goes through the guard.
+  // 10. Install.  The consumer's `reading` report takes no cold-read ticket of its own: it joins
+  //     the scan_ticket the readahead published before this attempt.  From here every non-issued
+  //     exit goes through the guard.
   if (!split->set_prefetched_ranges(ranges)) {
     SIRIUS_LOG_WARN("[readahead] device prefetch for '{}' not issued: slot already occupied",
                     path_of(hints[0]));
     return device_prefetch_issue::error;
   }
-  split->set_prefetch_state(scan_info::prefetch_state::prefetched);
   slot_guard guard{*split, *ranges};
 
   // 11. The consumer may have overtaken us while we allocated: abandon (a consumer already

@@ -213,7 +213,8 @@ TEST_CASE("describe_parquet maps nested local parquet bind shape like DuckDB CPU
   scan_manager_fixture fixture;
   scan_manager_config cfg{};
   cfg.backend = sirius::scan_manager::io_backend::native;
-  sirius_scan_manager manager{std::move(cfg), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, std::move(cfg), *fixture.memory, fixture.topology};
 
   for (auto const fixture_name : {"nested_struct.parquet",
                                   "nested_list.parquet",

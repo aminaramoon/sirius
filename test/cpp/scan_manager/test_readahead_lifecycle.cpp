@@ -852,8 +852,9 @@ TEST_CASE("cache.mode os keeps the readahead enabled by configuration", "[scan_m
   // `os` builds no pinned cache by design, on a backend that could hold one.  The
   // readahead stays enabled but has no pinned cache to fill (page-cache warming
   // would need cuCascade support), so the readahead is built but issues no IO.
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius::scan_manager::sirius_scan_manager manager{
-    config_with_uring_budget(cache_mode::os), *memory, topology};
+    scan_lifecycle, config_with_uring_budget(cache_mode::os), *memory, topology};
   REQUIRE(manager.io_ctx() != nullptr);
   REQUIRE(manager.io_ctx()->can_use_fs_cache());
   REQUIRE(manager.io_ctx()->cache() == nullptr);
@@ -871,8 +872,9 @@ TEST_CASE("a requested cache that failed to build turns the readahead off",
   // the check below is about the cache rather than about the query or budget.
   {
     auto memory = initialize_memory_manager(1);
+    sirius::exec::query_lifecycle_registry scan_lifecycle;
     sirius::scan_manager::sirius_scan_manager manager{
-      config_with_uring_budget(cache_mode::cucs), *memory, topology};
+      scan_lifecycle, config_with_uring_budget(cache_mode::cucs), *memory, topology};
     REQUIRE(manager.io_ctx()->cache() != nullptr);
     CHECK(local_scan_reads_ahead(manager, sirius::make_query_id(4)));
   }
@@ -882,8 +884,9 @@ TEST_CASE("a requested cache that failed to build turns the readahead off",
   // publishes a budget.
   {
     auto memory = initialize_memory_manager_too_wide_for_cache();
+    sirius::exec::query_lifecycle_registry scan_lifecycle;
     sirius::scan_manager::sirius_scan_manager manager{
-      config_with_uring_budget(cache_mode::cucs), *memory, topology};
+      scan_lifecycle, config_with_uring_budget(cache_mode::cucs), *memory, topology};
     REQUIRE(manager.io_ctx()->can_use_fs_cache());
     REQUIRE(manager.io_ctx()->cache() == nullptr);
     CHECK_FALSE(local_scan_reads_ahead(manager, sirius::make_query_id(5)));
@@ -916,7 +919,8 @@ TEST_CASE("scan inputs populate the cache without a readahead manager",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index();
   auto cfg      = config_with_readahead_budget(0);
-  sirius::scan_manager::sirius_scan_manager manager{cfg, *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius::scan_manager::sirius_scan_manager manager{scan_lifecycle, cfg, *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());

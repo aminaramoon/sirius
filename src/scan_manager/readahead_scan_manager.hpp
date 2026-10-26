@@ -194,6 +194,21 @@ struct device_prefetch_options {
   [[nodiscard]] bool enabled() const noexcept { return fraction > 0.0 && memory != nullptr; }
 };
 
+/// How a readahead takes part in the runtime-wide scan I/O budget (@ref shared_scan_budget), which
+/// rations speculative IO per backend across every query.
+struct shared_budget_options {
+  /// Null: no runtime-wide accounting (only the per-query gatekeeper applies).
+  std::shared_ptr<shared_scan_budget> budget;
+  /// scan_manager.max_readahead_scans: when set, the limit of every backend.
+  std::optional<std::size_t> limit_override;
+  /// Limit of a backend that publishes none (`n_max_concurrent_scans() == 0`, the local uring
+  /// default); 0 keeps such a backend out of speculation.  Config-only and query-independent --
+  /// never the per-query budget -- because a backend's limit must not change while tickets exist.
+  /// The scan manager sets it to the pipeline width when the device tier is on, the figure
+  /// scan_manager_config::resolve_readahead gives that readahead.
+  std::size_t zero_backend_limit{0};
+};
+
 /// Per-query readahead for GPU scans.
 ///
 /// One work queue per scan operator, held in execution order and fed by the
@@ -233,7 +248,8 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   readahead_scan_manager(event::query_event_publisher& publisher,
                          std::size_t budget,
                          std::shared_ptr<op::scan::physical_check_counters> physical_counters = {},
-                         device_prefetch_options device                                       = {});
+                         device_prefetch_options device                                       = {},
+                         shared_budget_options shared                                         = {});
   /// Stops and joins both workers -- the prefetch worker and the event subscriber.
   ~readahead_scan_manager() override;
   readahead_scan_manager(readahead_scan_manager const&)            = delete;
@@ -418,12 +434,14 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   [[nodiscard]] bool in_backoff(device_tier& tier) noexcept;
   /// Phase 1 for @p candidate.  True when the device reads were issued, which hands the
   /// candidate's ticket to the completion; false leaves the ticket with the caller.
-  [[nodiscard]] bool try_issue_device(prefetch_candidate const& candidate);
+  [[nodiscard]] bool try_issue_device(prefetch_candidate const& candidate,
+                                      split_key const& split,
+                                      std::shared_ptr<scan_ticket> const& ticket);
   /// Classify and record one settled device prefetch, release the host staging under
   /// @ref device_prefetch_options::release_host_staging, and hand its ticket back.  Runs on
   /// whichever thread settled the last read, so it never blocks and never throws.
-  void on_device_prefetch_complete(std::size_t operator_id,
-                                   std::weak_ptr<op::scan::scan_info> const& split,
+  void on_device_prefetch_complete(split_key const& split,
+                                   std::shared_ptr<scan_ticket> const& ticket,
                                    device_prefetch_result const& result) noexcept;
 
   device_prefetch_options _device;
@@ -519,6 +537,7 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   query_id_t _query_id{make_query_id(0)};
   std::shared_ptr<shared_scan_budget> _shared_budget;
   std::optional<std::size_t> _budget_override;
+  std::size_t _zero_backend_limit{0};
   std::mutex _tickets_mutex;
   // Ownership identity avoids confusing a late completion with a new split
   // allocated at the same address. Neither the map nor callbacks retain splits.

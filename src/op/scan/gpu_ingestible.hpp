@@ -30,6 +30,8 @@
 #include <op/scan/scan_filter_analysis.hpp>
 
 // cccl
+#include "scan_manager/preparation.hpp"
+
 #include <cuda/stream>
 
 // standard library

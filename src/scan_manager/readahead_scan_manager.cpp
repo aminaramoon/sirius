@@ -51,7 +51,8 @@ readahead_scan_manager::readahead_scan_manager(
   event::query_event_publisher& publisher,
   std::size_t budget,
   std::shared_ptr<op::scan::physical_check_counters> physical_counters,
-  device_prefetch_options device)
+  device_prefetch_options device,
+  shared_budget_options shared)
   : event::query_event_subscriber(publisher,
                                   {event::event_type::task_deployed,
                                    event::event_type::task_queue_empty,
@@ -60,7 +61,10 @@ readahead_scan_manager::readahead_scan_manager(
     _device(device),
     _physical_counters(std::move(physical_counters)),
     _budget(budget),
-    _gatekeeper(static_cast<int>(budget))
+    _gatekeeper(static_cast<int>(budget)),
+    _shared_budget(std::move(shared.budget)),
+    _budget_override(shared.limit_override),
+    _zero_backend_limit(shared.zero_backend_limit)
 {
   if (!_device.enabled()) { return; }
   using cucascade::memory::Tier;
@@ -337,19 +341,39 @@ void readahead_scan_manager::update_scan_state(std::size_t,
   // A zero budget means the backend opted out, so there is no readahead for this
   // read to compete with and no budget to charge it against.
   if (task == nullptr || _budget == 0) { return; }
-  if (stage != io::cache::scan_stage::reading && stage != io::cache::scan_stage::disposed) return;
+  if (stage != cucascade::io::cache::scan_stage::reading &&
+      stage != cucascade::io::cache::scan_stage::disposed) {
+    return;
+  }
+  // A disposal frees memory on the split's GPU, which ends that GPU's device back-off.  Counted
+  // for every disposal, with or without a ticket entry, and before the bookkeeping lock: it needs
+  // only the atomic.
+  if (stage == cucascade::io::cache::scan_stage::disposed && !_tiers.empty()) {
+    if (auto const device = task->preferred_device()) {
+      if (auto* tier = tier_for(*device)) {
+        tier->disposals.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
   auto key = task->weak_from_this();
   std::lock_guard lock(_tickets_mutex);
   auto it = _tickets.find(key);
 
   if (stage == cucascade::io::cache::scan_stage::reading) {
-    // A split whose prefetch DID start is already paying for its IO out of the
-    // ticket that prefetch holds; charging it twice would throttle the readahead
-    // for work it is doing itself.
-    if (split->get_prefetch_state() == op::scan::scan_info::prefetch_state::prefetched) { return; }
-    // Nothing was prefetched, so this read is about to do the IO itself. It
-    // spends from the same budget the readahead does -- and never waits for it.
-    if (!split->take_readahead_ticket()) { return; }
+    // Stage publication precedes this call. Do not recreate an entry if a
+    // disposal overtook this report while it was waiting for the mutex.
+    if (task->get_scan_stage() == cucascade::io::cache::scan_stage::disposed) return;
+    if (it != _tickets.end()) {
+      it->second->demand_started = true;
+      return;
+    }
+    auto ticket            = std::make_shared<scan_ticket>();
+    ticket->owner          = scan_ticket::phase::demand;
+    ticket->demand_started = true;
+    // Demand acquisition never waits for budget capacity. Serialize it with
+    // ownership publication so prefetch cannot install a second charge.
+    if (_shared_budget) ticket->shared = acquire_shared_ticket(*task, true);
+    _tickets.emplace(key, std::move(ticket));
     _counters.cold_read_tickets.fetch_add(1, std::memory_order_relaxed);
     if (_gatekeeper.acquire_or_borrow()) {
       _counters.borrowed.fetch_add(1, std::memory_order_relaxed);
@@ -357,20 +381,12 @@ void readahead_scan_manager::update_scan_state(std::size_t,
     return;
   }
 
-  if (stage == cucascade::io::cache::scan_stage::disposed) {
-    // The read is over, so give the ticket back -- paying down any debt first.
-    if (split->give_back_readahead_ticket()) { _gatekeeper.release(); }
-    // A disposal frees memory on the split's GPU, which ends that GPU's device back-off.
-    if (!_tiers.empty()) {
-      if (auto const device = split->preferred_device()) {
-        if (auto* tier = tier_for(*device)) {
-          tier->disposals.fetch_add(1, std::memory_order_relaxed);
-        }
-      }
-    }
-    {
-      std::lock_guard lock(_disposable_mutex);
-      ++_disposable_generation;
+  if (stage == cucascade::io::cache::scan_stage::disposed && it != _tickets.end()) {
+    // An in-flight prefetch still owns both credits until its completion, even
+    // if its consumer is disposed or the manager is destroyed in the meantime.
+    if (it->second->owner == scan_ticket::phase::demand) {
+      it->second->shared.reset();
+      _gatekeeper.release();
     }
     _tickets.erase(it);
   }
@@ -436,7 +452,7 @@ void readahead_scan_manager::settle_prefetch(split_key const& split,
   auto it             = _tickets.find(split);
   auto task           = split.lock();
   bool const retained = it != _tickets.end() && it->second == ticket && task &&
-                        task->get_scan_stage() != io::cache::scan_stage::disposed;
+                        task->get_scan_stage() != cucascade::io::cache::scan_stage::disposed;
   if (retained && !covered && ticket->demand_started) {
     // Failure or partial coverage leaves demand IO outstanding. Transfer the
     // existing charge; disposal will release it, without a gap or double count.
@@ -463,12 +479,8 @@ void readahead_scan_manager::on_prefetch_complete(split_key const& split,
   _counters.record(
     classify_prefetch(out.declined_memory_pressure > 0,
                       task != nullptr,
-                      issued_io,
+                      out.issued > 0,
                       task ? task->get_scan_stage() : cucascade::io::cache::scan_stage::disposed));
-  // Pairs with the acquire in worker_loop.  The slot is free once the IO
-  // settles, not once the split is finally read: the budget caps concurrent IO,
-  // and a landed prefetch is doing none.
-  _gatekeeper.release();
 }
 
 readahead_scan_manager::device_tier* readahead_scan_manager::tier_for(int device) const noexcept
@@ -495,7 +507,9 @@ bool readahead_scan_manager::in_backoff(device_tier& tier) noexcept
   return true;
 }
 
-bool readahead_scan_manager::try_issue_device(prefetch_candidate const& candidate)
+bool readahead_scan_manager::try_issue_device(prefetch_candidate const& candidate,
+                                              split_key const& split,
+                                              std::shared_ptr<scan_ticket> const& ticket)
 {
   auto const& task  = candidate.task;
   auto const device = task->preferred_device();
@@ -516,11 +530,11 @@ bool readahead_scan_manager::try_issue_device(prefetch_candidate const& candidat
   try {
     outcome = tier->issuer->issue(
       task,
-      [weak = weak_from_this(), op_id = candidate.operator_id, split = std::weak_ptr{task}](
-        device_prefetch_result const& result) noexcept {
-        // weak, not shared: a completion firing after the query tore the manager down must not
-        // resurrect it.
-        if (auto self = weak.lock()) { self->on_device_prefetch_complete(op_id, split, result); }
+      // `ticket` by value, like the host attempt's completion: its shared-budget token must come
+      // back even when the completion fires after the manager is gone.  `weak`, not shared: a
+      // completion firing after the query tore the manager down must not resurrect it.
+      [ticket, weak = weak_from_this(), split](device_prefetch_result const& result) noexcept {
+        if (auto self = weak.lock()) { self->on_device_prefetch_complete(split, ticket, result); }
       });
   } catch (...) {
     // Building the callback may allocate; issue() itself reports failures as outcomes.
@@ -556,20 +570,20 @@ bool readahead_scan_manager::try_issue_device(prefetch_candidate const& candidat
 }
 
 void readahead_scan_manager::on_device_prefetch_complete(
-  std::size_t,
-  std::weak_ptr<op::scan::scan_info> const& split,
+  split_key const& split,
+  std::shared_ptr<scan_ticket> const& ticket,
   device_prefetch_result const& result) noexcept
 {
   using cucascade::io::cache::scan_stage;
   using kind      = prefetch_outcome_kind;
   auto const task = split.lock();
+  // First, like on_prefetch_complete: both credits are free once the IO settles.  A copy that did
+  // not land hands them to a demand read that already started (the consumer's own read is then
+  // the one charged) or releases them; a landed copy releases them and leaves the zero-capacity
+  // `covered` marker, so a later `reading` report charges nothing.  Replaces the old
+  // prefetched -> attempted correction and the direct gatekeeper release.
+  settle_prefetch(split, ticket, /*covered=*/result.ok);
   if (!result.ok) {
-    // Back to attempted, so the consumer's own read is charged a ticket.
-    if (task) {
-      std::ignore =
-        task->compare_exchange_prefetch_state(op::scan::scan_info::prefetch_state::prefetched,
-                                              op::scan::scan_info::prefetch_state::attempted);
-    }
     _counters.record(kind::device_failed);
   } else {
     _counters.device_bytes.fetch_add(result.bytes, std::memory_order_relaxed);
@@ -606,9 +620,7 @@ void readahead_scan_manager::on_device_prefetch_complete(
     }
   }
 
-  // Pairs with the acquire in worker_loop: exactly once per issued device attempt.
-  _gatekeeper.release();
-  // After the release: stop() waits on this for the ticket.
+  // After the settle: stop() waits on this for the ticket.
   _device_inflight.fetch_sub(1, std::memory_order_release);
 }
 
@@ -619,26 +631,10 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
   constexpr auto k_slot_wait = std::chrono::milliseconds{100};
   // Back-off when the order has nothing to prefetch right now.
   constexpr auto k_idle_wait = std::chrono::milliseconds{10};
-  // Bound the wait for a disposal notification. The timeout is also a recovery
-  // path for a coalesced or missed notification.
-  constexpr auto k_memory_retry = std::chrono::milliseconds{25};
 
-  // Prepare a candidate and, if that succeeds, issue its IO.  Returns whether
-  // the prefetch was issued -- which is also whether the completion has taken
-  // ownership of the slot.
-  auto try_issue = [&](prefetch_candidate const& candidate) {
-    // Phase 1, the device tier: once per candidate, never once per host retry.  The ticket is
-    // still ours unless it issued.
-    //
-    // The device tier may run this manager although no backend of the query has an fs_cache.
-    // The host loop then finds nothing to stage (prepare_for_prefetching returns {0, 0, 0}) and
-    // records nothing_to_issue without entering the memory-retry wait: it must never assume a
-    // cache exists, and a phase-1 refusal is not retried.
-    if (_device.enabled() && try_issue_device(candidate)) { return true; }
-
-    // Phase 2, the host tier.
-    bool evict_on_failure = false;
-    while (!st.stop_requested()) {
+  enum class issue_result { issued, finished, memory_pressure };
+  auto try_issue =
+    [&](prefetch_candidate const& candidate, bool delayed_retry, bool& slot_transferred) {
       if (candidate.task->has_fallen_behind()) {
         _counters.record(prefetch_outcome_kind::skipped_fell_behind);
         return issue_result::finished;
@@ -667,6 +663,19 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
         return issue_result::finished;
       }
       auto attempt = [&] {
+        // Phase 1, the device tier: once per candidate, never once per host retry (a delayed retry
+        // exists only because phase 2 met memory pressure; a phase-1 refusal is not retried).  The
+        // ticket and its shared-budget token are already published above, so a refusal leaves them
+        // with this attempt: the host phase below uses the same ticket, and a non-issued result
+        // settles it in the caller.
+        //
+        // The device tier may run this manager although no backend of the query has an fs_cache.
+        // The host loop then finds nothing to stage (prepare_for_prefetching returns {0, 0, 0})
+        // and records nothing_to_issue without entering the memory-retry path: it must never
+        // assume a cache exists.
+        if (!delayed_retry && _device.enabled() && try_issue_device(candidate, split, ticket)) {
+          return issue_result::issued;
+        }
         bool evict_on_failure = delayed_retry;
         while (!st.stop_requested()) {
           if (candidate.task->has_fallen_behind()) {
@@ -782,8 +791,12 @@ shared_scan_budget::token readahead_scan_manager::acquire_shared_ticket(
   std::vector<shared_scan_budget::request> requests;
   for (auto const& source : task.datasources()) {
     auto backend = source->io_ctx();
-    if (!backend || !backend->can_use_prefetching_cache()) continue;
+    if (!backend || !backend->can_use_fs_cache()) continue;
     auto limit = _budget_override.value_or(backend->n_max_concurrent_scans());
+    // A backend that publishes no budget (local uring by default) opts out of speculation, except
+    // for the device tier: scan_manager_config::resolve_readahead runs the readahead on the
+    // pipeline width there.  Config-only, so the backend's limit is the same for every query.
+    if (!limit) limit = _zero_backend_limit;
     if (!limit) {
       if (!demand) return {};
       continue;

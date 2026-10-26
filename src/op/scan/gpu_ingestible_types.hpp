@@ -20,6 +20,7 @@
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/cache/types.hpp>
+#include <expression/ast/node.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -124,22 +125,6 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
 
   // ---- readahead -----------------------------------------------------------
 
-  /// Whether anybody managed to read this split ahead of demand.  Producer-side
-  /// and deliberately separate from @c cucascade::io::cache::scan_stage, which tracks the
-  /// consumer's progress: the two advance independently.
-  enum class prefetch_state : int {
-    idle       = 0,  ///< no prefetch has been attempted
-    attempted  = 1,  ///< @ref prefetch ran but every datasource refused
-    prefetched = 2,  ///< at least one datasource started IO
-  };
-
-  /// Read without a lock -- the readahead worker writes this while the executor
-  /// may be reading it.
-  [[nodiscard]] prefetch_state get_prefetch_state() const noexcept
-  {
-    return _prefetch_state.load(std::memory_order_acquire);
-  }
-
   /// How one @ref prefetch call resolved, once every datasource has settled.
   /// A backend refusing the request is not an error -- it is busy -- but it is
   /// worth counting, because a refusal while work is queued means capacity went
@@ -204,23 +189,6 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     return get_scan_stage() >= cucascade::io::cache::scan_stage::preparing;
   }
 
-  /// Take / give back the readahead ticket this split holds for its own read.
-  ///
-  /// A split the readahead never covered spends from the same IO budget the
-  /// readahead does, and the flag is what makes that exactly-once: `take`
-  /// returns false if it already holds one (a stage can be reported twice), and
-  /// `give_back` returns false if it never had one, so neither a double-charge
-  /// nor a double-refund is possible.
-  [[nodiscard]] bool take_readahead_ticket() noexcept
-  {
-    return !_holds_readahead_ticket.exchange(true, std::memory_order_acq_rel);
-  }
-
-  [[nodiscard]] bool give_back_readahead_ticket() noexcept
-  {
-    return _holds_readahead_ticket.exchange(false, std::memory_order_acq_rel);
-  }
-
   // ---- device tier -----------------------------------------------------------
 
   /// The GPU this split was balanced onto, stamped by scan_operator_input::initialize_prefetch
@@ -260,8 +228,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
 
   /// Consume the slot: the caller now owns the only split-side reference.  Const because the
   /// consumer only has a const view (materialize_metadata_to_table takes `scan_info const&`); the
-  /// slot is split-owned bookkeeping like the readahead ticket flag, so its members are mutable
-  /// and no const_cast is needed.
+  /// slot is split-owned bookkeeping, so its members are mutable and no const_cast is needed.
   [[nodiscard]] std::shared_ptr<prefetched_ranges> take_prefetched_ranges() const noexcept
   {
     std::lock_guard lock(_prefetched_mutex);
@@ -271,22 +238,6 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   /// Drop the slot's reference.  Released outside the lock: the last reference frees device
   /// memory.
   void discard_prefetched_ranges() const noexcept { std::ignore = take_prefetched_ranges(); }
-
-  /// Producer-side correction after a device prefetch was issued (state prefetched) but
-  /// abandoned or failed: back to attempted so the consumer's own read charges a ticket.
-  void set_prefetch_state(prefetch_state state) noexcept
-  {
-    _prefetch_state.store(state, std::memory_order_release);
-  }
-
-  /// @ref set_prefetch_state only while the state is still @p expected; true when this call
-  /// moved it to @p desired.  A correction made this way cannot overwrite a state another writer
-  /// published in between.
-  bool compare_exchange_prefetch_state(prefetch_state expected, prefetch_state desired) noexcept
-  {
-    return _prefetch_state.compare_exchange_strong(
-      expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
-  }
 
   /// Allocate staging buffers for this split's prefetch requests.  A chunk
   /// without one cannot be claimed for loading, so a prefetch issued over it
@@ -334,9 +285,10 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     auto pending =
       std::make_shared<prefetch_completion>(_datasources.size() + 1, std::move(on_done));
     for (auto const& ds : _datasources) {
-      switch (ds->prefetch_async([pending](bool ok) noexcept { pending->arrive(ok); })) {
+      switch (ds->prefetch_async([pending](cucascade::io::cache::prefetch_result result) noexcept {
+        pending->arrive(result);
+      })) {
         case cucascade::io::prefetch_refusal::issued:
-          ++issued;
           pending->issued.fetch_add(1, std::memory_order_relaxed);
           continue;
         case cucascade::io::prefetch_refusal::memory_pressure:
@@ -418,7 +370,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     {
     }
 
-    void arrive(io::cache::prefetch_result result) noexcept
+    void arrive(cucascade::io::cache::prefetch_result result) noexcept
     {
       if (!result.ok) { ok.store(false, std::memory_order_relaxed); }
       if (!result.covered) { covered.store(false, std::memory_order_relaxed); }
@@ -451,9 +403,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
 
   std::vector<fadvise_entry> _hints;
   std::vector<std::shared_ptr<cucascade::io::datasource>> _datasources;
-  std::atomic<prefetch_state> _prefetch_state{prefetch_state::idle};
   std::atomic<cucascade::io::cache::scan_stage> _scan_stage{cucascade::io::cache::scan_stage::none};
-  std::atomic<bool> _holds_readahead_ticket{false};
   std::atomic<int> _preferred_device{-1};
   mutable std::mutex _prefetched_mutex;
   mutable std::shared_ptr<prefetched_ranges> _prefetched;

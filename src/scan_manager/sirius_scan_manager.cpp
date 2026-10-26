@@ -84,7 +84,6 @@
 #include <duckdb/transaction/duck_transaction_manager.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -662,19 +661,13 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
   return {};
 }
 
-/// Strip a leading "file://" scheme (case-insensitive) so the path can be
-/// resolved by a local-file backend. Thin alias for the shared helper — kept so
-/// the cache-key and routing call sites below read as they did, while there is
-/// exactly ONE implementation of the rule (sirius::io::strip_file_scheme).
+/// Strip a leading "file://" scheme and canonicalize the case-insensitive S3
+/// scheme. Bucket and key bytes remain byte-identical because they are part of
+/// the object-store identity and may be case-sensitive.
 std::string normalize_path(std::string const& p)
 {
-  auto normalized  = sirius::io::strip_file_scheme(p);
-  auto const delim = normalized.find("://");
-  if (delim == 2 && std::tolower(static_cast<unsigned char>(normalized[0])) == 's' &&
-      std::tolower(static_cast<unsigned char>(normalized[1])) == '3') {
-    normalized[0] = 's';
-    normalized[1] = '3';
-  }
+  auto normalized = sirius::io::strip_file_scheme(p);
+  if (sirius::io::s3::is_s3_path(normalized)) { normalized.replace(0, 5, "s3://"); }
   return normalized;
 }
 
@@ -1513,25 +1506,13 @@ void sirius_scan_manager::prepare_for_query(
     reset(query_id);
   }
 
-  // KNOWN GAP under concurrent queries: the cache's query epoch is a single GLOBAL counter
-  // (cucascade::io::cache::fs_cache::_ticker, bumped by fs_cache::prepare_for_query). It is
-  // stamped on each prefetch request and drives the per-cycle statistics (summary() deltas),
-  // so a second query starting here folds the first query's remaining prefetch activity into
-  // its own cycle. Eviction itself does not read the epoch: the evictor sweeps finished
-  // prefetch requests in creation order (one pass under eviction: idle; under lru only past
-  // eviction_threshold_fraction, with a second pass that takes subscribed chunks), and
-  // mark_evicting() succeeds only at pin == 0, so a chunk a live reader holds is never
-  // reclaimed. Observability only, never correctness; a per-query epoch would belong in
-  // fs_cache, not here.
+  // Refresh synchronized cache accounting; cache entries retain their own IO/read leases.
   if (_io_ctx && _io_ctx->cache()) {
     auto const report = _io_ctx->cache()->prepare_for_query();
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", report);
   }
 
-  // Routed ioctxs (e.g. the restful context serving s3://) are built lazily and
-  // reused across queries; advance their caches to this query too, or a routed
-  // cache's epoch freezes at build time and a later query serves the prior
-  // query's cached chunks as current. Same global-epoch caveat as above.
+  // Refresh accounting for lazily created backend caches too.
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
     for (auto& [key, io_ctx] : _routed_io_ctxs) {
@@ -1630,7 +1611,17 @@ void sirius_scan_manager::prepare_for_query(
             _config.cache.use_fs_cache() &&
             _config.cache.eviction == cucascade::io::cache::eviction_policy::prefetch,
           .max_parked_splits = _config.device_prefetch_max_splits,
-          .pipeline_width    = _config.pipeline_width});
+          .pipeline_width    = _config.pipeline_width},
+        shared_budget_options{
+          .budget         = _shared_readahead_budget,
+          .limit_override = _config.max_readahead_scans,
+          // A backend that publishes no budget (local uring by default) gets the pipeline width
+          // when the device tier is on: the budget resolve_readahead gives that readahead.
+          // Config-only, so one backend never sees two limits while tickets are outstanding.
+          .zero_backend_limit = _config.device_prefetching_enabled()
+                                  ? (_config.pipeline_width > 0 ? _config.pipeline_width
+                                                                : default_device_readahead_budget)
+                                  : std::size_t{0}});
       state->readahead->prepare_for_query(query);
       state->readahead->start(plan.strategy);
     }
@@ -2187,10 +2178,10 @@ std::shared_ptr<cucascade::io::datasource> sirius_scan_manager::create_datasourc
   return sirius::io::open_datasource(std::move(io_ctx), std::move(file_path), hint);
 }
 
-sirius::io::cache::metadata_store::counters sirius_scan_manager::metadata_cache_statistics() const
+cucascade::io::cache::metadata_store::counters sirius_scan_manager::metadata_cache_statistics() const
 {
-  sirius::io::cache::metadata_store::counters total;
-  auto add = [&total](sirius::io::cache::metadata_store::counters const& current) {
+  cucascade::io::cache::metadata_store::counters total;
+  auto add = [&total](cucascade::io::cache::metadata_store::counters const& current) {
     total.entries += current.entries;
     total.hits += current.hits;
     total.misses += current.misses;
@@ -2268,6 +2259,16 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(std::s
   return ioctx_for_type(*type, file_path);
 }
 
+std::optional<cucascade::io::io_context_type> sirius_scan_manager::planning_io_backend(
+  std::string_view path) const
+{
+  // The registry checker is deliberately the only operation here. In
+  // particular, do not call ioctx_for_path(): that starts reactors, allocates
+  // cache state, and may construct an authorizer. This method is used by the
+  // Iceberg planner before it chooses the eager/deferred Puffin route.
+  return _ioctx_registry.lookup_path(normalize_path(std::string(path)));
+}
+
 std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   cucascade::io::io_context_type type, std::string_view path)
 {
@@ -2288,27 +2289,24 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
 
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find({type, config_id}); it != _routed_io_ctxs.end()) {
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
       return it->second;
     }
   }
-  // Build outside the map mutex: make_ioctx/start spawn reactor threads and
-  // initialize_cache allocates, so holding _routed_io_ctxs_mtx across them would
-  // park every concurrent lookup behind one long critical section. The build
-  // mutex serializes builders instead, so two first-touches of the same type
-  // never construct twice (a losing ioctx would need drain/stop teardown).
+  // Serialize construction, not ordinary lookups. A waiting builder rechecks
+  // the scope so it cannot publish an ioctx with superseded credentials.
   std::unique_lock build_lk{_routed_io_ctxs_build_mtx};
-  if (uses_object_store_config && !canonical_path.empty()) {
-    auto latest          = _s3_configs.resolve(canonical_path);
+  if (uses_object_store_config && !file_path.empty()) {
+    auto latest          = _s3_configs.resolve(file_path);
     auto const latest_id = latest ? latest->id : 0;
     if (latest_id != config_id) {
       build_lk.unlock();
-      return ioctx_for_type(type, canonical_path);
+      return ioctx_for_type(type, file_path);
     }
   }
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find({type, config_id}); it != _routed_io_ctxs.end()) {
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
       return it->second;
     }
   }
@@ -2334,8 +2332,7 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   }
   init_cache_for(*io_ctx);
   std::lock_guard lk{_routed_io_ctxs_mtx};
-  auto [it, inserted] =
-    _routed_io_ctxs.emplace(routed_ioctx_key{type, config_id}, std::move(io_ctx));
+  auto [it, inserted] = _routed_io_ctxs.emplace(cache_key, std::move(io_ctx));
   return it->second;
 }
 
@@ -3506,7 +3503,7 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
     std::latch settled{1};
     bool loaded = false;
     std::ignore = datasource->prefetch_async(
-      [&settled, &loaded](sirius::io::cache::prefetch_result result) noexcept {
+      [&settled, &loaded](cucascade::io::cache::prefetch_result result) noexcept {
         bool const ok = result.ok;
         loaded        = ok;
         settled.count_down();

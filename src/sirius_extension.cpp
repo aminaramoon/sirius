@@ -1324,6 +1324,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       return metadata;
     };
 
+    // Every tier materializes through the scan manager's ioctx rather than cuDF's bundled
+    // file_source factory, which uses kvikIO internally and binds to a single CUDA context.
+    // That is mandatory on multi-GPU.
     if (data.args.tier == "host") {
       // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
       // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local
@@ -1412,94 +1415,14 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         pin_metadata(mat.unique_verdicts, std::move(base_row_count_per_chunk)));
     }
 
-  // Every tier materializes through the scan manager's ioctx rather than cuDF's bundled
-  // file_source factory, which uses kvikIO internally and binds to a single CUDA context.
-  // That is mandatory on multi-GPU.
-  if (data.args.tier == "host") {
-    // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
-    // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local
-    // host space, then free the GPU table before materializing the next. Peak GPU residency
-    // stays at ~one batch, so the whole table never needs to fit in GPU memory. On multi-GPU
-    // the chunks land round-robin across NUMA nodes; the cached-serve path then reads each
-    // chunk back on a NUMA-local GPU.
-    auto host_result =
-      sirius::materialize_pin_to_host(*ingestible,
-                                      gpu_spaces_mut,
-                                      host_space_by_gpu,
-                                      *scan_mgr.io_ctx(),
-                                      pinned_column_types,
-                                      pin_comp,
-                                      {.capture_chunk_stats               = capture_chunk_stats,
-                                       .enable_compressed_materialization = compressed_pin,
-                                       .probe_unique_columns              = probe_unique_columns});
-    sirius_ctx->get_event_publisher().publish_compressed_materialization(
-      sirius::event::compressed_materialization_activity::pin_columns_narrowed,
-      count_narrowed_columns(host_result.column_storage));
-    // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
-    // NUMA-local memory_space. Pass a representative (the first GPU's host space).
-    int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
-    auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
-
-    scan_mgr.insert_pinned_entry_host(data.args.name,
-                                      std::move(cache_info),
-                                      std::move(host_result.chunks),
-                                      *representative_host_space,
-                                      std::move(pinned_column_types),
-                                      std::move(host_result.chunk_stats),
-                                      std::move(host_result.column_storage));
-    // The host path always REPLACES, so every pinned column holds this
-    // materialization's values.
-    attach_proven_unique(host_result.unique_verdicts, pinned_column_names);
-    attach_duckdb_mvcc_metadata(std::move(host_result.base_row_count_per_chunk));
-  } else if (pin_comp.enabled) {
-    // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
-    // on), then compress it when it qualifies, keeping the compressed payload in device
-    // memory; batches that do not qualify are pinned uncompressed. Both forms land in
-    // one ordered chunk vector, so a table that mixes them pins without special-casing.
-    auto dev_result = sirius::materialize_all_batches_compressed(
-      *ingestible,
-      gpu_spaces_mut,
-      *scan_mgr.io_ctx(),
-      pinned_column_types,
-      pin_comp,
-      {.capture_chunk_stats               = false,
-       .enable_compressed_materialization = compressed_pin,
-       .probe_unique_columns              = probe_unique_columns});
-    sirius_ctx->get_event_publisher().publish_compressed_materialization(
-      sirius::event::compressed_materialization_activity::pin_columns_narrowed,
-      count_narrowed_columns(dev_result.column_storage));
-
-    scan_mgr.insert_pinned_entry_device(data.args.name,
-                                        std::move(cache_info),
-                                        std::move(dev_result.chunks),
-                                        *gpu_spaces_mut[0],
-                                        std::move(dev_result.column_storage));
-    // The compressed device path always REPLACES, as above.
-    attach_proven_unique(dev_result.unique_verdicts, pinned_column_names);
-    attach_duckdb_mvcc_metadata(std::move(dev_result.base_row_count_per_chunk));
-  } else {
-    // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
-    // (with its GPU placement) and pin them in place.
-    auto mat = sirius::materialize_all_batches(*ingestible,
-                                               gpu_spaces_mut,
-                                               *scan_mgr.io_ctx(),
-                                               pinned_column_types,
-                                               {.capture_chunk_stats = capture_chunk_stats,
-                                                .enable_compressed_materialization = compressed_pin,
-                                                .probe_unique_columns = probe_unique_columns});
-    sirius_ctx->get_event_publisher().publish_compressed_materialization(
-      sirius::event::compressed_materialization_activity::pin_columns_narrowed,
-      count_narrowed_columns(mat.column_storage));
-    auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
-    auto const stored             = scan_mgr.insert_pinned_entry(data.args.name,
-                                                     std::move(cache_info),
-                                                     std::move(mat.tables),
-                                                     std::move(mat.chunk_memory_spaces),
-                                                     std::move(pinned_column_types),
-                                                     std::move(mat.chunk_stats),
-                                                     std::move(mat.column_storage));
-    attach_proven_unique(mat.unique_verdicts, stored);
-    attach_duckdb_mvcc_metadata(std::move(base_row_count_per_chunk));
+    output.SetCardinality(1);
+    output.SetValue(0, 0, Value::BOOLEAN(true));
+    data.finished = true;
+    window.finish();
+  } catch (...) {
+    auto error = std::current_exception();
+    sirius_ctx->get_query_lifecycle_registry().report_failure(error, window.query_id());
+    throw;
   }
 }
 

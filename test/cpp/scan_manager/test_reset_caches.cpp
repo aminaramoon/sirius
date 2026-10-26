@@ -147,7 +147,7 @@ TEST_CASE("reset_caches replaces a populated cache with an empty one",
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{
-    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
+    scan_lifecycle, config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   auto* before = manager.io_ctx()->cache();
   REQUIRE(before != nullptr);
   bool const was_armed = before->is_armed();
@@ -182,7 +182,7 @@ TEST_CASE("a rebuilt cache is usable again", "[scan_manager][cache][reset_cache]
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{
-    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
+    scan_lifecycle, config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   REQUIRE(claim_some_cache(manager, file) > 0);
   manager.reset_caches();
 
@@ -200,7 +200,7 @@ TEST_CASE("reset_caches is idempotent", "[scan_manager][cache][reset_cache]")
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{
-    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
+    scan_lifecycle, config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   REQUIRE(manager.io_ctx()->cache() != nullptr);
 
   manager.reset_caches();
@@ -233,7 +233,7 @@ TEST_CASE("reset_caches reclaims still-resident chunk buffers, not just evicted 
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{
-    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
+    scan_lifecycle, config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   REQUIRE(manager.io_ctx()->cache() != nullptr);
 
   // Baseline AFTER construction: the scan manager's own io/uring buffers are
@@ -263,7 +263,7 @@ TEST_CASE("reset_caches is a no-op where the configuration does not cache",
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{
-    config_with_cache(cucascade::io::cache::cache_mode::none), *memory, topology};
+    scan_lifecycle, config_with_cache(cucascade::io::cache::cache_mode::none), *memory, topology};
   // Caching off, so no cache was ever built...
   REQUIRE(manager.io_ctx()->cache() == nullptr);
 

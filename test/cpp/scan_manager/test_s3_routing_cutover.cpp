@@ -114,7 +114,7 @@ std::vector<std::uint8_t> read_binary_file(std::filesystem::path const& path)
   return std::vector<std::uint8_t>(chars.begin(), chars.end());
 }
 
-void prime_parquet_metadata(sirius::io::sirius_datasource& source, std::string const& path)
+void prime_parquet_metadata(cucascade::io::datasource& source, std::string const& path)
 {
   auto const options = cudf::io::parquet_reader_options::builder().build();
   auto metadata      = sirius::op::scan::resolve_parquet_metadata(source, 0, path, options);
@@ -496,6 +496,7 @@ TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx", "[s3
   scan_manager_fixture fixture;
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native),
     *fixture.memory,
     fixture.topology};
@@ -564,7 +565,7 @@ TEST_CASE("scan_manager planning backend lookup does not open remote objects", "
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
     scan_lifecycle,
-    make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::sirius),
+    make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::native),
     *fixture.memory,
     fixture.topology};
 
@@ -582,6 +583,7 @@ TEST_CASE("scan_manager create_datasource normalizes file URI paths before routi
   scan_manager_fixture fixture;
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native),
     *fixture.memory,
     fixture.topology};
@@ -600,7 +602,8 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query", "[s3][routing
   scan_manager_fixture fixture;
   auto cfg       = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
   cfg.cache.mode = cucascade::io::cache::cache_mode::cucs;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
   REQUIRE(datasource != nullptr);
@@ -635,7 +638,8 @@ TEST_CASE("scan_manager tolerates a routed S3 ioctx when cache.mode is none", "[
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
   REQUIRE_FALSE(cfg.cache.use_fs_cache());
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
   REQUIRE(datasource != nullptr);
@@ -700,7 +704,8 @@ TEST_CASE("warmup is a no-op for backends with nothing to connect", "[s3][routin
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   // The default ioctx is the local uring one: a file it can open is already
   // "connected", so the base class no-op is the whole implementation.
@@ -718,6 +723,7 @@ TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independentl
   scan_manager_fixture fixture;
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native),
     *fixture.memory,
     fixture.topology};
@@ -756,6 +762,7 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
   scan_manager_fixture fixture;
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native),
     *fixture.memory,
     fixture.topology};
@@ -811,7 +818,9 @@ TEST_CASE("describe_parquet probes the S3 footer on a cold bind and reuses the m
   CAPTURE(fault.etag);
   range_s3_server server(std::move(parquet_bytes), fault);
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native),
     *fixture.memory,
     fixture.topology};
@@ -856,7 +865,8 @@ TEST_CASE("routed S3 cache fill at the object tail is clipped to EOF", "[s3][rou
   scan_manager_fixture fixture;
   auto cfg       = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
   cfg.cache.mode = cucascade::io::cache::cache_mode::cucs;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://tail-cache-bucket/object.bin");
   REQUIRE(datasource != nullptr);
 
@@ -909,6 +919,7 @@ TEST_CASE("scan_manager teardown resolves an in-flight S3 read", "[s3][routing]"
                       completed      = std::move(completed)]() mutable {
     datasource.reset();
     manager.reset();
+    scan_lifecycle.reset();
     fixture.reset();
     completed.set_value();
   });
@@ -949,7 +960,8 @@ TEST_CASE("backend=native without an object store declines s3 paths and says why
   cfg.cache.mode              = cucascade::io::cache::cache_mode::none;
   REQUIRE(cfg.object_store.endpoint.empty());
   REQUIRE(cfg.object_store.access_key.empty());
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   // No backend can serve the path, so the datasource is null (callers map that
   // to their own error); the cause is logged once, as a WARN.

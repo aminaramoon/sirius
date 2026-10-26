@@ -417,7 +417,7 @@ TEST_CASE("late failure classification uses exception types rather than message 
   CHECK(classify_failure(credentials, late_failure_cause::gpu_error).cause ==
         late_failure_cause::reader_io);
   auto descriptor =
-    std::make_exception_ptr(sirius::io::descriptor_mismatch_error("descriptor mismatch"));
+    std::make_exception_ptr(cucascade::io::descriptor_mismatch_error("descriptor mismatch"));
   CHECK(classify_failure(descriptor, late_failure_cause::gpu_error).cause ==
         late_failure_cause::reader_io);
   auto text_only = std::make_exception_ptr(

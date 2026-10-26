@@ -92,8 +92,8 @@ class device_prefetch_issuer {
                          double fraction,
                          std::size_t max_parked_splits) noexcept;
 
-  /// Attempt phase 1 for @p split.  On `issued` the split carries a pending prefetched_ranges, its
-  /// prefetch_state is `prefetched`, the window counts it, and @p on_done runs exactly once (on an
+  /// Attempt phase 1 for @p split.  On `issued` the split carries a pending prefetched_ranges, the
+  /// window counts it, and @p on_done runs exactly once (on an
   /// IO thread, or inline before this returns).  On every other value nothing stays installed on
   /// the split (an installed slot was abandoned, so no consumer can wait on it) and @p on_done is
   /// never called.  Host-side failures return `error` rather than throw.  The caller keeps

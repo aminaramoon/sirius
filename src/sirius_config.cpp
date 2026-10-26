@@ -376,6 +376,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
         "cuCascade; using the native backend");
     }
   }
+  r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});
   r.optional(
     "uring_reactors_per_gpu", opt.uring_reactors_per_gpu, yaml::greater_than<std::size_t>{0});
   r.optional(

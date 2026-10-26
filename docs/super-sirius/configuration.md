@@ -388,7 +388,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 4 uring reactor threads), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer threads. Preparation and coalescing run on each query owner thread, so they cannot occupy producer capacity. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 4 uring reactor threads), with a floor of 4. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: `io_uring` for local paths, and REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://` reads, listing and glob expansion. cuCascade's cuFile (GDS) backend is not selectable here. `sirius` is a deprecated alias of `native`, still accepted. `kvikio` names the removed kvikIO backend: it still loads, as `native`, with a deprecation WARN. Values are lowercase. |
 | `uring_reactors_per_gpu` | int (**> 0**) | 1 | uring reactors per GPU for local-disk reads (4 GPUs and `1` give 4 reactors). Each reactor is one worker thread with its own io_uring ring and request queue, pinned to its GPU's local CPUs, and allocates its own pinned staging from the host memory space of its GPU's NUMA node when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). A device read goes to the reactors on its GPU's NUMA node unless they are much busier than the rest (cuCascade's `io_config::reactor_spill`). |
@@ -422,8 +422,13 @@ against the pipeline pool's width rather than the backend's depth — one prefet
 deployment is only useful while a pipeline thread could still pick up another scan. An explicit
 `max_readahead_scans` wins over that substitution.
 
-Both are resolved against a single backend: the live one publishing the widest
-`n_max_concurrent_scans`, so the budget and the strategy always describe the same backend.
+A query's local policy is selected from the serving backend publishing the widest budget, so the budget and
+the strategy always describe the same backend. A runtime budget (`shared_scan_budget`) additionally accounts for
+every backend touched by each split across all queries: its limit is `max_readahead_scans` when set, else the
+backend's `n_max_concurrent_scans`, and for a local backend that publishes none, the pipeline width when
+`device_prefetching_fraction > 0` (the device tier draws from the same budget as the host tier). Demand reads
+borrow immediately; their debt pauses speculative prefetch. Events are routed by query ID. A failed cache
+allocation gets one eviction retry before speculation yields.
 
 #### Device-tier readahead
 
@@ -824,8 +829,22 @@ per-pool extras.
 
 The task-creator, downgrade, and scan-manager pools and the preload executor support optional CPU
 affinity lists (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from
-the selected GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_manager`,
-which requires `> 2`; the preload executor has no `num_threads`.
+the selected GPU's CPU topology. `num_threads` must be `> 0` for every pool; the preload executor has
+no `num_threads`.
+
+## DuckDB Settings Changed by Sirius
+
+Loading Sirius changes the database-wide default of one DuckDB setting. A session `SET` still wins, and a value the database already carries explicitly (from the connection config or a `SET GLOBAL` before `LOAD`) is left alone.
+
+| Setting | DuckDB default | Default with Sirius | Description |
+|---------|----------------|---------------------|-------------|
+| `delim_join_as_cte` | `true` | `false` | Whether DuckDB rewrites the delim joins it creates while decorrelating subqueries into materialized CTEs |
+
+DuckDB v2 rewrites decorrelated subqueries (correlated `EXISTS`, `NOT EXISTS`, `IN` and scalar subqueries) into materialized CTEs by default. Sirius does not yet plan those shapes well: at TPC-H SF1000, Q20, Q21 and Q22 ran 1.2-3.5x slower than with explicit delim joins, because Q21's `NOT EXISTS` became an anti join that hashes every late `lineitem` row and Q20/Q22 lost their dynamic filters behind mark joins. Sirius therefore keeps the explicit `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` plans. This is a stopgap until Sirius handles the CTE plan shapes, and DuckDB already marks the setting as deprecated, so it must be revisited when DuckDB removes it. To get DuckDB's CTE plans in one session:
+
+```sql
+SET delim_join_as_cte = true;
+```
 
 ## DuckDB SET Variables
 
