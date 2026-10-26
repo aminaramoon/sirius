@@ -326,7 +326,7 @@ struct scoped_host_decoder {
       .register_converter<cucascade::encoded_data_representation,
                           cucascade::gpu_table_representation>(
         [calls = calls, over_allocate](
-          cucascade::idata_representation& source,
+          const cucascade::idata_representation& source,
           cucascade::memory::memory_space const* target,
           ::cuda::stream_ref stream,
           cucascade::memory::reservation*) -> std::unique_ptr<cucascade::idata_representation> {
@@ -387,7 +387,7 @@ class opaque_representation final : public cucascade::idata_representation {
 
   [[nodiscard]] std::size_t get_size_in_bytes() const override { return 4096; }
   [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override { return 4096; }
-  std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) override
+  std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) const override
   {
     return std::make_unique<opaque_representation>(get_memory_space());
   }

@@ -571,7 +571,7 @@ struct consumer_fixture {
       auto task = ingestible->next_split_provider(
         [this](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
       REQUIRE(task);
-      for (auto& batch : coalescer->push(task())) {
+      for (auto& batch : coalescer->push(task({}))) {
         batches.push_back(std::move(batch));
       }
     }

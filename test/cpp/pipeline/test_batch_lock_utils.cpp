@@ -823,7 +823,7 @@ struct scoped_test_decoder {
       .register_converter<cucascade::encoded_data_representation,
                           cucascade::gpu_table_representation>(
         [calls = calls, fail_with_oom = fail_with_oom](
-          cucascade::idata_representation& source,
+          const cucascade::idata_representation& source,
           const cucascade::memory::memory_space* target,
           ::cuda::stream_ref stream,
           cucascade::memory::reservation*) -> std::unique_ptr<cucascade::idata_representation> {

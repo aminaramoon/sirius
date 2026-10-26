@@ -16,7 +16,7 @@
 
 // An overwritten S3 parquet object must bind with its new schema: describe_parquet
 // may skip the footer probe on a path hint (metadata_store::has_path), but metadata
-// is reused only for the exact object generation (raw_file_cache_id). The cache
+// is reused only for the exact object identity (io_object::identity_cache_key). The cache
 // internals behind this are covered by cuCascade's test_cache_object_identity and
 // test_rest_cache_identity; these cases cover Sirius's bind path on top of them.
 
@@ -28,7 +28,6 @@
 #include "utils/s3_test_env.hpp"
 
 #include <cucascade/cudf/datasource.hpp>
-#include <cucascade/io/rest/rest_reactor.hpp>
 #include <duckdb.hpp>
 #include <unistd.h>
 
@@ -44,7 +43,6 @@
 
 namespace {
 
-using cucascade::io::rest::rest_io_object;
 using sirius::test::s3::env_or;
 using sirius::test::s3::require_env;
 using sirius::test::s3::sql_quote;
@@ -129,10 +127,8 @@ void metadata_overwrite(cucascade::io::cache::cache_mode mode)
   auto first        = manager.create_datasource(objects.uri);
   auto old_metadata = first->metadata();
   REQUIRE(old_metadata != nullptr);
-  auto const old_key = first->get_io_object().raw_file_cache_id();
   auto const old_tag = std::string(first->get_io_object().validation_tag());
   REQUIRE_FALSE(old_tag.empty());
-  CHECK(old_key == rest_io_object::generation_key(objects.uri, old_tag));
   auto& store = first->io_ctx()->metadata_store();
   CHECK(store.has_path(objects.uri));
 
@@ -142,9 +138,7 @@ void metadata_overwrite(cucascade::io::cache::cache_mode mode)
   CHECK(second_shape.names.front() == "column_b");
   auto second = manager.create_datasource(objects.uri);
   REQUIRE(second->get_io_object().validation_tag() != old_tag);
-  CHECK(second->get_io_object().raw_file_cache_id() != old_key);
   CHECK(store.has_path(objects.uri));
-  CHECK(store.get_metadata(old_key) == nullptr);
   CHECK(second->metadata() != nullptr);
 
   // The first datasource still holds the old generation's parsed footer.

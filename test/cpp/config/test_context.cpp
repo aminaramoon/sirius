@@ -3124,7 +3124,7 @@ class lifetime_probe_representation final : public cucascade::idata_representati
 
   [[nodiscard]] std::size_t get_size_in_bytes() const override { return 64; }
   [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override { return 64; }
-  std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) override
+  std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) const override
   {
     return std::make_unique<lifetime_probe_representation>(get_memory_space(), nullptr);
   }

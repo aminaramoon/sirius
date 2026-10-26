@@ -19,6 +19,7 @@
 
 #include <catch.hpp>
 #include <cucascade/cudf/datasource.hpp>
+#include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
@@ -1124,21 +1125,24 @@ class failing_dv_context final : public cucascade::io::ioctx {
     }
     return 0;
   }
-  sirius::exec::semi_future<size_t> host_read_async_io(cucascade::io::io_object const& object,
-                                                       size_t offset,
-                                                       size_t bytes,
-                                                       uint8_t* dst) noexcept override
+  cucascade::exec::semi_future<size_t> host_read_async_io(
+    cucascade::io::io_object const& object,
+    size_t offset,
+    size_t bytes,
+    uint8_t* dst,
+    cucascade::io::io_priority) noexcept override
   {
     try {
-      return sirius::exec::make_semi_future<size_t>(host_read_io(object, offset, bytes, dst));
+      return cucascade::exec::make_semi_future<size_t>(host_read_io(object, offset, bytes, dst));
     } catch (...) {
-      return sirius::exec::make_semi_future<size_t>(std::current_exception());
+      return cucascade::exec::make_semi_future<size_t>(std::current_exception());
     }
   }
-  sirius::exec::semi_future<size_t> mixed_readv_async_io(
-    cucascade::io::io_object const&, std::vector<cucascade::io::prepared_io_slice>&&) noexcept override
+  cucascade::exec::semi_future<size_t> mixed_readv_async_io(
+    cucascade::io::io_object const&,
+    std::vector<cucascade::io::prepared_io_slice>&&) noexcept override
   {
-    return sirius::exec::make_semi_future<size_t>(
+    return cucascade::exec::make_semi_future<size_t>(
       std::make_exception_ptr(std::logic_error("unexpected vectored DV read")));
   }
 

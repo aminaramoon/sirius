@@ -93,7 +93,7 @@ TEST_CASE("pin does not reuse foreign local footer across opens",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
   sirius::exec::query_lifecycle_registry scan_lifecycle;
-  sirius_scan_manager manager{scan_lifecycle, config_with_sirius_cache(), *memory, topology};
+  sirius_scan_manager manager{scan_lifecycle, config_with_cucs_cache(), *memory, topology};
   auto source = manager.create_datasource(good_parquet());
   REQUIRE(source);
   auto foreign = std::make_shared<sirius::op::scan::parquet_metadata>(
