@@ -16,6 +16,7 @@
  */
 
 // sirius
+#include "cuda/device_health.hpp"
 #include "io/path_utils.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
@@ -2216,6 +2217,9 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
       } catch (std::bad_alloc const&) {
         throw;  // rmm::out_of_memory among them: the scheduler's retry needs it
       } catch (std::exception const& e) {  // prefetched_mismatch, cudf::logic_error, ...
+        // A fatal CUDA error poisons the context: the general route would only fail again and
+        // report its own error instead of this one.
+        if (sirius::fatal_device_status(std::current_exception())) { throw; }
         SIRIUS_LOG_WARN(
           "[parquet_scan] device-route decode failed ({}); reading through the general route",
           e.what());

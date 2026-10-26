@@ -26,7 +26,6 @@
 #include "io/ioctx_resolver.hpp"
 #include "io/parquet_helpers.hpp"
 #include "io/path_utils.hpp"
-#include "io/s3/duckdb_secret_config.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
@@ -84,6 +83,7 @@
 #include <duckdb/transaction/duck_transaction_manager.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -666,8 +666,13 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
 /// the object-store identity and may be case-sensitive.
 std::string normalize_path(std::string const& p)
 {
-  auto normalized = sirius::io::strip_file_scheme(p);
-  if (sirius::io::s3::is_s3_path(normalized)) { normalized.replace(0, 5, "s3://"); }
+  auto normalized  = sirius::io::strip_file_scheme(p);
+  auto const delim = normalized.find("://");
+  if (delim == 2 && std::tolower(static_cast<unsigned char>(normalized[0])) == 's' &&
+      std::tolower(static_cast<unsigned char>(normalized[1])) == '3') {
+    normalized[0] = 's';
+    normalized[1] = '3';
+  }
   return normalized;
 }
 

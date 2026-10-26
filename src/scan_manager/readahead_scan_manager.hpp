@@ -390,6 +390,8 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   /// Both budgets have one owner per split. A prefetch publishes this before
   /// preparing/issuing IO; demand joins it rather than charging another ticket.
+  /// The device tier's attempt (phase 1) is the same owner: it issues on the ticket
+  /// the host attempt would use, and a refused device attempt leaves it to the host.
   /// A covered entry holds no capacity, but remembers success until disposal.
   struct scan_ticket {
     enum class phase { prefetching, demand, covered };
@@ -437,9 +439,10 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   [[nodiscard]] bool try_issue_device(prefetch_candidate const& candidate,
                                       split_key const& split,
                                       std::shared_ptr<scan_ticket> const& ticket);
-  /// Classify and record one settled device prefetch, release the host staging under
-  /// @ref device_prefetch_options::release_host_staging, and hand its ticket back.  Runs on
-  /// whichever thread settled the last read, so it never blocks and never throws.
+  /// Settle one device prefetch's ticket (released, or handed to a demand read that already
+  /// started when the copy did not land), then classify and record the outcome and release the
+  /// host staging under @ref device_prefetch_options::release_host_staging.  Runs on whichever
+  /// thread settled the last read, so it never blocks and never throws.
   void on_device_prefetch_complete(split_key const& split,
                                    std::shared_ptr<scan_ticket> const& ticket,
                                    device_prefetch_result const& result) noexcept;

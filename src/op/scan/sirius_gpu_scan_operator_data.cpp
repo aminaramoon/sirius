@@ -221,10 +221,11 @@ void scan_operator_input::update(cucascade::io::cache::scan_stage site) const
                             ? std::get<std::shared_ptr<scan_info>>(materialization_info).get()
                             : nullptr;
   if (task != nullptr) {
-    // Publish the split and datasource state before notifying readahead. In
-    // particular, a disposed notification is the condition that wakes a memory
-    // retry, so the evictor must already be able to observe the cache handles as
-    // disposable when that worker wakes.
+    // Publish the split and datasource state before notifying readahead: it reads
+    // the split's stage when it settles a ticket (a disposal that overtook a
+    // `reading` report must not recreate that split's entry), and the evictor
+    // must already observe the cache handles as disposable once the split is
+    // reported disposed.
     std::get<std::shared_ptr<scan_info>>(materialization_info)->set_scan_stage(site);
     // Datasources only, not the fadvise hints: this runs on every stage
     // transition of every split, and the hints carry the split's entire

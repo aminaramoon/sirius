@@ -580,8 +580,7 @@ void readahead_scan_manager::on_device_prefetch_complete(
   // First, like on_prefetch_complete: both credits are free once the IO settles.  A copy that did
   // not land hands them to a demand read that already started (the consumer's own read is then
   // the one charged) or releases them; a landed copy releases them and leaves the zero-capacity
-  // `covered` marker, so a later `reading` report charges nothing.  Replaces the old
-  // prefetched -> attempted correction and the direct gatekeeper release.
+  // `covered` marker, so a later `reading` report charges nothing.
   settle_prefetch(split, ticket, /*covered=*/result.ok);
   if (!result.ok) {
     _counters.record(kind::device_failed);

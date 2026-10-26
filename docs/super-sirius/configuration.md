@@ -426,7 +426,9 @@ A query's local policy is selected from the serving backend publishing the wides
 the strategy always describe the same backend. A runtime budget (`shared_scan_budget`) additionally accounts for
 every backend touched by each split across all queries: its limit is `max_readahead_scans` when set, else the
 backend's `n_max_concurrent_scans`, and for a local backend that publishes none, the pipeline width when
-`device_prefetching_fraction > 0` (the device tier draws from the same budget as the host tier). Demand reads
+`device_prefetching_fraction > 0` (the device tier draws from the same budget as the host tier). A backend whose
+reads cannot go through a host cache (`ioctx::can_use_fs_cache()` false, such as cuFile) is left out of that
+accounting: device-tier reads on it are bounded only by the query's own readahead budget. Demand reads
 borrow immediately; their debt pauses speculative prefetch. Events are routed by query ID. A failed cache
 allocation gets one eviction retry before speculation yields.
 
