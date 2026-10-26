@@ -22,10 +22,10 @@
 
 #include <cudf/table/table.hpp>
 
-#include <cucascade/memory/memory_space.hpp>
-#include <duckdb/common/exception.hpp>
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/io_errors.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/exception.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
 #include <op/scan/parquet_batch_layout.hpp>

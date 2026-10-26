@@ -1163,11 +1163,11 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-    sirius_ds = sirius::io::open_datasource(io_ctx,
-                                            normalized,
-                                            footer_cached
-                                              ? cucascade::io::open_hint::generic
-                                              : cucascade::io::open_hint::parquet_footer_probe);
+    sirius_ds =
+      sirius::io::open_datasource(io_ctx,
+                                  normalized,
+                                  footer_cached ? cucascade::io::open_hint::generic
+                                                : cucascade::io::open_hint::parquet_footer_probe);
   }
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);

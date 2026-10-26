@@ -2178,7 +2178,8 @@ std::shared_ptr<cucascade::io::datasource> sirius_scan_manager::create_datasourc
   return sirius::io::open_datasource(std::move(io_ctx), std::move(file_path), hint);
 }
 
-cucascade::io::cache::metadata_store::counters sirius_scan_manager::metadata_cache_statistics() const
+cucascade::io::cache::metadata_store::counters sirius_scan_manager::metadata_cache_statistics()
+  const
 {
   cucascade::io::cache::metadata_store::counters total;
   auto add = [&total](cucascade::io::cache::metadata_store::counters const& current) {
