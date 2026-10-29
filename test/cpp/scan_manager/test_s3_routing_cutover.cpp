@@ -44,6 +44,7 @@
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -158,8 +159,8 @@ scan_manager_config make_s3_scan_config(std::string endpoint,
   cfg.rest.honor_retry_after       = false;
   cfg.rest.max_connections         = 1;
   cfg.thread_pool.num_threads      = 1;
-  cfg.uring_n_reactors             = 1;
-  cfg.rest_n_reactors              = 1;
+  cfg.uring_reactors_per_gpu       = 1;
+  cfg.rest_reactors_per_gpu        = 1;
   cfg.cache.mode                   = cucascade::io::cache::cache_mode::none;
   return cfg;
 }
@@ -701,8 +702,8 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   // (each reactor owns its own, thread-confined connection pool).
   cfg.rest.max_connections = 1;
   // Keep the rate-limit window above the serial server's accept/receive deadlines.
-  cfg.rest.conn_max_age = std::chrono::seconds{30};
-  cfg.rest_n_reactors   = 2;
+  cfg.rest.conn_max_age     = std::chrono::seconds{30};
+  cfg.rest_reactors_per_gpu = 2;
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
@@ -723,7 +724,7 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
 
   int const baseline          = server.connection_count();
   int const baseline_requests = server.request_count();
-  constexpr int expected_warm = 2;  // rest_n_reactors * max_connections
+  constexpr int expected_warm = 2;  // rest_reactors_per_gpu * max_connections
 
   // A bucket URL, with no object in it: warmup opens TCP connections only.
   io_ctx->warmup("s3://warm-bucket");
@@ -743,6 +744,65 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   CHECK(server.connection_count() == after_warm);
   CHECK(server.request_count() == baseline_requests);
+}
+
+TEST_CASE("scan manager forwards its topology to the io registries, scoped S3 included",
+          "[s3][routing][scan_manager]")
+{
+  // Two GPUs on one NUMA node. Reactor placement needs no CUDA device per GPU id, so this
+  // also runs with a single visible GPU; only the reactor counts per pool matter here.
+  cucascade::memory::system_topology_info info;
+  info.num_gpus = 2;
+  for (int id : {0, 1}) {
+    cucascade::memory::gpu_topology_info gpu;
+    gpu.id        = static_cast<unsigned>(id);
+    gpu.numa_node = 0;
+    info.gpus.push_back(std::move(gpu));
+  }
+  auto const topology =
+    std::make_shared<sirius::memory::topology_index>(info, std::vector<int>{0, 1});
+  constexpr std::size_t gpus = 2;
+
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
+  scan_manager_fixture fixture;
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
+  cfg.uring_reactors_per_gpu = 1;
+  cfg.rest_reactors_per_gpu  = 1;
+  // One connection per reactor: warmup then opens exactly one per REST reactor.
+  cfg.rest.max_connections = 1;
+  cfg.rest.conn_max_age    = std::chrono::seconds{30};
+
+  auto const store  = cfg.object_store;
+  bool const scoped = GENERATE(false, true);
+  CAPTURE(scoped);
+  // The path-scoped case builds its REST context through the scan manager's throwaway
+  // registry; without a default object store an unscoped path could not reach REST at all.
+  if (scoped) { cfg.object_store = {}; }
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, topology};
+  if (scoped) { manager.install_s3_config("s3://placed-bucket", store); }
+
+  // The shared registry's uring pool has one reactor per GPU of the topology, not one in all.
+  auto* uring = dynamic_cast<cucascade::io::uring::uring_ioctx*>(manager.io_ctx());
+  REQUIRE(uring != nullptr);
+  CHECK(uring->reactor_gauges().size() == gpus * cfg.uring_reactors_per_gpu);
+
+  // The REST pool's size shows as warmup connections: one per reactor at max_connections 1.
+  auto datasource = manager.create_datasource("s3://placed-bucket/data.parquet");
+  REQUIRE(datasource != nullptr);
+  auto io_ctx = datasource->io_ctx();
+  REQUIRE(io_ctx != nullptr);
+  REQUIRE(io_ctx->type() == io_context_type::restful);
+  int const baseline      = server.connection_count();
+  int const expected_warm = static_cast<int>(gpus * cfg.rest_reactors_per_gpu);
+  auto const deadline     = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  io_ctx->warmup("s3://placed-bucket");
+  while (server.connection_count() < baseline + expected_warm &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  // An unplaced pool has one reactor, which opens a single connection.
+  CHECK(server.connection_count() >= baseline + expected_warm);
 }
 
 TEST_CASE("warmup is a no-op for backends with nothing to connect", "[s3][routing]")
@@ -1006,7 +1066,7 @@ TEST_CASE("backend=native without an object store declines s3 paths and says why
   scan_manager_config cfg{};
   cfg.backend                 = sirius::scan_manager::io_backend::native;
   cfg.thread_pool.num_threads = 1;
-  cfg.uring_n_reactors        = 1;
+  cfg.uring_reactors_per_gpu  = 1;
   cfg.cache.mode              = cucascade::io::cache::cache_mode::none;
   REQUIRE(cfg.object_store.endpoint.empty());
   REQUIRE(cfg.object_store.access_key.empty());

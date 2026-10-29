@@ -28,7 +28,7 @@
 //   --host_chunk_mib N  host memory pool block size
 //   --chunk_mib N       IO chunk size (REST: target bytes per GET before fusing)
 //   --max_connections N in-flight requests per runner (REST)
-//   --n_reactors N      REST runner thread count (rest_n_reactors)
+//   --n_reactors N      REST runner thread count (rest_reactors_per_gpu)
 //
 // Sources:
 //   --dir  local directory, read through io_uring
