@@ -1004,10 +1004,16 @@ void SiriusContext::rollback_initialization() noexcept
   attempt([&] {
     if (task_creator_) task_creator_->stop_thread_pool();
   });
+  // Joins a promotion still copying; it borrows the memory manager and the downgrade
+  // executors' events, so it stops and goes before either (same order as terminate()).
+  attempt([&] {
+    if (preload_executor_) preload_executor_->stop();
+  });
   for (auto& executor : downgrade_executors_) {
     attempt([&] { executor->stop(); });
   }
   task_creator_.reset();
+  preload_executor_.reset();
   downgrade_executors_.clear();
   scan_manager_.reset();
   task_scheduler_.reset();
@@ -1015,6 +1021,11 @@ void SiriusContext::rollback_initialization() noexcept
   query_event_publisher_.reset();
   cuvs_index_cache_.reset();
   attempt([&] { data_repository_registry_.clear(); });
+  // As in terminate(): only after the repositories, whose buffers may have been freed on
+  // preload streams.
+  preload_streams_.reset();
+  device_preload_budget_.reset();
+  memory_wait_board_.reset();
   attempt([&] { query_lifecycle_.clear(); });
   drain_remote_removals_for_shutdown();
   restore_cudf_pinned_memory_resource();

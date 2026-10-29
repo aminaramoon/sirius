@@ -176,6 +176,7 @@ std::string budget_text(std::size_t bytes, refusal closed)
     case Tier::GPU: return "GPU";
     case Tier::HOST: return "HOST";
     case Tier::DISK: return "DISK";
+    case Tier::REMOTE: return "REMOTE";
     default: break;
   }
   return "?";

@@ -863,6 +863,50 @@ TEST_CASE("SiriusContext releases REMOTE contexts when later initialization fail
   CHECK(cudf::get_allocate_host_as_pinned_threshold() == previous_threshold);
 }
 
+TEST_CASE("SiriusContext stops the preload executor when later initialization fails",
+          "[sirius][context][config][remote][preload][isolated_context]")
+{
+  // The preload executor starts with the downgrade executors and borrows the memory manager;
+  // a failure after the workers started must stop and destroy it before the manager goes.
+  auto const retry = GENERATE(false, true);
+  CAPTURE(retry);
+  std::weak_ptr<cucascade::io::ioctx> remote_context;
+  std::weak_ptr<sirius::preload::preload_streams const> preload_streams;
+  {
+    duckdb::SiriusContext context;
+    cucascade::io::object_store_config object_store;
+    object_store.access_key = "rollback-test-access";
+    object_store.secret_key = "rollback-test-secret";
+    context.get_config().set_object_store_config(object_store);
+    context.initialization_hook_for_testing = [&](std::string_view phase, auto const& manager) {
+      if (phase != "workers_started") { return; }
+      preload_streams = context.preload_streams_for_testing();
+      REQUIRE_FALSE(preload_streams.expired());
+      auto const spaces = manager.get_memory_spaces_for_tier(cucascade::memory::Tier::REMOTE);
+      REQUIRE(spaces.size() == 1);
+      remote_context = spaces.front()->get_io_context();
+      throw std::runtime_error("injected late initialization failure");
+    };
+    auto node                                                         = remote_spill_context_yaml();
+    node["sirius"]["executor"]["preload"]["device_preloading_budget"] = 0.05;
+    auto const config = sirius::parsed_sirius_config::from_node(node);
+    REQUIRE_THROWS_WITH(context.initialize(config),
+                        Catch::Matchers::ContainsSubstring("injected late initialization failure"));
+    CHECK_FALSE(context.is_initialized());
+    // Device preloading created per-GPU stream pools; the rollback must release them with
+    // the executor, before the memory manager.
+    CHECK(preload_streams.expired());
+    CHECK(remote_context.expired());
+    if (retry) {
+      context.initialization_hook_for_testing = {};
+      REQUIRE_NOTHROW(context.initialize(config));
+      CHECK(context.is_initialized());
+      CHECK(context.get_preload_executor() != nullptr);
+    }
+  }
+  CHECK(remote_context.expired());
+}
+
 TEST_CASE("SiriusContext init failure restores the cuDF pinned resource",
           "[sirius][context][config][isolated_context]")
 {
@@ -3773,9 +3817,9 @@ TEST_CASE("SiriusContext initialize failure after preload start joins the preloa
   CHECK(threads_at_failure > 0);
   CHECK(cudf::get_allocate_host_as_pinned_threshold() == prev_threshold);
 
-  // Nothing stops them but the context's destruction, which joins them before the scheduler,
-  // the lifecycle and the publisher they borrow are destroyed.
-  CHECK(preload_threads() == threads_at_failure);
+  // The failed initialize rolls back: it joins them before the scheduler, the lifecycle and
+  // the publisher they borrow are destroyed, so none survive until the context's destruction.
+  CHECK(preload_threads() == 0);
   ctx.reset();
   CHECK(preload_threads() == 0);
 }
