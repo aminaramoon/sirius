@@ -32,8 +32,8 @@ namespace sirius::test {
 inline std::shared_ptr<cucascade::io::ioctx> make_test_local_ioctx()
 {
   cucascade::disk_io_context_options options;
-  options.backend             = cucascade::disk_io_backend::uring;
-  options.io.uring_n_reactors = 1;
+  options.backend                   = cucascade::disk_io_backend::uring;
+  options.io.uring_reactors_per_gpu = 1;
   return cucascade::make_disk_io_context(options);
 }
 
