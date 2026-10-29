@@ -360,6 +360,15 @@ intake_status candidate_store::intake(query_id_t q, event::downgraded_batch cons
   }
 
   if (auto const cit = _by_id.find(id); cit != _by_id.end()) {
+    if (rec.conversion_seq > cit->second.last_seq && !lower_tier(rec.to.tier) &&
+        !cit->second.in_flight) {
+      count(q, counter::dropped_unsupported);
+      erase_candidate(cit);
+      if (auto const tit = qs.claimed_seqs.find(id); tit != qs.claimed_seqs.end()) {
+        tit->second = std::max(tit->second, rec.conversion_seq);
+      }
+      return intake_status::dropped_unsupported;
+    }
     // A genuinely newer downgrade (or a bounce) is a new generation that reopens the id for
     // preloading; a duplicate or delayed record that only fills hints must NOT renew the watch,
     // or it would undo a claim and let the worker charge an already-claimed generation.
@@ -369,6 +378,11 @@ intake_status candidate_store::intake(query_id_t q, event::downgraded_batch cons
     if (_budget && new_generation) { _budget->watch(id); }
     count(q, counter::merged);
     return intake_status::merged;
+  }
+
+  if (!lower_tier(rec.to.tier)) {
+    count(q, counter::dropped_unsupported);
+    return intake_status::dropped_unsupported;
   }
 
   // A claimed tombstone (the batch was claimed by a task and its candidate removed): a duplicate
@@ -385,10 +399,6 @@ intake_status candidate_store::intake(query_id_t q, event::downgraded_batch cons
   if (rec.batch.expired()) {
     count(q, counter::dropped_expired);
     return intake_status::dropped_expired;
-  }
-  if (!lower_tier(rec.to.tier)) {
-    count(q, counter::dropped_unsupported);
-    return intake_status::dropped_unsupported;
   }
 
   candidate c;
@@ -784,6 +794,13 @@ outcome_effect candidate_store::apply_outcome(promotion_job const& job,
       qs.reported_failure           = true;
       erase_candidate(it);
       break;
+  }
+  // A newer record or the worker's stale observation may have moved an in-flight candidate
+  // somewhere preload cannot promote from. Its budget charge has now been released.
+  if (auto const cit = _by_id.find(job.batch_id);
+      cit != _by_id.end() && !lower_tier(cit->second.location.tier)) {
+    count(job.query, counter::dropped_unsupported);
+    erase_candidate(cit);
   }
   return effect;
 }

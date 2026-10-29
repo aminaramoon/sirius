@@ -47,6 +47,7 @@ memory_space_id const gpu0{Tier::GPU, 0};
 memory_space_id const gpu1{Tier::GPU, 1};
 memory_space_id const host0{Tier::HOST, 0};
 memory_space_id const disk0{Tier::DISK, 0};
+memory_space_id const remote0{Tier::REMOTE, 0};
 
 target const gpu_t0{Tier::GPU, 0};
 target const gpu_t1{Tier::GPU, 1};
@@ -226,6 +227,139 @@ TEST_CASE("candidate_store drops records of unknown or retired queries", "[prelo
           intake_status::dropped_unsupported);
     CHECK(f.store.size() == 0);
   }
+}
+
+TEST_CASE("candidate_store drops a known candidate that a newer record moves to REMOTE",
+          "[preload]")
+{
+  store_fixture f;
+  fake_batch b;
+
+  SECTION("HOST to REMOTE removes the candidate and its indexes")
+  {
+    REQUIRE(f.store.intake(f.q1, record(b, 7, 1, gpu0, host0, 100)) == intake_status::inserted);
+    CHECK(f.store.intake(f.q1, record(b, 7, 2, host0, remote0, 100)) ==
+          intake_status::dropped_unsupported);
+    CHECK(f.store.find(7) == nullptr);
+    CHECK(f.store.size() == 0);
+    CHECK(f.counters.get(counter::dropped_unsupported) == 1);
+    auto const snap = f.store.snapshot_phase0();
+    CHECK_FALSE(snap.has_candidates);
+    REQUIRE(snap.queries.size() == 2);
+    CHECK(snap.queries[0].repos.empty());
+    CHECK(f.budget.watched_count() == 0);
+
+    for (int pass = 0; pass < 100; ++pass) {
+      f.store.advance_queue_epoch();
+      f.store.prune_expired_candidates(256);
+      CHECK(f.store.find(7) == nullptr);
+      CHECK_FALSE(f.store.snapshot_phase0().has_candidates);
+    }
+
+    SECTION("a later GPU to HOST record reopens the id")
+    {
+      CHECK(f.store.intake(f.q1, record(b, 7, 3, gpu0, host0, 100)) == intake_status::inserted);
+    }
+  }
+
+  SECTION("an older or equal REMOTE record only fills hints")
+  {
+    REQUIRE(f.store.intake(f.q1, record(b, 7, 5, gpu0, host0, 100)) == intake_status::inserted);
+    for (auto const seq : {3, 5}) {
+      CHECK(f.store.intake(f.q1, record(b, 7, seq, host0, remote0, 100)) == intake_status::merged);
+      REQUIRE(f.store.find(7) != nullptr);
+      CHECK(f.store.find(7)->location == host0);
+    }
+  }
+
+  SECTION("GPU to REMOTE into a staged candidate")
+  {
+    REQUIRE(f.store.intake(f.q1, record(b, 7, 1, gpu0, disk0, 100)) == intake_status::inserted);
+    CHECK(f.store.intake(f.q1, record(b, 7, 2, gpu0, remote0, 100)) ==
+          intake_status::dropped_unsupported);
+    CHECK(f.store.find(7) == nullptr);
+    CHECK(f.budget.watched_count() == 0);
+  }
+}
+
+TEST_CASE("candidate_store drops an in-flight candidate moved to REMOTE once its outcome arrives",
+          "[preload]")
+{
+  store_fixture f;
+  fake_batch b;
+  REQUIRE(f.store.intake(f.q1, record(b, 7, 1, gpu0, host0, 100)) == intake_status::inserted);
+  auto const job = f.take(7, gpu_t0);
+  REQUIRE(f.store.outstanding_bytes(0) == store_fixture::charged(100));
+  REQUIRE(f.store.intake(f.q1, record(b, 7, 5, host0, remote0, 100)) == intake_status::merged);
+  REQUIRE(f.store.find(7) != nullptr);
+  CHECK(f.store.find(7)->location == remote0);
+  CHECK(f.store.find(7)->in_flight);
+
+  auto result = outcome(promotion_outcome::stale);
+  SECTION("stale") { result.observed = remote0; }
+  SECTION("promoted (bounce branch)") { result = outcome(promotion_outcome::promoted, 100); }
+  SECTION("no_memory") { result = outcome(promotion_outcome::no_memory); }
+  SECTION("gated") { result = outcome(promotion_outcome::gated); }
+  SECTION("held_off") { result = outcome(promotion_outcome::held_off); }
+  SECTION("too_big") { result = outcome(promotion_outcome::too_big); }
+  SECTION("oom") { result = outcome(promotion_outcome::oom); }
+  SECTION("unsupported") { result = outcome(promotion_outcome::unsupported); }
+  SECTION("contended") { result = outcome(promotion_outcome::contended); }
+  f.store.apply_outcome(job, result);
+  CHECK(f.store.find(7) == nullptr);
+  CHECK(f.store.outstanding_bytes(0) == 0);
+  CHECK(f.store.find_ledger(7) == nullptr);
+  CHECK(f.budget.watched_count() == 0);
+  CHECK(f.counters.get(counter::dropped_unsupported) == 1);
+}
+
+TEST_CASE("candidate_store drops a candidate the worker observes on REMOTE", "[preload]")
+{
+  store_fixture f;
+  fake_batch b;
+  REQUIRE(f.store.intake(f.q1, record(b, 7, 1, gpu0, host0, 100)) == intake_status::inserted);
+  auto const job  = f.take(7, gpu_t0);
+  auto result     = outcome(promotion_outcome::stale);
+  result.observed = remote0;
+  f.store.apply_outcome(job, result);
+  CHECK(f.store.find(7) == nullptr);
+  CHECK(f.counters.get(counter::dropped_unsupported) == 1);
+  CHECK(f.store.outstanding_bytes(0) == 0);
+  CHECK(f.budget.watched_count() == 0);
+}
+
+TEST_CASE("candidate_store: a REMOTE record keeps the claim tombstone", "[preload]")
+{
+  store_fixture f;
+  fake_batch b;
+  REQUIRE(f.store.intake(f.q1, record(b, 7, 5, gpu0, host0, 100)) == intake_status::inserted);
+  std::array<std::uint64_t, 1> const ids{7};
+  f.budget.claim(ids);
+
+  SECTION("the REMOTE record removes a known claimed candidate")
+  {
+    CHECK(f.store.intake(f.q1, record(b, 7, 6, host0, remote0, 100)) ==
+          intake_status::dropped_unsupported);
+    CHECK(f.store.find(7) == nullptr);
+    // Removing the candidate also advances the claim's sequence to the unsupported record.
+    CHECK(f.store.intake(f.q1, record(b, 7, 6, gpu0, host0, 100)) ==
+          intake_status::dropped_stale_record);
+  }
+  SECTION("the REMOTE record arrives after a refused take removed the candidate")
+  {
+    CHECK_FALSE(f.store.take({7, gpu_t0, klass::A, 0}).has_value());
+    REQUIRE(f.store.find(7) == nullptr);
+    CHECK(f.store.intake(f.q1, record(b, 7, 6, host0, remote0, 100)) ==
+          intake_status::dropped_unsupported);
+  }
+  CHECK(f.store.intake(f.q1, record(b, 7, 6, host0, remote0, 100)) ==
+        intake_status::dropped_unsupported);
+  CHECK(f.store.intake(f.q1, record(b, 7, 5, gpu0, host0, 100)) ==
+        intake_status::dropped_stale_record);
+  CHECK(f.store.find(7) == nullptr);
+  CHECK(f.budget.watched_count() == 1);
+  f.store.retire_query(f.q1);
+  CHECK(f.budget.watched_count() == 0);
 }
 
 TEST_CASE("candidate_store evicts the newest query's most recent candidate on overflow",

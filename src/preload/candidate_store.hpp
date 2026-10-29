@@ -158,7 +158,9 @@ enum class intake_status : std::uint8_t {
   merged,                 ///< merged into an existing candidate
   dropped_unknown_query,  ///< the query is not prepared, or already retired
   dropped_expired,        ///< the batch is gone
-  dropped_unsupported,    ///< the batch did not move to HOST or DISK
+  /// The batch did not move to HOST or DISK (a known candidate a newer record moves elsewhere
+  /// is removed).
+  dropped_unsupported,
   dropped_promotion_cap,  ///< the batch was promoted the maximum number of times
   dropped_overflow,       ///< the store is full and this record lost the eviction
   dropped_stale_record    ///< the record predates the promotion in the ledger
@@ -342,7 +344,8 @@ class candidate_store {
    * origins and task hints. A batch still in the ledger bounced when the record is newer than the
    * promotion: its entry is erased and the candidate is banned from speculative promotion. A
    * record older than the promotion is ignored. At @c max_candidates the newest query's most
-   * recently downgraded candidate that is not in flight is evicted.
+   * recently downgraded candidate that is not in flight is evicted. A newer record moving a known
+   * candidate outside HOST or DISK removes it, after its outcome arrives if it is in flight.
    */
   intake_status intake(query_id_t q, event::downgraded_batch const& rec);
 
@@ -350,6 +353,7 @@ class candidate_store {
 
   [[nodiscard]] candidate const* find(std::uint64_t batch_id) const noexcept;
   /// Not in flight, not unsupported, and not blocked at the current queue epoch.
+  /// A candidate's location is HOST or DISK whenever it is not in flight.
   [[nodiscard]] bool plannable(candidate const& c) const noexcept;
   [[nodiscard]] std::size_t size() const noexcept { return _by_id.size(); }
   [[nodiscard]] bool has_candidates() const noexcept { return !_by_id.empty(); }
