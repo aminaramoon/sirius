@@ -221,12 +221,21 @@ static void from_yaml(const YAML::Node& node, cucascade::io::tls::config& opt)
 {
   namespace tls = cucascade::io::tls;
   yaml::reader r(node, "rest.tls");
-  for (auto const* key : {"verify", "ca_file", "ca_dir", "ca_blob"}) {
+  if (r.has("verify")) {
+    throw std::runtime_error(
+      "'sirius.executor.scan_manager.rest.tls.verify': trust is owned by object_store; set "
+      "VERIFY_SSL on the selected CREATE SECRET (TYPE SIRIUS_S3, ...) or tls_verify through "
+      "sirius_config::set_object_store_config() instead");
+  }
+  for (auto const* key : {"ca_file", "ca_dir", "ca_blob"}) {
     if (r.has(key)) {
-      throw std::runtime_error("'sirius.executor.scan_manager.rest.tls." + std::string(key) +
-                               "': trust is owned by object_store; use CREATE SECRET "
-                               "(TYPE SIRIUS_S3, ...) or "
-                               "sirius_config::set_object_store_config() instead");
+      throw std::runtime_error(
+        "'sirius.executor.scan_manager.rest.tls." + std::string(key) +
+        "': trust is owned by object_store; set ca_bundle_path through "
+        "sirius_config::set_object_store_config() (kept when a SQL secret is selected), or "
+        "NIX_SSL_CERT_FILE / SSL_CERT_FILE / SSL_CERT_DIR in the process environment "
+        "(a usable NIX_SSL_CERT_FILE takes precedence over SSL_CERT_FILE); SQL secrets carry no "
+        "CA");
     }
   }
   auto enum_value = [&]<typename T>(char const* key,

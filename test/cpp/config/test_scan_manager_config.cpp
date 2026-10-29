@@ -1332,11 +1332,22 @@ TEST_CASE("REST TLS trust remains owned by object_store", "[scan_manager][config
       CAPTURE(key, spelling);
       scoped_yaml yaml("sirius_tls_trust_rejected.yaml",
                        tls_yaml(std::string{"          "} + key + ": " + spelling + "\n"));
-      REQUIRE_THROWS_WITH(
-        sirius::parsed_sirius_config::from_file(yaml.path()),
-        Catch::Matchers::ContainsSubstring(std::string{"rest.tls."} + key) &&
-          Catch::Matchers::ContainsSubstring("trust is owned by object_store") &&
-          Catch::Matchers::ContainsSubstring("sirius_config::set_object_store_config()"));
+      using Catch::Matchers::ContainsSubstring;
+      if (std::string_view{key} == "verify") {
+        REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                            ContainsSubstring(std::string{"rest.tls."} + key) &&
+                              ContainsSubstring("trust is owned by object_store") &&
+                              ContainsSubstring("sirius_config::set_object_store_config()") &&
+                              ContainsSubstring("VERIFY_SSL"));
+      } else {
+        REQUIRE_THROWS_WITH(
+          sirius::parsed_sirius_config::from_file(yaml.path()),
+          ContainsSubstring(std::string{"rest.tls."} + key) &&
+            ContainsSubstring("trust is owned by object_store") &&
+            ContainsSubstring("sirius_config::set_object_store_config()") &&
+            ContainsSubstring("ca_bundle_path") && ContainsSubstring("NIX_SSL_CERT_FILE") &&
+            ContainsSubstring("SSL_CERT_FILE") && !ContainsSubstring("CREATE SECRET"));
+      }
     }
   }
 }
