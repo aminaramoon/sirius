@@ -201,7 +201,7 @@ on every run.
 `nation.parquet` has 25 rows, keys 0-24, and five nations per region.
 The HTTPS tests use the generated CA bundle so `rest_ioctx` checks the
 certificate. Trust comes from the resolved `object_store_config`'s
-`ca_bundle_path` / `tls_verify` (or the selected SQL secret), not from
+`ca_bundle_path` / `tls_verify` (a selected SQL secret can set only `VERIFY_SSL`), not from
 `scan_manager.rest.tls`. That YAML block exposes protocol/offload policy only;
 trust keys such as `verify` and `ca_file` are rejected. See the
 [REST/TLS configuration reference](../../../../docs/super-sirius/configuration.md#scan_managerrest--rest--s3-backend-iorestconfighpp).

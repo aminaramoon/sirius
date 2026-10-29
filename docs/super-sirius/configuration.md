@@ -455,21 +455,27 @@ can make S3 unavailable. There is no alternate transport fallback.
 
 TLS trust is supplied by the resolved `object_store_config`: its
 `ca_bundle_path` and `tls_verify` are applied to transport as well as signing.
-Use `sirius_config::set_object_store_config()` or a selected SQL secret
-(`VERIFY_SSL` controls verification). `scan_manager.object_store` and
+Set a private CA with `ca_bundle_path` through `sirius_config::set_object_store_config()`.
+A selected SQL secret keeps that path, but a secret cannot carry a CA itself.
+Alternatively, set `NIX_SSL_CERT_FILE` / `SSL_CERT_FILE` / `SSL_CERT_DIR` in the process
+environment; these apply when `ca_bundle_path` is empty. A usable `NIX_SSL_CERT_FILE`
+takes precedence over `SSL_CERT_FILE`. With neither an explicit CA nor usable
+process trust settings, trust falls back to the OpenSSL default store and system bundles.
+Certificate verification is controlled by `tls_verify`, or by `VERIFY_SSL` on a selected
+`SIRIUS_S3` secret. `scan_manager.object_store` and
 `rest.ca_bundle_path` / `rest.tls_verify` are not YAML-loadable and are rejected.
 The `rest.tls` block below controls protocol/offload policy only, not trust.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `n_max_concurrent_scans` | int | max(8, 2 × `pipeline.num_threads`) | Readahead budget the REST backend publishes, which an unset `max_readahead_scans` defers to. Unset derives it from the pipeline pool; an explicit value wins. |
-| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout for control-plane requests (HEAD / LIST / footer probe) and the base for the presigned-URL TTL (this value plus 60 s). At `0`, control requests retain the transport's 30 s limit and presigned URLs use 300 s. Data GETs use the stall detector instead. |
+| `request_timeout_s` | int (seconds) | 30 | Per-attempt timeout for control-plane requests (HEAD / LIST / footer probe); retries can extend a call's total time. Also the base for the presigned-URL TTL (this value plus 60 s). At `0`, control requests use cuCascade's planner attempt bound instead, which is 10 s plus request-body size at 1 MB/s (10 s for HEAD / LIST / footer probe), and presigned URLs use 300 s. Data GETs use the stall detector instead. |
 | `connect_timeout_ms` | int (ms, **> 0**) | 3000 | TCP connection deadline; separate from the TLS handshake deadline. |
 | `tls_handshake_timeout_ms` | int (ms, **> 0**) | 3000 | TLS handshake deadline per connection. |
 | `stall_speed_limit_bytes` | int (bytes/s) | 65536 | Data GETs below this wire-progress rate for `stall_time_s` fail and are retried. `0` disables the detector. |
 | `stall_time_s` | int (seconds) | 30 | How long a data GET may remain below the stall rate; `0` disables the detector. |
 | `max_connections` | int (**> 0**) | 64 | Maximum connections per reactor per endpoint, not a process-wide cap. |
-| `conn_max_age_s` | int (seconds) | 4 | Idle cutoff of pooled connections, also the warmup rate limit. `0` uses 4 s. |
+| `conn_max_age_s` | int (seconds) | 4 | Idle cutoff of pooled connections; also the minimum interval between repeated warmups of the same bucket. At `0`, the idle cutoff uses cuCascade's 4 s default, but repeated warmups of the same bucket are suppressed for 60 s. |
 | `keep_warm_connections` | int (**>= 0**) | 0 | Connections kept open per endpoint while idle; `0` disables warming. |
 | `min_segment_bytes` | bytes (**> 0**) | 1Mi | Lower target bound for adaptive physical GET sizing; a short remainder may be smaller. Must not exceed `max_segment_bytes`. |
 | `max_segment_bytes` | bytes (**> 0**) | 32Mi | Upper bound for adaptive physical GET sizing. |
@@ -492,7 +498,7 @@ The `rest.tls` block below controls protocol/offload policy only, not trust.
 
 Explicit bucket warmup preconnects each reactor's TCP/TLS pool without sending
 HEAD or GET requests. It uses the connect and TLS handshake deadlines and is
-rate-limited by `conn_max_age_s`.
+rate-limited per bucket by `conn_max_age_s` (60 s when it is `0`).
 
 Physical GET sizing remains reactor-owned within the configured segment bounds.
 The worker uses endpoint throughput estimates and cuts a request evenly, rather
@@ -506,8 +512,9 @@ the asynchronous H2D copy, and its CUDA completion event.
 
 All enum values are lowercase. Certificate/hostname verification stays enabled by
 default; configure trust through `object_store_config`, not this block.
-`verify`, `ca_file`, `ca_dir`, and `ca_blob` under `rest.tls` are rejected
-with an error directing users to the object-store trust configuration.
+`verify`, `ca_file`, `ca_dir`, and `ca_blob` under `rest.tls` are rejected.
+The error for `verify` points to `VERIFY_SSL` / `tls_verify`. The errors for `ca_*`
+point to `ca_bundle_path` or the process trust environment.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
