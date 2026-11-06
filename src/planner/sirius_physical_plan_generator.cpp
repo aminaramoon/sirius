@@ -78,6 +78,7 @@
 #include "op/sirius_physical_union.hpp"
 #include "op/sirius_physical_window.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/scan_sort_plan_pass.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "planner/sirius_plan_window.hpp"
@@ -860,6 +861,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> assemble_gpu_scan_leaf(
                                                                   sirius_ctx,
                                                                   scan.read_views,
                                                                   consumer);
+  leaf->Cast<sirius::op::scan::sirius_gpu_scan_operator>().batch_sort_keys = scan.batch_sort_keys;
   // Preserve propagated carriers; dynamic-filter targets are already native.
   if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
 
@@ -2456,6 +2458,8 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     }
   }
   plan->verify();
+  // Experimental per-output-batch clustering only: no operator or pipeline semantic rewrite.
+  if (scan_batch_sort_enabled()) { (void)admit_scan_batch_sort(*plan); }
 
   // Rewrite the plan tree to contain the GPU pipeline operators so the converter becomes a
   // pure topology pass over `build_pipelines` virtuals; `set_parent_ops` then derives every

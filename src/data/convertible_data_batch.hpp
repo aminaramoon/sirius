@@ -38,6 +38,7 @@
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -123,6 +124,11 @@ class convertible_data_batch : public convertible_data {
       return going_to_gpu ? data->get_uncompressed_data_size_in_bytes() : data->get_size_in_bytes();
     }();
 
+    auto const metrics_enabled = spill_metrics_enabled();
+    auto const source_bytes    = metrics_enabled ? mut.get_data()->get_size_in_bytes() : 0;
+    auto const gpu_uncompressed_bytes =
+      metrics_enabled ? mut.get_data()->get_uncompressed_data_size_in_bytes() : 0;
+
     for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
       const auto* space = target_spaces[idx];
       auto* mem_space   = res_mgr.get_memory_space(space->get_tier(), space->get_id().device_id);
@@ -151,13 +157,16 @@ class convertible_data_batch : public convertible_data {
 
       auto& converter_registry = sirius::converter_registry::get();
 
+      bool compression_desired      = false;
+      auto* compression_desired_out = metrics_enabled ? &compression_desired : nullptr;
       switch (space->get_tier()) {
         case cucascade::memory::Tier::GPU:
           mut.convert_to<cucascade::gpu_table_representation>(
             converter_registry, *reservation, stream);
           break;
         case cucascade::memory::Tier::HOST:
-          if (try_spill_compressed<compressed_host_representation>(mut, *reservation, stream)) {
+          if (try_spill_compressed<compressed_host_representation>(
+                mut, *reservation, stream, compression_desired_out)) {
             break;
           }
           // A compressed batch has no raw host form to fall back to.
@@ -168,11 +177,13 @@ class convertible_data_batch : public convertible_data {
         case cucascade::memory::Tier::DISK:
           if (dynamic_cast<compressed_host_representation const*>(mut.get_data()) != nullptr) {
             // Already compressed: write it out as is.
+            compression_desired = true;
             mut.convert_to<compressed_disk_representation>(
               converter_registry, *reservation, stream);
             break;
           }
-          if (try_spill_compressed<compressed_disk_representation>(mut, *reservation, stream)) {
+          if (try_spill_compressed<compressed_disk_representation>(
+                mut, *reservation, stream, compression_desired_out)) {
             break;
           }
           if (is_simpatico_compressed_representation(mut.get_data())) { continue; }
@@ -180,6 +191,44 @@ class convertible_data_batch : public convertible_data {
             converter_registry, *reservation, stream);
           break;
         default: continue;
+      }
+
+      // convert_to has committed; inspect the actual destination while still exclusively locked.
+      // Logging must not turn a successful conversion into a reported failure.
+      if (metrics_enabled && cur_space != nullptr &&
+          ((cur_space->get_tier() == cucascade::memory::Tier::GPU &&
+            (space->get_tier() == cucascade::memory::Tier::HOST ||
+             space->get_tier() == cucascade::memory::Tier::DISK)) ||
+           (cur_space->get_tier() == cucascade::memory::Tier::HOST &&
+            space->get_tier() == cucascade::memory::Tier::DISK))) {
+        log::log_noexcept([&] {
+          auto const* destination = mut.get_data();
+          auto payload_bytes      = destination->get_size_in_bytes();
+          auto serialized_bytes   = payload_bytes;
+          bool compressed         = false;
+          if (auto const* host = dynamic_cast<compressed_host_representation const*>(destination)) {
+            compressed = true;
+            serialized_bytes += host->header().size();
+          } else if (auto const* disk =
+                       dynamic_cast<compressed_disk_representation const*>(destination)) {
+            compressed = true;
+            payload_bytes -= disk->header_bytes();
+          }
+          SIRIUS_LOG_INFO(
+            "[scan_sort_spill] event=conversion_committed batch_id={} source_tier={} "
+            "target_tier={} source_bytes={} gpu_uncompressed_bytes={} representation={} "
+            "payload_bytes={} serialized_bytes={} compression_desired={} compression_fallback={}",
+            mut.get_batch_id(),
+            cur_space->get_tier() == cucascade::memory::Tier::GPU ? "GPU" : "HOST",
+            space->get_tier() == cucascade::memory::Tier::HOST ? "HOST" : "DISK",
+            source_bytes,
+            gpu_uncompressed_bytes,
+            compressed ? "compressed" : "uncompressed",
+            payload_bytes,
+            serialized_bytes,
+            compression_desired ? 1 : 0,
+            compression_desired && !compressed ? 1 : 0);
+        });
       }
 
       // RAII: mutable_data_batch destructor releases the mutable lock and transitions back to idle
@@ -209,6 +258,15 @@ class convertible_data_batch : public convertible_data {
   }
 
  private:
+  static bool spill_metrics_enabled()
+  {
+    static bool const enabled = [] {
+      auto const* value = std::getenv("SIRIUS_EXP_SCAN_SPILL_METRICS");
+      return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+  }
+
   /**
    * @brief Spill a GPU batch in its Simpatico-compressed form, when spill compression
    *        applies to it.
@@ -220,13 +278,15 @@ class convertible_data_batch : public convertible_data {
   template <typename Compressed>
   static bool try_spill_compressed(cucascade::mutable_data_batch& mut,
                                    cucascade::memory::reservation& reservation,
-                                   ::cuda::stream_ref stream)
+                                   ::cuda::stream_ref stream,
+                                   bool* compression_desired = nullptr)
   {
     auto* data = mut.get_data();
     if (dynamic_cast<cucascade::gpu_table_representation*>(data) == nullptr ||
         !compression::spill_compression_applies(data->get_size_in_bytes())) {
       return false;
     }
+    if (compression_desired != nullptr) { *compression_desired = true; }
     try {
       mut.convert_to<Compressed>(sirius::converter_registry::get(), reservation, stream);
       return true;

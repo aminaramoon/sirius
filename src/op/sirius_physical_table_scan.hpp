@@ -22,6 +22,7 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
+#include "op/scan/scan_batch_sort.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 
@@ -97,6 +98,9 @@ class sirius_physical_table_scan : public sirius_physical_operator {
 
   std::unique_ptr<scan::iceberg_ingestible_table_info> prepared_iceberg_info;
   std::shared_ptr<scan::gpu_ingestible> prepared_ingestible;
+
+  /// Opt-in experimental hint in finished output ordinals; never a global ordering guarantee.
+  std::vector<scan::scan_sort_key> batch_sort_keys;
 
   //! The table function
   duckdb::BoundTableFunction function;

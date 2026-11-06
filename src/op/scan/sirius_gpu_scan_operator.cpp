@@ -38,12 +38,15 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_stream.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/traits.hpp>
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
@@ -70,8 +73,59 @@ using sirius::memory::saturating_mul;
 struct scan_assembly_state {
   std::unique_ptr<cudf::table> output;
   std::unique_ptr<cudf::column> survivors;
+  // Retain the pre-sort output and permutation until gather reads retire, including on OOM.
+  std::unique_ptr<cudf::table> sort_source;
+  std::unique_ptr<cudf::column> sort_order;
   std::vector<std::unique_ptr<cudf::column>> columns;
 };
+
+/// Sort only the finished output, never the pinned/input table. All owning buffers are retained
+/// in the caller's retirement state and deallocate on the stream that enqueued their last read.
+void sort_output_batch(sirius_gpu_scan_operator const& scan,
+                       scan_operator_input const& input,
+                       scan_assembly_state& assembly,
+                       ::cuda::stream_ref stream)
+{
+  if (!scan.batch_sort_active() || input.stolen_table || input.stolen_table_consumed ||
+      input.converted_table_steal_pending || assembly.output->num_rows() <= 1) {
+    return;
+  }
+  auto const source = assembly.output->view();
+  std::vector<cudf::column_view> key_columns;
+  std::vector<cudf::order> directions;
+  std::vector<cudf::null_order> nulls;
+  for (auto const& key : scan.batch_sort_keys) {
+    if (key.output_ordinal >= static_cast<std::size_t>(source.num_columns())) { return; }
+    auto const column = source.column(static_cast<cudf::size_type>(key.output_ordinal));
+    if (!cudf::is_fixed_width(column.type())) { return; }
+    key_columns.push_back(column);
+    directions.push_back(key.direction);
+    nulls.push_back(key.null_ordering);
+  }
+
+  assembly.sort_source = std::move(assembly.output);
+  assembly.columns     = assembly.sort_source->release();
+  for (auto& column : assembly.columns) {
+    column = cudf::rebind_stream(std::move(*column), stream);
+  }
+  assembly.sort_source = std::make_unique<cudf::table>(std::move(assembly.columns));
+  auto const mr        = input.gpu_memory_space->get_default_allocator();
+  assembly.sort_order =
+    cudf::sorted_order(cudf::table_view(key_columns), directions, nulls, stream, mr);
+  assembly.sort_order = cudf::rebind_stream(std::move(*assembly.sort_order), stream);
+  detail::check_read_checkpoint(detail::read_checkpoint::SCAN_SORT_ORDER);
+  // Gather ALL columns with one permutation so payload values and nulls retain row association.
+  assembly.output = cudf::gather(assembly.sort_source->view(),
+                                 assembly.sort_order->view(),
+                                 cudf::out_of_bounds_policy::DONT_CHECK,
+                                 stream,
+                                 mr);
+  detail::check_read_checkpoint(detail::read_checkpoint::SCAN_SORT_GATHER);
+  SIRIUS_LOG_INFO("[scan_batch_sort] rows={} keys={} operator_id={} sorted_batches=1",
+                  assembly.output->num_rows(),
+                  scan.batch_sort_keys.size(),
+                  scan.operator_id);
+}
 
 /// Emit the deferred positions as a rowid and placeholders instead of values.
 ///
@@ -710,6 +764,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     scan_input->pushdown_selection_unprofitable = _decode_selection_unprofitable;
     scan_input->consumer                        = decode_consumer();
     scan_input->cached_view_possible            = cached_view_possible();
+    // Both converted-table steal arms surrender the retry source before the sort allocates.
+    scan_input->preserve_converted_input = batch_sort_active();
     // A compacted decode may write a column directly in the type this scan would restore it to,
     // which saves the scan's widening cast. Slot i of the decode is output column i only when the
     // output assembly is a leading identity, so the targets are passed on only then.
@@ -817,7 +873,9 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   try {
     // An owned table, transferred here or stolen by prepare_for_processing, bypasses the cached
     // checkpoint.
-    assembly->output = transfer_converted_table(*this, *scan_input, stream);
+    if (!batch_sort_active()) {
+      assembly->output = transfer_converted_table(*this, *scan_input, stream);
+    }
     if (assembly->output) {
       selection.placement.cached_bypassed_transfer = 1;
     } else {
@@ -826,6 +884,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       selection.placement.cached_bypassed_transfer = stolen ? 1 : 0;
       finish_assembly(*this, *scan_input, *assembly, stream);
     }
+    sort_output_batch(*this, *scan_input, *assembly, stream);
   } catch (...) {
     detail::retire_reads(assembly, stream, unjoined);
     throw;
@@ -841,6 +900,10 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   detail::check_read_checkpoint(detail::read_checkpoint::BATCH);
   auto const batch_id = batch->get_batch_id();
+  sirius::log::log_noexcept([&] {
+    SIRIUS_LOG_DEBUG("[scan_batch_output] batch_id={} operator_id={} rows={} bytes={} sort_active={}",
+                     batch_id, operator_id, emitted_rows, emitted_bytes, batch_sort_active());
+  });
   std::unique_ptr<operator_data> output;
   if (_dynamic_filter_consumer) {
     output = std::make_unique<scan_output_operator_data>(std::move(batch));
@@ -879,25 +942,38 @@ std::size_t sirius_gpu_scan_operator::resident_carrier_conversion_peak_memory_es
 std::size_t sirius_gpu_scan_operator::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
-  if (stats.resident) {
-    // cached_databatch_provider sets this only when normalize_physical_schema will cast the split.
-    if (stats.needs_carrier_conversion) {
-      return resident_carrier_conversion_peak_memory_estimate(stats);
+  auto const baseline = [&] {
+    if (stats.resident) {
+      // cached_databatch_provider sets this only when normalization will cast the split.
+      if (stats.needs_carrier_conversion) {
+        return resident_carrier_conversion_peak_memory_estimate(stats);
+      }
+      if (has_physical_overrides()) { return saturating_add(stats.working_set_bytes, stats.bytes); }
+      return std::max(stats.bytes, stats.working_set_bytes);
     }
-    if (has_physical_overrides()) {
-      // Keep an input-sized fallback for sidecar scans because per-split metadata may be
-      // incomplete.
-      return saturating_add(stats.working_set_bytes, stats.bytes);
-    }
-    return std::max(stats.bytes, stats.working_set_bytes);
-  }
+    // Fresh decode may expand carriers and also retain filter-only columns.
+    auto const expanded_bytes = saturating_mul(stats.bytes, kMaxNumericCarrierExpansion);
+    auto const filter_only_bytes =
+      stats.working_set_bytes > stats.bytes ? stats.working_set_bytes - stats.bytes : 0;
+    return saturating_add(expanded_bytes, filter_only_bytes);
+  }();
+  if (!batch_sort_active()) { return baseline; }
 
-  // Fresh reads expand projected bytes by the maximum carrier factor. The working set may also
-  // contain decoded filter-only columns, so add only the bytes beyond the projected input.
-  auto const expanded_bytes = saturating_mul(stats.bytes, kMaxNumericCarrierExpansion);
-  auto const filter_only_bytes =
-    stats.working_set_bytes > stats.bytes ? stats.working_set_bytes - stats.bytes : 0;
-  return saturating_add(expanded_bytes, filter_only_bytes);
+  // The cold input stats have no row count. Fixed-width output bytes give a conservative row
+  // bound; ignore variable-width columns, and use the planned physical (possibly narrow) widths.
+  // The admitted fixed-width key guarantees a nonzero denominator in production.
+  std::size_t minimum_row_bytes = 0;
+  for (auto const type : normalization_targets()) {
+    if (cudf::is_fixed_width(type)) {
+      minimum_row_bytes = saturating_add(minimum_row_bytes, cudf::size_of(type));
+    }
+  }
+  minimum_row_bytes = std::max(std::size_t{1}, minimum_row_bytes);
+  auto const rows   = baseline / minimum_row_bytes + (baseline % minimum_row_bytes != 0);
+  // Keep unsorted input + a full gathered output, INT32 permutation and conservative sort
+  // scratch (eight index arrays plus a small fixed workspace). Learned history/retry is unchanged.
+  auto const scratch = saturating_add(saturating_mul(rows, 8 * sizeof(cudf::size_type)), 64 * 1024);
+  return saturating_add(saturating_add(baseline, baseline), scratch);
 }
 
 }  // namespace sirius::op::scan

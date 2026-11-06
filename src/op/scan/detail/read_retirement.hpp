@@ -62,6 +62,8 @@ enum class read_checkpoint {
   COPY,
   SUBSTITUTION,
   NORMALIZATION,
+  SCAN_SORT_ORDER,
+  SCAN_SORT_GATHER,
   BATCH,
   PAYLOAD
 };

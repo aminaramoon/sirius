@@ -1,0 +1,43 @@
+# HOST-only spill; no disk tier. Capacity is per NUMA node.
+sirius:
+  max_concurrent_queries: 1
+  topology: { num_gpus: 1 }
+  memory:
+    gpu:
+      usage_limit_bytes: 1Gi
+      reservation_limit_fraction: 1.0
+      downgrade_trigger_fraction: 0.65
+      downgrade_stop_fraction: 0.45
+    host:
+      capacity_bytes: 8Gi
+      block_size: 1Mi
+      pool_size: 16
+      initial_number_pools: 1
+      downgrade_trigger_fraction: 0.70
+      downgrade_stop_fraction: 0.45
+  compression:
+    enable_spill_compression: true
+    spill_min_batch_bytes: 1Mi
+    spill_max_compressed_fraction: 0.99
+    spill_encode_reserve_fraction: 0.5
+  executor:
+    scan_manager:
+      num_threads: 2
+      backend: native
+      cache: { mode: none }
+    pipeline: { num_threads: 2 }
+    task_creator: { num_threads: 1 }
+    downgrade: { num_threads: 1 }
+  operator_params:
+    scan_task_batch_size: 32Mi
+    hash_partition_bytes: 32Mi
+    concat_batch_bytes: 32Mi
+    max_sort_partition_bytes: 64Mi
+    sort_sample_bytes: 8Mi
+    # Force materializing partitioned joins, not a streaming resident-build join.
+    max_build_hash_table_bytes: 0
+    max_broadcast_join_size: 0
+    enable_dynamic_filter: false
+    enable_compressed_materialization: false
+  telemetry:
+    enable_quent: false

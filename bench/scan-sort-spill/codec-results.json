@@ -1,0 +1,199 @@
+{
+  "records": [
+    {
+      "case": "shuffled_correlated",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 4775442,
+      "header_bytes": 477,
+      "serialized_bytes": 4775919,
+      "representation_bytes": 4775442,
+      "target": "HOST",
+      "encode_ms": 27.299
+    },
+    {
+      "case": "shuffled_correlated",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 4775442,
+      "header_bytes": 477,
+      "serialized_bytes": 4775919,
+      "representation_bytes": 4775919,
+      "target": "DISK",
+      "encode_ms": 7.09317
+    },
+    {
+      "case": "shuffled_correlated",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 156376,
+      "target": "HOST",
+      "encode_ms": 17.1645
+    },
+    {
+      "case": "shuffled_correlated",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 157615,
+      "target": "DISK",
+      "encode_ms": 3.3853
+    },
+    {
+      "case": "shuffled_independent",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 9650442,
+      "header_bytes": 477,
+      "serialized_bytes": 9650919,
+      "representation_bytes": 9650442,
+      "target": "HOST",
+      "encode_ms": 3.25814
+    },
+    {
+      "case": "shuffled_independent",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 9650442,
+      "header_bytes": 477,
+      "serialized_bytes": 9650919,
+      "representation_bytes": 9650919,
+      "target": "DISK",
+      "encode_ms": 9.36819
+    },
+    {
+      "case": "shuffled_independent",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 7948331,
+      "header_bytes": 858,
+      "serialized_bytes": 7949189,
+      "representation_bytes": 7948331,
+      "target": "HOST",
+      "encode_ms": 2.95162
+    },
+    {
+      "case": "shuffled_independent",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 7948331,
+      "header_bytes": 858,
+      "serialized_bytes": 7949189,
+      "representation_bytes": 7949189,
+      "target": "DISK",
+      "encode_ms": 10.3228
+    },
+    {
+      "case": "already_sorted",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 156376,
+      "target": "HOST",
+      "encode_ms": 2.41594
+    },
+    {
+      "case": "already_sorted",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 157615,
+      "target": "DISK",
+      "encode_ms": 3.22242
+    },
+    {
+      "case": "already_sorted",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 156376,
+      "target": "HOST",
+      "encode_ms": 2.37302
+    },
+    {
+      "case": "already_sorted",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 157615,
+      "target": "DISK",
+      "encode_ms": 3.4885
+    }
+  ],
+  "comparisons": [
+    {
+      "case": "shuffled_correlated",
+      "target": "HOST",
+      "original_serialized_bytes": 4775919,
+      "sorted_serialized_bytes": 157615,
+      "saved_serialized_bytes": 4618304,
+      "reduction_percent": 96.69979746306417
+    },
+    {
+      "case": "shuffled_correlated",
+      "target": "DISK",
+      "original_serialized_bytes": 4775919,
+      "sorted_serialized_bytes": 157615,
+      "saved_serialized_bytes": 4618304,
+      "reduction_percent": 96.69979746306417
+    },
+    {
+      "case": "shuffled_independent",
+      "target": "HOST",
+      "original_serialized_bytes": 9650919,
+      "sorted_serialized_bytes": 7949189,
+      "saved_serialized_bytes": 1701730,
+      "reduction_percent": 17.632828542027966
+    },
+    {
+      "case": "shuffled_independent",
+      "target": "DISK",
+      "original_serialized_bytes": 9650919,
+      "sorted_serialized_bytes": 7949189,
+      "saved_serialized_bytes": 1701730,
+      "reduction_percent": 17.632828542027966
+    },
+    {
+      "case": "already_sorted",
+      "target": "HOST",
+      "original_serialized_bytes": 157615,
+      "sorted_serialized_bytes": 157615,
+      "saved_serialized_bytes": 0,
+      "reduction_percent": 0.0
+    },
+    {
+      "case": "already_sorted",
+      "target": "DISK",
+      "original_serialized_bytes": 157615,
+      "sorted_serialized_bytes": 157615,
+      "saved_serialized_bytes": 0,
+      "reduction_percent": 0.0
+    }
+  ],
+  "caveat": "Single matched batch per distribution; conversion wall times include cold-start effects and exclude sorting. HOST representation bytes exclude header; serialized bytes include it."
+}

@@ -19,6 +19,7 @@
 // sirius
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/scan_batch_sort.hpp>
 #include <op/scan/table_scan/scan_contract.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
@@ -194,6 +195,13 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    */
   std::unique_ptr<op::operator_data> execute(const op::operator_data& input_data,
                                              ::cuda::stream_ref stream) override;
+
+  /// Planned once, before execution. Sorting permutes each output batch independently.
+  std::vector<scan_sort_key> batch_sort_keys;
+
+  /// Deferrals are installed later than planning. Keep their positional contract untouched.
+  [[nodiscard]] bool batch_sort_active() const noexcept
+  { return !batch_sort_keys.empty() && deferred_output().empty(); }
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;

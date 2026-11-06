@@ -1,0 +1,2479 @@
+{
+  "run_counts": {
+    "ok": 60,
+    "failed": 6
+  },
+  "total_runs": 66,
+  "groups": [
+    {
+      "matrix": "synthetic-disk",
+      "query": "join",
+      "sorted": 0,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.4714629419904668,
+      "query_seconds": [
+        0.46735015301965177,
+        0.4714629419904668,
+        0.4755502920015715
+      ],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 162,
+          "original_bytes": 1029968768,
+          "payload_bytes": 466935626,
+          "header_bytes": 77712,
+          "committed_bytes": 467013338,
+          "native_source_bytes": 1029968768,
+          "compression_desired_events": 162,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.453424756662136
+        },
+        "HOST->DISK/compressed": {
+          "events": 142,
+          "original_bytes": 911568768,
+          "payload_bytes": 411420802,
+          "header_bytes": 68172,
+          "committed_bytes": 411488974,
+          "native_source_bytes": 411420802,
+          "compression_desired_events": 142,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.45140749490882076
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 162,
+          "original_bytes": 1029968768,
+          "payload_bytes": 466935626,
+          "header_bytes": 77712,
+          "committed_bytes": 467013338,
+          "native_source_bytes": 1029968768,
+          "compression_desired_events": 162,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.453424756662136
+        },
+        "DISK": {
+          "events": 142,
+          "original_bytes": 911568768,
+          "payload_bytes": 411420802,
+          "header_bytes": 68172,
+          "committed_bytes": 411488974,
+          "native_source_bytes": 411420802,
+          "compression_desired_events": 142,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.45140749490882076
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 163,
+          "original_bytes": 1061426048,
+          "payload_bytes": 481731186,
+          "header_bytes": 78189,
+          "committed_bytes": 481809375,
+          "native_source_bytes": 1061426048,
+          "compression_desired_events": 163,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.45392646610458914
+        }
+      },
+      "host_to_disk_traffic_metrics": {
+        "HOST->DISK/compressed": {
+          "events": 143,
+          "original_bytes": 943026048,
+          "payload_bytes": 426216362,
+          "header_bytes": 68649,
+          "committed_bytes": 426285011,
+          "native_source_bytes": 426216362,
+          "compression_desired_events": 143,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.4520394870365235
+        }
+      },
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 163,
+          "original_bytes": 1061426048,
+          "payload_bytes": 481731186,
+          "header_bytes": 78189,
+          "committed_bytes": 481809375,
+          "native_source_bytes": 1061426048,
+          "compression_desired_events": 163,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.45392646610458914
+        },
+        "HOST->DISK/compressed": {
+          "events": 143,
+          "original_bytes": 943026048,
+          "payload_bytes": 426216362,
+          "header_bytes": 68649,
+          "committed_bytes": 426285011,
+          "native_source_bytes": 426216362,
+          "compression_desired_events": 143,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.4520394870365235
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/join-r1-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/join-r2-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/join-r3-sort0"
+      ]
+    },
+    {
+      "matrix": "synthetic-disk",
+      "query": "join",
+      "sorted": 1,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.48929263002355583,
+      "query_seconds": [
+        0.44428026699461043,
+        0.49667652300558984,
+        0.48929263002355583
+      ],
+      "sorted_batches": 249,
+      "sorted_rows": 99000000,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 159,
+          "original_bytes": 1015349632,
+          "payload_bytes": 229461022,
+          "header_bytes": 104361,
+          "committed_bytes": 229565383,
+          "native_source_bytes": 1015349632,
+          "compression_desired_events": 159,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22609490934448873
+        },
+        "HOST->DISK/compressed": {
+          "events": 136,
+          "original_bytes": 870154624,
+          "payload_bytes": 195517574,
+          "header_bytes": 89250,
+          "committed_bytes": 195606824,
+          "native_source_bytes": 195517574,
+          "compression_desired_events": 136,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2247954772691066
+        },
+        "GPU->DISK/compressed": {
+          "events": 4,
+          "original_bytes": 25165824,
+          "payload_bytes": 5903776,
+          "header_bytes": 2628,
+          "committed_bytes": 5906404,
+          "native_source_bytes": 25165824,
+          "compression_desired_events": 4,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.23469940821329752
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 159,
+          "original_bytes": 1015349632,
+          "payload_bytes": 229461022,
+          "header_bytes": 104361,
+          "committed_bytes": 229565383,
+          "native_source_bytes": 1015349632,
+          "compression_desired_events": 159,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22609490934448873
+        },
+        "DISK": {
+          "events": 140,
+          "original_bytes": 895320448,
+          "payload_bytes": 201421350,
+          "header_bytes": 91878,
+          "committed_bytes": 201513228,
+          "native_source_bytes": 220683398,
+          "compression_desired_events": 140,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22507385869511606
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 159,
+          "original_bytes": 1015349632,
+          "payload_bytes": 229461022,
+          "header_bytes": 104361,
+          "committed_bytes": 229565383,
+          "native_source_bytes": 1015349632,
+          "compression_desired_events": 159,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22609490934448873
+        },
+        "GPU->DISK/compressed": {
+          "events": 4,
+          "original_bytes": 25165824,
+          "payload_bytes": 5903776,
+          "header_bytes": 2628,
+          "committed_bytes": 5906404,
+          "native_source_bytes": 25165824,
+          "compression_desired_events": 4,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.23469940821329752
+        }
+      },
+      "host_to_disk_traffic_metrics": {
+        "HOST->DISK/compressed": {
+          "events": 136,
+          "original_bytes": 870154624,
+          "payload_bytes": 195517574,
+          "header_bytes": 89250,
+          "committed_bytes": 195606824,
+          "native_source_bytes": 195517574,
+          "compression_desired_events": 136,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2247954772691066
+        }
+      },
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 159,
+          "original_bytes": 1015349632,
+          "payload_bytes": 229461022,
+          "header_bytes": 104361,
+          "committed_bytes": 229565383,
+          "native_source_bytes": 1015349632,
+          "compression_desired_events": 159,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22609490934448873
+        },
+        "HOST->DISK/compressed": {
+          "events": 136,
+          "original_bytes": 870154624,
+          "payload_bytes": 195517574,
+          "header_bytes": 89250,
+          "committed_bytes": 195606824,
+          "native_source_bytes": 195517574,
+          "compression_desired_events": 136,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2247954772691066
+        },
+        "GPU->DISK/compressed": {
+          "events": 4,
+          "original_bytes": 25165824,
+          "payload_bytes": 5903776,
+          "header_bytes": 2628,
+          "committed_bytes": 5906404,
+          "native_source_bytes": 25165824,
+          "compression_desired_events": 4,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.23469940821329752
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/join-r1-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/join-r2-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/join-r3-sort1"
+      ]
+    },
+    {
+      "matrix": "synthetic-disk",
+      "query": "sort",
+      "sorted": 0,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.7987114889838267,
+      "query_seconds": [
+        0.8268256119918078,
+        0.7987114889838267,
+        0.7423384849971626
+      ],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {},
+      "scan_output_compressed_destinations": {},
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 141,
+          "original_bytes": 1183148808,
+          "payload_bytes": 202514728,
+          "header_bytes": 92263,
+          "committed_bytes": 202606991,
+          "native_source_bytes": 1183148808,
+          "compression_desired_events": 141,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.1712438787327925
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 768,
+          "original_bytes": 604156720,
+          "payload_bytes": 604156720,
+          "header_bytes": 0,
+          "committed_bytes": 604156720,
+          "native_source_bytes": 604156720,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        },
+        "GPU->DISK/uncompressed": {
+          "events": 435,
+          "original_bytes": 342228784,
+          "payload_bytes": 343564632,
+          "header_bytes": 0,
+          "committed_bytes": 343564632,
+          "native_source_bytes": 342228784,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.003903377104598
+        },
+        "GPU->DISK/compressed": {
+          "events": 7,
+          "original_bytes": 225618328,
+          "payload_bytes": 6784720,
+          "header_bytes": 4361,
+          "committed_bytes": 6789081,
+          "native_source_bytes": 225618328,
+          "compression_desired_events": 7,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.030090999521989188
+        }
+      },
+      "host_to_disk_traffic_metrics": {
+        "HOST->DISK/compressed": {
+          "events": 112,
+          "original_bytes": 766904552,
+          "payload_bytes": 164251320,
+          "header_bytes": 73516,
+          "committed_bytes": 164324836,
+          "native_source_bytes": 164251320,
+          "compression_desired_events": 112,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2142702577152
+        },
+        "HOST->DISK/uncompressed": {
+          "events": 699,
+          "original_bytes": 550215984,
+          "payload_bytes": 553602840,
+          "header_bytes": 0,
+          "committed_bytes": 553602840,
+          "native_source_bytes": 550215984,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0061555027452638
+        }
+      },
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 141,
+          "original_bytes": 1183148808,
+          "payload_bytes": 202514728,
+          "header_bytes": 92263,
+          "committed_bytes": 202606991,
+          "native_source_bytes": 1183148808,
+          "compression_desired_events": 141,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.1712438787327925
+        },
+        "HOST->DISK/compressed": {
+          "events": 112,
+          "original_bytes": 766904552,
+          "payload_bytes": 164251320,
+          "header_bytes": 73516,
+          "committed_bytes": 164324836,
+          "native_source_bytes": 164251320,
+          "compression_desired_events": 112,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2142702577152
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 768,
+          "original_bytes": 604156720,
+          "payload_bytes": 604156720,
+          "header_bytes": 0,
+          "committed_bytes": 604156720,
+          "native_source_bytes": 604156720,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        },
+        "HOST->DISK/uncompressed": {
+          "events": 699,
+          "original_bytes": 550215984,
+          "payload_bytes": 553602840,
+          "header_bytes": 0,
+          "committed_bytes": 553602840,
+          "native_source_bytes": 550215984,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0061555027452638
+        },
+        "GPU->DISK/uncompressed": {
+          "events": 435,
+          "original_bytes": 342228784,
+          "payload_bytes": 343564632,
+          "header_bytes": 0,
+          "committed_bytes": 343564632,
+          "native_source_bytes": 342228784,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.003903377104598
+        },
+        "GPU->DISK/compressed": {
+          "events": 7,
+          "original_bytes": 225618328,
+          "payload_bytes": 6784720,
+          "header_bytes": 4361,
+          "committed_bytes": 6789081,
+          "native_source_bytes": 225618328,
+          "compression_desired_events": 7,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.030090999521989188
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/sort-r1-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/sort-r2-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/sort-r3-sort0"
+      ]
+    },
+    {
+      "matrix": "synthetic-disk",
+      "query": "sort",
+      "sorted": 1,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.7576897949911654,
+      "query_seconds": [
+        0.8182587499904912,
+        0.7220278199820314,
+        0.7576897949911654
+      ],
+      "sorted_batches": 246,
+      "sorted_rows": 96000000,
+      "scan_output_metrics": {},
+      "scan_output_compressed_destinations": {},
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 190,
+          "original_bytes": 1571147392,
+          "payload_bytes": 272434620,
+          "header_bytes": 124354,
+          "committed_bytes": 272558974,
+          "native_source_bytes": 1571147392,
+          "compression_desired_events": 190,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.1734776605860286
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 868,
+          "original_bytes": 680751312,
+          "payload_bytes": 680751312,
+          "header_bytes": 0,
+          "committed_bytes": 680751312,
+          "native_source_bytes": 680751312,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        },
+        "GPU->DISK/uncompressed": {
+          "events": 254,
+          "original_bytes": 198388608,
+          "payload_bytes": 199066752,
+          "header_bytes": 0,
+          "committed_bytes": 199066752,
+          "native_source_bytes": 198388608,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0034182607904583
+        },
+        "GPU->DISK/compressed": {
+          "events": 4,
+          "original_bytes": 128412600,
+          "payload_bytes": 3881244,
+          "header_bytes": 2492,
+          "committed_bytes": 3883736,
+          "native_source_bytes": 128412600,
+          "compression_desired_events": 4,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.030244197220521973
+        }
+      },
+      "host_to_disk_traffic_metrics": {
+        "HOST->DISK/compressed": {
+          "events": 134,
+          "original_bytes": 1010900928,
+          "payload_bytes": 194717492,
+          "header_bytes": 87834,
+          "committed_bytes": 194805326,
+          "native_source_bytes": 194717492,
+          "compression_desired_events": 134,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.1927046663073199
+        },
+        "HOST->DISK/uncompressed": {
+          "events": 496,
+          "original_bytes": 389771632,
+          "payload_bytes": 391793464,
+          "header_bytes": 0,
+          "committed_bytes": 391793464,
+          "native_source_bytes": 389771632,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.005187222039802
+        }
+      },
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 190,
+          "original_bytes": 1571147392,
+          "payload_bytes": 272434620,
+          "header_bytes": 124354,
+          "committed_bytes": 272558974,
+          "native_source_bytes": 1571147392,
+          "compression_desired_events": 190,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.1734776605860286
+        },
+        "HOST->DISK/compressed": {
+          "events": 134,
+          "original_bytes": 1010900928,
+          "payload_bytes": 194717492,
+          "header_bytes": 87834,
+          "committed_bytes": 194805326,
+          "native_source_bytes": 194717492,
+          "compression_desired_events": 134,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.1927046663073199
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 868,
+          "original_bytes": 680751312,
+          "payload_bytes": 680751312,
+          "header_bytes": 0,
+          "committed_bytes": 680751312,
+          "native_source_bytes": 680751312,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        },
+        "HOST->DISK/uncompressed": {
+          "events": 496,
+          "original_bytes": 389771632,
+          "payload_bytes": 391793464,
+          "header_bytes": 0,
+          "committed_bytes": 391793464,
+          "native_source_bytes": 389771632,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.005187222039802
+        },
+        "GPU->DISK/uncompressed": {
+          "events": 254,
+          "original_bytes": 198388608,
+          "payload_bytes": 199066752,
+          "header_bytes": 0,
+          "committed_bytes": 199066752,
+          "native_source_bytes": 198388608,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0034182607904583
+        },
+        "GPU->DISK/compressed": {
+          "events": 4,
+          "original_bytes": 128412600,
+          "payload_bytes": 3881244,
+          "header_bytes": 2492,
+          "committed_bytes": 3883736,
+          "native_source_bytes": 128412600,
+          "compression_desired_events": 4,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.030244197220521973
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/sort-r1-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/sort-r2-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-disk/sort-r3-sort1"
+      ]
+    },
+    {
+      "matrix": "synthetic-host",
+      "query": "join",
+      "sorted": 0,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.4320650589943398,
+      "query_seconds": [
+        0.4369940540054813,
+        0.39898614201229066,
+        0.4320650589943398
+      ],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 117,
+          "original_bytes": 747962752,
+          "payload_bytes": 335608174,
+          "header_bytes": 56247,
+          "committed_bytes": 335664421,
+          "native_source_bytes": 747962752,
+          "compression_desired_events": 117,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.44877157332027146
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 117,
+          "original_bytes": 747962752,
+          "payload_bytes": 335608174,
+          "header_bytes": 56247,
+          "committed_bytes": 335664421,
+          "native_source_bytes": 747962752,
+          "compression_desired_events": 117,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.44877157332027146
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 117,
+          "original_bytes": 747962752,
+          "payload_bytes": 335608174,
+          "header_bytes": 56247,
+          "committed_bytes": 335664421,
+          "native_source_bytes": 747962752,
+          "compression_desired_events": 117,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.44877157332027146
+        }
+      },
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 117,
+          "original_bytes": 747962752,
+          "payload_bytes": 335608174,
+          "header_bytes": 56247,
+          "committed_bytes": 335664421,
+          "native_source_bytes": 747962752,
+          "compression_desired_events": 117,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.44877157332027146
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/join-r1-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/join-r2-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/join-r3-sort0"
+      ]
+    },
+    {
+      "matrix": "synthetic-host",
+      "query": "join",
+      "sorted": 1,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.4527491680055391,
+      "query_seconds": [
+        0.4079138060042169,
+        0.4577848839981016,
+        0.4527491680055391
+      ],
+      "sorted_batches": 249,
+      "sorted_rows": 99000000,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 131,
+          "original_bytes": 837222784,
+          "payload_bytes": 188119998,
+          "header_bytes": 85965,
+          "committed_bytes": 188205963,
+          "native_source_bytes": 837222784,
+          "compression_desired_events": 131,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22479794697034905
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 131,
+          "original_bytes": 837222784,
+          "payload_bytes": 188119998,
+          "header_bytes": 85965,
+          "committed_bytes": 188205963,
+          "native_source_bytes": 837222784,
+          "compression_desired_events": 131,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22479794697034905
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 131,
+          "original_bytes": 837222784,
+          "payload_bytes": 188119998,
+          "header_bytes": 85965,
+          "committed_bytes": 188205963,
+          "native_source_bytes": 837222784,
+          "compression_desired_events": 131,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22479794697034905
+        }
+      },
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 131,
+          "original_bytes": 837222784,
+          "payload_bytes": 188119998,
+          "header_bytes": 85965,
+          "committed_bytes": 188205963,
+          "native_source_bytes": 837222784,
+          "compression_desired_events": 131,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22479794697034905
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/join-r1-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/join-r2-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/join-r3-sort1"
+      ]
+    },
+    {
+      "matrix": "synthetic-host",
+      "query": "sort",
+      "sorted": 0,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.6300776000134647,
+      "query_seconds": [
+        0.6323086159827653,
+        0.6300776000134647,
+        0.5896047499845736
+      ],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {},
+      "scan_output_compressed_destinations": {},
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 176,
+          "original_bytes": 1580228424,
+          "payload_bytes": 248890076,
+          "header_bytes": 115020,
+          "committed_bytes": 249005096,
+          "native_source_bytes": 1580228424,
+          "compression_desired_events": 176,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.15757538101339708
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 1060,
+          "original_bytes": 834210016,
+          "payload_bytes": 834210016,
+          "header_bytes": 0,
+          "committed_bytes": 834210016,
+          "native_source_bytes": 834210016,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        }
+      },
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 176,
+          "original_bytes": 1580228424,
+          "payload_bytes": 248890076,
+          "header_bytes": 115020,
+          "committed_bytes": 249005096,
+          "native_source_bytes": 1580228424,
+          "compression_desired_events": 176,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.15757538101339708
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 1060,
+          "original_bytes": 834210016,
+          "payload_bytes": 834210016,
+          "header_bytes": 0,
+          "committed_bytes": 834210016,
+          "native_source_bytes": 834210016,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/sort-r1-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/sort-r2-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/sort-r3-sort0"
+      ]
+    },
+    {
+      "matrix": "synthetic-host",
+      "query": "sort",
+      "sorted": 1,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.6345479919982608,
+      "query_seconds": [
+        0.6312591689929832,
+        0.6345479919982608,
+        0.6723039030039217
+      ],
+      "sorted_batches": 246,
+      "sorted_rows": 96000000,
+      "scan_output_metrics": {},
+      "scan_output_compressed_destinations": {},
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 179,
+          "original_bytes": 1598643632,
+          "payload_bytes": 253314876,
+          "header_bytes": 116991,
+          "committed_bytes": 253431867,
+          "native_source_bytes": 1598643632,
+          "compression_desired_events": 179,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.158529306924359
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 1193,
+          "original_bytes": 938941808,
+          "payload_bytes": 938941808,
+          "header_bytes": 0,
+          "committed_bytes": 938941808,
+          "native_source_bytes": 938941808,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        }
+      },
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 179,
+          "original_bytes": 1598643632,
+          "payload_bytes": 253314876,
+          "header_bytes": 116991,
+          "committed_bytes": 253431867,
+          "native_source_bytes": 1598643632,
+          "compression_desired_events": 179,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.158529306924359
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 1193,
+          "original_bytes": 938941808,
+          "payload_bytes": 938941808,
+          "header_bytes": 0,
+          "committed_bytes": 938941808,
+          "native_source_bytes": 938941808,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/sort-r1-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/sort-r2-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-synthetic-host/sort-r3-sort1"
+      ]
+    },
+    {
+      "matrix": "tpch-disk",
+      "query": "join",
+      "sorted": 0,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.5457398290163837,
+      "query_seconds": [
+        0.5457398290163837,
+        0.5770174750068691,
+        0.524137767002685
+      ],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 103,
+          "original_bytes": 652564720,
+          "payload_bytes": 210065042,
+          "header_bytes": 49131,
+          "committed_bytes": 210114173,
+          "native_source_bytes": 652564720,
+          "compression_desired_events": 103,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.32198212155876277
+        },
+        "HOST->DISK/compressed": {
+          "events": 103,
+          "original_bytes": 652564720,
+          "payload_bytes": 210065042,
+          "header_bytes": 49131,
+          "committed_bytes": 210114173,
+          "native_source_bytes": 210065042,
+          "compression_desired_events": 103,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.32198212155876277
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 103,
+          "original_bytes": 652564720,
+          "payload_bytes": 210065042,
+          "header_bytes": 49131,
+          "committed_bytes": 210114173,
+          "native_source_bytes": 652564720,
+          "compression_desired_events": 103,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.32198212155876277
+        },
+        "DISK": {
+          "events": 103,
+          "original_bytes": 652564720,
+          "payload_bytes": 210065042,
+          "header_bytes": 49131,
+          "committed_bytes": 210114173,
+          "native_source_bytes": 210065042,
+          "compression_desired_events": 103,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.32198212155876277
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 242,
+          "original_bytes": 1151871936,
+          "payload_bytes": 383152302,
+          "header_bytes": 113319,
+          "committed_bytes": 383265621,
+          "native_source_bytes": 1151871936,
+          "compression_desired_events": 242,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.33273284036325373
+        },
+        "GPU->DISK/compressed": {
+          "events": 13,
+          "original_bytes": 27302224,
+          "payload_bytes": 8789354,
+          "header_bytes": 6201,
+          "committed_bytes": 8795555,
+          "native_source_bytes": 27302224,
+          "compression_desired_events": 13,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.3221552573885556
+        }
+      },
+      "host_to_disk_traffic_metrics": {
+        "HOST->DISK/compressed": {
+          "events": 162,
+          "original_bytes": 983288688,
+          "payload_bytes": 328880830,
+          "header_bytes": 75159,
+          "committed_bytes": 328955989,
+          "native_source_bytes": 328880830,
+          "compression_desired_events": 162,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.33454670333805364
+        }
+      },
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 242,
+          "original_bytes": 1151871936,
+          "payload_bytes": 383152302,
+          "header_bytes": 113319,
+          "committed_bytes": 383265621,
+          "native_source_bytes": 1151871936,
+          "compression_desired_events": 242,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.33273284036325373
+        },
+        "HOST->DISK/compressed": {
+          "events": 162,
+          "original_bytes": 983288688,
+          "payload_bytes": 328880830,
+          "header_bytes": 75159,
+          "committed_bytes": 328955989,
+          "native_source_bytes": 328880830,
+          "compression_desired_events": 162,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.33454670333805364
+        },
+        "GPU->DISK/compressed": {
+          "events": 13,
+          "original_bytes": 27302224,
+          "payload_bytes": 8789354,
+          "header_bytes": 6201,
+          "committed_bytes": 8795555,
+          "native_source_bytes": 27302224,
+          "compression_desired_events": 13,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.3221552573885556
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/join-r1-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/join-r2-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/join-r3-sort0"
+      ]
+    },
+    {
+      "matrix": "tpch-disk",
+      "query": "join",
+      "sorted": 1,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.5768093939987011,
+      "query_seconds": [
+        0.5302358879998792,
+        0.5876293049950618,
+        0.5768093939987011
+      ],
+      "sorted_batches": 276,
+      "sorted_rows": 124235352,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 117,
+          "original_bytes": 742680912,
+          "payload_bytes": 146787608,
+          "header_bytes": 66339,
+          "committed_bytes": 146853947,
+          "native_source_bytes": 742680912,
+          "compression_desired_events": 117,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.19773491499132537
+        },
+        "HOST->DISK/compressed": {
+          "events": 117,
+          "original_bytes": 742680912,
+          "payload_bytes": 146787608,
+          "header_bytes": 66339,
+          "committed_bytes": 146853947,
+          "native_source_bytes": 146787608,
+          "compression_desired_events": 117,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.19773491499132537
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 117,
+          "original_bytes": 742680912,
+          "payload_bytes": 146787608,
+          "header_bytes": 66339,
+          "committed_bytes": 146853947,
+          "native_source_bytes": 742680912,
+          "compression_desired_events": 117,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.19773491499132537
+        },
+        "DISK": {
+          "events": 117,
+          "original_bytes": 742680912,
+          "payload_bytes": 146787608,
+          "header_bytes": 66339,
+          "committed_bytes": 146853947,
+          "native_source_bytes": 146787608,
+          "compression_desired_events": 117,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.19773491499132537
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 216,
+          "original_bytes": 1157303232,
+          "payload_bytes": 291407916,
+          "header_bytes": 111447,
+          "committed_bytes": 291519363,
+          "native_source_bytes": 1157303232,
+          "compression_desired_events": 216,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.25189540212050493
+        }
+      },
+      "host_to_disk_traffic_metrics": {
+        "HOST->DISK/compressed": {
+          "events": 171,
+          "original_bytes": 1062924672,
+          "payload_bytes": 261213358,
+          "header_bytes": 89982,
+          "committed_bytes": 261303340,
+          "native_source_bytes": 261213358,
+          "compression_desired_events": 171,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2458342974656251
+        }
+      },
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 216,
+          "original_bytes": 1157303232,
+          "payload_bytes": 291407916,
+          "header_bytes": 111447,
+          "committed_bytes": 291519363,
+          "native_source_bytes": 1157303232,
+          "compression_desired_events": 216,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.25189540212050493
+        },
+        "HOST->DISK/compressed": {
+          "events": 171,
+          "original_bytes": 1062924672,
+          "payload_bytes": 261213358,
+          "header_bytes": 89982,
+          "committed_bytes": 261303340,
+          "native_source_bytes": 261213358,
+          "compression_desired_events": 171,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2458342974656251
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/join-r1-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/join-r2-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/join-r3-sort1"
+      ]
+    },
+    {
+      "matrix": "tpch-disk",
+      "query": "sort",
+      "sorted": 0,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.6901670200168155,
+      "query_seconds": [
+        0.6901670200168155,
+        0.761624169012066,
+        0.668802758998936
+      ],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {},
+      "scan_output_compressed_destinations": {},
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 144,
+          "original_bytes": 1215339312,
+          "payload_bytes": 266973752,
+          "header_bytes": 77748,
+          "committed_bytes": 267051500,
+          "native_source_bytes": 1215339312,
+          "compression_desired_events": 144,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2197341082964985
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 885,
+          "original_bytes": 700100016,
+          "payload_bytes": 700100016,
+          "header_bytes": 0,
+          "committed_bytes": 700100016,
+          "native_source_bytes": 700100016,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        },
+        "GPU->DISK/uncompressed": {
+          "events": 321,
+          "original_bytes": 252936928,
+          "payload_bytes": 253571440,
+          "header_bytes": 0,
+          "committed_bytes": 253571440,
+          "native_source_bytes": 252936928,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0025085779487288
+        },
+        "GPU->DISK/compressed": {
+          "events": 6,
+          "original_bytes": 192266984,
+          "payload_bytes": 51372581,
+          "header_bytes": 1452,
+          "committed_bytes": 51374033,
+          "native_source_bytes": 192266984,
+          "compression_desired_events": 6,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2672015336756934
+        }
+      },
+      "host_to_disk_traffic_metrics": {
+        "HOST->DISK/compressed": {
+          "events": 122,
+          "original_bytes": 973908560,
+          "payload_bytes": 210340018,
+          "header_bytes": 66574,
+          "committed_bytes": 210406592,
+          "native_source_bytes": 210340018,
+          "compression_desired_events": 122,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.21604347742872287
+        },
+        "HOST->DISK/uncompressed": {
+          "events": 456,
+          "original_bytes": 361001296,
+          "payload_bytes": 361883816,
+          "header_bytes": 0,
+          "committed_bytes": 361883816,
+          "native_source_bytes": 361001296,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0024446449632691
+        }
+      },
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 144,
+          "original_bytes": 1215339312,
+          "payload_bytes": 266973752,
+          "header_bytes": 77748,
+          "committed_bytes": 267051500,
+          "native_source_bytes": 1215339312,
+          "compression_desired_events": 144,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2197341082964985
+        },
+        "HOST->DISK/compressed": {
+          "events": 122,
+          "original_bytes": 973908560,
+          "payload_bytes": 210340018,
+          "header_bytes": 66574,
+          "committed_bytes": 210406592,
+          "native_source_bytes": 210340018,
+          "compression_desired_events": 122,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.21604347742872287
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 885,
+          "original_bytes": 700100016,
+          "payload_bytes": 700100016,
+          "header_bytes": 0,
+          "committed_bytes": 700100016,
+          "native_source_bytes": 700100016,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        },
+        "HOST->DISK/uncompressed": {
+          "events": 456,
+          "original_bytes": 361001296,
+          "payload_bytes": 361883816,
+          "header_bytes": 0,
+          "committed_bytes": 361883816,
+          "native_source_bytes": 361001296,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0024446449632691
+        },
+        "GPU->DISK/uncompressed": {
+          "events": 321,
+          "original_bytes": 252936928,
+          "payload_bytes": 253571440,
+          "header_bytes": 0,
+          "committed_bytes": 253571440,
+          "native_source_bytes": 252936928,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0025085779487288
+        },
+        "GPU->DISK/compressed": {
+          "events": 6,
+          "original_bytes": 192266984,
+          "payload_bytes": 51372581,
+          "header_bytes": 1452,
+          "committed_bytes": 51374033,
+          "native_source_bytes": 192266984,
+          "compression_desired_events": 6,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2672015336756934
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/sort-r1-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/sort-r2-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/sort-r3-sort0"
+      ]
+    },
+    {
+      "matrix": "tpch-disk",
+      "query": "sort",
+      "sorted": 1,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.6930365980078932,
+      "query_seconds": [
+        0.6930365980078932,
+        0.7287275929993484,
+        0.685197467013495
+      ],
+      "sorted_batches": 243,
+      "sorted_rows": 96000000,
+      "scan_output_metrics": {},
+      "scan_output_compressed_destinations": {},
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 177,
+          "original_bytes": 1422619896,
+          "payload_bytes": 307920247,
+          "header_bytes": 96459,
+          "committed_bytes": 308016706,
+          "native_source_bytes": 1422619896,
+          "compression_desired_events": 177,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.21651370606165063
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 1060,
+          "original_bytes": 838791632,
+          "payload_bytes": 838791632,
+          "header_bytes": 0,
+          "committed_bytes": 838791632,
+          "native_source_bytes": 838791632,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        },
+        "GPU->DISK/uncompressed": {
+          "events": 224,
+          "original_bytes": 176278208,
+          "payload_bytes": 176735584,
+          "header_bytes": 0,
+          "committed_bytes": 176735584,
+          "native_source_bytes": 176278208,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0025946258768412
+        },
+        "GPU->DISK/compressed": {
+          "events": 6,
+          "original_bytes": 192114872,
+          "payload_bytes": 51333193,
+          "header_bytes": 1452,
+          "committed_bytes": 51334645,
+          "native_source_bytes": 192114872,
+          "compression_desired_events": 6,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.26720807434418714
+        }
+      },
+      "host_to_disk_traffic_metrics": {
+        "HOST->DISK/compressed": {
+          "events": 126,
+          "original_bytes": 998654288,
+          "payload_bytes": 215204836,
+          "header_bytes": 68842,
+          "committed_bytes": 215273678,
+          "native_source_bytes": 215204836,
+          "compression_desired_events": 126,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2155637647449825
+        },
+        "HOST->DISK/uncompressed": {
+          "events": 426,
+          "original_bytes": 337531216,
+          "payload_bytes": 338364584,
+          "header_bytes": 0,
+          "committed_bytes": 338364584,
+          "native_source_bytes": 337531216,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.002469010155197
+        }
+      },
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 177,
+          "original_bytes": 1422619896,
+          "payload_bytes": 307920247,
+          "header_bytes": 96459,
+          "committed_bytes": 308016706,
+          "native_source_bytes": 1422619896,
+          "compression_desired_events": 177,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.21651370606165063
+        },
+        "HOST->DISK/compressed": {
+          "events": 126,
+          "original_bytes": 998654288,
+          "payload_bytes": 215204836,
+          "header_bytes": 68842,
+          "committed_bytes": 215273678,
+          "native_source_bytes": 215204836,
+          "compression_desired_events": 126,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2155637647449825
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 1060,
+          "original_bytes": 838791632,
+          "payload_bytes": 838791632,
+          "header_bytes": 0,
+          "committed_bytes": 838791632,
+          "native_source_bytes": 838791632,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        },
+        "GPU->DISK/uncompressed": {
+          "events": 224,
+          "original_bytes": 176278208,
+          "payload_bytes": 176735584,
+          "header_bytes": 0,
+          "committed_bytes": 176735584,
+          "native_source_bytes": 176278208,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0025946258768412
+        },
+        "HOST->DISK/uncompressed": {
+          "events": 426,
+          "original_bytes": 337531216,
+          "payload_bytes": 338364584,
+          "header_bytes": 0,
+          "committed_bytes": 338364584,
+          "native_source_bytes": 337531216,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.002469010155197
+        },
+        "GPU->DISK/compressed": {
+          "events": 6,
+          "original_bytes": 192114872,
+          "payload_bytes": 51333193,
+          "header_bytes": 1452,
+          "committed_bytes": 51334645,
+          "native_source_bytes": 192114872,
+          "compression_desired_events": 6,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.26720807434418714
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/sort-r1-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/sort-r2-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-disk/sort-r3-sort1"
+      ]
+    },
+    {
+      "matrix": "tpch-host",
+      "query": "join",
+      "sorted": 0,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.5240814069984481,
+      "query_seconds": [
+        0.5239250070007984,
+        0.5330983870080672,
+        0.5240814069984481
+      ],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 105,
+          "original_bytes": 667020480,
+          "payload_bytes": 214718406,
+          "header_bytes": 50085,
+          "committed_bytes": 214768491,
+          "native_source_bytes": 667020480,
+          "compression_desired_events": 105,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.3219818542902911
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 105,
+          "original_bytes": 667020480,
+          "payload_bytes": 214718406,
+          "header_bytes": 50085,
+          "committed_bytes": 214768491,
+          "native_source_bytes": 667020480,
+          "compression_desired_events": 105,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.3219818542902911
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 204,
+          "original_bytes": 1081726768,
+          "payload_bytes": 360570436,
+          "header_bytes": 95193,
+          "committed_bytes": 360665629,
+          "native_source_bytes": 1081726768,
+          "compression_desired_events": 204,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.33341657031084954
+        }
+      },
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 204,
+          "original_bytes": 1081726768,
+          "payload_bytes": 360570436,
+          "header_bytes": 95193,
+          "committed_bytes": 360665629,
+          "native_source_bytes": 1081726768,
+          "compression_desired_events": 204,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.33341657031084954
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/join-r1-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/join-r2-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/join-r3-sort0"
+      ]
+    },
+    {
+      "matrix": "tpch-host",
+      "query": "join",
+      "sorted": 1,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.5675859329930972,
+      "query_seconds": [
+        0.5217165109934285,
+        0.5675859329930972,
+        0.5891245940001681
+      ],
+      "sorted_batches": 276,
+      "sorted_rows": 124235352,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 112,
+          "original_bytes": 711163360,
+          "payload_bytes": 140557442,
+          "header_bytes": 63504,
+          "committed_bytes": 140620946,
+          "native_source_bytes": 711163360,
+          "compression_desired_events": 112,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.19773367683059487
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 112,
+          "original_bytes": 711163360,
+          "payload_bytes": 140557442,
+          "header_bytes": 63504,
+          "committed_bytes": 140620946,
+          "native_source_bytes": 711163360,
+          "compression_desired_events": 112,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.19773367683059487
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 211,
+          "original_bytes": 1125857872,
+          "payload_bytes": 285202068,
+          "header_bytes": 108612,
+          "committed_bytes": 285310680,
+          "native_source_bytes": 1125857872,
+          "compression_desired_events": 211,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.25341625003977414
+        }
+      },
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 211,
+          "original_bytes": 1125857872,
+          "payload_bytes": 285202068,
+          "header_bytes": 108612,
+          "committed_bytes": 285310680,
+          "native_source_bytes": 1125857872,
+          "compression_desired_events": 211,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.25341625003977414
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/join-r1-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/join-r2-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/join-r3-sort1"
+      ]
+    },
+    {
+      "matrix": "tpch-host",
+      "query": "sort",
+      "sorted": 0,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.6058185849979054,
+      "query_seconds": [
+        0.6197038360114675,
+        0.5615714540181216,
+        0.6058185849979054
+      ],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {},
+      "scan_output_compressed_destinations": {},
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 155,
+          "original_bytes": 1541517080,
+          "payload_bytes": 353690812,
+          "header_bytes": 80735,
+          "committed_bytes": 353771547,
+          "native_source_bytes": 1541517080,
+          "compression_desired_events": 155,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2294957036739418
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 1111,
+          "original_bytes": 876895984,
+          "payload_bytes": 876895984,
+          "header_bytes": 0,
+          "committed_bytes": 876895984,
+          "native_source_bytes": 876895984,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        }
+      },
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 155,
+          "original_bytes": 1541517080,
+          "payload_bytes": 353690812,
+          "header_bytes": 80735,
+          "committed_bytes": 353771547,
+          "native_source_bytes": 1541517080,
+          "compression_desired_events": 155,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2294957036739418
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 1111,
+          "original_bytes": 876895984,
+          "payload_bytes": 876895984,
+          "header_bytes": 0,
+          "committed_bytes": 876895984,
+          "native_source_bytes": 876895984,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/sort-r1-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/sort-r2-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/sort-r3-sort0"
+      ]
+    },
+    {
+      "matrix": "tpch-host",
+      "query": "sort",
+      "sorted": 1,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.6414186189940665,
+      "query_seconds": [
+        0.6265533209952991,
+        0.6414186189940665,
+        0.6541313429770526
+      ],
+      "sorted_batches": 243,
+      "sorted_rows": 96000000,
+      "scan_output_metrics": {},
+      "scan_output_compressed_destinations": {},
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 174,
+          "original_bytes": 1558298944,
+          "payload_bytes": 348115341,
+          "header_bytes": 92808,
+          "committed_bytes": 348208149,
+          "native_source_bytes": 1558298944,
+          "compression_desired_events": 174,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22345401076008173
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 1120,
+          "original_bytes": 884116848,
+          "payload_bytes": 884116848,
+          "header_bytes": 0,
+          "committed_bytes": 884116848,
+          "native_source_bytes": 884116848,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        }
+      },
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 174,
+          "original_bytes": 1558298944,
+          "payload_bytes": 348115341,
+          "header_bytes": 92808,
+          "committed_bytes": 348208149,
+          "native_source_bytes": 1558298944,
+          "compression_desired_events": 174,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22345401076008173
+        },
+        "GPU->HOST/uncompressed": {
+          "events": 1120,
+          "original_bytes": 884116848,
+          "payload_bytes": 884116848,
+          "header_bytes": 0,
+          "committed_bytes": 884116848,
+          "native_source_bytes": 884116848,
+          "compression_desired_events": 0,
+          "compression_fallback_events": 0,
+          "committed_over_original": 1.0
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/sort-r1-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/sort-r2-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-host/sort-r3-sort1"
+      ]
+    },
+    {
+      "matrix": "tpch-orderkey-disk",
+      "query": "join",
+      "sorted": 0,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.5426325690059457,
+      "query_seconds": [
+        0.5426325690059457,
+        0.5869920999975875,
+        0.5056969989964273
+      ],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 107,
+          "original_bytes": 675849664,
+          "payload_bytes": 110353367,
+          "header_bytes": 91806,
+          "committed_bytes": 110445173,
+          "native_source_bytes": 675849664,
+          "compression_desired_events": 107,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341677577574412
+        },
+        "HOST->DISK/compressed": {
+          "events": 107,
+          "original_bytes": 675849664,
+          "payload_bytes": 110353367,
+          "header_bytes": 91806,
+          "committed_bytes": 110445173,
+          "native_source_bytes": 110353367,
+          "compression_desired_events": 107,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341677577574412
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 107,
+          "original_bytes": 675849664,
+          "payload_bytes": 110353367,
+          "header_bytes": 91806,
+          "committed_bytes": 110445173,
+          "native_source_bytes": 675849664,
+          "compression_desired_events": 107,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341677577574412
+        },
+        "DISK": {
+          "events": 107,
+          "original_bytes": 675849664,
+          "payload_bytes": 110353367,
+          "header_bytes": 91806,
+          "committed_bytes": 110445173,
+          "native_source_bytes": 110353367,
+          "compression_desired_events": 107,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341677577574412
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 206,
+          "original_bytes": 1189471904,
+          "payload_bytes": 278798603,
+          "header_bytes": 137384,
+          "committed_bytes": 278935987,
+          "native_source_bytes": 1189471904,
+          "compression_desired_events": 206,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.23450405685244333
+        },
+        "GPU->DISK/compressed": {
+          "events": 13,
+          "original_bytes": 156236064,
+          "payload_bytes": 50775739,
+          "header_bytes": 5731,
+          "committed_bytes": 50781470,
+          "native_source_bytes": 156236064,
+          "compression_desired_events": 13,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.3250303975911733
+        }
+      },
+      "host_to_disk_traffic_metrics": {
+        "HOST->DISK/compressed": {
+          "events": 184,
+          "original_bytes": 1091370976,
+          "payload_bytes": 247837190,
+          "header_bytes": 127125,
+          "committed_bytes": 247964315,
+          "native_source_bytes": 247837190,
+          "compression_desired_events": 184,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22720442494157
+        }
+      },
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 206,
+          "original_bytes": 1189471904,
+          "payload_bytes": 278798603,
+          "header_bytes": 137384,
+          "committed_bytes": 278935987,
+          "native_source_bytes": 1189471904,
+          "compression_desired_events": 206,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.23450405685244333
+        },
+        "HOST->DISK/compressed": {
+          "events": 184,
+          "original_bytes": 1091370976,
+          "payload_bytes": 247837190,
+          "header_bytes": 127125,
+          "committed_bytes": 247964315,
+          "native_source_bytes": 247837190,
+          "compression_desired_events": 184,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22720442494157
+        },
+        "GPU->DISK/compressed": {
+          "events": 13,
+          "original_bytes": 156236064,
+          "payload_bytes": 50775739,
+          "header_bytes": 5731,
+          "committed_bytes": 50781470,
+          "native_source_bytes": 156236064,
+          "compression_desired_events": 13,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.3250303975911733
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-disk/join-r1-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-disk/join-r2-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-disk/join-r3-sort0"
+      ]
+    },
+    {
+      "matrix": "tpch-orderkey-disk",
+      "query": "join",
+      "sorted": 1,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.5664861640252639,
+      "query_seconds": [
+        0.5257151820114814,
+        0.5664861640252639,
+        0.5680956539872568
+      ],
+      "sorted_batches": 270,
+      "sorted_rows": 120000084,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 108,
+          "original_bytes": 686005200,
+          "payload_bytes": 112012519,
+          "header_bytes": 92664,
+          "committed_bytes": 112105183,
+          "native_source_bytes": 686005200,
+          "compression_desired_events": 108,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341739537834407
+        },
+        "HOST->DISK/compressed": {
+          "events": 108,
+          "original_bytes": 686005200,
+          "payload_bytes": 112012519,
+          "header_bytes": 92664,
+          "committed_bytes": 112105183,
+          "native_source_bytes": 112012519,
+          "compression_desired_events": 108,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341739537834407
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 108,
+          "original_bytes": 686005200,
+          "payload_bytes": 112012519,
+          "header_bytes": 92664,
+          "committed_bytes": 112105183,
+          "native_source_bytes": 686005200,
+          "compression_desired_events": 108,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341739537834407
+        },
+        "DISK": {
+          "events": 108,
+          "original_bytes": 686005200,
+          "payload_bytes": 112012519,
+          "header_bytes": 92664,
+          "committed_bytes": 112105183,
+          "native_source_bytes": 112012519,
+          "compression_desired_events": 108,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341739537834407
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 204,
+          "original_bytes": 1161357264,
+          "payload_bytes": 265067706,
+          "header_bytes": 137046,
+          "committed_bytes": 265204752,
+          "native_source_bytes": 1161357264,
+          "compression_desired_events": 204,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22835759522144772
+        }
+      },
+      "host_to_disk_traffic_metrics": {
+        "HOST->DISK/compressed": {
+          "events": 174,
+          "original_bytes": 1066803424,
+          "payload_bytes": 238698494,
+          "header_bytes": 122736,
+          "committed_bytes": 238821230,
+          "native_source_bytes": 238698494,
+          "compression_desired_events": 174,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2238662012393391
+        }
+      },
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 204,
+          "original_bytes": 1161357264,
+          "payload_bytes": 265067706,
+          "header_bytes": 137046,
+          "committed_bytes": 265204752,
+          "native_source_bytes": 1161357264,
+          "compression_desired_events": 204,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22835759522144772
+        },
+        "HOST->DISK/compressed": {
+          "events": 174,
+          "original_bytes": 1066803424,
+          "payload_bytes": 238698494,
+          "header_bytes": 122736,
+          "committed_bytes": 238821230,
+          "native_source_bytes": 238698494,
+          "compression_desired_events": 174,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.2238662012393391
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-disk/join-r1-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-disk/join-r2-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-disk/join-r3-sort1"
+      ]
+    },
+    {
+      "matrix": "tpch-orderkey-host",
+      "query": "join",
+      "sorted": 0,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.5070866949972697,
+      "query_seconds": [
+        0.4943612920178566,
+        0.511811206000857,
+        0.5070866949972697
+      ],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 113,
+          "original_bytes": 713546736,
+          "payload_bytes": 116506511,
+          "header_bytes": 96954,
+          "committed_bytes": 116603465,
+          "native_source_bytes": 713546736,
+          "compression_desired_events": 113,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341391406771147
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 113,
+          "original_bytes": 713546736,
+          "payload_bytes": 116506511,
+          "header_bytes": 96954,
+          "committed_bytes": 116603465,
+          "native_source_bytes": 713546736,
+          "compression_desired_events": 113,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341391406771147
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 180,
+          "original_bytes": 1097442416,
+          "payload_bytes": 245171354,
+          "header_bytes": 127503,
+          "committed_bytes": 245298857,
+          "native_source_bytes": 1097442416,
+          "compression_desired_events": 180,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22351865885963715
+        }
+      },
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 180,
+          "original_bytes": 1097442416,
+          "payload_bytes": 245171354,
+          "header_bytes": 127503,
+          "committed_bytes": 245298857,
+          "native_source_bytes": 1097442416,
+          "compression_desired_events": 180,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22351865885963715
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/join-r1-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/join-r2-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/join-r3-sort0"
+      ]
+    },
+    {
+      "matrix": "tpch-orderkey-host",
+      "query": "join",
+      "sorted": 1,
+      "attempted_repeats": 3,
+      "successful_repeats": 3,
+      "statuses": {
+        "ok": 3
+      },
+      "median_query_seconds": 0.521015067002736,
+      "query_seconds": [
+        0.5016122200177051,
+        0.5323052610037848,
+        0.521015067002736
+      ],
+      "sorted_batches": 270,
+      "sorted_rows": 120000084,
+      "scan_output_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 112,
+          "original_bytes": 709284528,
+          "payload_bytes": 115811916,
+          "header_bytes": 96096,
+          "committed_bytes": 115908012,
+          "native_source_bytes": 709284528,
+          "compression_desired_events": 112,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341539597209429
+        }
+      },
+      "scan_output_compressed_destinations": {
+        "HOST": {
+          "events": 112,
+          "original_bytes": 709284528,
+          "payload_bytes": 115811916,
+          "header_bytes": 96096,
+          "committed_bytes": 115908012,
+          "native_source_bytes": 709284528,
+          "compression_desired_events": 112,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.16341539597209429
+        }
+      },
+      "gpu_encoding_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 179,
+          "original_bytes": 1094103280,
+          "payload_bytes": 243620485,
+          "header_bytes": 126645,
+          "committed_bytes": 243747130,
+          "native_source_bytes": 1094103280,
+          "compression_desired_events": 179,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22278256034476013
+        }
+      },
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {
+        "GPU->HOST/compressed": {
+          "events": 179,
+          "original_bytes": 1094103280,
+          "payload_bytes": 243620485,
+          "header_bytes": 126645,
+          "committed_bytes": 243747130,
+          "native_source_bytes": 1094103280,
+          "compression_desired_events": 179,
+          "compression_fallback_events": 0,
+          "committed_over_original": 0.22278256034476013
+        }
+      },
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/join-r1-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/join-r2-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/join-r3-sort1"
+      ]
+    },
+    {
+      "matrix": "tpch-orderkey-host",
+      "query": "sort",
+      "sorted": 0,
+      "attempted_repeats": 3,
+      "successful_repeats": 0,
+      "statuses": {
+        "failed": 3
+      },
+      "median_query_seconds": null,
+      "query_seconds": [],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {},
+      "scan_output_compressed_destinations": {},
+      "gpu_encoding_metrics": {},
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {},
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r1-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r2-sort0",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r3-sort0"
+      ]
+    },
+    {
+      "matrix": "tpch-orderkey-host",
+      "query": "sort",
+      "sorted": 1,
+      "attempted_repeats": 3,
+      "successful_repeats": 0,
+      "statuses": {
+        "failed": 3
+      },
+      "median_query_seconds": null,
+      "query_seconds": [],
+      "sorted_batches": 0,
+      "sorted_rows": 0,
+      "scan_output_metrics": {},
+      "scan_output_compressed_destinations": {},
+      "gpu_encoding_metrics": {},
+      "host_to_disk_traffic_metrics": {},
+      "all_conversion_metrics": {},
+      "runs": [
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r1-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r2-sort1",
+        "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r3-sort1"
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "matrix": "tpch-orderkey-host",
+      "query": "sort",
+      "repeat": 1,
+      "sorted": 0,
+      "status": "failed",
+      "directory": "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r1-sort0",
+      "error_tail": "Traceback (most recent call last):\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 315, in <module>\n    main()\n    ~~~~^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 241, in main\n    worker(args)\n    ~~~~~~^^^^^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 105, in worker\n    rows = con.execute(statement).fetchall()\n           ~~~~~~~~~~~^^^^^^^^^^^\n_duckdb.NotImplementedException: Not implemented Error: SiriusExecuteQuery error: UNION with ordered arms (allow_out_of_order = false) is not supported on the GPU (falling back to CPU)\n"
+    },
+    {
+      "matrix": "tpch-orderkey-host",
+      "query": "sort",
+      "repeat": 1,
+      "sorted": 1,
+      "status": "failed",
+      "directory": "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r1-sort1",
+      "error_tail": "Traceback (most recent call last):\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 315, in <module>\n    main()\n    ~~~~^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 241, in main\n    worker(args)\n    ~~~~~~^^^^^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 105, in worker\n    rows = con.execute(statement).fetchall()\n           ~~~~~~~~~~~^^^^^^^^^^^\n_duckdb.NotImplementedException: Not implemented Error: SiriusExecuteQuery error: UNION with ordered arms (allow_out_of_order = false) is not supported on the GPU (falling back to CPU)\n"
+    },
+    {
+      "matrix": "tpch-orderkey-host",
+      "query": "sort",
+      "repeat": 2,
+      "sorted": 1,
+      "status": "failed",
+      "directory": "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r2-sort1",
+      "error_tail": "Traceback (most recent call last):\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 315, in <module>\n    main()\n    ~~~~^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 241, in main\n    worker(args)\n    ~~~~~~^^^^^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 105, in worker\n    rows = con.execute(statement).fetchall()\n           ~~~~~~~~~~~^^^^^^^^^^^\n_duckdb.NotImplementedException: Not implemented Error: SiriusExecuteQuery error: UNION with ordered arms (allow_out_of_order = false) is not supported on the GPU (falling back to CPU)\n"
+    },
+    {
+      "matrix": "tpch-orderkey-host",
+      "query": "sort",
+      "repeat": 2,
+      "sorted": 0,
+      "status": "failed",
+      "directory": "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r2-sort0",
+      "error_tail": "Traceback (most recent call last):\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 315, in <module>\n    main()\n    ~~~~^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 241, in main\n    worker(args)\n    ~~~~~~^^^^^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 105, in worker\n    rows = con.execute(statement).fetchall()\n           ~~~~~~~~~~~^^^^^^^^^^^\n_duckdb.NotImplementedException: Not implemented Error: SiriusExecuteQuery error: UNION with ordered arms (allow_out_of_order = false) is not supported on the GPU (falling back to CPU)\n"
+    },
+    {
+      "matrix": "tpch-orderkey-host",
+      "query": "sort",
+      "repeat": 3,
+      "sorted": 0,
+      "status": "failed",
+      "directory": "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r3-sort0",
+      "error_tail": "Traceback (most recent call last):\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 315, in <module>\n    main()\n    ~~~~^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 241, in main\n    worker(args)\n    ~~~~~~^^^^^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 105, in worker\n    rows = con.execute(statement).fetchall()\n           ~~~~~~~~~~~^^^^^^^^^^^\n_duckdb.NotImplementedException: Not implemented Error: SiriusExecuteQuery error: UNION with ordered arms (allow_out_of_order = false) is not supported on the GPU (falling back to CPU)\n"
+    },
+    {
+      "matrix": "tpch-orderkey-host",
+      "query": "sort",
+      "repeat": 3,
+      "sorted": 1,
+      "status": "failed",
+      "directory": "/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/results-final-tpch-orderkey-host/sort-r3-sort1",
+      "error_tail": "Traceback (most recent call last):\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 315, in <module>\n    main()\n    ~~~~^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 241, in main\n    worker(args)\n    ~~~~~~^^^^^^\n  File \"/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/experiment.py\", line 105, in worker\n    rows = con.execute(statement).fetchall()\n           ~~~~~~~~~~~^^^^^^^^^^^\n_duckdb.NotImplementedException: Not implemented Error: SiriusExecuteQuery error: UNION with ordered arms (allow_out_of_order = false) is not supported on the GPU (falling back to CPU)\n"
+    }
+  ],
+  "matched_codec_records": [
+    {
+      "case": "shuffled_correlated",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 4775442,
+      "header_bytes": 477,
+      "serialized_bytes": 4775919,
+      "representation_bytes": 4775442,
+      "target": "HOST",
+      "encode_ms": 27.299
+    },
+    {
+      "case": "shuffled_correlated",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 4775442,
+      "header_bytes": 477,
+      "serialized_bytes": 4775919,
+      "representation_bytes": 4775919,
+      "target": "DISK",
+      "encode_ms": 7.09317
+    },
+    {
+      "case": "shuffled_correlated",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 156376,
+      "target": "HOST",
+      "encode_ms": 17.1645
+    },
+    {
+      "case": "shuffled_correlated",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 157615,
+      "target": "DISK",
+      "encode_ms": 3.3853
+    },
+    {
+      "case": "shuffled_independent",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 9650442,
+      "header_bytes": 477,
+      "serialized_bytes": 9650919,
+      "representation_bytes": 9650442,
+      "target": "HOST",
+      "encode_ms": 3.25814
+    },
+    {
+      "case": "shuffled_independent",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 9650442,
+      "header_bytes": 477,
+      "serialized_bytes": 9650919,
+      "representation_bytes": 9650919,
+      "target": "DISK",
+      "encode_ms": 9.36819
+    },
+    {
+      "case": "shuffled_independent",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 7948331,
+      "header_bytes": 858,
+      "serialized_bytes": 7949189,
+      "representation_bytes": 7948331,
+      "target": "HOST",
+      "encode_ms": 2.95162
+    },
+    {
+      "case": "shuffled_independent",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 7948331,
+      "header_bytes": 858,
+      "serialized_bytes": 7949189,
+      "representation_bytes": 7949189,
+      "target": "DISK",
+      "encode_ms": 10.3228
+    },
+    {
+      "case": "already_sorted",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 156376,
+      "target": "HOST",
+      "encode_ms": 2.41594
+    },
+    {
+      "case": "already_sorted",
+      "mode": "ORIGINAL",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 157615,
+      "target": "DISK",
+      "encode_ms": 3.22242
+    },
+    {
+      "case": "already_sorted",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 156376,
+      "target": "HOST",
+      "encode_ms": 2.37302
+    },
+    {
+      "case": "already_sorted",
+      "mode": "PER_BATCH_SORTED",
+      "rows": 1000000,
+      "raw_bytes": 16000000,
+      "payload_bytes": 156376,
+      "header_bytes": 1239,
+      "serialized_bytes": 157615,
+      "representation_bytes": 157615,
+      "target": "DISK",
+      "encode_ms": 3.4885
+    }
+  ],
+  "caveats": [
+    "Only status=ok runs contribute bytes/times; failed/inconclusive attempts remain listed.",
+    "Ratios are sum(committed destination bytes)/sum(decoded original bytes), not mean ratios.",
+    "scan_output_metrics is direct scan batch provenance; empty means no direct scan spill evidence.",
+    "gpu_encoding_metrics includes all GPU-origin outputs, including downstream already-sorted batches.",
+    "HOST->DISK is another destination write, not another newly encoded input; scopes overlap, never sum scopes.",
+    "Compression comparisons use /compressed keys; /uncompressed keys separately expose fallback or size-gate traffic.",
+    "Async pressure selects different original byte totals; compare original bytes/events alongside ratios.",
+    "All sort runs lack direct scan-output spills; do not infer scan compression benefit from downstream sort spill ratios.",
+    "Orderkey control sort rejected both arms (ordered UNION unsupported); DISK orderkey intentionally join-only.",
+    "Sorting disables converted-table steal on opted-in scans for retry safety; timing includes this overhead.",
+    "Pristine smoke and pilot directories are excluded from this final aggregate."
+  ]
+}

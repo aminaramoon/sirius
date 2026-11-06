@@ -1,0 +1,8 @@
+__pycache__/
+data/
+data-*/
+results*/
+prepare*/
+smoke*/
+cpu-check*/
+*.log

@@ -24,6 +24,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -43,12 +44,16 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <numeric>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -106,9 +111,7 @@ spill_env& env()
 /// Installs @p settings for one test and switches spill compression off afterwards.
 struct scoped_settings {
   explicit scoped_settings(spill_compression_settings settings)
-  {
-    sirius::compression::set_spill_compression_settings(settings);
-  }
+  { sirius::compression::set_spill_compression_settings(settings); }
   ~scoped_settings() { sirius::compression::set_spill_compression_settings({}); }
 };
 
@@ -249,7 +252,158 @@ bool holds(cucascade::data_batch& batch)
   return dynamic_cast<Representation const*>(ro.get_data()) != nullptr;
 }
 
+// The experiment deliberately measures only workload columns, not an artificial row id.
+using codec_rows = std::vector<std::pair<std::int64_t, std::int64_t>>;
+
+codec_rows copy_codec_rows(cudf::table_view const& view)
+{
+  REQUIRE(view.num_columns() == 2);
+  auto const keys =
+    utils::copy_column_to_host<std::int64_t>(view.column(0), utils::default_stream());
+  auto const payload =
+    utils::copy_column_to_host<std::int64_t>(view.column(1), utils::default_stream());
+  codec_rows rows(keys.size());
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    rows[i] = {keys[i], payload[i]};
+  }
+  return rows;
+}
+
+codec_rows copy_codec_rows(cucascade::data_batch& batch)
+{
+  auto ro = batch.to_read_only();
+  return copy_codec_rows(
+    ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+}
+
+std::unique_ptr<cudf::table> codec_table(bool independent_payload, bool already_sorted)
+{
+  constexpr std::size_t rows = 1'000'000;
+  std::mt19937_64 rng{20260604};
+  std::vector<std::int64_t> keys(rows), payload(rows);
+  // Exactly the same repeated-key population in every distribution.
+  for (std::size_t i = 0; i < rows; ++i) {
+    keys[i] = static_cast<std::int64_t>(i / 64);
+  }
+  if (!already_sorted) { std::shuffle(keys.begin(), keys.end(), rng); }
+  for (std::size_t i = 0; i < rows; ++i) {
+    payload[i] = independent_payload ? static_cast<std::int64_t>(rng() >> 1) : keys[i] * 1009 + 17;
+  }
+  auto stream = utils::default_stream();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(numeric_column(cudf::data_type{cudf::type_id::INT64}, keys, stream));
+  columns.push_back(numeric_column(cudf::data_type{cudf::type_id::INT64}, payload, stream));
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+void measure_codec_roundtrips(char const* name,
+                              char const* mode,
+                              std::unique_ptr<cudf::table> table)
+{
+  auto const expected_rows   = copy_codec_rows(table->view());
+  auto batch                 = gpu_batch(std::move(table));
+  auto const expected_digest = digest(*batch);
+  auto const raw_bytes       = batch->to_read_only().get_data()->get_size_in_bytes();
+  REQUIRE(raw_bytes == expected_rows.size() * 2 * sizeof(std::int64_t));
+
+  for (bool const to_disk : {false, true}) {
+    INFO("case=" << name << " mode=" << mode << " target=" << (to_disk ? "DISK" : "HOST"));
+    // Wall time includes planning, encoding, transfer and synchronization, not sorting
+    // or correctness checks. Device sync also covers column-parallel encoder streams.
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    auto const start = std::chrono::steady_clock::now();
+    move_to(batch, to_disk ? env().disk : env().host);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    auto const encode_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+    std::size_t header_bytes = 0, payload_bytes = 0, serialized_bytes = 0;
+    std::size_t representation_bytes = 0;
+    std::string path;
+    if (to_disk) {
+      REQUIRE(holds<sirius::compressed_disk_representation>(*batch));
+      auto ro              = batch->to_read_only();
+      auto const& rep      = ro.get_data()->cast<sirius::compressed_disk_representation>();
+      header_bytes         = rep.header_bytes();
+      representation_bytes = serialized_bytes = rep.get_size_in_bytes();
+      REQUIRE(serialized_bytes > header_bytes);
+      payload_bytes = serialized_bytes - header_bytes;
+      path          = rep.path();
+      CHECK(fs::file_size(path) == serialized_bytes);
+      CHECK(rep.get_uncompressed_data_size_in_bytes() == raw_bytes);
+    } else {
+      REQUIRE(holds<sirius::compressed_host_representation>(*batch));
+      auto ro              = batch->to_read_only();
+      auto const& rep      = ro.get_data()->cast<sirius::compressed_host_representation>();
+      header_bytes         = rep.header().size();
+      representation_bytes = payload_bytes = rep.get_size_in_bytes();
+      serialized_bytes                     = header_bytes + payload_bytes;
+      CHECK(rep.get_uncompressed_data_size_in_bytes() == raw_bytes);
+    }
+    CHECK(header_bytes > 0);
+    CHECK(payload_bytes > 0);
+    CHECK(serialized_bytes == header_bytes + payload_bytes);
+    CHECK(encode_ms >= 0);
+    // HOST reports payload only; DISK reports the complete header + payload file.
+    std::cout << "[scan_sort_codec] case=" << name << " mode=" << mode
+              << " rows=" << expected_rows.size() << " raw_bytes=" << raw_bytes
+              << " payload_bytes=" << payload_bytes << " header_bytes=" << header_bytes
+              << " serialized_bytes=" << serialized_bytes
+              << " representation_bytes=" << representation_bytes
+              << " target=" << (to_disk ? "DISK" : "HOST") << " encode_ms=" << encode_ms
+              << std::endl;
+
+    move_to(batch, env().gpu);
+    REQUIRE(holds<cucascade::gpu_table_representation>(*batch));
+    CHECK(digest(*batch) == expected_digest);
+    // Exact ordered values supplement the digest's 32-bit row hashes.
+    CHECK(copy_codec_rows(*batch) == expected_rows);
+    if (to_disk) { CHECK_FALSE(fs::exists(path)); }
+  }
+}
+
 }  // namespace
+
+TEST_CASE("spill compression: matched original and per-batch sorted codec experiment",
+          "[compression][spill][scan-sort-experiment][.]")
+{
+  if (!has_gpu()) { return; }
+  scoped_settings settings(enabled_settings());
+  std::cout << "[scan_sort_codec] schema=key_int64,payload_int64 batches=1 rows_per_batch=1000000"
+               " host_size=payload_bytes disk_size=header_bytes+payload_bytes"
+               " timing=conversion_wall_ms_excludes_sort seed=20260604"
+            << std::endl;
+
+  for (auto const* name : {"shuffled_correlated", "shuffled_independent", "already_sorted"}) {
+    INFO("case=" << name);
+    std::string const case_name{name};
+    auto original = codec_table(case_name == "shuffled_independent", case_name == "already_sorted");
+    auto const original_rows = copy_codec_rows(original->view());
+    // Stable sort gathers ALL columns with one key permutation, including payloads
+    // unrelated to the key. No scheduler, scan split, or spill-set decision is involved.
+    auto sorted      = cudf::stable_sort_by_key(original->view(),
+                                                original->view().select({0}),
+                                                {},
+                                                {},
+                                                utils::default_stream(),
+                                                utils::get_resource_ref(*env().gpu));
+    auto sorted_rows = copy_codec_rows(sorted->view());
+    REQUIRE(sorted_rows.size() == original_rows.size());
+    CHECK(std::is_sorted(sorted_rows.begin(), sorted_rows.end(), [](auto const& a, auto const& b) {
+      return a.first < b.first;
+    }));
+    if (case_name == "already_sorted") { CHECK(sorted_rows == original_rows); }
+    // Exact pair multiset equality verifies both row association and multiplicities,
+    // without adding a row-id column that could confound compressed byte measurements.
+    auto canonical_original = original_rows;
+    std::sort(canonical_original.begin(), canonical_original.end());
+    std::sort(sorted_rows.begin(), sorted_rows.end());
+    REQUIRE(sorted_rows == canonical_original);
+
+    measure_codec_roundtrips(name, "ORIGINAL", std::move(original));
+    measure_codec_roundtrips(name, "PER_BATCH_SORTED", std::move(sorted));
+  }
+}
 
 TEST_CASE("spill compression: default plans follow the column type and a sample",
           "[compression][spill]")
@@ -290,8 +444,8 @@ TEST_CASE("spill compression: default plans follow the column type and a sample"
   auto const tail    = cudf::slice(spliced->view(),
                                    {static_cast<cudf::size_type>(random.size()),
                                     static_cast<cudf::size_type>(random_then_repeated.size())},
-                                stream)
-                      .front();
+                                   stream)
+                         .front();
   CHECK(contains(plan(tail), "rle"));
 
   // Other fixed-width types are bitpacked as they are.

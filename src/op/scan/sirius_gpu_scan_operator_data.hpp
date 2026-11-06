@@ -207,6 +207,11 @@ class scan_operator_input : public op::operator_data {
     return std::holds_alternative<std::shared_ptr<::cucascade::data_batch>>(materialization_info);
   }
 
+  /// A batch-local sort allocates after assembly, so retain converted source ownership for OOM
+  /// retry instead of consuming either the immediate or transactional steal arm. Stamped at
+  /// dequeue.
+  bool preserve_converted_input = false;
+
   /// Whether a per-query table freshly converted by prepare_for_processing may leave the cached
   /// wrapper: the split is resident, carries no mvcc keep-mask, and any pending row filter has
   /// already been applied by the decode (pushdown_row_filtered). Policy shared by prepare's
@@ -215,7 +220,7 @@ class scan_operator_input : public op::operator_data {
   /// / already-stolen / predicate columns) stays in the steal.
   [[nodiscard]] bool converted_table_transferable() const noexcept
   {
-    return is_resident() && !mvcc_keep_mask.has_mask() &&
+    return !preserve_converted_input && is_resident() && !mvcc_keep_mask.has_mask() &&
            (!row_filter_pending || pushdown_row_filtered);
   }
 

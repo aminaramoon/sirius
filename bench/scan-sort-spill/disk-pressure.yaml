@@ -1,0 +1,49 @@
+# Small HOST tier encourages DISK; async selection is not deterministic.
+# Harness replaces @SPILL_DIR@ with an isolated per-process absolute directory.
+sirius:
+  max_concurrent_queries: 1
+  topology: { num_gpus: 1 }
+  memory:
+    gpu:
+      usage_limit_bytes: 1Gi
+      reservation_limit_fraction: 1.0
+      downgrade_trigger_fraction: 0.25
+      downgrade_stop_fraction: 0.15
+    host:
+      capacity_bytes: 128Mi
+      block_size: 1Mi
+      pool_size: 16
+      initial_number_pools: 1
+      downgrade_trigger_fraction: 0.70
+      downgrade_stop_fraction: 0.45
+    disk:
+      disk_id: 0
+      capacity_bytes: 16Gi
+      downgrade_root_dirs: "@SPILL_DIR@"
+  compression:
+    enable_spill_compression: true
+    spill_min_batch_bytes: 1Mi
+    spill_max_compressed_fraction: 0.99
+    spill_encode_reserve_fraction: 0.5
+  executor:
+    scan_manager:
+      num_threads: 2
+      backend: native
+      uring_n_reactors: 1
+      cache: { mode: none }
+    pipeline: { num_threads: 2 }
+    task_creator: { num_threads: 1 }
+    downgrade: { num_threads: 1 }
+  operator_params:
+    scan_task_batch_size: 8Mi
+    hash_partition_bytes: 32Mi
+    concat_batch_bytes: 32Mi
+    max_sort_partition_bytes: 64Mi
+    sort_sample_bytes: 8Mi
+    # Force materializing partitioned joins, not a streaming resident-build join.
+    max_build_hash_table_bytes: 0
+    max_broadcast_join_size: 0
+    enable_dynamic_filter: false
+    enable_compressed_materialization: false
+  telemetry:
+    enable_quent: false
