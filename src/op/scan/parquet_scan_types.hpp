@@ -127,6 +127,13 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   std::size_t projected_output_count = 0;
 
+  /// Planning-snapshotted, safely admitted first batch-sort key in SCAN OUTPUT space.
+  /// Only normal GPU lowering sets this; pinning and adapters remain streaming.
+  std::optional<std::size_t> experimental_range_cluster_output_key;
+  bool experimental_range_cluster_reorder = true;
+  // Observer-only split membership/span logging. Does not change provider scheduling.
+  std::optional<std::size_t> experimental_range_cluster_audit_output_key;
+
   parquet_ingestible_table_info() = default;
 
   /// True when file @p index is read whole (no ranges, or a `(0,0)` range among them).
@@ -409,6 +416,42 @@ class parquet_file_scan_info : public scan_info {
     }
     return total;
   }
+};
+
+/// One opt-in eager metadata job owns every selected file until bounded coalescing finishes.
+/// References address selected row-group slots, never borrowed descriptors. Empty files retain
+/// one sentinel reference so the ordinary coalescer preserves its typed-empty fallback.
+class parquet_range_scan_info : public scan_info {
+ public:
+  struct row_group_ref {
+    std::size_t file_slot;
+    std::size_t row_group_slot;
+    std::optional<std::pair<int64_t, int64_t>> interval;
+  };
+  std::vector<std::unique_ptr<parquet_file_scan_info>> files;
+  std::vector<row_group_ref> row_groups;
+  std::string key;
+  bool eligible  = false;
+  bool reordered = false;
+  std::string fallback_reason;
+
+  void cluster(std::string key_name, bool reorder = true);
+  [[nodiscard]] std::size_t estimated_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& file : files)
+      total = memory::saturating_add(total, file->estimated_bytes());
+    return total;
+  }
+  [[nodiscard]] std::size_t preparation_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& file : files)
+      total = memory::saturating_add(total, file->preparation_bytes());
+    return total;
+  }
+  [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
+  { return preparation_bytes(); }
 };
 
 /// A top-level `<col> IS [NOT] NULL` conjunct, recorded so the row groups it

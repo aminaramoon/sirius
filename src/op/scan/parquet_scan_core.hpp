@@ -185,6 +185,9 @@ class parquet_scan_core {
   // Per-file metadata-scan cursor. next_split_provider hands out one file index
   // per claim; the coalescer downstream batches files and chunks row groups.
   std::atomic<std::size_t> _next_file_idx{0};
+  // Set only for eligible plain, fresh reader scans, from the admitted output key.
+  std::optional<std::string> _range_cluster_key;
+  std::optional<std::string> _range_cluster_audit_key;
   std::atomic<std::size_t> _reader_calls{0};
 
   // Dynamic join filters shared with the producing hash join; null when none are wired.

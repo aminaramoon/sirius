@@ -354,6 +354,21 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
 {
   auto info = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
   populate_parquet_table_info(*info, scan_op, op_params, context);
+  // The existing batch-sort pass is the semantic safety preflight (including downstream
+  // order-sensitive operators). Snapshot this experiment only during normal GPU lowering;
+  // synchronous pinning and the Iceberg adapter never populate this hint.
+  auto const* mode = std::getenv("SIRIUS_EXP_ROWGROUP_RANGE_CLUSTER");
+  auto const* audit = std::getenv("SIRIUS_EXP_ROWGROUP_RANGE_AUDIT");
+  if (!scan_op.batch_sort_keys.empty() && scan_op.deferred_output().empty() &&
+      !info->has_requested_user_virtual_columns()) {
+    auto const key = scan_op.batch_sort_keys.front().output_ordinal;
+    if (mode && (std::string_view(mode) == "1" || std::string_view(mode) == "collect")) {
+      info->experimental_range_cluster_output_key = key;
+      info->experimental_range_cluster_reorder = std::string_view(mode) == "1";
+    }
+    if (audit && std::string_view(audit) == "1")
+      info->experimental_range_cluster_audit_output_key = key;
+  }
   return info;
 }
 

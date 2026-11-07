@@ -1,0 +1,142 @@
+{
+  "duckdb_version": "2.0.0",
+  "cpu_only": true,
+  "dataset": "real-supplier",
+  "rows": 32000000,
+  "row_group_rows": 8192,
+  "source_manifest": {
+    "rows": 32000000,
+    "keys": 1000000,
+    "seed": 1729,
+    "duckdb_version": "2.0.0",
+    "fact_sql": "SELECT \"l_suppkey\"::BIGINT AS k, \"l_extendedprice\"::BIGINT AS payload FROM read_parquet('/localhome/local-aaramoon/tpch/sf1000/lineitem/part.0.parquet') LIMIT 32000000",
+    "source_parquet": "/localhome/local-aaramoon/tpch/sf1000/lineitem/part.0.parquet",
+    "actual_rows": 32000000,
+    "files": {
+      "fact": {
+        "bytes": 512063592,
+        "sha256": "bac2e55d29bc001275c68389fc75f15080f57a6037a301ad2f0aaecc79de5ae0"
+      },
+      "dim": {
+        "bytes": 75304220,
+        "sha256": "4cf3dcf8aba6784a5cb207eccb357ec411a8886650ddb942e0580ae5b1c8a1ef"
+      }
+    }
+  },
+  "source_fact_sha256": "bac2e55d29bc001275c68389fc75f15080f57a6037a301ad2f0aaecc79de5ae0",
+  "sql_by_table": [
+    "SELECT * FROM read_parquet('/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/data-tpch/fact.parquet')",
+    "SELECT * FROM read_parquet('/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/scan-sort-spill/data-tpch/dim.parquet')"
+  ],
+  "fact_files": [
+    "data-real-supplier/fact.parquet"
+  ],
+  "dim_file": "data-real-supplier/dim.parquet",
+  "files": {
+    "fact.parquet": {
+      "bytes": 512976673,
+      "sha256": "06b9e5e39664b027c934f419621b791e50f7cb184cf58a353647f6a10c629a69"
+    },
+    "dim.parquet": {
+      "bytes": 75443283,
+      "sha256": "91b95283dacd8a89452541635f79ddfe1581a97706811c1cab1fef4cb9e2d35c"
+    }
+  },
+  "fingerprint": [
+    "32000000",
+    "160011995553094",
+    "1223760627341",
+    "295137509590691070136626320",
+    "1",
+    "10000000"
+  ],
+  "source_multiset_difference_rows": 0,
+  "cpu_join_sql": "SELECT count(*),sum(f.payload) FROM read_parquet('/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-real-supplier/fact.parquet') f JOIN read_parquet('/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-real-supplier/dim.parquet') d ON f.k=d.k",
+  "cpu_join_reference": [
+    "32000000",
+    "1223760627341"
+  ],
+  "physical_schedule": {
+    "batches": 62,
+    "span_min": 9999916,
+    "span_median": 9999969,
+    "span_max": 9999997,
+    "span_over_domain_median": 0.9999969,
+    "source_files_per_batch_min": 1,
+    "source_files_per_batch_max": 1,
+    "batch_rows": [
+      226802,
+      516125,
+      516143,
+      516210,
+      516216,
+      516446,
+      516452,
+      516706,
+      516709,
+      516808,
+      516883,
+      516927,
+      517070,
+      517152,
+      517168,
+      517228,
+      517236,
+      517313,
+      517318,
+      517339,
+      517439,
+      517457,
+      517501,
+      517528,
+      517532,
+      517684,
+      517703,
+      517783,
+      517941,
+      517965,
+      524288
+    ]
+  },
+  "clustered_schedule": {
+    "batches": 62,
+    "span_min": 9993625,
+    "span_median": 9999176,
+    "span_max": 9999975,
+    "span_over_domain_median": 0.9999176,
+    "source_files_per_batch_min": 1,
+    "source_files_per_batch_max": 1,
+    "batch_rows": [
+      204800,
+      516125,
+      516143,
+      516210,
+      516216,
+      516446,
+      516709,
+      516808,
+      516927,
+      517062,
+      517070,
+      517152,
+      517228,
+      517313,
+      517318,
+      517339,
+      517439,
+      517457,
+      517501,
+      517528,
+      517684,
+      517703,
+      517783,
+      517941,
+      517955,
+      517965,
+      518672,
+      521714,
+      524288
+    ]
+  },
+  "schedule_note": "Metadata-only equal8MiB cap simulation, not observed engine batches or codec compression."
+}

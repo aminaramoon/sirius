@@ -1,6 +1,7 @@
 # cmake-format: off
 set(TEST_SOURCES
     test/cpp/scan/test_parquet_delete_reader.cpp
+    test/cpp/scan/test_parquet_range_cluster.cpp
     test/cpp/scan/bench_parquet_footer_cache.cpp
     test/cpp/io/test_parquet_metadata_retention.cpp
     test/cpp/scan_manager/test_preparation_readiness.cpp

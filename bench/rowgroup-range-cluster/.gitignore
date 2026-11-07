@@ -1,0 +1,6 @@
+data-*/
+.tools/
+__pycache__/
+results*/
+metadata-raw.json
+*.log

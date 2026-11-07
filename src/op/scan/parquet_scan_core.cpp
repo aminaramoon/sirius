@@ -86,6 +86,7 @@
 
 // standard library
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
@@ -402,6 +403,69 @@ std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
   std::span<row_group_slice const> slices,
   std::span<std::vector<cudf::io::text::byte_range_info> const> per_slice_ranges);
 
+// Signed integer footer intervals only. Resolve by the exact flat leaf name, never by an
+// output ordinal or presumed file column order. Any uncertainty disables the entire reorder.
+std::optional<std::pair<int64_t, int64_t>> range_interval(
+  cudf::io::parquet::FileMetaData const* metadata, cudf::size_type index, std::string const& key)
+{
+  using namespace cudf::io::parquet;
+  if (!metadata || metadata->schema.empty() || index < 0 ||
+      static_cast<std::size_t>(index) >= metadata->row_groups.size() ||
+      metadata->schema.front().num_children != static_cast<int64_t>(metadata->schema.size()) - 1)
+    return {};
+  SchemaElement const* leaf = nullptr;
+  for (std::size_t i = 1; i < metadata->schema.size(); ++i) {
+    auto const& field = metadata->schema[i];
+    if (field.num_children != 0 ||
+        (field.repetition_type != FieldRepetitionType::REQUIRED &&
+         field.repetition_type != FieldRepetitionType::OPTIONAL))
+      return {};
+    if (field.name == key) {
+      if (leaf) return {};
+      leaf = &field;
+    }
+  }
+  if (!leaf || (leaf->type != Type::INT32 && leaf->type != Type::INT64)) return {};
+  auto const width = leaf->type == Type::INT32 ? 4u : 8u;
+  if (leaf->converted_type &&
+      *leaf->converted_type != (width == 4 ? ConvertedType::INT_32 : ConvertedType::INT_64))
+    return {};
+  if (leaf->logical_type &&
+      (leaf->logical_type->type != LogicalType::INTEGER || !leaf->logical_type->int_type ||
+       !leaf->logical_type->is_signed() || leaf->logical_type->bit_width() != width * 8))
+    return {};
+  auto const& rg                    = metadata->row_groups[index];
+  ColumnChunkMetaData const* column = nullptr;
+  for (auto const& chunk : rg.columns) {
+    if (chunk.meta_data.path_in_schema == std::vector<std::string>{key}) {
+      if (column) return {};
+      column = &chunk.meta_data;
+    }
+  }
+  if (!column || column->type != leaf->type || rg.num_rows <= 0 ||
+      column->num_values != rg.num_rows)
+    return {};
+  auto const& stats = column->statistics;
+  // Only modern min_value/max_value. Missing exactness flags mean exact by the Parquet
+  // specification; explicit false (e.g. truncated statistics) is never admitted.
+  if (!stats.min_value || !stats.max_value || !stats.is_min_value_exact.value_or(true) ||
+      !stats.is_max_value_exact.value_or(true) || !stats.null_count || *stats.null_count < 0 ||
+      *stats.null_count >= rg.num_rows || stats.min_value->size() != width ||
+      stats.max_value->size() != width)
+    return {};
+  auto decode = [width](std::vector<uint8_t> const& bytes) -> int64_t {
+    uint64_t bits = 0;
+    for (std::size_t i = 0; i < width; ++i)
+      bits |= uint64_t{bytes[i]} << (i * 8);
+    return width == 4 ? static_cast<int64_t>(std::bit_cast<int32_t>(static_cast<uint32_t>(bits)))
+                      : std::bit_cast<int64_t>(bits);
+  };
+  auto const lo = decode(*stats.min_value);
+  auto const hi = decode(*stats.max_value);
+  if (lo > hi) return {};
+  return std::pair{lo, hi};
+}
+
 //===----------------------------------------------------------------------===//
 // parquet_batch_coalescer
 //===----------------------------------------------------------------------===//
@@ -425,8 +489,10 @@ class parquet_batch_coalescer : public batch_coalescer {
                           std::shared_ptr<physical_check_counters> counters,
                           parquet_source_kind source_kind,
                           parquet_read_mode read_mode,
-                          std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters)
-    : _cap(cap),
+                          std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters,
+                          std::optional<std::string> audit_key)
+    : _range_cluster_key(std::move(audit_key)),
+      _cap(cap),
       _read_mode(read_mode),
       _source_kind(source_kind),
       _reader_options(std::move(reader_options)),
@@ -465,6 +531,24 @@ class parquet_batch_coalescer : public batch_coalescer {
     return emit_current();
   }
   cursor_step advance(scan_info& input, size_t& cursor, size_t quantum) override
+  {
+    auto* aggregate = dynamic_cast<parquet_range_scan_info*>(&input);
+    if (!aggregate) return advance_file(input, cursor, quantum);
+    _range_cluster_key = aggregate->key;
+    for (size_t processed = 0; cursor < aggregate->row_groups.size() && processed < quantum;
+         ++processed) {
+      auto const& ref   = aggregate->row_groups[cursor];
+      auto& file        = *aggregate->files.at(ref.file_slot);
+      auto local_cursor = ref.row_group_slot;
+      auto step         = advance_file(file, local_cursor, 1);
+      // Compatibility/cap flushes may emit without consuming the selected group.
+      if (file.row_groups.empty() || local_cursor != ref.row_group_slot) ++cursor;
+      if (step.batch) return {std::move(step.batch), cursor == aggregate->row_groups.size()};
+    }
+    return {nullptr, cursor == aggregate->row_groups.size()};
+  }
+
+  cursor_step advance_file(scan_info& input, size_t& cursor, size_t quantum)
   {
     auto* file = dynamic_cast<parquet_file_scan_info*>(&input);
     if (file == nullptr) { return {nullptr, true}; }
@@ -703,6 +787,47 @@ class parquet_batch_coalescer : public batch_coalescer {
     split->needs_assembly   = _needs_assembly;
     split->partition_values = _partition_values;
     split->set_contract_payload(_contract_id, std::move(_certificates), std::move(_dependencies));
+    if (_range_cluster_key) {
+      std::string membership;
+      std::set<std::size_t> files;
+      std::size_t groups = 0;
+      int64_t rows       = 0;
+      std::optional<std::pair<int64_t, int64_t>> span;
+      bool complete_span = true;
+      for (auto const& slice : split->rg_slices) {
+        files.insert(slice.file_index);
+        for (auto index : slice.row_group_indices) {
+          if (!membership.empty()) membership += ',';
+          membership += std::to_string(slice.file_index) + ':' + std::to_string(index);
+          ++groups;
+          if (slice.file_metadata && index >= 0 &&
+              static_cast<std::size_t>(index) < slice.file_metadata->row_groups.size())
+            rows += slice.file_metadata->row_groups[index].num_rows;
+          auto const interval =
+            range_interval(slice.file_metadata.get(), index, *_range_cluster_key);
+          if (!interval)
+            complete_span = false;
+          else if (!span)
+            span = interval;
+          else {
+            span->first  = std::min(span->first, interval->first);
+            span->second = std::max(span->second, interval->second);
+          }
+        }
+      }
+      SIRIUS_LOG_DEBUG(
+        "[rowgroup_range_cluster_split] contract_id={} key={} membership={} files={} rowgroups={} "
+        "rows={} bytes={} span_min={} span_max={}",
+        _contract_id,
+        *_range_cluster_key,
+        membership,
+        files.size(),
+        groups,
+        rows,
+        split->preparation_bytes(),
+        complete_span && span ? std::to_string(span->first) : "unknown",
+        complete_span && span ? std::to_string(span->second) : "unknown");
+    }
     _slices.clear();
     _certificates.clear();
     _dependencies.clear();
@@ -715,6 +840,8 @@ class parquet_batch_coalescer : public batch_coalescer {
     return split;
   }
 
+  // Owned diagnostic key survives aggregate retirement before the final flush.
+  std::optional<std::string> _range_cluster_key;
   const std::size_t _cap;
   const parquet_read_mode _read_mode;
   const parquet_source_kind _source_kind;
@@ -798,6 +925,59 @@ std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
 }
 
 }  // namespace
+
+void parquet_range_scan_info::cluster(std::string key_name, bool reorder)
+{
+  key = std::move(key_name);
+  row_groups.clear();
+  eligible  = true;
+  reordered = false;
+  fallback_reason.clear();
+  std::size_t selected_groups = 0;
+  for (std::size_t f = 0; f < files.size(); ++f) {
+    auto const& file = *files[f];
+    if (file.row_groups.empty()) row_groups.push_back({f, 0, {}});
+    for (std::size_t r = 0; r < file.row_groups.size(); ++r) {
+      auto interval = range_interval(file.file_metadata.get(), file.row_groups[r].index, key);
+      row_groups.push_back({f, r, interval});
+      ++selected_groups;
+      if (!interval || file.field_mapping || file.requires_row_positions) eligible = false;
+    }
+  }
+  if (selected_groups == 0) {
+    eligible        = false;
+    fallback_reason = "no_selected_rowgroups";
+  } else if (!eligible)
+    fallback_reason = "unsupported_or_missing_key_statistics";
+  if (eligible && reorder) {
+    auto original = row_groups;
+    // Keep empty-file sentinels in place: only selected data groups participate in the
+    // reorder or its diagnostic, and equal endpoints retain their original ordinal.
+    std::vector<row_group_ref> selected;
+    for (auto const& ref : row_groups)
+      if (ref.interval) selected.push_back(ref);
+    std::stable_sort(selected.begin(), selected.end(), [](auto const& a, auto const& b) {
+      return *a.interval < *b.interval;
+    });
+    std::size_t next = 0;
+    for (auto& ref : row_groups)
+      if (ref.interval) ref = selected[next++];
+    for (std::size_t i = 0; i < row_groups.size(); ++i)
+      reordered |= row_groups[i].file_slot != original[i].file_slot ||
+                   row_groups[i].row_group_slot != original[i].row_group_slot;
+  }
+  SIRIUS_LOG_INFO(
+    "[rowgroup_range_cluster] contract_id={} key={} files={} rowgroups={} eligible={} reordered={} "
+    "fallback_reason={} mode={}",
+    files.empty() ? scan_contract_id{0} : files.front()->contract_id(),
+    key,
+    files.size(),
+    selected_groups,
+    eligible,
+    reordered,
+    fallback_reason.empty() ? "none" : fallback_reason,
+    reorder ? "cluster" : "collect");
+}
 
 bool parquet_split_info::position_reader_filter_available(std::optional<int> device) const noexcept
 {
@@ -912,6 +1092,23 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
   }
   for (auto const& column : bind.virtual_columns) {
     _virtual_types.emplace(column.column_id, column.type);
+  }
+  auto const range_output_key = bind.experimental_range_cluster_output_key
+                                  ? bind.experimental_range_cluster_output_key
+                                  : bind.experimental_range_cluster_audit_output_key;
+  if (range_output_key &&
+      _source_kind == parquet_source_kind::PLAIN_PARQUET &&
+      _read_mode == parquet_read_mode::READER && !bind.physical_schema &&
+      !bind.field_mapping_requirements && !bind.prepare_field_mapping &&
+      !_plan->has_user_virtual_columns()) {
+    auto const output = *range_output_key;
+    if (output < _plan->output_layout.size()) {
+      auto const& entry = _plan->output_layout[output];
+      if (entry.source == scan_plan::output_entry::DATA && entry.idx < _plan->data_columns.size()) {
+        _range_cluster_audit_key = _plan->data_columns[entry.idx].name;
+        if (bind.experimental_range_cluster_output_key) _range_cluster_key = _range_cluster_audit_key;
+      }
+    }
   }
 
   // AST translation deferred to materialize_table so a task-local stream is used.
@@ -1152,7 +1349,8 @@ std::unique_ptr<batch_coalescer> parquet_scan_core::create_batch_coalescer() con
                                                    _info->profiles->counters,
                                                    _source_kind,
                                                    _read_mode,
-                                                   _sirius_dynamic_filters);
+                                                   _sirius_dynamic_filters,
+                                                   _range_cluster_audit_key);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1167,7 +1365,9 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   io::ioctx_resolver resolve)
 {
   if (!resolve) { throw std::runtime_error("parquet_scan_core: no scan_manager is wired."); }
-  auto const position = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
+  auto const stride =
+    _range_cluster_key ? std::max<std::size_t>(1, _selected_file_indices.size()) : std::size_t{1};
+  auto const position = _next_file_idx.fetch_add(stride, std::memory_order_relaxed);
   if (position >= _selected_file_indices.size()) { return nullptr; }
   auto const idx = _selected_file_indices[position];
 
@@ -1181,8 +1381,29 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
            scan_manager::preparation_stop_token stop) -> std::unique_ptr<scan_info> {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-    auto io_ctx = resolve(file_path);
+    // Keep ordinary streaming resolution unchanged. The opt-in job resolves and prepares ALL
+    // selected files inside this same classified error boundary, checking cancellation per file.
+    auto io_ctx = _range_cluster_key ? nullptr : resolve(file_path);
     try {
+      if (_range_cluster_key) {
+        auto aggregate = std::make_unique<parquet_range_scan_info>();
+        aggregate->files.reserve(_selected_file_indices.size());
+        for (auto file_index : _selected_file_indices) {
+          if (stop.stop_requested())
+            throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+          auto const& path = _file_paths[file_index];
+          auto prepared    = build_file_scan_info(path, file_index, resolve(path), stop.token());
+          auto* file       = dynamic_cast<parquet_file_scan_info*>(prepared.get());
+          if (!file) throw sirius::internal_exception("expected Parquet file metadata");
+          std::unique_ptr<parquet_file_scan_info> owned_file(
+            static_cast<parquet_file_scan_info*>(prepared.release()));
+          aggregate->files.push_back(std::move(owned_file));
+        }
+        if (stop.stop_requested())
+          throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+        aggregate->cluster(*_range_cluster_key, _info->experimental_range_cluster_reorder);
+        return aggregate;
+      }
       return build_file_scan_info(file_path, idx, io_ctx, stop.token());
     } catch (unsupported_physical_input const&) {
       throw;

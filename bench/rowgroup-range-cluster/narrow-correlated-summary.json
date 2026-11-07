@@ -1,0 +1,155 @@
+{
+  "duckdb_version": "2.0.0",
+  "cpu_only": true,
+  "dataset": "narrow-correlated",
+  "rows": 33554432,
+  "row_group_rows": 8192,
+  "keys": 2097152,
+  "buckets": 128,
+  "sql_by_file": [
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(0,2097152) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(2097152,4194304) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(4194304,6291456) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(6291456,8388608) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(8388608,10485760) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(10485760,12582912) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(12582912,14680064) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(14680064,16777216) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(16777216,18874368) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(18874368,20971520) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(20971520,23068672) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(23068672,25165824) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(25165824,27262976) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(27262976,29360128) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(29360128,31457280) t(i))",
+    "SELECT k, (k*1000003 + (hash(i+1729)%8)::BIGINT)::BIGINT AS payload FROM (SELECT i, (((17 * (i // 8192)) % 128) * 16384 + hash(i+1729) % 16384)::BIGINT AS k FROM range(31457280,33554432) t(i))"
+  ],
+  "fact_files": [
+    "data-narrow-correlated/fact-00.parquet",
+    "data-narrow-correlated/fact-01.parquet",
+    "data-narrow-correlated/fact-02.parquet",
+    "data-narrow-correlated/fact-03.parquet",
+    "data-narrow-correlated/fact-04.parquet",
+    "data-narrow-correlated/fact-05.parquet",
+    "data-narrow-correlated/fact-06.parquet",
+    "data-narrow-correlated/fact-07.parquet",
+    "data-narrow-correlated/fact-08.parquet",
+    "data-narrow-correlated/fact-09.parquet",
+    "data-narrow-correlated/fact-10.parquet",
+    "data-narrow-correlated/fact-11.parquet",
+    "data-narrow-correlated/fact-12.parquet",
+    "data-narrow-correlated/fact-13.parquet",
+    "data-narrow-correlated/fact-14.parquet",
+    "data-narrow-correlated/fact-15.parquet"
+  ],
+  "dim_file": "data-narrow-correlated/dim.parquet",
+  "files": {
+    "fact-00.parquet": {
+      "bytes": 33622110,
+      "sha256": "7ca021758955c04c233fd86924eb10450244f3f899d42ae42c11888777e0a37c"
+    },
+    "fact-01.parquet": {
+      "bytes": 33622110,
+      "sha256": "bec3ba48f48004b5342ca11d85d5673b89cbc9f43fa75040dc8af17569fda41a"
+    },
+    "fact-02.parquet": {
+      "bytes": 33622110,
+      "sha256": "1fa6089addccd6a28a66ed9688761bbe78e13c76f4511cdbe76cea877b3f006a"
+    },
+    "fact-03.parquet": {
+      "bytes": 33622110,
+      "sha256": "74e2d96d9e85e2c1f8e9ec6c08e37bf075b16caccdc077222af921e9978c3cee"
+    },
+    "fact-04.parquet": {
+      "bytes": 33622110,
+      "sha256": "1c5a4686299a81bb328048ae40f4b67ac415c0cd33474201ef583ec60ae5368c"
+    },
+    "fact-05.parquet": {
+      "bytes": 33622110,
+      "sha256": "d0283cbbf497acc785f63d9b91b54ea7d1ceab6fcacdeabf219730754ca91c3a"
+    },
+    "fact-06.parquet": {
+      "bytes": 33622110,
+      "sha256": "26953c9cfc39f0abed71cbb38b47529497d77820c5b37b0aac80f905333f80e0"
+    },
+    "fact-07.parquet": {
+      "bytes": 33622110,
+      "sha256": "c94503f7863ad85315c4fc076b018f2757ec7ca9e9eeac2cb411d1e1f1ccadca"
+    },
+    "fact-08.parquet": {
+      "bytes": 33622110,
+      "sha256": "885cde533267e0437fc24f67833df30b407155cb8e26fe9b5dfb8a0177b5171c"
+    },
+    "fact-09.parquet": {
+      "bytes": 33622110,
+      "sha256": "0254ca1566d34dc70e3648edeb54525e40614139739806d107454b3e345a5c71"
+    },
+    "fact-10.parquet": {
+      "bytes": 33622110,
+      "sha256": "801f844107e42911a83317cb3ab82961807c7712353a617ace522b80198e7455"
+    },
+    "fact-11.parquet": {
+      "bytes": 33622110,
+      "sha256": "ce6e2f8ff5f45f9171344b13c035a801cf32a8b9e1773626054ce2516f993d1d"
+    },
+    "fact-12.parquet": {
+      "bytes": 33622110,
+      "sha256": "000176d7edeccac5fa510d2dbc77ba8d3fb9fe12e752bc6fea3cc27d14bfc991"
+    },
+    "fact-13.parquet": {
+      "bytes": 33622110,
+      "sha256": "fcf961d644285f6d9b4c550240ef0b72f6efb7bd994da855bf5bdbcaf5a8e7f1"
+    },
+    "fact-14.parquet": {
+      "bytes": 33622110,
+      "sha256": "aedeebc04cb11c0b9e40994beb5e95b977d32324c36f40a9df07661c9e19ca6a"
+    },
+    "fact-15.parquet": {
+      "bytes": 33622110,
+      "sha256": "801bf7bd73719402a9075a8437bbde74b998c689a65280ed2a473cd282bb15f8"
+    },
+    "dim.parquet": {
+      "bytes": 16812867,
+      "sha256": "51469235e845d090b04899361c860451aab95870199b5a60beed88d289f49d09"
+    }
+  },
+  "fingerprint_sql": "SELECT count(*),sum(k::HUGEINT),sum(payload::HUGEINT),sum(hash(k,payload)::HUGEINT),min(k),max(k) FROM read_parquet(['/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-00.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-01.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-02.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-03.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-04.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-05.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-06.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-07.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-08.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-09.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-10.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-11.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-12.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-13.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-14.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-15.parquet'])",
+  "fingerprint": [
+    "33554432",
+    "35184372463471",
+    "35184478016705823572",
+    "309725533933157303966680189",
+    "0",
+    "2097151"
+  ],
+  "cpu_join_sql": "SELECT count(*),sum(f.payload) FROM read_parquet(['/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-00.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-01.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-02.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-03.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-04.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-05.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-06.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-07.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-08.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-09.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-10.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-11.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-12.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-13.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-14.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/fact-15.parquet']) f JOIN read_parquet('/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-narrow-correlated/dim.parquet') d ON f.k=d.k",
+  "cpu_join_reference": [
+    "33554432",
+    "35184478016705823572"
+  ],
+  "physical_schedule": {
+    "batches": 64,
+    "span_min": 2015219,
+    "span_median": 2097142,
+    "span_max": 2097152,
+    "span_over_domain_median": 0.999995231628418,
+    "source_files_per_batch_min": 1,
+    "source_files_per_batch_max": 1,
+    "batch_rows": [
+      524288
+    ]
+  },
+  "clustered_schedule": {
+    "batches": 64,
+    "span_min": 32768,
+    "span_median": 32768,
+    "span_max": 32768,
+    "span_over_domain_median": 0.015625,
+    "source_files_per_batch_min": 16,
+    "source_files_per_batch_max": 16,
+    "batch_rows": [
+      524288
+    ]
+  },
+  "schedule_note": "Metadata-only equal 8MiB cap simulation, not measured engine batching or compression."
+}

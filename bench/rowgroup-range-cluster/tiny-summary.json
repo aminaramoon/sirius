@@ -1,0 +1,73 @@
+{
+  "dataset": "tiny",
+  "duckdb_version": "2.0.0",
+  "cpu_only": true,
+  "rows": 32768,
+  "row_group_rows": 2048,
+  "keys": 1024,
+  "sql_by_file": [
+    "SELECT k, (k*1000003+i%997)::BIGINT AS payload FROM\n        (SELECT i, (((i//2048)*3)%8*128+hash(i+1729)%128)::BIGINT AS k\n         FROM range(0,8192) t(i))",
+    "SELECT k, (k*1000003+i%997)::BIGINT AS payload FROM\n        (SELECT i, (((i//2048)*3)%8*128+hash(i+1729)%128)::BIGINT AS k\n         FROM range(8192,16384) t(i))",
+    "SELECT k, (k*1000003+i%997)::BIGINT AS payload FROM\n        (SELECT i, (((i//2048)*3)%8*128+hash(i+1729)%128)::BIGINT AS k\n         FROM range(16384,24576) t(i))",
+    "SELECT k, (k*1000003+i%997)::BIGINT AS payload FROM\n        (SELECT i, (((i//2048)*3)%8*128+hash(i+1729)%128)::BIGINT AS k\n         FROM range(24576,32768) t(i))"
+  ],
+  "fact_files": [
+    "data-tiny/fact-00.parquet",
+    "data-tiny/fact-01.parquet",
+    "data-tiny/fact-02.parquet",
+    "data-tiny/fact-03.parquet"
+  ],
+  "dim_file": "data-tiny/dim.parquet",
+  "files": {
+    "fact-00.parquet": {
+      "bytes": 79185,
+      "sha256": "5e0e5fa77c9b2c2e23efaa223e4d73cc89b0e047cf8218ea87389d80db7e491e"
+    },
+    "fact-01.parquet": {
+      "bytes": 79185,
+      "sha256": "ef8fd20cae6b477ba5d01278fba21ca90622d020da63a7a8ac6df05ef2ce5a48"
+    },
+    "fact-02.parquet": {
+      "bytes": 79185,
+      "sha256": "cd22ff6ec50b782914e4fd1dd5d97f9f7f8633e8c66d8ae7d15d04521d1be22f"
+    },
+    "fact-03.parquet": {
+      "bytes": 79185,
+      "sha256": "7ebe33864c015108b3057360da61d034282114a747092f415d9a62d05535eeba"
+    },
+    "dim.parquet": {
+      "bytes": 8420,
+      "sha256": "26ccd7be0a9d4bb27ac7b04152e645b8026ba41edeba4dc12cb78bce0ac4defc"
+    }
+  },
+  "cpu_join_sql": "SELECT count(*),sum(f.payload) FROM read_parquet(['/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-tiny/fact-00.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-tiny/fact-01.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-tiny/fact-02.parquet','/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-tiny/fact-03.parquet']) f JOIN read_parquet('/localhome/local-aaramoon/workspace/sirius-scan-sort-spill/bench/rowgroup-range-cluster/data-tiny/dim.parquet') d ON f.k=d.k",
+  "cpu_join_reference": [
+    "32768",
+    "16760430542100"
+  ],
+  "physical_schedule": {
+    "batches": 1,
+    "span_min": 1024,
+    "span_median": 1024,
+    "span_max": 1024,
+    "span_over_domain_median": 1.0,
+    "source_files_per_batch_min": 4,
+    "source_files_per_batch_max": 4,
+    "batch_rows": [
+      32768
+    ]
+  },
+  "clustered_schedule": {
+    "batches": 1,
+    "span_min": 1024,
+    "span_median": 1024,
+    "span_max": 1024,
+    "span_over_domain_median": 1.0,
+    "source_files_per_batch_min": 4,
+    "source_files_per_batch_max": 4,
+    "batch_rows": [
+      32768
+    ]
+  },
+  "purpose": "Full-row multiset GPU correctness fixture, not spill-pressure measurement."
+}
