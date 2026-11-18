@@ -848,7 +848,7 @@ Header paths are relative to `cucascade/include/cucascade/`.
 | `min_dynamic_io_size` / `max_dynamic_io_size` (256 KiB / 16 MiB) | `io/uring/types.hpp` | Bounds of the physical operation size a uring reactor picks from its backlog and free staging slots. |
 | chunk size | `buffer_pool::chunk_size()` (FSMR block size) | Cache / staging chunk granularity; sourced from the pinned `fixed_size_host_memory_resource`'s block size rather than a compile-time constant. |
 | `eviction_threshold_fraction` / `min_prefetching_budget_fraction` | `io/cache/config.hpp` | When the pool starts evicting and the floor reserved for prefetching. |
-| `use_odirect` | `io/uring/config.hpp` | Buffered-vs-`O_DIRECT` toggle, derived from `scan_manager.cache.mode`; operation size and `readv` fusion are selected dynamically from queue pressure, free slots, and the FSMR block size. |
+| `use_odirect` | `io/uring/config.hpp` | Buffered-vs-`O_DIRECT` toggle, derived from `scan_manager.cache.mode` (an explicit YAML value must match); operation size and `readv` fusion are selected dynamically from queue pressure, free slots, and the FSMR block size. |
 | `merge_max_gap` / retry policy | `io/rest/config.hpp` | REST planner hint and retry tunables (see [S3 / Object-Store Backend](#s3--object-store-backend)). The reactor sizes physical GETs from backlog and free connections within `min_segment_bytes` / `max_segment_bytes` (default 4–16 MiB), not from `merge_max_gap`. |
 
 ## Complete Scan Flow

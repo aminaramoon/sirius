@@ -71,7 +71,8 @@ memory_capacity = 1TB;          // reservation / in-flight conversion bound, not
 ### DISK I/O and ownership
 
 Raw spills and compressed `.hpln` spills use the same per-space
-`std::shared_ptr<cucascade::io::ioctx>`. Unless a context is supplied through the C++ API,
+`std::shared_ptr<cucascade::io::ioctx>`. Unless a context is supplied through the C++ API
+or configured through [DISK I/O YAML](configuration.md#disk-io-siriusmemorydiskio),
 `get_or_init_io_context(cucascade::default_disk_io_context)` adopts the default on first
 conversion. That default is process-shared but cached only through a weak pointer: live
 spaces and in-flight conversions hold strong references, not a static owning singleton or
@@ -90,6 +91,8 @@ before the transfer settles; device-write bodies on a real GDS host go through r
 GPU staging slots from the same process-wide pool as scan reads, but each reactor holds
 slots of its own: the default context reserves them when it starts at the first spill,
 after the GPU memory pools exist (see [cuFile staging memory](configuration.md#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
+The YAML path instead shares one context across all DISK spaces at initialization and
+reserves cuFile staging before the GPU pools, adding matching-size scan and DISK demand.
 Destruction stops/drains reactor
 workers before releasing their staging. The weak default cache does not prolong that
 lifetime; spill representations and contexts must still be released before CUDA/RMM global
@@ -102,7 +105,7 @@ and remain synchronous to their callers. The raw file layout, mount paths, file-
 ownership and downgrade/reservation policy are unchanged. Spill reads use cache-unaware
 I/O; factory DISK contexts do not arm `fs_cache`. The scan manager's contexts, backend,
 reactor counts and cache configuration are independent and are not shared with DISK by
-default. No new YAML settings or backend registration are needed; see
+default. The lazy default needs no YAML settings or backend registration; see
 [Disk Memory](configuration.md#disk-memory-siriusmemorydisk).
 
 ## Parquet scan working sets

@@ -1156,7 +1156,7 @@ TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
         std::pair{"      cufile:\n        storage_hint_path: /\n", "cufile.storage_hint_path"},
         std::pair{"      cufile:\n        use_odirect: false\n        compat_mode: off\n",
                   "cufile.use_odirect"},
-        std::pair{"      cufile:\n        write_split_bytes: 4096\n", "write_split_bytes"},
+        std::pair{"      cufile:\n        write_split_bytes: 4095\n", "write_split_bytes"},
         std::pair{"      cufile:\n        register_min_bytes: 4096\n", "register_min_bytes"},
         std::pair{"      io_backend: cufile\n", "io_backend"}}) {
     CAPTURE(body);
@@ -1172,19 +1172,22 @@ TEST_CASE("the documented cuFile configuration example loads",
   std::ifstream doc(SIRIUS_PROJECT_ROOT "/docs/super-sirius/configuration.md");
   REQUIRE(doc.is_open());
   bool in_yaml = false;
+  bool marked  = false;
   std::string block;
   std::string example;
   size_t examples = 0;
   for (std::string line; std::getline(doc, line);) {
+    if (line == "<!-- scan-cufile-example -->") { marked = true; }
     if (!in_yaml) {
       if (line == "```yaml") {
         in_yaml = true;
         block.clear();
       }
     } else if (line == "```") {
-      if (block.find("backend: cufile") != std::string::npos) {
+      if (marked) {
         ++examples;
         example = block;
+        marked  = false;
       }
       in_yaml = false;
     } else {

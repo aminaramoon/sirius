@@ -1,0 +1,18 @@
+sirius:
+  topology: {num_gpus: 1}
+  space:
+    gpu:
+      - {device_id: 0, memory_capacity: 1Gi, per_stream_reservation: false}
+    host:
+      - {numa_id: -1, memory_capacity: 256Mi, initial_number_pools: 1}
+    disk:
+      - disk_id: 0
+        mount_path: /tmp/sirius_disk_io_0
+        memory_capacity: 1Gi
+        io: {backend: uring, uring_n_reactors: 1}
+      - {disk_id: 1, mount_path: /tmp/sirius_disk_io_1, memory_capacity: 1Gi}
+  executor:
+    pipeline: {num_threads: 2}
+    downgrade: {num_threads: 1, monitor_period: 10ms}
+    scan_manager: {uring_n_reactors: 1}
+  telemetry: {enable_quent: false}

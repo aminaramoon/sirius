@@ -169,12 +169,18 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_spa
     "sirius.space.host", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
 }
 
-static void from_yaml(const YAML::Node& node, cucascade::memory::disk_memory_space_config& opt)
+static void read_disk_io(const YAML::Node& node,
+                         std::optional<cucascade::disk_io_context_options>& out);
+
+static void from_yaml(const YAML::Node& node,
+                      cucascade::memory::disk_memory_space_config& opt,
+                      std::optional<cucascade::disk_io_context_options>& io)
 {
   yaml::reader r(node, "disk_memory_space");
   r.optional("disk_id", opt.disk_id);
   r.optional("mount_path", opt.mount_paths);
   r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
+  if (auto n = r.optional_node("io")) { read_disk_io(*n, io); }
   r.reject_unknown();
 }
 
@@ -477,6 +483,12 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
       opt.range_batch_slices = static_cast<std::size_t>(*batch);
     }
   }
+  r.optional("use_odirect", opt.use_odirect);
+  read_count(r, "low_service_interval", opt.low_service_interval);
+  r.optional("write_split_bytes", yaml::bytes(opt.write_split_bytes));
+  if (opt.write_split_bytes != 0 && opt.write_split_bytes < cucascade::io::IO_BLOCK_SIZE) {
+    throw std::runtime_error("'uring.write_split_bytes': must be 0 or at least 4 KiB");
+  }
   r.reject_unknown();
 }
 
@@ -505,6 +517,10 @@ static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt
   r.optional("max_op_bytes", yaml::bytes(opt.max_op_bytes));
   if (opt.max_op_bytes < cucascade::io::IO_BLOCK_SIZE) {
     throw std::runtime_error("'cufile.max_op_bytes': must be at least 4 KiB");
+  }
+  r.optional("write_split_bytes", yaml::bytes(opt.write_split_bytes));
+  if (opt.write_split_bytes != 0 && opt.write_split_bytes < cucascade::io::IO_BLOCK_SIZE) {
+    throw std::runtime_error("'cufile.write_split_bytes': must be 0 or at least 4 KiB");
   }
   r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));
   r.optional("use_odirect", opt.use_odirect);
@@ -561,6 +577,51 @@ static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt
       "'cufile.storage_hint_path': must name a file on the data filesystem, not a directory");
   }
   r.reject_unknown();
+}
+
+static void read_disk_io(const YAML::Node& node,
+                         std::optional<cucascade::disk_io_context_options>& out)
+{
+  // The context is tier-wide, never one pool per mount. A low-level configuration
+  // may name it in any one disk entry; the remaining spaces share it.
+  if (out) {
+    throw std::runtime_error("'disk.io': specify once only; all DISK spaces share one context");
+  }
+  cucascade::disk_io_context_options opt;
+  yaml::reader r(node, "disk.io");
+  read_choice(r,
+              "backend",
+              opt.backend,
+              {{"automatic", cucascade::disk_io_backend::automatic},
+               {"uring", cucascade::disk_io_backend::uring},
+               {"cufile", cucascade::disk_io_backend::cufile}});
+  read_count(r, "uring_n_reactors", opt.io.uring_n_reactors);
+#ifdef CUCASCADE_HAS_CUFILE
+  read_count(r, "cufile_n_reactors", opt.io.cufile_n_reactors);
+#else
+  if (opt.backend == cucascade::disk_io_backend::cufile || r.has("cufile_n_reactors") ||
+      r.has("cufile")) {
+    throw std::runtime_error("'disk.io': Sirius was built without cuFile support");
+  }
+#endif
+  if (opt.backend != cucascade::disk_io_backend::cufile && opt.io.uring_n_reactors == 0) {
+    throw std::runtime_error("'disk.io.uring_n_reactors': must be positive for uring or automatic");
+  }
+  // cuFile's 0 is intentional: the pinned factory plans a per-GPU pool.
+  try {
+    if (auto n = r.optional_node("uring")) { from_yaml(*n, opt.io.uring); }
+#ifdef CUCASCADE_HAS_CUFILE
+    if (auto n = r.optional_node("cufile")) { from_yaml(*n, opt.io.cufile); }
+#endif
+  } catch (std::exception const& e) {
+    throw std::runtime_error("'sirius.memory.disk.io': " + std::string(e.what()));
+  }
+  r.optional("staging_numa_node", opt.staging_numa_node);
+  if (opt.staging_numa_node < -1) {
+    throw std::runtime_error("'disk.io.staging_numa_node': must be -1 or nonnegative");
+  }
+  r.reject_unknown();
+  out = std::move(opt);
 }
 
 static void from_yaml(const YAML::Node& node, cucascade::io::cache::config& opt)
@@ -680,7 +741,12 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   read_count(r, "cufile_n_reactors", opt.cufile_n_reactors);
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
-  if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
+  std::optional<bool> explicit_odirect;
+  if (auto n = r.optional_node("uring")) {
+    sirius::from_yaml(*n, opt.uring);
+    yaml::reader ur(*n, "uring");
+    ur.optional("use_odirect", explicit_odirect);
+  }
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   // Same rule as rest_ioctx: the default fan-out is clamped to a smaller pool, any other value
   // must fit it.  An auto-sized pool (0) is only known when the REST ioctx is built.
@@ -697,6 +763,10 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   // Stamped here rather than by the caller: `cache` and the `uring` sub-config
   // it overrides have both been read by now.
   opt.apply_cache_mode();
+  if (explicit_odirect && *explicit_odirect != opt.uring.use_odirect) {
+    throw std::runtime_error(
+      "'uring.use_odirect': conflicts with cache.mode (os requires false; none/cucs require true)");
+  }
 }
 
 static void from_yaml(const YAML::Node& node, operator_params& opt)
@@ -1019,12 +1089,15 @@ struct disk_mem_config {
   std::size_t capacity_bytes{1024UL << 30};  // 1TB
   std::string downgrade_root_dirs;
 
-  static void from_yaml(const YAML::Node& node, disk_mem_config& opt)
+  static void from_yaml(const YAML::Node& node,
+                        disk_mem_config& opt,
+                        std::optional<cucascade::disk_io_context_options>& io)
   {
     yaml::reader r(node, "memory.disk");
     r.optional("disk_id", opt.id);
     r.optional("capacity_bytes", yaml::bytes(opt.capacity_bytes));
     r.optional("downgrade_root_dirs", opt.downgrade_root_dirs);
+    if (auto n = r.optional_node("io")) { read_disk_io(*n, io); }
     r.reject_unknown();
   }
 
@@ -1201,7 +1274,7 @@ try {
     }
     if (auto n = mr.optional_node("disk")) {
       high_level_memory_configured = true;
-      disk_mem_config::from_yaml(*n, disk_cfg);
+      disk_mem_config::from_yaml(*n, disk_cfg, settings._disk_io_options);
     }
     mr.reject_unknown();
   }
@@ -1236,7 +1309,14 @@ try {
     yaml::reader sr(*space_node, "sirius.space");
     if (auto n = sr.optional_node("gpu")) read_yaml_vec(*n, gpu_space_configs);
     if (auto n = sr.optional_node("host")) read_yaml_vec(*n, host_space_configs);
-    if (auto n = sr.optional_node("disk")) read_yaml_vec(*n, disk_space_configs);
+    if (auto n = sr.optional_node("disk")) {
+      if (!n->IsSequence()) { throw std::runtime_error("sirius.space.disk: expected a sequence"); }
+      for (auto const& item : *n) {
+        cucascade::memory::disk_memory_space_config disk;
+        from_yaml(item, disk, settings._disk_io_options);
+        disk_space_configs.push_back(std::move(disk));
+      }
+    }
     sr.reject_unknown();
   }
 
@@ -1316,6 +1396,33 @@ try {
       }
     }
     settings._memory_space_configs = builder.build(hw_topology);
+  }
+
+  if (settings._disk_io_options) {
+    auto& options = *settings._disk_io_options;
+    if (options.staging_numa_node >= 0 &&
+        std::ranges::none_of(hw_topology.numa_nodes, [&](auto const& node) {
+          return node.id == options.staging_numa_node;
+        })) {
+      throw std::runtime_error("'disk.io.staging_numa_node': NUMA node is not present in topology");
+    }
+#ifdef CUCASCADE_HAS_CUFILE
+    if (options.backend != cucascade::disk_io_backend::uring) {
+      std::vector<int> gpu_ids;
+      for (auto const& space : settings._memory_space_configs) {
+        if (auto gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
+          gpu_ids.push_back(gpu->device_id);
+        }
+      }
+      auto cufile_config   = scan_manager::scan_manager_config{};
+      cufile_config.cufile = options.io.cufile;
+      try {
+        options.io.cufile = cufile_config.resolved_cufile(gpu_ids);
+      } catch (std::exception const& e) {
+        throw std::runtime_error("'sirius.memory.disk.io': " + std::string(e.what()));
+      }
+    }
+#endif
   }
 
   const auto defaults =

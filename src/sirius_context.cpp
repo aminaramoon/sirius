@@ -29,6 +29,7 @@
 #include "duckdb/planner/planner.hpp"
 #include "exec/stream_bind_catalog.hpp"
 #include "helper/transaction_utils.hpp"
+#include "io/disk_staging.hpp"
 #include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
 #include "log/noop_sink.hpp"
@@ -53,6 +54,11 @@
 
 #include <cuda_runtime_api.h>
 
+#ifdef CUCASCADE_HAS_CUFILE
+#include <cucascade/io/cufile/cufile_ioctx.hpp>
+#include <cucascade/io/cufile/platform.hpp>
+#include <cucascade/io/cufile/staging.hpp>
+#endif
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -203,6 +209,67 @@ std::optional<std::string> get_config_file_path()
   }
 
   return std::nullopt;
+}
+
+// Reserve configured DISK staging before RMM pools, but construct its context only
+// after the memory manager exists. Slots are process-wide; reserve the sum, not
+// max(scan, disk), because the two live reactor sets lease distinct slots.
+void reserve_disk_staging(cucascade::disk_io_context_options const& options,
+                          sirius::scan_manager::scan_manager_config const& scan,
+                          std::span<int const> gpu_ids,
+                          cucascade::memory::system_topology_info const& topology)
+{
+#ifdef CUCASCADE_HAS_CUFILE
+  namespace cf = cucascade::io::cufile;
+  if (options.backend == cucascade::disk_io_backend::uring ||
+      (options.backend == cucascade::disk_io_backend::automatic && !cf::gds_available())) {
+    return;
+  }
+  auto cfg            = options.io.cufile;
+  auto const platform = cf::probe_platform();
+  auto const plan     = cf::plan_cufile_pool(cfg, &topology, platform);
+  if (plan.staging_piece_bytes != 0) { cfg.staging_piece_bytes = plan.staging_piece_bytes; }
+  std::optional<cf::pool_plan> scan_plan;
+  cf::config scan_cfg;
+  if (scan.backend == sirius::scan_manager::io_backend::cufile) {
+    scan_cfg  = scan.resolved_cufile(gpu_ids);
+    scan_plan = cf::plan_cufile_pool(scan_cfg, &topology, platform);
+    if (scan_plan->staging_piece_bytes != 0) {
+      scan_cfg.staging_piece_bytes = scan_plan->staging_piece_bytes;
+    }
+  }
+  for (auto const& group : plan.groups) {
+    if (group.staging_slots == 0) { continue; }
+    auto const scan_slots = sirius::io::shared_scan_staging_slots(
+      group.device, cfg, scan_plan ? &*scan_plan : nullptr, scan_cfg, scan.cufile_n_reactors);
+    auto const slots =
+      sirius::io::staging_slots_for_device(group.device, plan, cfg, options.io.cufile_n_reactors) +
+      scan_slots;
+    cfg.max_staging_bytes_per_device = group.staging_cap_bytes;
+    auto const reserved              = cf::reserve_staging(group.device, slots, cfg);
+    auto const usage                 = cf::staging_usage_of(group.device);
+    SIRIUS_LOG_INFO(
+      "SiriusContext: DISK cuFile staging GPU {}: reserved {}/{} slots, {} MiB allocated, "
+      "{} MiB registered{}",
+      group.device,
+      reserved,
+      slots,
+      usage.allocated_bytes >> 20,
+      usage.registered_bytes >> 20,
+      scan_slots != 0 ? " (includes shared scan staging)" : "");
+    if (reserved < slots) {
+      SIRIUS_LOG_WARN(
+        "SiriusContext: DISK/scan staging capped on GPU {}; reactors without slots "
+        "use cuFile bounce buffers",
+        group.device);
+    }
+  }
+#else
+  (void)options;
+  (void)scan;
+  (void)gpu_ids;
+  (void)topology;
+#endif
 }
 
 bool sirius_disabled_by_env()
@@ -966,10 +1033,46 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     }
     sirius::scan_manager::reserve_cufile_staging(
       config_.get_scan_manager_config(), gpu_ids, config_.get_hw_topology());
+    bool const has_disk =
+      std::ranges::any_of(config_.get_memory_space_configs(), [](auto const& s) {
+        return std::holds_alternative<cucascade::memory::disk_memory_space_config>(s);
+      });
+    if (has_disk && config_.get_disk_io_options()) {
+      reserve_disk_staging(
+        *config_.get_disk_io_options(), config_.get_scan_manager_config(), gpu_ids, topo);
+    }
   }
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
+
+  if (config_.get_disk_io_options()) {
+    auto spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
+    if (!spaces.empty()) {
+      auto context = [&] {
+        try {
+          return cucascade::make_disk_io_context(*config_.get_disk_io_options());
+        } catch (std::exception const& e) {
+          throw std::runtime_error(
+            "SiriusContext: building the DISK io context (sirius.memory.disk.io): " +
+            std::string(e.what()));
+        }
+      }();
+      SIRIUS_LOG_INFO(
+        "SiriusContext: DISK io context: {} ({} spaces)",
+        context->type() == cucascade::io::io_context_type::cufile ? "cufile" : "uring",
+        spaces.size());
+      // make_disk_io_context's cuFile factory logs its resolved plan through the
+      // cuCascade log bridge. Only DISK spaces retain ownership: release_resources
+      // drains workers and resets the manager (DISK before HOST) while CUDA is live.
+      for (auto const* space : spaces) {
+        memory_manager_->get_memory_space(cucascade::memory::Tier::DISK, space->get_device_id())
+          ->set_io_context(context);
+      }
+    } else {
+      SIRIUS_LOG_WARN("sirius.memory.disk.io ignored: no DISK space configured");
+    }
+  }
 
   // Session cache for pinned GPU-resident cuVS ANN indexes. Takes the memory
   // manager so an index build can reserve its GPU footprint through Sirius.

@@ -181,6 +181,7 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 | `disk_id` | int | 0 | Identifier for the disk space. |
 | `capacity_bytes` | bytes | 1Ti | Capacity bound for reservations / in-flight conversions, not a quota on stored spill files. The filesystem must have enough free space. |
 | `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
+| `io` | mapping | absent (lazy default) | Optional tier-wide I/O context; see below. |
 
 Raw and compressed `.hpln` spills use the DISK space's shared `cucascade::io::ioctx`.
 The default is adopted lazily on first conversion and shared process-wide through a weak
@@ -191,11 +192,64 @@ HOST space per transfer); see [DISK I/O and ownership](memory-management.md#disk
 On a GDS host it also reserves registered GPU staging when it starts, after the GPU memory
 pools exist (see [staging memory](#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
 
-The existing `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and spill-file
-layouts are unchanged. There are no additional DISK-backend or per-mount reactor YAML
-settings, and no backend registration is required. `sirius.executor.scan_manager.backend`,
-reactor counts and cache settings configure independent scan contexts, not this spill
-default. The removed kvikIO backend is not available for reads or writes.
+#### DISK I/O (`sirius.memory.disk.io`)
+
+Omit `io` (or use `io: null`) to preserve the existing lazy default exactly: no new
+probing, reservation or context construction at startup. `io: {}` opts into eager
+construction with cuCascade's defaults. This does not change spill-file layouts.
+
+```yaml
+sirius:
+  memory:
+    disk:
+      downgrade_root_dirs: /nvme/sirius-spill
+      capacity_bytes: 1Ti
+      io:
+        backend: uring
+        uring_n_reactors: 4
+        staging_numa_node: -1
+        uring:
+          use_odirect: true
+          slices_per_pass: 4
+          range_batch_slices: 8
+          low_service_interval: 4
+          write_split_bytes: 32Mi
+```
+
+| Key | Type | Default when `io` is present | Description |
+|-----|------|------------------------------|-------------|
+| `backend` | `automatic`, `uring`, `cufile` | `automatic` | Automatic prefers real GDS, then usable io_uring, then cuFile POSIX fallback. Explicit `uring` fails if io_uring is forbidden; explicit `cufile` may still use POSIX when GDS is unavailable. |
+| `uring_n_reactors` | nonnegative int | 4 | Must be **positive** for `uring` or `automatic` (automatic may select uring). Each owns 64 MiB of portable pinned staging outside the HOST budget. |
+| `uring` | mapping | cuCascade defaults | Same keys and validation as [scan uring](#scan_manageruring--io_uring-backend-iouringconfighpp). Unlike scans, `use_odirect` is independent: the spill tier has no cache. Readahead fields are accepted but have no effect on spills. |
+| `cufile_n_reactors` | nonnegative int | 0 | **0 is valid:** plans a per-GPU pool. Positive = one flat, unpinned pool. |
+| `cufile` | mapping | cuCascade defaults | Same keys/defaults and validation as [scan cuFile](#scan_managercufile--local-cufile-reads-iocufileconfighpp), including rejection of `n_max_concurrent_scans` and directory `storage_hint_path`. Empty `devices` narrows to Sirius's configured GPUs; explicit IDs must belong to that set. |
+| `staging_numa_node` | int | -1 | uring's private host staging placement: -1 unbound, otherwise an existing NUMA node. Ignored when cuFile is selected. |
+
+Both backend sub-blocks may be supplied under any backend; only the selected backend's
+settings (including `staging_numa_node`) are used. REST, object-store and cache settings are deliberately not exposed
+here: spills are local files without a prefetch cache. The internal
+`n_max_concurrent_scans_explicit` flags are parser bookkeeping, not YAML keys.
+
+One started context is constructed **after the memory manager exists and before spill
+workers/converters can run**, and attached to **every** DISK space. The resolved backend
+is logged by Sirius, and cuFile's factory logs its pool plan and setup warnings through
+the existing cuCascade log bridge. Scan contexts remain independent.
+
+For configured cuFile (including `automatic` on a GDS host), Sirius reserves registered
+GPU staging **before GPU pools are created**, including flat-pool demand. Scan and DISK
+reactors lease separate slots: matching slot-size budgets are added, not maxed, and
+still obey the process-wide cap/BAR1/cuFile limits. Different slot sizes need separate
+allocations. Reservation shortfalls are logged; reactors without slots use cuFile's
+bounce buffers. Leave room above `usage_limit_*` for this memory; reservation does not
+subtract it from the configured GPU capacity. With no `io` block, the lazy default
+still reserves only on its first spill, after GPU pools exist.
+
+Only DISK spaces retain the configured context (the config retains options, not a
+shared pointer). Normal shutdown and failed-initialization rollback drain workers and
+reset the memory manager, which releases DISK contexts before HOST pools, while CUDA
+and the cuFile driver are live. No new static owner or `atexit` handler is needed.
+Registered GPU staging itself is cuCascade's process-wide, reusable allocation; context
+teardown returns its leases but does not free that staging.
 
 ### Input-table compression (`sirius.compression`)
 
@@ -304,8 +358,11 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 | `mount_path` | string | "" | Spill directory. |
 | `memory_capacity` | bytes | space default | Reservation / in-flight conversion bound, not a stored-file quota. |
 
-These spaces use the same [lazy DISK I/O default](#disk-memory-siriusmemorydisk),
-independent of the scan contexts; the low-level YAML surface adds no I/O selection knobs.
+An optional `io` mapping has the same schema as
+[`sirius.memory.disk.io`](#disk-io-siriusmemorydiskio). Specify it in **at most one**
+`sirius.space.disk[]` entry; it applies to **all** DISK spaces, including entries without
+`io`. Multiple blocks are rejected rather than building per-mount pools or choosing one
+silently. Omission preserves the lazy default; scan contexts remain independent.
 
 ```yaml
 sirius:
@@ -449,6 +506,9 @@ sirius:
 |-----|------|---------|-------------|
 | `n_max_concurrent_scans` | int | 0 | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to (under `opportunistic`, the default for local reads, a positive value switches the readahead on and the pipeline width sets the budget). `0` (Sirius's default, and cuCascade's) keeps the readahead off for local reads, since a local NVMe read competes with the executor's own reads rather than hiding a round trip. An explicit `max_readahead_scans` overrides it. |
 | `slices_per_pass` | int (**0..64**) | 4 | Most slices of the active request a reactor turns into physical reads per loop pass before it waits for a completion. A reactor works through one request at a time, in queue order; the default `4` keeps a single many-slice request (a whole-split prefetch, a wide demand read) deep — up to 4 slices per pass, bounded by the reactor's free staging slots — without letting one pass claim every free slot. `0` = no cap: keep going while every planned read finds a free staging slot (each reactor has at most 64). `1` expands one slice per pass, which holds such a request to a depth of 1-2 per reactor. |
+| `use_odirect` | bool | true (false with `cache.mode: os`) | Explicit value must agree with cache mode: `os` requires false; `none` and `cucs` require true. Mismatches are rejected rather than silently overwritten. DISK contexts have no such cache constraint. |
+| `low_service_interval` | int (**>= 0**) | 4 | Grant low-priority work one quantum after this many high-priority request starts while low work waits. `0` restores strict priority. |
+| `write_split_bytes` | bytes (**0 or >= 4KiB**) | 32MiB | Cut larger writes into entries spread over reactors, rounded down to the write granule; `0` disables cutting. Relevant to DISK spills; scan contexts currently read only. |
 | `range_batch_slices` | int (**>= 0**) | 8 | Most slices one queue entry holds when a host-only multi-range read (a whole-split prefetch, the DuckDB-native decoder's column-chunk set) is dispatched to the uring reactors: a local read does not prefer bulk I/O, so the read is queued as several entries of at most this many slices instead of one per reactor. Reads with a device destination are never split. `0` = no split. |
 
 Sirius rejects a negative `range_batch_slices` and a `slices_per_pass` outside 0..64 when it loads the config, naming the
@@ -641,6 +701,7 @@ reactors and one set of staging slots per GPU, and each read is routed by its de
 The example below is for a GPFS deployment. Point `storage_hint_path` at a file on the
 data filesystem so the pool is sized for network storage:
 
+<!-- scan-cufile-example -->
 ```yaml
 sirius:
   topology:
@@ -677,6 +738,8 @@ sirius:
 | `max_staging_bytes_per_device` | bytes | 1GiB | Cap on registered staging per GPU. `0` = no cap beyond the device limits (half the free BAR1, cuFile's pinned-memory limit). |
 | `max_inflight` | int (**> 0**) | 32 | Per-reactor bound on asynchronous items holding copy resources (staged scatter copies waiting for their stream, H2D copies of fallback reads), not concurrent `cuFileRead` calls. |
 | `max_op_bytes` | bytes (**>= 4KiB**) | 64MiB | Largest direct (unstaged) `cuFileRead` issued by a worker; larger device reads are chunked. |
+| `write_split_bytes` | bytes (**0 or >= 4KiB**) | 64MiB | Cut large write slices across reactors, rounded down to the write granule; `0` disables cutting. Primarily for DISK contexts. |
+| `fuse_gap_bytes` | bytes | 0 | Fuse neighbouring small device slices of a vectored read through one staged cuFile call when each is at most half a piece and the combined window fits a slot. `0` disables fusion; see throughput recipes. |
 | `gds_threshold` | bytes | 256KiB | Device reads below this size use POSIX reads and pinned H2D staging rather than cuFile. `0` is legal. |
 | `use_odirect` | bool | true | Open the direct-I/O descriptor needed for cuFile. `false` skips cuFile registration and uses buffered POSIX reads; it conflicts with `compat_mode: off`. Independent of `cache.mode`. |
 | `compat_mode` | enum: `auto`, `on`, `off` | `auto` | Per-file policy: `auto` tries cuFile and permits POSIX fallback, `on` forces POSIX, `off` requires a usable cuFile handle and fails the open rather than falling back if it cannot be registered. Values are lowercase. |
@@ -685,7 +748,8 @@ sirius:
 
 cuFile cannot fill fragmented pinned-cache destinations, so it never arms `fs_cache`
 or scan readahead, **even with `cache.mode: cucs`**. Neither `max_readahead_scans` nor
-`readahead_strategy` enables it. These are read-only settings; no write or
+`readahead_strategy` enables it. Scan contexts currently only read;
+`write_split_bytes` also serves the shared parser used by DISK contexts. No
 per-transfer buffer-registration controls are exposed.
 `cufile.n_max_concurrent_scans` is intentionally not a YAML setting: cuFile cannot
 publish a usable cache/readahead budget. Tune read concurrency with
@@ -694,7 +758,8 @@ publish a usable cache/readahead budget. Tune read concurrency with
 
 **Staging memory.** Staging slots are `cudaMalloc`ed outside RMM, registered with cuFile
 once, and kept for the life of the process. With the defaults on GPFS that is about
-32 reactors × 2 slots × (8 MiB + 128 KiB of alignment) ≈ 520 MiB per GPU, capped by
+32 reactors × 2 slots × (8 MiB + 128 KiB of allocation/alignment overhead) ≈ 520 MiB
+allocated (516 MiB registered) per GPU, capped by
 `max_staging_bytes_per_device`. For a planned pool, Sirius reserves the slots at startup
 **before** the GPU memory pools are created, so they come on top of
 `sirius.memory.gpu.usage_limit_*`; on a small GPU, lower the usage limit or
@@ -702,14 +767,16 @@ once, and kept for the life of the process. With the defaults on GPFS that is ab
 slots as its reactors first stage a read, from whatever the pools left free. So does the
 [DISK tier's default context](#disk-memory-siriusmemorydisk) on a GDS host: a planned
 cuFile pool with cuCascade's defaults that, when it starts at the first spill, reserves
-16 reactors × 2 slots ≈ 260 MiB on every visible GPU, on top of the scan pool's slots
+16 reactors × 2 slots ≈ 260 MiB allocated (258 MiB registered) on every visible GPU, on top of the scan pool's slots
 (each reactor holds its own), so leave room for it in the `usage_limit_*` headroom. The POSIX
 fallback (small and host reads, and staged writes) stages through pinned host memory
 borrowed per transfer from the HOST space of the reactor's GPU's NUMA node: up to two
 8 MiB slots, counted against that space only while the transfer runs. If a slot
 cannot be allocated or registered, reads (and DISK device writes) go directly through
 cuFile's own bounce buffers and a WARN says so. With `staging_mode: automatic` on a host
-without GDS, nothing is allocated.
+without GDS, nothing is allocated. An explicitly configured
+[DISK I/O context](#disk-io-siriusmemorydiskio) reserves its staging ahead of GPU pools,
+including demand from a flat pool; this is independent of the lazy-default behavior above.
 
 **Plan and counters.** At startup the pool plan (`cufile pool: ...`, with each GPU
 group's reactors, CPUs and staging) is logged at INFO, and each GDS setup problem
@@ -803,11 +870,12 @@ pinned host allocations pass `eviction_threshold_fraction`; `eviction: idle` dro
 it goes idle, making the cache a prefetch staging area sized for the reads in flight rather
 than for reuse.
 
-Those two knobs derive the settings below, which are therefore **not** individually settable from YAML:
+Those two knobs derive the settings below. They are **not** independently settable from
+YAML; an explicit `uring.use_odirect` is accepted only when it matches `cache.mode`:
 
 | Derived setting | Derived from |
 |-----------------|--------------|
-| `uring.use_odirect` | `mode` — true for everything but `os` |
+| `uring.use_odirect` | `mode` — true for everything but `os`; an explicit YAML value must match |
 | whether the prefetching cache is armed | `mode` — only under `cucs`, and only for a backend that supports `fs_cache` (not cuFile) |
 | `dispose_on_idle` | `eviction` — true under `idle` |
 | the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
@@ -899,6 +967,218 @@ devices; independent background placement could conflict with a task's already s
 ### Programmatic S3 credentials
 
 S3 credentials are not YAML-loadable. Use `CREATE SECRET (TYPE SIRIUS_S3, ...)` for SQL-managed credentials, or set an in-memory `io::object_store_config` through `sirius_config::set_object_store_config()` before initializing the scan manager. A matching secret takes precedence over this programmatic fallback. YAML containing `sirius.executor.scan_manager.object_store` is rejected.
+
+## Maximum I/O throughput recipes
+
+<!-- io-throughput-recipes:start -->
+
+These are **starting points, not measured maximum-throughput profiles**. Measure on the
+deployment host with cuCascade's
+[cuFile tuning sweep](../../cucascade/docs/io/cufile-gds.md#tuning-on-the-deployment-host)
+and representative queries (including simultaneous scans and spills). Confirm real GDS
+with `gdscheck -p`, cuFile/GPFS counters and staged-byte counters; successful handle
+registration alone does not prove direct DMA. Multi-GPU node throughput can be limited
+by shared NICs, PCIe links or storage servers.
+
+### (a) GDS host, IBM Storage Scale / WEKA / VAST over RDMA
+
+Use the filesystem's supported GDS client/mount configuration. The example assumes one
+GPU; change `devices`/topology to the GPUs Sirius uses, and use an **existing regular
+file**, not a directory, for each `storage_hint_path`. For VAST/NFS, verify the supported
+NFS-over-RDMA mount (`proto=rdma`), not a TCP mount. IBM's client architecture/support
+restrictions still apply (see its checklist above). Keep spills on local NVMe to avoid
+competing with network scans on the same NICs and storage servers; the DISK hint must
+name a file on that local filesystem.
+
+```yaml
+sirius:
+  topology: {num_gpus: 1}
+  memory:
+    gpu: {usage_limit_fraction: 0.90}  # unmeasured headroom starting point; size explicitly
+    disk:
+      downgrade_root_dirs: /nvme/spill
+      io:
+        backend: cufile               # device-heavy spills; compare uring for HOST-heavy spills
+        cufile_n_reactors: 0
+        cufile:
+          devices: [0]
+          storage_hint_path: /nvme/spill/existing-probe.bin
+          reactors_per_device: 8        # shallow local-NVMe pool, independent of network scans
+          staging_mode: automatic
+          staging_piece_bytes: 8Mi
+          staging_slots_per_reactor: 2
+          max_staging_bytes_per_device: 1Gi
+          pin_to_device_cpus: true
+          write_split_bytes: 64Mi
+  executor:
+    scan_manager:
+      backend: cufile
+      cufile_n_reactors: 0            # planned per-GPU groups, NOT zero workers
+      cache: {mode: none}            # cuFile cannot use fs_cache/readahead
+      cufile:
+        devices: [0]
+        storage_hint_path: /gpfs/data/existing-part.parquet
+        reactors_per_device: 0        # auto: 32 network, 8 local, 16 unknown
+        pin_to_device_cpus: true
+        staging_mode: automatic
+        staging_piece_bytes: 8Mi
+        staging_slots_per_reactor: 2
+        max_staging_bytes_per_device: 1Gi
+        fuse_gap_bytes: 1Mi          # measured on Storage Scale; measure on WEKA/VAST
+        max_inflight: 32
+        max_op_bytes: 64Mi
+        gds_threshold: 256Ki
+```
+
+One synchronous storage operation runs per reactor. cuCascade's
+[GDS guide](../../cucascade/docs/io/cufile-gds.md#sizing-the-pool-one-group-of-reactors-per-gpu)
+uses Little's law: 50 GB/s × 2–5 ms needs 100–250 MB in flight per GPU (12–31 reads of
+8 MB), motivating 32 network reactors per GPU. Tune `reactors_per_device` and
+`staging_piece_bytes` together; `max_inflight` bounds pending copies **per reactor**, not
+synchronous storage calls. Two staging slots let a read finish while its scatter copy
+waits on compute. The 1 GiB cap is shared by scan and DISK contexts: this 32-reactor
+network scan pool plus the 8-reactor local spill pool wants 80 slots, about 650 MiB
+allocated per GPU (645 MiB registered). BAR1/cuFile limits can reduce the available
+budget further; leave GPU-pool headroom for the actual allocation. Two 32-reactor
+pools would instead need about 1040 MiB allocated, exceeding that cap.
+
+**Measured fusion evidence:** cuCascade commit `d5ea7d61` ("fuse neighbouring small
+device slices into one staged read") reports one GB200 on Storage Scale, 32 reactors,
+eight neighbouring chunks, 1 MiB gaps: 100–700 KiB chunks improved **52 → 77–81 GB/s**;
+16–200 KiB chunks improved **16 → 54–58 GB/s**. Fixed read latency was about 0.22 ms up
+to 256 KiB. The experiment's real-GDS versus forced-staging platform mode is unverified.
+`fuse_gap_bytes: 1Mi` is grounded in that experiment, not a result measured
+on WEKA/VAST or a promise for arbitrary Parquet layouts. It trades gap bytes for fewer
+calls; default remains **0/off**. It only affects staged vectored device reads.
+
+**NIC steering is process-wide cuFile configuration, not YAML.** Set
+`CUFILE_ENV_PATH_JSON=/absolute/path/cufile.json` **before starting Sirius / before any
+cuFile use**, including automatic DISK backend probing or topology discovery. Configure
+`properties.rdma_dev_addr_list` with the storage-facing RDMA port IPs; CPU pinning does
+not pick the NIC. For example (replace addresses and validate with your vendor):
+
+```json
+{
+  "properties": {
+    "rdma_dev_addr_list": ["192.0.2.10", "192.0.2.11"],
+    "rdma_load_balancing_policy": "RoundRobin",
+    "use_poll_mode": false,
+    "max_direct_io_size_kb": 16384
+  },
+  "logging": {"level": "ERROR", "dir": "/tmp"}
+}
+```
+
+Storage Scale requires a nonempty RDMA list; its guide recommends `RoundRobin` for
+storage NICs or `RoundRobinMaxMin` for compute NICs, and no poll mode. Ensure peer memory
+or DMA-BUF, supported client architecture, cluster `verbsGPUDirectStorage` and RDMA
+settings, and no filesystem denylist. cuFile merges the override over `/etc/cufile.json`;
+one process cannot independently steer its scan and DISK pools with different JSON files.
+
+### (b) GDS host, local NVMe
+
+Start with the planner's shallower local pool (8 reactors/GPU), no gap fusion, and default
+8 MiB staging. Paths must be on the actual NVMe filesystem. These are planner defaults,
+not a measured local-GDS optimum; sweep depth/piece size before adding threads.
+
+```yaml
+sirius:
+  topology: {num_gpus: 1}
+  memory:
+    gpu: {usage_limit_fraction: 0.90}  # unmeasured headroom starting point
+    disk:
+      downgrade_root_dirs: /nvme/spill
+      io:
+        backend: cufile
+        cufile_n_reactors: 0
+        cufile:
+          devices: [0]
+          storage_hint_path: /nvme/spill/existing-probe.bin
+          reactors_per_device: 8
+          pin_to_device_cpus: true
+          staging_mode: automatic
+          staging_piece_bytes: 8Mi
+          staging_slots_per_reactor: 2
+          max_staging_bytes_per_device: 1Gi
+          write_split_bytes: 64Mi
+  executor:
+    scan_manager:
+      backend: cufile
+      cufile_n_reactors: 0
+      cache: {mode: none}
+      cufile:
+        devices: [0]
+        storage_hint_path: /nvme/data/existing-part.parquet
+        reactors_per_device: 8
+        pin_to_device_cpus: true
+        staging_mode: automatic
+        staging_piece_bytes: 8Mi
+        staging_slots_per_reactor: 2
+        max_staging_bytes_per_device: 1Gi
+        fuse_gap_bytes: 0
+        max_inflight: 32
+        max_op_bytes: 64Mi
+        gds_threshold: 256Ki
+```
+
+`max_op_bytes: 64Mi` comes from a **compatibility-mode**, not real-GDS, local-NVMe
+measurement in cuCascade's `cufile/config.hpp`: one thread reached 6.83 GB/s vs 6.00 GB/s
+at 16 MiB on a 7.1 GB/s device. Staged operations instead follow `staging_piece_bytes`,
+capped at cuFile's `max_direct_io_size` (16 MiB maximum). The 256 KiB `gds_threshold`
+default avoids NVIDIA's documented ≤128 KiB small-I/O regression on kernels ≥6.11;
+it is not a universal crossover. Measure before changing either.
+
+### (c) Non-GDS host (or predominantly HOST→DISK spills)
+
+Use native io_uring scans and explicit uring spills to avoid routing host buffers through
+cuFile's one-synchronous-operation-per-thread path. Four reactors and 32 MiB write splits
+are cuCascade defaults, **not a measured optimum**. `staging_numa_node: -1` leaves the
+DISK context's private portable staging unbound; select an existing node if measurements
+favor placement near the storage. io_uring must be permitted by the kernel/container.
+
+```yaml
+sirius:
+  memory:
+    disk:
+      downgrade_root_dirs: /nvme/spill
+      io:
+        backend: uring
+        uring_n_reactors: 4
+        staging_numa_node: -1
+        uring:
+          use_odirect: true
+          slices_per_pass: 4
+          range_batch_slices: 8
+          low_service_interval: 4
+          write_split_bytes: 32Mi
+  executor:
+    scan_manager:
+      backend: native
+      uring_n_reactors: 4
+      cache: {mode: none}
+      uring:
+        use_odirect: true
+        slices_per_pass: 4
+        range_batch_slices: 8
+        low_service_interval: 4
+```
+
+For page-cache scans use `cache: {mode: os}` with `uring.use_odirect: false`; for the
+pinned cache use `mode: cucs` with `use_odirect: true`. Measure cache behavior separately
+from cold-storage bandwidth. If io_uring is forbidden, explicit uring fails rather than
+falling back; `automatic` can use cuFile's POSIX fallback without real GDS.
+
+**Spill backend choice on GDS hosts:** compare **cuFile for device spills** (registered
+staging can use GDS writes) against **uring for mostly HOST→DISK spills**. cuFile still
+serves host buffers with synchronous POSIX operations. Host-source bodies below **4 MiB**
+or not congruent with their source address (including the DISK tier's pinned pool blocks)
+use buffered page-cache writeback; most HOST→DISK spills therefore take this path. cuCascade commit `1265be73` sets cuFile's default
+`write_split_bytes: 64Mi` to avoid a multi-GiB slice monopolizing a reactor (reported
+150–350 ms/GiB); uring defaults to 32 MiB. Both allow 0 to disable cutting. Mixed query
+loads, storage and source alignment decide the winner: measure rather than assume that
+GDS availability makes every spill faster. Scan and DISK backend selections are independent.
+
+<!-- io-throughput-recipes:end -->
 
 ## Operator Parameters
 

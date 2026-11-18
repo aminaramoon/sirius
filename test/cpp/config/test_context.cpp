@@ -34,6 +34,7 @@
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -63,6 +64,16 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+#ifdef __linux__
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+
+#include <cerrno>
+#include <stdexcept>
+#endif
 
 namespace {
 // Data integrity guard: FNV-1a checksum over a packed batch payload.
@@ -615,6 +626,86 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE(telemetry.output_directory == "/tmp/sirius_telemetry_config_test");
   REQUIRE(telemetry.engine_name == "sirius_config_test");
 }
+
+TEST_CASE("DISK io configuration shares one context and absence stays lazy",
+          "[sirius][context][config][disk_io_config][isolated_context]")
+{
+  auto root = YAML::LoadFile((fs::path(__FILE__).parent_path() / "data" / "disk_io.yaml").string());
+  bool const configured = GENERATE(true, false);
+  if (!configured) { root["sirius"]["space"]["disk"][0].remove("io"); }
+
+  duckdb::SiriusContext engine;
+  REQUIRE_NOTHROW(engine.initialize(sirius::parsed_sirius_config::from_node(root)));
+  auto& manager = engine.get_memory_manager();
+  auto spaces   = manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
+  REQUIRE(spaces.size() == 2);
+  auto const first = spaces[0]->get_io_context();
+  if (configured) {
+    REQUIRE(first);
+    CHECK(first->type() == cucascade::io::io_context_type::uring);
+    CHECK(spaces[1]->get_io_context() == first);
+  } else {
+    CHECK_FALSE(first);
+    CHECK_FALSE(spaces[1]->get_io_context());
+  }
+  for (auto const tier : {cucascade::memory::Tier::GPU, cucascade::memory::Tier::HOST}) {
+    for (auto const* space : manager.get_memory_spaces_for_tier(tier)) {
+      CHECK_THROWS_WITH(space->get_io_context(),
+                        Catch::Matchers::ContainsSubstring("non-DISK memory space"));
+    }
+  }
+}
+
+#ifdef __linux__
+TEST_CASE("DISK explicit uring startup failure reports its YAML key and rolls back",
+          "[sirius][context][config][disk_io_config][isolated_context]")
+{
+  auto root = YAML::LoadFile((fs::path(__FILE__).parent_path() / "data" / "disk_io.yaml").string());
+  auto config = sirius::parsed_sirius_config::from_node(root);
+
+  // Cache the successful process-wide one-entry uring probe before restricting
+  // only the disposable thread below. Actual DISK reactors must still fail to
+  // create their rings; neither the main thread nor later tests inherit this filter.
+  cucascade::disk_io_context_options options;
+  options.backend             = cucascade::disk_io_backend::uring;
+  options.io.uring_n_reactors = 1;
+  REQUIRE_NOTHROW(cucascade::make_disk_io_context(options));
+  auto const previous_threshold = cudf::get_allocate_host_as_pinned_threshold();
+
+  auto result =
+    std::async(std::launch::async, [&] {
+      sock_filter filter[] = {BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+                              BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 0, 1),
+                              BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+                              BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)};
+      sock_fprog program{.len = 4, .filter = filter};
+      if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+          prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) != 0) {
+        throw std::runtime_error("Could not install thread-local io_uring failure filter");
+      }
+      duckdb::SiriusContext engine;
+      try {
+        engine.initialize(config);
+      } catch (std::exception const& e) {
+        return std::pair{std::string(e.what()), engine.is_initialized()};
+      }
+      return std::pair{std::string{}, engine.is_initialized()};
+    }).get();
+  CHECK_THAT(result.first, Catch::Matchers::ContainsSubstring("building the DISK io context"));
+  CHECK_THAT(result.first, Catch::Matchers::ContainsSubstring("sirius.memory.disk.io"));
+  CHECK_FALSE(result.second);
+  CHECK(cudf::get_allocate_host_as_pinned_threshold() == previous_threshold);
+  auto pinned              = cudf::get_pinned_memory_resource();
+  constexpr auto alignment = alignof(std::max_align_t);
+  void* p                  = pinned.allocate_sync(256, alignment);
+  CHECK(p != nullptr);
+  pinned.deallocate_sync(p, 256, alignment);
+
+  // A fresh initialization must still work after the failing context was destroyed.
+  duckdb::SiriusContext recovered;
+  CHECK_NOTHROW(recovered.initialize(config));
+}
+#endif
 
 TEST_CASE("SiriusContext init failure restores the cuDF pinned resource",
           "[sirius][context][config][isolated_context]")

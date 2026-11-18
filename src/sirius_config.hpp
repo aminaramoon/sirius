@@ -24,6 +24,7 @@
 #include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
+#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
@@ -452,6 +453,14 @@ struct sirius_config {
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
+  /// Absent: DISK spaces retain cuCascade's lazy process default. One configured
+  /// context serves every DISK space; options own no runtime resources.
+  [[nodiscard]] const std::optional<cucascade::disk_io_context_options>& get_disk_io_options()
+    const noexcept
+  {
+    return _disk_io_options;
+  }
+
   /// The read path's caching configuration (the
   /// @c sirius.executor.scan_manager.cache YAML block).  Stored inside the
   /// scan_manager config, which is its only consumer, so the two can never
@@ -540,6 +549,7 @@ struct sirius_config {
   /// Query admission limit (`sirius.max_concurrent_queries`).
   int _max_concurrent_queries{1};
   scan_manager::scan_manager_config _scan_manager_config{};
+  std::optional<cucascade::disk_io_context_options> _disk_io_options;
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
