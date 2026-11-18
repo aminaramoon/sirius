@@ -492,6 +492,124 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
   r.reject_unknown();
 }
 
+// cuCascade's opt-in async GDS engine (cufile::async_engine_config). Default mode is legacy: the
+// planned reactor pools serve every transfer exactly as without this block.
+static void read_async_engine(const YAML::Node& node,
+                              cucascade::io::cufile::async_engine_config& opt)
+{
+  namespace cf = cucascade::io::cufile;
+  yaml::reader r(node, "cufile.async_engine");
+  read_choice(r,
+              "mode",
+              opt.mode,
+              {{"legacy", cf::engine_mode::legacy}, {"async_auto", cf::engine_mode::async_auto}});
+  r.optional("async_reads", opt.async_reads);
+  r.optional("async_writes", opt.async_writes);
+  r.optional("unregistered_device_tier", opt.unregistered_device_tier);
+  r.optional("direct_registered_io", opt.direct_registered_io);
+  r.optional("stream_register", opt.stream_register);
+  r.optional("affinity", opt.affinity);
+  r.optional("strict_parameters", opt.strict_parameters);
+  r.optional("coalesce", opt.coalesce);
+  read_count(r, "coalesce_max_targets", opt.coalesce_max_targets, true);
+  read_count(r, "submitters_per_device", opt.submitters_per_device, true);
+  r.optional("arena_bytes", yaml::bytes(opt.arena_bytes));  // 0 = auto
+  if (r.has("arena_slot_classes")) {
+    opt.arena_slot_classes.clear();
+    r.optional("arena_slot_classes", opt.arena_slot_classes);  // MiB, members of {1,2,4,8}
+  }
+  read_count(r, "device_lane_cap", opt.device_lane_cap, true);
+  read_count(r, "max_pending_slices_per_device", opt.max_pending_slices_per_device, true);
+  read_count(r, "low_service_interval", opt.low_service_interval);
+  read_count(r, "max_short_reads", opt.max_short_reads, true);
+  if (auto n = r.optional_node("process_params")) {
+    auto& p = opt.process_params;
+    yaml::reader pr(*n, "cufile.async_engine.process_params");
+    pr.optional("cufile_json_path", p.cufile_json_path);
+    pr.optional("allow_compat_mode", p.allow_compat_mode);
+    pr.optional("force_compat_mode", p.force_compat_mode);
+    pr.optional("max_direct_io_size_kib", p.max_direct_io_size_kib);
+    pr.optional("max_device_pinned_mem_size_kib", p.max_device_pinned_mem_size_kib);
+    pr.optional("max_device_cache_size_kib", p.max_device_cache_size_kib);
+    pr.optional("rdma_dev_addr_list", p.rdma_dev_addr_list);
+    pr.optional("rdma_load_balancing_policy", p.rdma_load_balancing_policy);
+    pr.optional("stats_level", p.stats_level);
+    pr.optional("logging_level", p.logging_level);
+    if (auto s = pr.optional_node("gpu_bounce_buffer_slabs")) {
+      cf::gpu_bounce_slabs slabs;
+      yaml::reader sr(*s, "cufile.async_engine.process_params.gpu_bounce_buffer_slabs");
+      sr.required("sizes_kib", slabs.sizes_kib);
+      sr.required("counts", slabs.counts);
+      sr.reject_unknown();
+      p.gpu_bounce_buffer_slabs = std::move(slabs);
+    }
+    pr.reject_unknown();
+  }
+  if (auto n = r.optional_node("mount_overrides")) {
+    if (!n->IsSequence()) {
+      throw std::runtime_error("'cufile.async_engine.mount_overrides': expected a sequence");
+    }
+    opt.mount_overrides.clear();
+    for (auto const& item : *n) {
+      cf::mount_override m;
+      yaml::reader mr(item, "cufile.async_engine.mount_overrides[]");
+      read_choice(mr,
+                  "match",
+                  m.match,
+                  {{"fsid", cf::mount_match::fsid},
+                   {"mount_prefix", cf::mount_match::mount_prefix},
+                   {"fs_type", cf::mount_match::fs_type}});
+      mr.required("value", m.value);
+      read_choice(mr,
+                  "state",
+                  m.state,
+                  {{"operator_qualified", cf::mount_override_state::operator_qualified},
+                   {"known_compat", cf::mount_override_state::known_compat},
+                   {"legacy", cf::mount_override_state::legacy}});
+      mr.optional("qd", m.qd);
+      mr.optional("op_bytes", yaml::bytes(m.op_bytes));
+      mr.optional("allow_writes", m.allow_writes);
+      mr.optional("lanes", m.lanes);
+      mr.optional("nic", m.nic);
+      mr.optional("cpus", m.cpus);
+      mr.reject_unknown();
+      opt.mount_overrides.push_back(std::move(m));
+    }
+  }
+  if (auto n = r.optional_node("probe")) {
+    yaml::reader pr(*n, "cufile.async_engine.probe");
+    read_count(pr, "submit_max_us", opt.probe.submit_max_us, true);
+    pr.optional("require_direct_evidence", opt.probe.require_direct_evidence);
+    pr.optional("bytes", yaml::bytes(opt.probe.bytes));
+    pr.reject_unknown();
+  }
+  if (auto n = r.optional_node("demotion")) {
+    yaml::reader dr(*n, "cufile.async_engine.demotion");
+    read_count(dr, "slow_floor_us", opt.demotion.slow_floor_us, true);
+    read_count(dr, "p99_multiple", opt.demotion.p99_multiple, true);
+    read_count(dr, "slow_of_last_eight", opt.demotion.slow_of_last_eight, true);
+    read_count(dr, "stuck_ms", opt.demotion.stuck_ms, true);
+    read_count(dr, "cooldown_s", opt.demotion.cooldown_s, true);
+    read_count(dr, "cooldown_cap_s", opt.demotion.cooldown_cap_s, true);
+    dr.reject_unknown();
+  }
+  if (auto n = r.optional_node("poll")) {
+    yaml::reader pl(*n, "cufile.async_engine.poll");
+    read_count(pl, "io_cap_us", opt.poll.io_cap_us, true);
+    read_count(pl, "copy_cap_us", opt.poll.copy_cap_us, true);
+    read_count(pl, "fence_hint_us", opt.poll.fence_hint_us, true);
+    read_count(pl, "due_events_per_round", opt.poll.due_events_per_round, true);
+    read_count(pl, "idle_health_ms", opt.poll.idle_health_ms, true);
+    pl.reject_unknown();
+  }
+  r.reject_unknown();
+  try {
+    opt.validate();
+  } catch (std::exception const& e) {
+    throw std::runtime_error(std::string{"'cufile.async_engine': "} + e.what());
+  }
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt)
 {
   yaml::reader r(node, "cufile");
@@ -576,6 +694,7 @@ static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt
     throw std::runtime_error(
       "'cufile.storage_hint_path': must name a file on the data filesystem, not a directory");
   }
+  if (auto n = r.optional_node("async_engine")) read_async_engine(*n, opt.async_engine);
   r.reject_unknown();
 }
 

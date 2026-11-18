@@ -832,6 +832,47 @@ export CUFILE_ENV_PATH_JSON=/absolute/path/to/cufile.json
 Use a more verbose level such as `TRACE` only when diagnosing transfer mode; verbose
 logging can affect performance. This is cuFile configuration, not a Sirius YAML setting.
 
+#### `cufile.async_engine` — opt-in async GDS engine (`io/cufile/config.hpp`, `async_engine_config`)
+
+Valid under `scan_manager.cufile` and under the DISK tier's `io.cufile`. The default
+`mode: legacy` leaves the planned reactor pools above in charge of every transfer;
+`async_auto` routes eligible device-only slices on **operator-qualified** mounts to a
+per-GPU engine (`cuFileReadAsync`/`cuFileWriteAsync` on non-blocking stream lanes,
+registered staging arena, deadline-driven completion). Automatic GDS verification is not
+available yet, so a mount is engine-routed only through `mount_overrides`. Device reads
+served by the engine complete as *enqueued and ordered on the caller's stream*; callers
+synchronize the stream before host access. See cuCascade `docs/io/cufile-reactor.md`.
+
+```yaml
+scan_manager:
+  backend: cufile
+  cufile:
+    async_engine:
+      mode: async_auto              # legacy (default) | async_auto
+      async_reads: true
+      async_writes: false           # needs a write-qualified override as well
+      arena_bytes: 1Gi              # 0 = auto (min 1 GiB, 5% device memory)
+      arena_slot_classes: [4]       # MiB from {1,2,4,8}; [8] for GPFS 8-MiB blocks, [1] for VAST
+      submitters_per_device: 1
+      device_lane_cap: 160
+      affinity: false               # true pins only the engine's own threads
+      mount_overrides:
+        - {match: mount_prefix, value: /gpfs/data, state: operator_qualified, qd: 64, op_bytes: 4Mi}
+      process_params:
+        cufile_json_path: /etc/cucascade/cufile-gpu0.json   # applied before the cuFile driver opens
+      demotion: {slow_floor_us: 100, stuck_ms: 2}         # calibrate per filesystem
+```
+
+Other keys: `unregistered_device_tier`, `direct_registered_io`, `stream_register`,
+`strict_parameters`, `coalesce`, `coalesce_max_targets`, `max_pending_slices_per_device`,
+`low_service_interval`, `max_short_reads`, `probe.{submit_max_us,require_direct_evidence,bytes}`,
+`demotion.{p99_multiple,slow_of_last_eight,cooldown_s,cooldown_cap_s}`,
+`poll.{io_cap_us,copy_cap_us,fence_hint_us,due_events_per_round,idle_health_ms}`,
+`process_params.{allow_compat_mode,force_compat_mode,max_direct_io_size_kib,
+max_device_pinned_mem_size_kib,max_device_cache_size_kib,rdma_dev_addr_list,
+rdma_load_balancing_policy,stats_level,logging_level,gpu_bounce_buffer_slabs.{sizes_kib,counts}}`.
+Defaults and validation are cuCascade's (`async_engine_config::validate()`).
+
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 
 Everything about read-path caching lives in this one block — rather than a mode on the

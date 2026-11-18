@@ -23,6 +23,7 @@
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/config.hpp>
+#include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/tls/config.hpp>
@@ -1890,4 +1891,111 @@ TEST_CASE("Native runtime YAML rejects insufficient reader capacity",
                    scan_manager_yaml(std::string("      preparation:\n        ") + fields + "\n"));
   CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
                   sirius::configuration_input_error);
+}
+
+TEST_CASE("scan_manager.cufile.async_engine parses every engine knob",
+          "[scan_manager][config][cufile][async_engine]")
+{
+  namespace cf   = cucascade::io::cufile;
+  auto const cfg = load_scan_manager("async_engine.yaml", scan_manager_yaml(R"(      cufile:
+        async_engine:
+          mode: async_auto
+          async_reads: true
+          async_writes: true
+          unregistered_device_tier: false
+          direct_registered_io: true
+          stream_register: false
+          affinity: true
+          strict_parameters: true
+          coalesce: false
+          coalesce_max_targets: 32
+          submitters_per_device: 2
+          arena_bytes: 512Mi
+          arena_slot_classes: [4, 8]
+          device_lane_cap: 120
+          max_pending_slices_per_device: 2048
+          low_service_interval: 3
+          max_short_reads: 16
+          process_params:
+            cufile_json_path: /tmp/cufile-gpu0.json
+            allow_compat_mode: true
+            force_compat_mode: false
+            max_direct_io_size_kib: 16384
+            max_device_pinned_mem_size_kib: 1048576
+            max_device_cache_size_kib: 131072
+            rdma_dev_addr_list: [192.0.2.10, 192.0.2.11]
+            rdma_load_balancing_policy: RoundRobin
+            stats_level: 1
+            logging_level: WARN
+            gpu_bounce_buffer_slabs: {sizes_kib: [1024, 4096], counts: [8, 4]}
+          mount_overrides:
+            - {match: mount_prefix, value: /gpfs/data, state: operator_qualified, qd: 64, op_bytes: 4Mi, allow_writes: true, lanes: 80, nic: mlx5_0, cpus: [8, 10]}
+            - {match: fs_type, value: nfs4, state: known_compat}
+          probe: {submit_max_us: 200, require_direct_evidence: false, bytes: 32Mi}
+          demotion: {slow_floor_us: 2000, p99_multiple: 5, slow_of_last_eight: 4, stuck_ms: 20, cooldown_s: 10, cooldown_cap_s: 600}
+          poll: {io_cap_us: 200, copy_cap_us: 20, fence_hint_us: 50, due_events_per_round: 8, idle_health_ms: 40}
+)"));
+  auto const& e  = cfg.cufile.async_engine;
+  CHECK(e.mode == cf::engine_mode::async_auto);
+  CHECK(e.async_writes);
+  CHECK_FALSE(e.unregistered_device_tier);
+  CHECK(e.direct_registered_io);
+  CHECK_FALSE(e.stream_register);
+  CHECK(e.affinity);
+  CHECK(e.strict_parameters);
+  CHECK_FALSE(e.coalesce);
+  CHECK(e.coalesce_max_targets == 32);
+  CHECK(e.submitters_per_device == 2);
+  CHECK(e.arena_bytes == (512UL << 20));
+  CHECK(e.arena_slot_classes == std::vector<unsigned>{4, 8});
+  CHECK(e.device_lane_cap == 120);
+  CHECK(e.max_pending_slices_per_device == 2048);
+  CHECK(e.low_service_interval == 3);
+  CHECK(e.max_short_reads == 16);
+  CHECK(e.process_params.cufile_json_path == "/tmp/cufile-gpu0.json");
+  CHECK(e.process_params.max_direct_io_size_kib == 16384);
+  CHECK(e.process_params.rdma_dev_addr_list ==
+        std::vector<std::string>{"192.0.2.10", "192.0.2.11"});
+  CHECK(e.process_params.rdma_load_balancing_policy == "RoundRobin");
+  REQUIRE(e.process_params.gpu_bounce_buffer_slabs);
+  CHECK(e.process_params.gpu_bounce_buffer_slabs->counts == std::vector<std::size_t>{8, 4});
+  REQUIRE(e.mount_overrides.size() == 2);
+  auto const& m = e.mount_overrides[0];
+  CHECK(m.match == cf::mount_match::mount_prefix);
+  CHECK(m.value == "/gpfs/data");
+  CHECK(m.state == cf::mount_override_state::operator_qualified);
+  CHECK(m.qd == 64U);
+  CHECK(m.op_bytes == (4UL << 20));
+  CHECK(m.allow_writes);
+  CHECK(m.lanes == 80U);
+  CHECK(m.nic == "mlx5_0");
+  CHECK(m.cpus == std::vector<int>{8, 10});
+  CHECK(e.mount_overrides[1].match == cf::mount_match::fs_type);
+  CHECK(e.mount_overrides[1].state == cf::mount_override_state::known_compat);
+  CHECK(e.probe.submit_max_us == 200);
+  CHECK_FALSE(e.probe.require_direct_evidence);
+  CHECK(e.probe.bytes == (32UL << 20));
+  CHECK(e.demotion.slow_floor_us == 2000);
+  CHECK(e.demotion.stuck_ms == 20);
+  CHECK(e.demotion.cooldown_cap_s == 600);
+  CHECK(e.poll.io_cap_us == 200);
+  CHECK(e.poll.idle_health_ms == 40);
+}
+
+TEST_CASE("scan_manager.cufile.async_engine defaults to legacy and rejects bad values",
+          "[scan_manager][config][cufile][async_engine]")
+{
+  namespace cf = cucascade::io::cufile;
+  auto const cfg =
+    load_scan_manager("async_engine_default.yaml", scan_manager_yaml("      cufile: {}\n"));
+  CHECK(cfg.cufile.async_engine == cf::async_engine_config{});
+  CHECK_THROWS(
+    load_scan_manager("async_engine_bad_mode.yaml",
+                      scan_manager_yaml("      cufile:\n        async_engine: {mode: turbo}\n")));
+  CHECK_THROWS(load_scan_manager(
+    "async_engine_bad_class.yaml",
+    scan_manager_yaml("      cufile:\n        async_engine: {arena_slot_classes: [3]}\n")));
+  CHECK_THROWS(load_scan_manager(
+    "async_engine_unknown.yaml",
+    scan_manager_yaml("      cufile:\n        async_engine: {no_such_knob: 1}\n")));
 }
