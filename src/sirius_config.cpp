@@ -480,6 +480,80 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
   r.reject_unknown();
 }
 
+// cuCascade's opt-in fused device reads on stream lanes (cufile::fused_read_config), off by
+// default.  This reader owns names, types and enum spellings; ranges and cross-field rules are
+// cuCascade's validate(), run (when the block is enabled) by validate_cufile_read_blocks.
+static void read_fused_reads(const YAML::Node& node, cucascade::io::cufile::fused_read_config& opt)
+{
+  namespace cf = cucascade::io::cufile;
+  yaml::reader r(node, "cufile.fused_reads");
+  r.optional("enabled", opt.enabled);
+  read_count(r, "reactors_per_device", opt.reactors_per_device);
+  read_count(r, "lanes_per_reactor", opt.lanes_per_reactor);
+  read_count(r, "max_lanes_per_device", opt.max_lanes_per_device);
+  r.optional("slot_bytes", yaml::bytes(opt.slot_bytes));
+  r.optional("fuse", opt.fuse);
+  r.optional("fuse_gap_bytes", yaml::bytes(opt.fuse_gap_bytes));
+  r.optional("register_streams", opt.register_streams);
+  read_choice(r,
+              "completion",
+              opt.completion,
+              {{"poll", cf::lane_completion::poll}, {"callback", cf::lane_completion::callback}});
+  read_count(r, "max_gated_lanes", opt.max_gated_lanes);  // 0 = half the lanes
+  read_count(r, "max_resubmits", opt.max_resubmits);
+  read_count(r, "max_parts_per_read", opt.max_parts_per_read);
+  read_count(r, "failure_limit", opt.failure_limit);
+  read_count(r, "cooldown_s", opt.cooldown_s);
+  read_count(r, "stall_warn_s", opt.stall_warn_s);  // 0 = never
+  r.reject_unknown();
+}
+
+// cuCascade's opt-in host reads through cuFile's batch API (cufile::host_batch_config), off by
+// default.  Same split as read_fused_reads.
+static void read_host_batch(const YAML::Node& node, cucascade::io::cufile::host_batch_config& opt)
+{
+  namespace cf = cucascade::io::cufile;
+  yaml::reader r(node, "cufile.host_batch");
+  r.optional("enabled", opt.enabled);
+  read_count(r, "reactors", opt.reactors);
+  read_count(r, "depth", opt.depth);
+  r.optional("max_entry_bytes", yaml::bytes(opt.max_entry_bytes));
+  r.optional("max_wave_bytes", yaml::bytes(opt.max_wave_bytes));  // 0 = no cap
+  r.optional("min_bytes", yaml::bytes(opt.min_bytes));
+  read_count(r, "poll_us", opt.poll_us);
+  read_count(r, "failure_limit", opt.failure_limit);
+  read_choice(r,
+              "submit_policy",
+              opt.submit_policy,
+              {{"per_reader", cf::batch_submit_policy::per_reader},
+               {"exclusive", cf::batch_submit_policy::exclusive},
+               {"continuous", cf::batch_submit_policy::continuous}});
+  r.reject_unknown();
+}
+
+// Legal settings of the two opt-in blocks that rarely mean what the operator wanted.
+static void warn_cufile_read_blocks(cucascade::io::cufile::config const& opt)
+{
+  auto const& fused = opt.fused_reads;
+  if (fused.enabled &&
+      fused.reactors_per_device * fused.lanes_per_reactor > fused.max_lanes_per_device) {
+    SIRIUS_LOG_WARN(
+      "'cufile.fused_reads': reactors_per_device x lanes_per_reactor = {} exceeds "
+      "max_lanes_per_device ({}); at most {} lanes per GPU are created, so the excess lanes never "
+      "exist",
+      fused.reactors_per_device * fused.lanes_per_reactor,
+      fused.max_lanes_per_device,
+      fused.max_lanes_per_device);
+  }
+  if (opt.host_batch.enabled &&
+      opt.host_batch.submit_policy == cucascade::io::cufile::batch_submit_policy::continuous) {
+    SIRIUS_LOG_WARN(
+      "'cufile.host_batch.submit_policy': continuous crashes libcufile 1.17.1 in compatibility "
+      "mode; qualify it on this stack first (cuCascade's cucascade_io_tests "
+      "\"[host_batch_quirk]\") or use per_reader");
+  }
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt)
 {
   yaml::reader r(node, "cufile");
@@ -560,7 +634,12 @@ static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt
     throw std::runtime_error(
       "'cufile.storage_hint_path': must name a file on the data filesystem, not a directory");
   }
+  if (auto n = r.optional_node("fused_reads")) read_fused_reads(*n, opt.fused_reads);
+  if (auto n = r.optional_node("host_batch")) read_host_batch(*n, opt.host_batch);
   r.reject_unknown();
+  // cuCascade's validate() of both blocks, its errors reported under their YAML keys.
+  scan_manager::validate_cufile_read_blocks(opt);
+  warn_cufile_read_blocks(opt);
 }
 
 static void from_yaml(const YAML::Node& node, cucascade::io::cache::config& opt)
