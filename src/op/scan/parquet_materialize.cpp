@@ -253,6 +253,61 @@ std::unique_ptr<cudf::table> materialize_bulk(
   return std::move(result.tbl);
 }
 
+/// cufile_bulk_read_sync_before_submit on the general route: forwards every call to the wrapped
+/// datasource, but synchronizes the caller's stream (where cuDF allocated the destination) before
+/// each device read is handed on, so the reactor never races the allocation.
+class sync_before_submit_source final : public cudf::io::datasource {
+ public:
+  explicit sync_before_submit_source(cudf::io::datasource* inner) : _inner(inner) {}
+  std::unique_ptr<buffer> host_read(size_t offset, size_t size) override
+  {
+    return _inner->host_read(offset, size);
+  }
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override
+  {
+    return _inner->host_read(offset, size, dst);
+  }
+  [[nodiscard]] bool supports_device_read() const override { return _inner->supports_device_read(); }
+  [[nodiscard]] bool is_device_read_preferred(size_t size) const override
+  {
+    return _inner->is_device_read_preferred(size);
+  }
+  std::unique_ptr<buffer> device_read(size_t offset, size_t size, cuda::stream_ref stream) override
+  {
+    sync(stream);
+    return _inner->device_read(offset, size, stream);
+  }
+  size_t device_read(size_t offset, size_t size, uint8_t* dst, cuda::stream_ref stream) override
+  {
+    sync(stream);
+    return _inner->device_read(offset, size, dst, stream);
+  }
+  std::future<size_t> device_read_async(size_t offset,
+                                        size_t size,
+                                        uint8_t* dst,
+                                        cuda::stream_ref stream) override
+  {
+    sync(stream);
+    return _inner->device_read_async(offset, size, dst, stream);
+  }
+  [[nodiscard]] size_t size() const override { return _inner->size(); }
+
+ private:
+  static void sync(cuda::stream_ref stream)
+  {
+    auto& state      = sirius::io::bulk_read_sync();
+    auto const start = std::chrono::steady_clock::now();
+    stream.sync();
+    state.syncs.fetch_add(1, std::memory_order_relaxed);
+    state.sync_ns.fetch_add(static_cast<std::uint64_t>(
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count()),
+                            std::memory_order_relaxed);
+  }
+  cudf::io::datasource* _inner;
+};
+
 /// General route: let cudf read as it decodes, over whatever sources there are.
 std::unique_ptr<cudf::table> materialize_general(std::span<parquet_source const> sources,
                                                  cudf::io::parquet_reader_options const& options,
@@ -266,7 +321,14 @@ std::unique_ptr<cudf::table> materialize_general(std::span<parquet_source const>
   metadatas.reserve(sources.size());
   rg_per_src.reserve(sources.size());
 
+  bool const sync_first = sirius::io::bulk_read_sync().enabled.load(std::memory_order_relaxed);
   for (auto const& src : sources) {
+    if (sync_first) {
+      cudf_sources.push_back(std::make_unique<sync_before_submit_source>(src.datasource.get()));
+      metadatas.push_back(*src.metadata);
+      rg_per_src.push_back(src.row_group_indices);
+      continue;
+    }
     cudf_sources.push_back(cudf::io::datasource::create(src.datasource.get()));
     metadatas.push_back(*src.metadata);
     rg_per_src.push_back(src.row_group_indices);
