@@ -757,6 +757,13 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("reserve_rest_reactor_cpus", opt.reserve_rest_reactor_cpus);
   // 0 plans a pinned pool per GPU; a positive count is one flat pool.
   read_count(r, "cufile_n_reactors", opt.cufile_n_reactors);
+  // auto = the bulk (vectored) Parquet read route exactly when cufile.fused_reads is enabled.
+  read_choice(r,
+              "cufile_bulk_read",
+              opt.cufile_bulk_read,
+              {{"auto", scan_manager::cufile_bulk_read_mode::automatic},
+               {"on", scan_manager::cufile_bulk_read_mode::on},
+               {"off", scan_manager::cufile_bulk_read_mode::off}});
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);

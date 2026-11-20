@@ -393,6 +393,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `rest_n_reactors` | int (**>= 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. |
 | `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built from the startup mask the CPUs were planned from, so it pins the same way. |
 | `cufile_n_reactors` | int (**>= 0**) | 0 | cuFile reactors for local reads, each one worker thread keeping one read in flight. `0` plans a pinned group of `cufile.reactors_per_device` reactors for each GPU in `cufile.devices` (default: the GPU Sirius reads into). A positive count runs one flat, unpinned pool of that many reactors instead. See [`scan_manager.cufile`](#scan_managercufile--local-cufile-reads-iocufileconfighpp). |
+| `cufile_bulk_read` | enum: `auto`, `on`, `off` | `auto` | Parquet read route of cuFile scans. `on`: one vectored device request per file per split (the bulk route REST scans take), which lets `cufile.fused_reads` lanes fuse column chunks; `off`: cuDF's general reader, one request per contiguous run of chunks; `auto`: bulk exactly when `cufile.fused_reads.enabled`, so the default changes nothing without lanes. See [Fusion and Sirius's scan](#cufilefused_reads--fused-device-reads-on-stream-lanes-opt-in). No effect on other backends. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
@@ -816,7 +817,7 @@ sirius:
 | `max_lanes_per_device` | int, >= 1 | 128 | Process-wide ceiling on lanes per GPU, over every cuFile context of the process. It guards the storage: 128 asynchronous reads in flight is what was qualified on GPFS. A `reactors_per_device` x `lanes_per_reactor` above it is legal (Sirius warns): the excess lanes never exist. |
 | `slot_bytes` | bytes, multiple of 64KiB in [64KiB, 1GiB] | 8MiB | A lane's registered slot: the largest single read. Keep it at most cuFile's `max_direct_io_size_kb`. |
 | `fuse` | bool | true | Fuse neighbouring slices of one vectored read into one window; `false` only splits at `slot_bytes`, so every slice costs at least one read. |
-| `fuse_gap_bytes` | bytes, < `slot_bytes` | 0 | Largest gap between two slices of one vectored read still fused into one window (the gap is read and dropped). `0` fuses only contiguous slices. |
+| `fuse_gap_bytes` | bytes, < `slot_bytes` | 0 | Largest gap between two slices of one vectored read still fused into one window (the gap is read and dropped). `0` fuses only contiguous slices. On scans it only matters on the bulk route (see `cufile_bulk_read` below). |
 | `register_streams` | bool | true | Register lane streams with cuFile (`cuFileStreamRegister`), which cuts the setup of every read. |
 | `completion` | enum: `poll`, `callback` | `poll` | How a lane's completion reaches its reactor. `poll` queries the busy lanes' events every `poll_interval_us`; `callback` uses a stream callback (less CPU, but slower on GB200 + GPFS, and every lane completion stalls while anything blocks CUDA's host-callback thread). |
 | `max_gated_lanes` | int, <= `lanes_per_reactor` | 0 | Lanes per reactor and GPU that may hold data until a busy caller stream is ready. `0` = half the lanes. |
@@ -839,13 +840,26 @@ per GPU (they serve writes, small reads and fallbacks) instead of 32 / 8 / 16; a
 count is kept. `gds_threshold` applies to both: a smaller window goes to POSIX.
 `poll_interval_us` also paces `completion: poll`.
 
-**Fusion and Sirius's scan.** Fusion happens inside one vectored request. Sirius's cuFile
-scans decode through cuDF's general Parquet reader, which coalesces contiguous column chunks
-and issues one `device_read_async` per contiguous run, all on the decode stream after
-synchronizing it. Each run is therefore its own request: a run longer than `slot_bytes` is
-split into windows, but separate runs are never fused, so `fused_reads.fuse_gap_bytes` has
-no effect on scans today. Idle read streams are what the lanes turn over best, which is what
-that reader provides.
+**Fusion and Sirius's scan.** Fusion happens inside one vectored request, so Sirius picks the
+Parquet read route of cuFile scans with `scan_manager.cufile_bulk_read` (default `auto`: the
+bulk route exactly when `fused_reads.enabled`):
+
+- **Bulk route** (`auto` with fused reads on, or `on`): every column chunk a split reads from
+  a file goes into its own device buffer through ONE vectored request, and cuDF's hybrid scan
+  reader decodes from those buffers (the route REST scans always take). The lanes then fuse
+  neighbouring chunks of the whole split into `slot_bytes` windows, and bridge gaps up to
+  `fused_reads.fuse_gap_bytes`; the shutdown line shows it as `parts` above `reads`.
+- **General route** (`off`, or `auto` with fused reads off, the previous behaviour): cuDF's
+  general Parquet reader coalesces contiguous column chunks and issues one
+  `device_read_async` per contiguous run, after synchronizing the decode stream. Each run is
+  its own request: a run longer than `slot_bytes` is split into windows, but runs are never
+  fused with each other, and `fused_reads.fuse_gap_bytes` has no effect.
+
+Both routes apply the same row filter and return the same rows. The bulk route reads into
+buffers on the scan's stream without synchronizing it first, so a read whose stream is still
+busy becomes a two-phase lane read (counted in `gated`). Reader-position Iceberg delete
+filtering needs the general route, so scans on the bulk route use interval deletion
+instead, exactly as REST scans do.
 
 **Memory.** Each GPU's lanes hold `lanes x (slot_bytes + 64 KiB)` of registered device
 memory (1032 MiB with the defaults) outside RMM, on top of `max_staging_bytes_per_device`;
@@ -910,7 +924,8 @@ sirius:
       cufile:
         storage_hint_path: /path/on/the/gpfs/mount/some.parquet
         fused_reads:
-          enabled: true                # 8 x 16 lanes of 8 MiB, poll completion: the defaults
+          enabled: true                # 8 x 16 lanes of 8 MiB, poll completion: the defaults;
+                                       # cufile_bulk_read: auto then takes the bulk route
         host_batch:
           enabled: true                # only if host reads go through this context
 ```
@@ -938,8 +953,10 @@ full tables.
 The lanes reach the NICs' line rate with 8 submitting threads per GPU instead of 32, and
 keep their rate when the chunks are small, where a read-per-chunk pool is bound by reads/s x
 chunk size. Host batch reaches about 94% of 32 blocking threads with two reactors. These are
-cuCascade benchmark numbers, not Sirius query throughput; Sirius's scan issues one request
-per contiguous run (see **Fusion and Sirius's scan** above).
+cuCascade benchmark numbers (one vectored request per 15 chunks), not Sirius query
+throughput; Sirius's cuFile scans issue one vectored request per file per split on the bulk
+route that `cufile_bulk_read: auto` selects with this recipe (see **Fusion and Sirius's
+scan** above).
 
 Operational rules from that host:
 

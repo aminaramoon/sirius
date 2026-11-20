@@ -88,7 +88,9 @@ class column_chunk_range_cache {
 ///
 /// Takes one of two routes, picked from what the backend says it wants:
 ///
-///   bulk    - when every source's backend reports @c prefers_bulk_io().  Each
+///   bulk    - when every source's context prefers it (@c sirius::io::prefers_bulk_read:
+///             the backend's @c prefers_bulk_io(), i.e. REST, or a cuFile context with
+///             @c scan_manager.cufile_bulk_read on).  Each
 ///             source's column chunks are read in a single vectored device
 ///             request straight into their own device buffers, and the table is
 ///             decoded from those buffers by the hybrid scan reader —
