@@ -700,7 +700,11 @@ With the knob `off` (or lanes off) the scan keeps cuDF's general reader, which i
 never fused with each other. `scan_manager.cufile_bulk_read_sync_before_submit` (default off)
 registers the context in a second registry (`sirius::io::sync_before_submit_registration`):
 the bulk route then synchronizes its stream once per vectored request, and the general route
-wraps each source so every cuDF device read synchronizes cuDF's stream first.
+wraps each source so every cuDF device read synchronizes cuDF's stream first. Every
+general-route caller builds its cuDF sources with `op::scan::general_reader_source`: the table
+scan (`parquet_scan_core.cpp`, which calls `cudf::io::read_parquet` itself, so a TPC-H scan
+with `cufile_bulk_read: off` never reaches `materialize_parquet`) as well as
+`materialize_parquet`'s own general route.
 
 A device read is ordered after the work already queued on the caller's stream, through
 an event recorded on the submitting thread. Completion is host-observed: the read future

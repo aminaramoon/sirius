@@ -125,6 +125,15 @@ class column_chunk_range_cache {
   std::span<parquet_source const> sources,
   cudf::io::parquet_reader_options const& options) noexcept;
 
+/// The cuDF datasource over @p source for @c cudf::io::read_parquet (the general route), not
+/// owning it.  When @p source's io context runs with
+/// @c scan_manager.cufile_bulk_read_sync_before_submit on, every device read cuDF issues
+/// through it first synchronizes cuDF's stream, where cuDF allocated the destination;
+/// otherwise it is @c cudf::io::datasource::create(source).  Every general-route caller
+/// (this file's and the table scan's) builds its sources with this.
+[[nodiscard]] std::unique_ptr<cudf::io::datasource> general_reader_source(
+  cucascade::io::datasource* source);
+
 /// Throw unless every entry of @p sources has the same footer schema as the
 /// first, compared as cudf::io::read_parquet compares several sources.  The
 /// multi-file hybrid scan reader skips that check, so the bulk route calls

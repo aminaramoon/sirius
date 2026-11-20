@@ -335,15 +335,8 @@ std::unique_ptr<cudf::table> materialize_general(std::span<parquet_source const>
   metadatas.reserve(sources.size());
   rg_per_src.reserve(sources.size());
 
-  // With cufile_bulk_read_sync_before_submit on for a source's context, cuDF's device reads
-  // of it go through a wrapper that settles cuDF's stream (where it allocated their
-  // destinations) first.
   for (auto const& src : sources) {
-    if (sirius::io::syncs_before_submit(*src.datasource)) {
-      cudf_sources.push_back(std::make_unique<sync_before_submit_source>(src.datasource.get()));
-    } else {
-      cudf_sources.push_back(cudf::io::datasource::create(src.datasource.get()));
-    }
+    cudf_sources.push_back(general_reader_source(src.datasource.get()));
     metadatas.push_back(*src.metadata);
     rg_per_src.push_back(src.row_group_indices);
   }
@@ -362,6 +355,14 @@ std::unique_ptr<cudf::table> materialize_general(std::span<parquet_source const>
 }
 
 }  // namespace
+
+std::unique_ptr<cudf::io::datasource> general_reader_source(cucascade::io::datasource* source)
+{
+  if (source != nullptr && sirius::io::syncs_before_submit(*source)) {
+    return std::make_unique<sync_before_submit_source>(source);
+  }
+  return cudf::io::datasource::create(source);
+}
 
 void require_same_parquet_schema(std::span<parquet_source const> sources)
 {

@@ -2719,7 +2719,7 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
     for (auto const& slice : split.rg_slices) {
       if (!all_slices_pruned && slice.row_group_indices.empty()) { continue; }
       bindings.push_back(&slice);
-      sources.push_back(slice.datasource ? cudf::io::datasource::create(slice.datasource.get())
+      sources.push_back(slice.datasource ? general_reader_source(slice.datasource.get())
                                          : cudf::io::datasource::create(slice.file_path));
       metadatas.push_back(*slice.file_metadata);
       row_groups.push_back(slice.row_group_indices);
@@ -2779,9 +2779,9 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
       metadatas.reserve(split.rg_slices.size());
       rg_per_src.reserve(split.rg_slices.size());
       for (auto const& slice : split.rg_slices) {
-        cudf_sources.push_back(slice.datasource
-                                 ? cudf::io::datasource::create(slice.datasource.get())
-                                 : cudf::io::datasource::create(slice.file_path));
+        // general_reader_source: honours cufile_bulk_read_sync_before_submit on this route too.
+        cudf_sources.push_back(slice.datasource ? general_reader_source(slice.datasource.get())
+                                                : cudf::io::datasource::create(slice.file_path));
         metadatas.push_back(*slice.file_metadata);
         rg_per_src.push_back(slice.row_group_indices);
       }

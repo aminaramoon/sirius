@@ -1050,4 +1050,72 @@ TEST_CASE("a SQL scan through the cuFile backend reads on fused lanes",
   db.reset();
 }
 
+TEST_CASE("a SQL scan on cuDF's general reader waits for its stream with sync_before_submit on",
+          "[cufile][scan][bulk_read][isolated_context]")
+{
+  // The table scan builds its general-route sources itself (not through materialize_parquet),
+  // so this checks the switch where a TPC-H scan with cufile_bulk_read off really reads.
+  // Fused reads stay off: the switch does not need them.
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count == 0) { SKIP("cuFile scan integration requires a CUDA device"); }
+  sirius::test::scratch_dir directory("cufile_sync_sql");
+  write_parquet(directory);
+  auto const config_path = directory.file("sirius_cufile_sync.yaml");
+  {
+    std::ofstream yaml(config_path);
+    yaml << "sirius:\n"
+            "  topology:\n"
+            "    num_gpus: 1\n"
+            "  memory:\n"
+            "    gpu:\n"
+            "      usage_limit_bytes: 2GiB\n"
+            "    host:\n"
+            "      capacity_bytes: 1GiB\n"
+            "  executor:\n"
+            "    pipeline:\n"
+            "      num_threads: 2\n"
+            "    scan_manager:\n"
+            "      backend: cufile\n"
+            "      cufile_n_reactors: 0\n"
+            "      uring_n_reactors: 1\n"
+            "      cufile_bulk_read: off\n"
+            "      cufile_bulk_read_sync_before_submit: true\n";
+    REQUIRE(yaml);
+  }
+
+  auto db = sirius::test::open_sirius_db(nullptr, config_path);
+  {
+    duckdb::Connection con(*db);
+    auto const run = [&](std::string const& sql) {
+      auto result = con.Query(sql);
+      REQUIRE(result);
+      INFO((result->HasError() ? result->GetError() : std::string{}));
+      REQUIRE_FALSE(result->HasError());
+      return result;
+    };
+    std::ignore = run("SET enable_duckdb_fallback = false");
+    auto const query =
+      "SELECT count(*), min(id), max(id), min(value), max(value) FROM "
+      "read_parquet(" +
+      directory.file_literal("input.parquet") + ") WHERE id >= 100000";
+    auto const& counters = sirius::io::sync_before_submit_counters();
+    auto const before    = counters.syncs.load();
+    auto gpu             = run(query);
+    auto const syncs     = counters.syncs.load() - before;
+    std::ignore          = run("SET gpu_execution = false");
+    auto cpu             = run(query);
+    REQUIRE(gpu->RowCount() == 1);
+    REQUIRE(cpu->RowCount() == 1);
+    REQUIRE(gpu->ColumnCount() == cpu->ColumnCount());
+    for (duckdb::idx_t c = 0; c < gpu->ColumnCount(); ++c) {
+      CAPTURE(c);
+      CHECK(gpu->Collection().GetValue(c, 0).ToString() ==
+            cpu->Collection().GetValue(c, 0).ToString());
+    }
+    CHECK(syncs > 0);  // the scan's device reads went through the waiting source
+  }
+  db.reset();
+}
+
 #endif  // CUCASCADE_HAS_CUFILE
