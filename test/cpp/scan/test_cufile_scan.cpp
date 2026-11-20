@@ -708,6 +708,68 @@ TEST_CASE("cufile_bulk_read off keeps cuDF's general reader on fused lanes",
   CHECK(scanned.cufile_failures == 0);
 }
 
+TEST_CASE("cufile_bulk_read_sync_before_submit waits for the stream on both read routes",
+          "[cufile][scan][fused_reads][bulk_read]")
+{
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count == 0) { SKIP("cuFile scan integration requires a CUDA device"); }
+  auto const bulk = GENERATE(true, false);
+  CAPTURE(bulk);
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  sirius::test::scratch_dir directory("cufile_sync_before_submit");
+  write_parquet(directory);
+
+  auto config             = fused_reads_config();
+  config.cufile_bulk_read = bulk ? sirius::scan_manager::cufile_bulk_read_mode::on
+                                 : sirius::scan_manager::cufile_bulk_read_mode::off;
+  config.cufile_bulk_read_sync_before_submit = true;
+  auto memory                                = initialize_memory_manager(1);
+  auto topology                              = single_gpu_index();
+  sirius::exec::query_lifecycle_registry lifecycle;
+  {
+    sirius_scan_manager reader{lifecycle, config, *memory, topology};
+    sirius_scan_manager native{lifecycle, reader_config(io_backend::native), *memory, topology};
+    auto const path = directory.file("input.parquet");
+    auto source     = reader.create_datasource(path);
+    auto baseline   = native.create_datasource(path);
+    REQUIRE(source);
+    REQUIRE(baseline);
+    CHECK(sirius::io::syncs_before_submit(*source));
+    CHECK_FALSE(sirius::io::syncs_before_submit(*baseline));  // only the cuFile context
+
+    auto options =
+      cudf::io::parquet_reader_options::builder().column_names({"id", "value"}).build();
+    auto footer = cudf::io::parquet::fetch_footer_to_host(*baseline);
+    cudf::io::parquet::experimental::hybrid_scan_reader footer_reader(
+      cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), options);
+    auto const metadata =
+      std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
+    std::vector<cudf::size_type> groups(metadata->row_groups.size());
+    std::iota(groups.begin(), groups.end(), 0);
+
+    std::array<parquet_source, 1> const sources{{{source, metadata, groups}}};
+    CHECK(sirius::op::scan::prefers_bulk_materialize(sources, options) == bulk);
+    rmm::cuda_stream decoder(rmm::cuda_stream::flags::non_blocking);
+    auto const& counters = sirius::io::sync_before_submit_counters();
+    auto const before    = counters.syncs.load();
+    auto table           = sirius::op::scan::materialize_parquet(
+      sources, options, {}, decoder, cudf::get_current_device_resource_ref());
+    REQUIRE(table);
+    auto const actual   = host_columns(table->view(), decoder);
+    auto const expected = expected_rows(*metadata, groups);
+    CHECK(std::equal(actual.begin(), actual.end(), expected.begin(), expected.end()));
+    auto const syncs = counters.syncs.load() - before;
+    if (bulk) {
+      CHECK(syncs == 1);  // one vectored request for the file
+    } else {
+      CHECK(syncs >= 1);  // one per cuDF device read
+    }
+  }
+  // The scan manager withdrew its context when it went away.
+  CHECK(sirius::io::detail::sync_before_submit_registry().count.load() == 0);
+}
+
 TEST_CASE("cufile_bulk_read picks the Parquet read route of cuFile scans",
           "[cufile][scan][scan_manager][fused_reads][bulk_read]")
 {

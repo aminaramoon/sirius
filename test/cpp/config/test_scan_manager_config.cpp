@@ -2318,3 +2318,22 @@ TEST_CASE("sirius_config reads scan_manager.cufile_bulk_read",
         Catch::Matchers::ContainsSubstring("(expected auto, on, off)"));
   }
 }
+
+TEST_CASE("sirius_config reads scan_manager.cufile_bulk_read_sync_before_submit",
+          "[scan_manager][config][cufile][bulk_read]")
+{
+  CHECK_FALSE(scan_manager_config{}.cufile_bulk_read_sync_before_submit);
+  CHECK_FALSE(load_scan_manager("sirius_cufile_bulk_sync_default.yaml",
+                                single_gpu_scan_manager_yaml("      backend: cufile\n"))
+                .cufile_bulk_read_sync_before_submit);
+  for (auto const value : {true, false}) {
+    CAPTURE(value);
+    auto const body =
+      std::string{
+        "      backend: cufile\n"
+        "      cufile_bulk_read_sync_before_submit: "} +
+      (value ? "true" : "false") + "\n";
+    CHECK(load_scan_manager("sirius_cufile_bulk_sync.yaml", single_gpu_scan_manager_yaml(body))
+            .cufile_bulk_read_sync_before_submit == value);
+  }
+}

@@ -697,7 +697,10 @@ scans are. The scan manager registers its cuFile context for that route
 decision both `prefers_bulk_materialize` and the Iceberg reader-position eligibility read.
 With the knob `off` (or lanes off) the scan keeps cuDF's general reader, which issues one
 `device_read_async` per contiguous run of column chunks, so runs are split into windows but
-never fused with each other.
+never fused with each other. `scan_manager.cufile_bulk_read_sync_before_submit` (default off)
+registers the context in a second registry (`sirius::io::sync_before_submit_registration`):
+the bulk route then synchronizes its stream once per vectored request, and the general route
+wraps each source so every cuDF device read synchronizes cuDF's stream first.
 
 A device read is ordered after the work already queued on the caller's stream, through
 an event recorded on the submitting thread. Completion is host-observed: the read future

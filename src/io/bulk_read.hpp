@@ -46,44 +46,42 @@ namespace sirius::io {
 
 namespace detail {
 
-struct bulk_read_contexts {
+/// The io contexts a Sirius choice is registered on (see @ref context_registration).
+struct context_registry {
   std::mutex mutex;
   std::vector<cucascade::io::ioctx const*> contexts;
   /// Fast path: nothing is registered (every backend but a configured cuFile one).
   std::atomic<std::size_t> count{0};
+
+  [[nodiscard]] bool contains(cucascade::io::ioctx const& ctx) noexcept
+  {
+    if (count.load(std::memory_order_acquire) == 0) { return false; }
+    std::lock_guard lock(mutex);
+    return std::ranges::find(contexts, &ctx) != contexts.end();
+  }
 };
 
-inline bulk_read_contexts& bulk_read_registry() noexcept
+/// Contexts whose Parquet scans take the bulk route (@c scan_manager.cufile_bulk_read).
+inline context_registry& bulk_read_registry() noexcept
 {
-  static bulk_read_contexts registry;
+  static context_registry registry;
+  return registry;
+}
+
+/// Contexts whose Parquet device reads wait for their stream first
+/// (@c scan_manager.cufile_bulk_read_sync_before_submit).
+inline context_registry& sync_before_submit_registry() noexcept
+{
+  static context_registry registry;
   return registry;
 }
 
 }  // namespace detail
 
-/// @c scan_manager.cufile_bulk_read_sync_before_submit (default off): the bulk route
-/// synchronizes the stream its destination buffers were allocated on, once per vectored
-/// request, before handing the request to the io context.  Process-wide; the scan manager
-/// turns it on, the counters feed its shutdown stats.
-struct bulk_read_sync_state {
-  std::atomic<bool> enabled{false};
-  std::atomic<std::uint64_t> syncs{0};    ///< Synchronizes done.
-  std::atomic<std::uint64_t> sync_ns{0};  ///< Time spent in them.
-};
-
-[[nodiscard]] inline bulk_read_sync_state& bulk_read_sync() noexcept
-{
-  static bulk_read_sync_state state;
-  return state;
-}
-
 /// Whether Sirius asked for the bulk route on @p ctx (see @ref bulk_read_registration).
 [[nodiscard]] inline bool bulk_read_registered(cucascade::io::ioctx const& ctx) noexcept
 {
-  auto& registry = detail::bulk_read_registry();
-  if (registry.count.load(std::memory_order_acquire) == 0) { return false; }
-  std::lock_guard lock(registry.mutex);
-  return std::ranges::find(registry.contexts, &ctx) != registry.contexts.end();
+  return detail::bulk_read_registry().contains(ctx);
 }
 
 /// Whether Parquet column chunks served by @p ctx are read on the bulk route: the backend's
@@ -102,32 +100,54 @@ struct bulk_read_sync_state {
   return ctx && bulk_read_registered(*ctx);
 }
 
+/// Whether Parquet device reads served by @p source wait for their stream before they are
+/// submitted: its context is registered with @c cufile_bulk_read_sync_before_submit on.
+[[nodiscard]] inline bool syncs_before_submit(cucascade::io::datasource const& source) noexcept
+{
+  auto const ctx = source.io_ctx();
+  return ctx && detail::sync_before_submit_registry().contains(*ctx);
+}
+
+/// Process-wide counters of the waits @c cufile_bulk_read_sync_before_submit adds, for the
+/// scan manager's shutdown stats.
+struct sync_before_submit_stats {
+  std::atomic<std::uint64_t> syncs{0};    ///< Stream synchronizes done before a submit.
+  std::atomic<std::uint64_t> sync_ns{0};  ///< Time spent in them.
+};
+
+[[nodiscard]] inline sync_before_submit_stats& sync_before_submit_counters() noexcept
+{
+  static sync_before_submit_stats stats;
+  return stats;
+}
+
 /**
- * @brief Asks for the bulk route on one io context for as long as it lives.
+ * @brief Registers one io context in one of the registries above for as long as it lives.
  *
  * The owner of the context (the scan manager, for its default cuFile context) holds one and
  * must destroy it before it releases the context, so the address is never confused with a
- * later context's.  Datasources that outlive the registration fall back to the backend's own
- * preference.  Move-only.
+ * later context's.  Datasources that outlive the registration fall back to the default
+ * behaviour.  Move-only.
  */
-class bulk_read_registration {
+template <detail::context_registry& (*Registry)() noexcept>
+class context_registration {
  public:
-  bulk_read_registration() noexcept = default;
+  context_registration() noexcept = default;
 
-  explicit bulk_read_registration(cucascade::io::ioctx const& ctx) : _ctx(&ctx)
+  explicit context_registration(cucascade::io::ioctx const& ctx) : _ctx(&ctx)
   {
-    auto& registry = detail::bulk_read_registry();
+    auto& registry = Registry();
     std::lock_guard lock(registry.mutex);
     registry.contexts.push_back(_ctx);
     registry.count.fetch_add(1, std::memory_order_release);
   }
 
-  bulk_read_registration(bulk_read_registration&& other) noexcept
+  context_registration(context_registration&& other) noexcept
     : _ctx(std::exchange(other._ctx, nullptr))
   {
   }
 
-  bulk_read_registration& operator=(bulk_read_registration&& other) noexcept
+  context_registration& operator=(context_registration&& other) noexcept
   {
     if (this != &other) {
       reset();
@@ -136,16 +156,16 @@ class bulk_read_registration {
     return *this;
   }
 
-  bulk_read_registration(bulk_read_registration const&)            = delete;
-  bulk_read_registration& operator=(bulk_read_registration const&) = delete;
+  context_registration(context_registration const&)            = delete;
+  context_registration& operator=(context_registration const&) = delete;
 
-  ~bulk_read_registration() { reset(); }
+  ~context_registration() { reset(); }
 
   /// Withdraw the registration (no-op when empty).
   void reset() noexcept
   {
     if (_ctx == nullptr) { return; }
-    auto& registry = detail::bulk_read_registry();
+    auto& registry = Registry();
     std::lock_guard lock(registry.mutex);
     if (auto const it = std::ranges::find(registry.contexts, _ctx); it != registry.contexts.end()) {
       registry.contexts.erase(it);
@@ -159,5 +179,13 @@ class bulk_read_registration {
  private:
   cucascade::io::ioctx const* _ctx{nullptr};
 };
+
+/// Asks for the bulk route on one io context (@c scan_manager.cufile_bulk_read).
+using bulk_read_registration = context_registration<&detail::bulk_read_registry>;
+
+/// Makes one io context's Parquet device reads wait for their stream before they are submitted
+/// (@c scan_manager.cufile_bulk_read_sync_before_submit): the bulk route once per vectored
+/// request, the general route once per cuDF device read.
+using sync_before_submit_registration = context_registration<&detail::sync_before_submit_registry>;
 
 }  // namespace sirius::io

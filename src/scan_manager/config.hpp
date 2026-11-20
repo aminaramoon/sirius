@@ -303,9 +303,10 @@ struct scan_manager_config {
   /// @ref reads_cufile_in_bulk).  YAML @c cufile_bulk_read: @c auto | @c on | @c off.
   cufile_bulk_read_mode cufile_bulk_read{cufile_bulk_read_mode::automatic};
 
-  /// On the cuFile bulk route, synchronize the allocation stream once per vectored request
-  /// before it is submitted (an A/B switch for the stream-gate theory).  YAML
-  /// @c cufile_bulk_read_sync_before_submit, default false.
+  /// With the cuFile backend, synchronize the stream a Parquet scan allocated its device
+  /// destinations on before the read is submitted: once per vectored request on the bulk
+  /// route, once per cuDF device read on the general route (an A/B switch for the stream-gate
+  /// theory).  YAML @c cufile_bulk_read_sync_before_submit, default false.
   bool cufile_bulk_read_sync_before_submit{false};
 
   /// Scans the readahead scan manager may keep in flight, and the switch that

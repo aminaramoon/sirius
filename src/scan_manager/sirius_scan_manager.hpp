@@ -1185,6 +1185,10 @@ class sirius_scan_manager {
   /// `cufile_bulk_read` resolves to on (see sirius::io::prefers_bulk_read).  Declared after
   /// `_io_ctx`, so it is withdrawn before the context is released.
   sirius::io::bulk_read_registration _cufile_bulk_read;
+  /// Makes Parquet device reads served by `_io_ctx` wait for their stream before they are
+  /// submitted, when it is the cuFile context and `cufile_bulk_read_sync_before_submit` is on.
+  /// Declared after `_io_ctx` for the same reason.
+  sirius::io::sync_before_submit_registration _cufile_sync_before_submit;
   /// `[uring_gauges]` DEBUG sampler of `_io_ctx` when it is a uring ioctx (null
   /// otherwise).  Stopped in @ref stop, before any ioctx is released.
   std::unique_ptr<uring_gauges_sampler> _uring_gauges_sampler;

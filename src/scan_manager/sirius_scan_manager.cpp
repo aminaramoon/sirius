@@ -1436,12 +1436,15 @@ sirius_scan_manager::sirius_scan_manager(
           "file per split (cufile_bulk_read {}, fused_reads {})",
           _config.cufile_bulk_read == cufile_bulk_read_mode::automatic ? "auto" : "on",
           _config.cufile.fused_reads.enabled ? "on" : "off");
-        if (_config.cufile_bulk_read_sync_before_submit) {
-          sirius::io::bulk_read_sync().enabled.store(true, std::memory_order_relaxed);
-          SIRIUS_LOG_INFO(
-            "[sirius_scan_manager] cufile_bulk_read_sync_before_submit on: the bulk route "
-            "synchronizes its allocation stream once per request before the reactor gets it");
-        }
+      }
+      // An A/B switch: settle the stream the destinations were allocated on before a device
+      // read reaches the reactor, on either route.
+      if (_config.cufile_bulk_read_sync_before_submit) {
+        _cufile_sync_before_submit = sirius::io::sync_before_submit_registration{*_io_ctx};
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] cufile_bulk_read_sync_before_submit on: cuFile Parquet device "
+          "reads synchronize their stream before the reactor gets them (bulk route: once per "
+          "request; general route: once per cuDF read)");
       }
       break;
   }
@@ -1550,14 +1553,16 @@ sirius_scan_manager::~sirius_scan_manager()
             rs.worker_passes);
         }
       }
-      if (auto const& sync = sirius::io::bulk_read_sync();
-          _config.cufile_bulk_read_sync_before_submit || sync.syncs.load() != 0) {
-        auto const n = sync.syncs.load();
+      if (_config.cufile_bulk_read_sync_before_submit) {
+        // Process-wide totals (one cuFile scan manager per process in a benchmark).
+        auto const& sync  = sirius::io::sync_before_submit_counters();
+        auto const syncs  = sync.syncs.load(std::memory_order_relaxed);
+        auto const waited = sync.sync_ns.load(std::memory_order_relaxed);
         SIRIUS_LOG_INFO(
           "[sirius_scan_manager] cufile bulk sync before submit: {} syncs, {} ms ({} us/sync)",
-          n,
-          sync.sync_ns.load() / 1000000,
-          n == 0 ? 0 : sync.sync_ns.load() / n / 1000);
+          syncs,
+          waited / 1000000,
+          syncs == 0 ? 0 : waited / syncs / 1000);
       }
       if (_config.cufile.host_batch.enabled || s.batch_reads != 0) {
         SIRIUS_LOG_INFO(
