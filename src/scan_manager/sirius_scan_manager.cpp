@@ -1514,6 +1514,35 @@ sirius_scan_manager::~sirius_scan_manager()
           s.lane_failures,
           s.lane_gated_reads,
           finished == 0 ? 0 : s.lane_flight_ns / finished / 1000);
+        // Where the lane reactors spent their time: issuing (cuFileReadAsync alone is the
+        // part a saturated submit path shows up in), in flight, and asleep.  Worker wait and
+        // passes in the totals cover every reactor in the pool; the per-reactor lines cover
+        // the lane reactors only.  Benchmark scripts grep "cufile lane timing" and "cufile lane
+        // reactor"; keep that wording.
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] cufile lane timing: submit {} ms, cuFileReadAsync {} ms ({} "
+          "us/read), flight {} ms, all workers wait {} ms, passes {}",
+          s.lane_submit_ns / 1000000,
+          s.lane_read_async_ns / 1000000,
+          finished == 0 ? 0 : s.lane_read_async_ns / finished / 1000,
+          s.lane_flight_ns / 1000000,
+          s.worker_wait_ns / 1000000,
+          s.worker_passes);
+        for (std::size_t i = 0; i < cufile->reactor_count(); ++i) {
+          auto const& r = cufile->reactor(i);
+          if (!r.placement().fused_lanes) { continue; }
+          auto const rs = r.stats();
+          SIRIUS_LOG_INFO(
+            "[sirius_scan_manager] cufile lane reactor {}: reads {}, {} MiB, submit {} ms, "
+            "cuFileReadAsync {} ms, wait {} ms, passes {}",
+            i,
+            rs.lane_reads,
+            rs.lane_bytes >> 20,
+            rs.lane_submit_ns / 1000000,
+            rs.lane_read_async_ns / 1000000,
+            rs.worker_wait_ns / 1000000,
+            rs.worker_passes);
+        }
       }
       if (_config.cufile.host_batch.enabled || s.batch_reads != 0) {
         SIRIUS_LOG_INFO(
