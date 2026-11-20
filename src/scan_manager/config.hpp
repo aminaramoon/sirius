@@ -303,6 +303,11 @@ struct scan_manager_config {
   /// @ref reads_cufile_in_bulk).  YAML @c cufile_bulk_read: @c auto | @c on | @c off.
   cufile_bulk_read_mode cufile_bulk_read{cufile_bulk_read_mode::automatic};
 
+  /// On the cuFile bulk route, synchronize the allocation stream once per vectored request
+  /// before it is submitted (an A/B switch for the stream-gate theory).  YAML
+  /// @c cufile_bulk_read_sync_before_submit, default false.
+  bool cufile_bulk_read_sync_before_submit{false};
+
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
   /// with a cache on, the budget is the backend reactor's own

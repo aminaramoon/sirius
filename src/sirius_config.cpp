@@ -764,6 +764,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
               {{"auto", scan_manager::cufile_bulk_read_mode::automatic},
                {"on", scan_manager::cufile_bulk_read_mode::on},
                {"off", scan_manager::cufile_bulk_read_mode::off}});
+  r.optional("cufile_bulk_read_sync_before_submit", opt.cufile_bulk_read_sync_before_submit);
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);

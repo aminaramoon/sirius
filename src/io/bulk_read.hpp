@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -59,6 +60,22 @@ inline bulk_read_contexts& bulk_read_registry() noexcept
 }
 
 }  // namespace detail
+
+/// @c scan_manager.cufile_bulk_read_sync_before_submit (default off): the bulk route
+/// synchronizes the stream its destination buffers were allocated on, once per vectored
+/// request, before handing the request to the io context.  Process-wide; the scan manager
+/// turns it on, the counters feed its shutdown stats.
+struct bulk_read_sync_state {
+  std::atomic<bool> enabled{false};
+  std::atomic<std::uint64_t> syncs{0};    ///< Synchronizes done.
+  std::atomic<std::uint64_t> sync_ns{0};  ///< Time spent in them.
+};
+
+[[nodiscard]] inline bulk_read_sync_state& bulk_read_sync() noexcept
+{
+  static bulk_read_sync_state state;
+  return state;
+}
 
 /// Whether Sirius asked for the bulk route on @p ctx (see @ref bulk_read_registration).
 [[nodiscard]] inline bool bulk_read_registered(cucascade::io::ioctx const& ctx) noexcept

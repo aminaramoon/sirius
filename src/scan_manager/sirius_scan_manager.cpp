@@ -1436,6 +1436,12 @@ sirius_scan_manager::sirius_scan_manager(
           "file per split (cufile_bulk_read {}, fused_reads {})",
           _config.cufile_bulk_read == cufile_bulk_read_mode::automatic ? "auto" : "on",
           _config.cufile.fused_reads.enabled ? "on" : "off");
+        if (_config.cufile_bulk_read_sync_before_submit) {
+          sirius::io::bulk_read_sync().enabled.store(true, std::memory_order_relaxed);
+          SIRIUS_LOG_INFO(
+            "[sirius_scan_manager] cufile_bulk_read_sync_before_submit on: the bulk route "
+            "synchronizes its allocation stream once per request before the reactor gets it");
+        }
       }
       break;
   }
@@ -1543,6 +1549,15 @@ sirius_scan_manager::~sirius_scan_manager()
             rs.worker_wait_ns / 1000000,
             rs.worker_passes);
         }
+      }
+      if (auto const& sync = sirius::io::bulk_read_sync();
+          _config.cufile_bulk_read_sync_before_submit || sync.syncs.load() != 0) {
+        auto const n = sync.syncs.load();
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] cufile bulk sync before submit: {} syncs, {} ms ({} us/sync)",
+          n,
+          sync.sync_ns.load() / 1000000,
+          n == 0 ? 0 : sync.sync_ns.load() / n / 1000);
       }
       if (_config.cufile.host_batch.enabled || s.batch_reads != 0) {
         SIRIUS_LOG_INFO(

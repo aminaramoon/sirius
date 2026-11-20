@@ -27,6 +27,8 @@
 #include <cucascade/io/types.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <iterator>
 #include <stdexcept>
 #include <string>
@@ -157,6 +159,18 @@ fetched_chunks fetch_chunks(parquet_source const& src,
                        static_cast<std::uint8_t*>(out.buffers[i].data()));
   }
 
+  // Optional: settle the allocations (and anything else queued on the stream) before the
+  // reactor gets the request, so its stream gate is already passed.
+  if (auto& sync = sirius::io::bulk_read_sync(); sync.enabled.load(std::memory_order_relaxed)) {
+    auto const start = std::chrono::steady_clock::now();
+    stream.sync();
+    sync.syncs.fetch_add(1, std::memory_order_relaxed);
+    sync.sync_ns.fetch_add(static_cast<std::uint64_t>(
+                             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - start)
+                               .count()),
+                           std::memory_order_relaxed);
+  }
   {
     std::ignore = src.datasource->device_read_ranges_async(reads, stream).get();
   }
