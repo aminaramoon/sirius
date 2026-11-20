@@ -165,11 +165,11 @@ fetched_chunks fetch_chunks(parquet_source const& src,
     auto const start = std::chrono::steady_clock::now();
     stream.sync();
     sync.syncs.fetch_add(1, std::memory_order_relaxed);
-    sync.sync_ns.fetch_add(static_cast<std::uint64_t>(
-                             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               std::chrono::steady_clock::now() - start)
-                               .count()),
-                           std::memory_order_relaxed);
+    sync.sync_ns.fetch_add(
+      static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count()),
+      std::memory_order_relaxed);
   }
   {
     std::ignore = src.datasource->device_read_ranges_async(reads, stream).get();
