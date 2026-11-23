@@ -968,6 +968,7 @@ struct disk_mem_config {
   int id{0};
   std::size_t capacity_bytes{1024UL << 30};  // 1TB
   std::string downgrade_root_dirs;
+  bool allow_gds{true};
 
   static void from_yaml(const YAML::Node& node, disk_mem_config& opt)
   {
@@ -975,13 +976,14 @@ struct disk_mem_config {
     r.optional("disk_id", opt.id);
     r.optional("capacity_bytes", yaml::bytes(opt.capacity_bytes));
     r.optional("downgrade_root_dirs", opt.downgrade_root_dirs);
+    r.optional("allow_gds", opt.allow_gds);
     r.reject_unknown();
   }
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
   {
     if (downgrade_root_dirs.empty() || capacity_bytes == 0) { return; }
-    builder.set_disk_mounting_point(id, capacity_bytes, downgrade_root_dirs);
+    builder.set_disk_mounting_point(id, capacity_bytes, downgrade_root_dirs, nullptr, allow_gds);
   }
 };
 
